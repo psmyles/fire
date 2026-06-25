@@ -1,5 +1,5 @@
 [package]
-name = "texview-daemon"
+name = "fire-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,8 @@ publish.workspace = true
 # config) to keep iteration fast here. crossbeam-channel arrived with the Phase 2
 # decode worker pool.
 [dependencies]
-texview-ipc.workspace = true
-texview-decode.workspace = true
+fire-ipc.workspace = true
+fire-decode.workspace = true
 
 winit.workspace = true
 wgpu.workspace = true
@@ -29,6 +29,10 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+# Embeds the Fire .ico + product metadata into the exe (Explorer file icon).
+winresource.workspace = true
 
 [[example]]
 name = "adapter_probe"

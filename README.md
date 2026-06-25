@@ -13,10 +13,10 @@ design and `.claude/plans/` for the phased implementation plan.
 
 ```
 crates/
-  texview-ipc/      shared named-pipe protocol (stub <-> daemon), dependency-light
-  texview-stub/     tiny launcher exe Explorer invokes (connect → send → exit)
-  texview-daemon/   resident process: ipc server, session, wgpu render, egui UI
-  texview-decode/   uniform decode core: bytes → (pixels, format, bit depth, ICC)
+  fire-ipc/      shared named-pipe protocol (stub <-> daemon), dependency-light
+  fire-stub/     tiny launcher exe Explorer invokes (connect → send → exit)
+  fire-daemon/   resident process: ipc server, session, wgpu render, egui UI
+  fire-decode/   uniform decode core: bytes → (pixels, format, bit depth, ICC)
   psd-sdk-sys/      FFI to vendored psd_sdk C++ (cc + bindgen)
 installer/          Inno Setup script (Phase 6)
 ```
@@ -25,9 +25,9 @@ installer/          Inno Setup script (Phase 6)
 
 ```sh
 cargo build --workspace
-cargo run -p texview-daemon                 # start the resident daemon
-cargo run -p texview-stub -- C:\path\img.png  # forward a file to the daemon
-cargo run -p texview-daemon --example adapter_probe  # GPU adapter probe (Phase 0)
+cargo run -p fire-daemon                 # start the resident daemon
+cargo run -p fire-stub -- C:\path\img.png  # forward a file to the daemon
+cargo run -p fire-daemon --example adapter_probe  # GPU adapter probe (Phase 0)
 ```
 
 ## Toolchain prerequisites (Windows, x86_64-pc-windows-msvc)

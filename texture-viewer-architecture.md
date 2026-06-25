@@ -31,7 +31,7 @@ Explorer double-click
         │ if pipe absent                          │  • wgpu device + queue (warm) │
         └── spawn daemon, retry ──────────────────│  • pooled window               │
                                                    │  • decode worker pool          │
-                                                   │  • texview-decode core         │
+                                                   │  • fire-decode core         │
                                                    └──────────────────────────────┘
 ```
 
@@ -60,7 +60,7 @@ exits. If no daemon is listening, it spawns one, waits for the pipe, and forward
 
 ## 4. IPC protocol
 
-- **Transport:** Windows named pipe (e.g. `\\.\pipe\texview`).
+- **Transport:** Windows named pipe (e.g. `\\.\pipe\fire`).
 - **Framing:** length-prefixed messages (`u32` little-endian length + payload).
 - **Payload:** UTF-8 path + flags (window-mode override such as "new window",
   "new tab"; activate/focus request).
@@ -140,7 +140,7 @@ full adapter loss requires the complete rebuild in step 2.
 
 ## 6. Decode pipeline
 
-All decoders live behind a single **`texview-decode`** crate exposing a uniform
+All decoders live behind a single **`fire-decode`** crate exposing a uniform
 "bytes → (pixels, format, bit depth, optional ICC profile)" interface.
 
 | Format(s)              | Decoder                                  |
@@ -223,7 +223,7 @@ Notes:
 - **Association only** (no thumbnail handler in v1): register an `HKCU` ProgID,
   declare supported extensions (`.jpg .jpeg .png .tga .tif .tiff .psd .exr .hdr`
   …), and point them at the stub. Appears in "Open with".
-- Decoders are already factored into the standalone `texview-decode` crate, so an
+- Decoders are already factored into the standalone `fire-decode` crate, so an
   `IThumbnailProvider` handler can be added later as a separate `cdylib` reusing
   that core with no rework.
 
@@ -244,7 +244,7 @@ egui + egui-winit + egui-wgpu   # settings panel + overlay
 crossbeam-channel or std mpsc   # worker <-> render messaging
 windows          # named pipe, mutex, Run-key registration, shell assoc
 
-# decode (texview-decode crate)
+# decode (fire-decode crate)
 zune-image / zune-jpeg / zune-png / zune-hdr
 image            # TGA, TIFF, GIF, BMP fallback (+ ICC-bearing paths)
 exr              # OpenEXR
@@ -260,12 +260,12 @@ lcms2            # ICC transforms (FFI)
 ## 12. Workspace layout
 
 ```
-texview/
+fire/
 ├─ crates/
-│  ├─ texview-stub/      # tiny launcher exe (Explorer target)
-│  ├─ texview-daemon/    # resident process: ipc, session, render, ui
-│  ├─ texview-decode/    # uniform decode core (zune/image/exr/psd_sdk/lcms2)
-│  ├─ texview-ipc/       # pipe protocol + message types (shared)
+│  ├─ fire-stub/      # tiny launcher exe (Explorer target)
+│  ├─ fire-daemon/    # resident process: ipc, session, render, ui
+│  ├─ fire-decode/    # uniform decode core (zune/image/exr/psd_sdk/lcms2)
+│  ├─ fire-ipc/       # pipe protocol + message types (shared)
 │  └─ psd-sdk-sys/       # FFI bindings + cc build of psd_sdk
 ├─ installer/            # Inno Setup / cargo-wix script
 └─ Cargo.toml            # workspace

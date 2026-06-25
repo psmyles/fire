@@ -88,17 +88,17 @@ inline uint8_t sample_channel(const void* data, unsigned int bits, size_t i) {
 
 } // namespace
 
-struct texview_psd {
+struct fire_psd {
     Doc d;
 };
 
 extern "C" {
 
-texview_psd* texview_psd_open(const uint8_t* bytes, size_t len) {
+fire_psd* fire_psd_open(const uint8_t* bytes, size_t len) {
     if (!bytes || len == 0) {
         return nullptr;
     }
-    texview_psd* handle = new (std::nothrow) texview_psd();
+    fire_psd* handle = new (std::nothrow) fire_psd();
     if (!handle) {
         return nullptr;
     }
@@ -109,13 +109,13 @@ texview_psd* texview_psd_open(const uint8_t* bytes, size_t len) {
         d.bytes.assign(bytes, bytes + len);
         d.file = new (std::nothrow) MemoryFile(&d.allocator, d.bytes.data(), d.bytes.size());
         if (!d.file) {
-            texview_psd_free(handle);
+            fire_psd_free(handle);
             return nullptr;
         }
         d.file->OpenRead(L"memory");
         d.document = psd::CreateDocument(d.file, &d.allocator);
         if (!d.document) {
-            texview_psd_free(handle);
+            fire_psd_free(handle);
             return nullptr;
         }
         // Merged image is only present when the PSD was saved with Maximize Compatibility.
@@ -128,12 +128,12 @@ texview_psd* texview_psd_open(const uint8_t* bytes, size_t len) {
         }
         return handle;
     } catch (...) {
-        texview_psd_free(handle);
+        fire_psd_free(handle);
         return nullptr;
     }
 }
 
-int texview_psd_info_get(const texview_psd* doc, texview_psd_info* out_info) {
+int fire_psd_info_get(const fire_psd* doc, fire_psd_info* out_info) {
     if (!doc || !out_info || !doc->d.document) {
         return 1;
     }
@@ -145,7 +145,7 @@ int texview_psd_info_get(const texview_psd* doc, texview_psd_info* out_info) {
     return 0;
 }
 
-int texview_psd_read_merged_rgba8(const texview_psd* doc, uint8_t* out_pixels, size_t out_len) {
+int fire_psd_read_merged_rgba8(const fire_psd* doc, uint8_t* out_pixels, size_t out_len) {
     if (!doc || !out_pixels || !doc->d.document) {
         return 1;
     }
@@ -198,7 +198,7 @@ int texview_psd_read_merged_rgba8(const texview_psd* doc, uint8_t* out_pixels, s
     return 0;
 }
 
-size_t texview_psd_icc_len(const texview_psd* doc) {
+size_t fire_psd_icc_len(const fire_psd* doc) {
     if (!doc) {
         return 0;
     }
@@ -209,7 +209,7 @@ size_t texview_psd_icc_len(const texview_psd* doc) {
     return r->sizeOfICCProfile;
 }
 
-int texview_psd_icc_get(const texview_psd* doc, uint8_t* out_icc, size_t out_len) {
+int fire_psd_icc_get(const fire_psd* doc, uint8_t* out_icc, size_t out_len) {
     if (!doc || !out_icc) {
         return 1;
     }
@@ -224,7 +224,7 @@ int texview_psd_icc_get(const texview_psd* doc, uint8_t* out_icc, size_t out_len
     return 0;
 }
 
-void texview_psd_free(texview_psd* doc) {
+void fire_psd_free(fire_psd* doc) {
     if (!doc) {
         return;
     }

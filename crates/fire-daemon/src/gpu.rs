@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use texview_decode::{DecodedImage, PixelFormat};
+use fire_decode::{DecodedImage, PixelFormat};
 use winit::window::Window;
 
 /// Window-independent GPU objects, warmed at startup.
@@ -31,7 +31,7 @@ impl GpuContext {
         .expect("no suitable GPU adapter found");
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("texview-device"),
+            label: Some("fire-device"),
             required_features: wgpu::Features::empty(),
             // Request what the adapter supports so max_texture_dimension matches the
             // device the decoder downscales against.

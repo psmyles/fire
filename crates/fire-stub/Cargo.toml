@@ -1,5 +1,5 @@
 [package]
-name = "texview-stub"
+name = "fire-stub"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,9 +11,14 @@ publish.workspace = true
 # are needed (GetNamedPipeServerProcessId, AllowSetForegroundWindow); the pipe itself
 # is opened as a plain file via std.
 [dependencies]
-texview-ipc.workspace = true
+fire-ipc.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Pipes",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+# Build-only: embeds the Fire .ico into the exe. Does NOT add runtime weight to the
+# stub (the §15 "keep the stub tiny" constraint is about runtime, not build deps).
+winresource.workspace = true

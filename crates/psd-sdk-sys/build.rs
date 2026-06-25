@@ -28,8 +28,8 @@ fn main() {
         .clang_arg("c++")
         .clang_arg("-std=c++17")
         .clang_arg("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
-        .allowlist_function("texview_psd_.*")
-        .allowlist_type("texview_psd.*")
+        .allowlist_function("fire_psd_.*")
+        .allowlist_type("fire_psd.*")
         .generate()
         .expect("bindgen failed — check that libclang.dll is on PATH / LIBCLANG_PATH is set");
     bindings
@@ -70,5 +70,5 @@ fn main() {
         build.file(&path);
     }
 
-    build.compile("texview_psd");
+    build.compile("fire_psd");
 }

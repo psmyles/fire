@@ -1,4 +1,4 @@
-//! texview-daemon — the resident process.
+//! fire-daemon — the resident process.
 //!
 //! Startup: acquire the single-instance mutex (exit if another daemon owns it), build
 //! the winit event loop with a custom `UserEvent`, spawn the pipe-server thread (which
@@ -15,7 +15,7 @@ mod ipc_server;
 
 use std::ptr;
 
-use texview_ipc::{OpenRequest, MUTEX_NAME};
+use fire_ipc::{OpenRequest, MUTEX_NAME};
 use winit::event_loop::{ControlFlow, EventLoop};
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};

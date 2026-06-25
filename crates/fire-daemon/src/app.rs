@@ -4,13 +4,13 @@
 
 use std::sync::Arc;
 
-use texview_decode::DecodeOptions;
-use texview_ipc::OpenRequest;
+use fire_decode::DecodeOptions;
+use fire_ipc::OpenRequest;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
-use winit::window::{WindowAttributes, WindowId};
+use winit::window::{Icon, WindowAttributes, WindowId};
 
 use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool};
 use crate::gpu::{GpuContext, WindowState};
@@ -42,7 +42,7 @@ impl App {
         // window shows the placeholder (a solid clear; the "loading" label is Phase 4)
         // rather than the wrong file's pixels while the new one decodes.
         ws.clear_image();
-        ws.window.set_title(&format!("{name} — texview (loading…)"));
+        ws.window.set_title(&format!("{name} — Fire (loading…)"));
         ws.window.set_visible(true);
         ws.window.set_minimized(false);
         if req.flags.activate {
@@ -54,7 +54,7 @@ impl App {
 
         // Tag the job with a fresh generation; a later open supersedes this decode.
         // honor_icc: lcms2 transforms non-sRGB profiles into the sRGB working space
-        // (best-effort; see texview_decode::icc).
+        // (best-effort; see fire_decode::icc).
         let generation = ws.next_generation();
         let opts = DecodeOptions { max_dim: self.gpu.max_texture_dim(), honor_icc: true };
         self.pool.submit(DecodeJob {
@@ -86,16 +86,27 @@ impl App {
                 let (cw, ch) = clamp_window_size(w, h);
                 let _ = ws.window.request_inner_size(PhysicalSize::new(cw, ch));
                 ws.set_image(&self.gpu, img);
-                ws.window.set_title(&format!("{name} — texview"));
+                ws.window.set_title(&format!("{name} — Fire"));
                 ws.window.request_redraw();
-                println!("texview-daemon: opened {:?} ({w}x{h}, {fmt})", outcome.path);
+                println!("fire-daemon: opened {:?} ({w}x{h}, {fmt})", outcome.path);
             }
             Err(e) => {
-                ws.window.set_title(&format!("{name} — texview (failed)"));
-                eprintln!("texview-daemon: failed to open {:?}: {e}", outcome.path);
+                ws.window.set_title(&format!("{name} — Fire (failed)"));
+                eprintln!("fire-daemon: failed to open {:?}: {e}", outcome.path);
             }
         }
     }
+}
+
+/// The Fire window icon (taskbar + title bar), decoded for free from a raw 256×256 RGBA
+/// blob baked into the binary — no PNG decoder at startup. `magick`-generated from
+/// `assets/icon.png`; the on-disk exe icon is embedded separately via `build.rs`.
+fn load_window_icon() -> Option<Icon> {
+    const ICON_RGBA: &[u8] = include_bytes!("../../../assets/icon_256.rgba");
+    const SIDE: u32 = 256;
+    // from_rgba only fails on a length mismatch; the blob is generated at exactly
+    // 256×256×4, so this is infallible in practice (degrade to no icon if not).
+    Icon::from_rgba(ICON_RGBA.to_vec(), SIDE, SIDE).ok()
 }
 
 /// File name of an open request's path, for the window title (falls back to "image").
@@ -116,7 +127,8 @@ impl ApplicationHandler<UserEvent> for App {
         // at startup (resumed runs immediately). The first open just uploads a texture
         // and shows it (§12).
         let attrs = WindowAttributes::default()
-            .with_title("texview")
+            .with_title("Fire")
+            .with_window_icon(load_window_icon())
             .with_visible(false)
             .with_inner_size(PhysicalSize::new(1280, 800));
         let window = Arc::new(

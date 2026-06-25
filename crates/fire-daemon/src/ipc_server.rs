@@ -11,7 +11,7 @@ use std::fs::File;
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, RawHandle};
 use std::ptr;
 
-use texview_ipc::{read_message, PIPE_NAME};
+use fire_ipc::{read_message, PIPE_NAME};
 use winit::event_loop::EventLoopProxy;
 
 use windows_sys::Win32::Foundation::{
@@ -33,7 +33,7 @@ const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
 /// Spawn the pipe-server thread. `proxy` wakes the event loop with each open request.
 pub fn spawn(proxy: EventLoopProxy<UserEvent>) {
     std::thread::Builder::new()
-        .name("texview-pipe-server".into())
+        .name("fire-pipe-server".into())
         .spawn(move || run(proxy))
         .expect("failed to spawn pipe-server thread");
 }
@@ -54,7 +54,7 @@ fn run(proxy: EventLoopProxy<UserEvent>) {
     };
     if pipe == INVALID_HANDLE_VALUE {
         eprintln!(
-            "texview-daemon: CreateNamedPipeW failed (err {})",
+            "fire-daemon: CreateNamedPipeW failed (err {})",
             unsafe { GetLastError() }
         );
         return;
@@ -66,7 +66,7 @@ fn run(proxy: EventLoopProxy<UserEvent>) {
         if connected == 0 {
             let err = unsafe { GetLastError() };
             if err != ERROR_PIPE_CONNECTED {
-                eprintln!("texview-daemon: ConnectNamedPipe failed (err {err})");
+                eprintln!("fire-daemon: ConnectNamedPipe failed (err {err})");
                 unsafe { DisconnectNamedPipe(pipe) };
                 continue;
             }
@@ -86,7 +86,7 @@ fn run(proxy: EventLoopProxy<UserEvent>) {
                     break; // event loop is gone; stop serving
                 }
             }
-            Err(e) => eprintln!("texview-daemon: bad pipe message: {e}"),
+            Err(e) => eprintln!("fire-daemon: bad pipe message: {e}"),
         }
 
         unsafe { DisconnectNamedPipe(pipe) };

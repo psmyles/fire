@@ -19,11 +19,11 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 /// Named pipe the daemon listens on and the stub connects to.
-pub const PIPE_NAME: &str = r"\\.\pipe\texview";
+pub const PIPE_NAME: &str = r"\\.\pipe\fire";
 
 /// Single-instance mutex name. `Local\` scope = per-login session (supports
 /// fast-user-switching); we explicitly do NOT want one machine-wide daemon.
-pub const MUTEX_NAME: &str = r"Local\texview-singleton";
+pub const MUTEX_NAME: &str = r"Local\fire-singleton";
 
 /// Protocol version byte, bumped on incompatible wire changes.
 pub const PROTOCOL_VERSION: u8 = 1;

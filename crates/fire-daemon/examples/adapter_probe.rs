@@ -3,7 +3,7 @@
 //! never hardcode 16384), and confirms the fallback adapter is available (the §5.1
 //! device-loss recovery path requests `force_fallback_adapter = true`).
 //!
-//! Run: `cargo run -p texview-daemon --example adapter_probe`
+//! Run: `cargo run -p fire-daemon --example adapter_probe`
 //!
 //! wgpu-29 API notes (verified against the crate source): `Instance::new` takes the
 //! descriptor by value and `InstanceDescriptor` has no `Default`, so we use

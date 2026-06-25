@@ -1,4 +1,4 @@
-//! texview-stub — the tiny launcher Explorer invokes.
+//! fire-stub — the tiny launcher Explorer invokes.
 //!
 //! Flow (§3, §4.1):
 //!   1. Try to connect to the resident daemon's named pipe (opened as a plain file).
@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use texview_ipc::{write_message, OpenRequest, PIPE_NAME};
+use fire_ipc::{write_message, OpenRequest, PIPE_NAME};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
 use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
@@ -38,14 +38,14 @@ fn main() {
     let path = match std::env::args_os().nth(1) {
         Some(p) => PathBuf::from(p),
         None => {
-            eprintln!("usage: texview-stub <image-path>");
+            eprintln!("usage: fire-stub <image-path>");
             std::process::exit(2);
         }
     };
 
     let req = OpenRequest::new(path);
     if let Err(e) = run(&req) {
-        eprintln!("texview-stub: {e}");
+        eprintln!("fire-stub: {e}");
         std::process::exit(1);
     }
 }
@@ -117,7 +117,7 @@ fn spawn_daemon() -> std::io::Result<()> {
     let dir = exe.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, "stub has no parent directory")
     })?;
-    let daemon = dir.join("texview-daemon.exe");
+    let daemon = dir.join("fire-daemon.exe");
 
     // Spawn detached: the Child handle is dropped, but dropping it does not kill the
     // process, so the daemon survives this stub's exit.

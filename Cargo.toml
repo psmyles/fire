@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/texview-ipc",
-    "crates/texview-stub",
-    "crates/texview-daemon",
-    "crates/texview-decode",
+    "crates/fire-ipc",
+    "crates/fire-stub",
+    "crates/fire-daemon",
+    "crates/fire-decode",
     "crates/psd-sdk-sys",
 ]
 
@@ -55,13 +55,16 @@ windows = "0.61"
 windows-sys = "0.60"
 
 # --- internal crates ---
-texview-ipc = { path = "crates/texview-ipc" }
-texview-decode = { path = "crates/texview-decode" }
+fire-ipc = { path = "crates/fire-ipc" }
+fire-decode = { path = "crates/fire-decode" }
 psd-sdk-sys = { path = "crates/psd-sdk-sys" }
 
 # --- build deps ---
 cc = "1"
 bindgen = "0.71"
+# Embeds the Fire .ico + version/product metadata into the daemon & stub exes
+# (Explorer file icon, taskbar fallback, file-properties "Product name").
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3

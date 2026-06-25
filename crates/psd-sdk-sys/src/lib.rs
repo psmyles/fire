@@ -4,7 +4,7 @@
 //! v1 decodes the MERGED/composited image (present when the PSD was saved with
 //! "Maximize Compatibility"); layer browsing is deferred to v2 (#18).
 //!
-//! Safety: callers in texview-decode additionally run [`decode_psd`] inside
+//! Safety: callers in fire-decode additionally run [`decode_psd`] inside
 //! `std::panic::catch_unwind` on a decode worker, so a malformed PSD cannot take down
 //! the resident daemon (§6/§15). The C++ side also guards its entry points.
 #![allow(non_upper_case_globals)]
@@ -60,12 +60,12 @@ impl std::fmt::Display for PsdError {
 impl std::error::Error for PsdError {}
 
 /// RAII guard that frees the opaque psd document on drop (incl. early returns).
-struct DocHandle(*mut ffi::texview_psd);
+struct DocHandle(*mut ffi::fire_psd);
 
 impl Drop for DocHandle {
     fn drop(&mut self) {
-        // SAFETY: pointer came from texview_psd_open and is freed exactly once.
-        unsafe { ffi::texview_psd_free(self.0) };
+        // SAFETY: pointer came from fire_psd_open and is freed exactly once.
+        unsafe { ffi::fire_psd_free(self.0) };
     }
 }
 
@@ -75,35 +75,35 @@ pub fn decode_psd(bytes: &[u8]) -> Result<PsdImage, PsdError> {
     // the C++ side copies them internally. The handle is freed by DocHandle on every
     // return path.
     unsafe {
-        let handle = ffi::texview_psd_open(bytes.as_ptr(), bytes.len());
+        let handle = ffi::fire_psd_open(bytes.as_ptr(), bytes.len());
         if handle.is_null() {
             return Err(PsdError::OpenFailed);
         }
         let guard = DocHandle(handle);
 
-        let mut info = ffi::texview_psd_info {
+        let mut info = ffi::fire_psd_info {
             width: 0,
             height: 0,
             channels: 0,
             bits_per_channel: 0,
         };
-        if ffi::texview_psd_info_get(handle, &mut info) != 0 {
+        if ffi::fire_psd_info_get(handle, &mut info) != 0 {
             return Err(PsdError::InfoFailed);
         }
 
         let (w, h) = (info.width, info.height);
         let mut rgba = vec![0u8; w as usize * h as usize * 4];
-        let rc = ffi::texview_psd_read_merged_rgba8(handle, rgba.as_mut_ptr(), rgba.len());
+        let rc = ffi::fire_psd_read_merged_rgba8(handle, rgba.as_mut_ptr(), rgba.len());
         match rc {
             0 => {}
             2 => return Err(PsdError::NoMergedImage),
             other => return Err(PsdError::ReadFailed(other)),
         }
 
-        let icc_len = ffi::texview_psd_icc_len(handle);
+        let icc_len = ffi::fire_psd_icc_len(handle);
         let icc = if icc_len > 0 {
             let mut buf = vec![0u8; icc_len];
-            if ffi::texview_psd_icc_get(handle, buf.as_mut_ptr(), buf.len()) == 0 {
+            if ffi::fire_psd_icc_get(handle, buf.as_mut_ptr(), buf.len()) == 0 {
                 Some(buf)
             } else {
                 None

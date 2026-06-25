@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::thread;
 
 use crossbeam_channel::{unbounded, Sender};
-use texview_decode::{decode_path, DecodeError, DecodeOptions, DecodedImage};
+use fire_decode::{decode_path, DecodeError, DecodeOptions, DecodedImage};
 use winit::event_loop::EventLoopProxy;
 use winit::window::WindowId;
 
@@ -75,7 +75,7 @@ impl DecodePool {
             let rx = rx.clone();
             let proxy = proxy.clone();
             thread::Builder::new()
-                .name(format!("texview-decode-{i}"))
+                .name(format!("fire-decode-{i}"))
                 .spawn(move || {
                     // Exits when the pool (and thus `tx`) is dropped at shutdown.
                     while let Ok(job) = rx.recv() {
