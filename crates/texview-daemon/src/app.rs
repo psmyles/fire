@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use texview_decode::{decode_path, DecodeOptions};
+use texview_decode::DecodeOptions;
 use texview_ipc::OpenRequest;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -12,58 +12,99 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{WindowAttributes, WindowId};
 
+use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool};
 use crate::gpu::{GpuContext, WindowState};
 use crate::{foreground, UserEvent};
 
 pub struct App {
     gpu: GpuContext,
     window: Option<WindowState>,
+    pool: DecodePool,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(pool: DecodePool) -> Self {
         // Warm the expensive GPU objects at startup, before any window or open (§12).
-        Self { gpu: GpuContext::new(), window: None }
+        Self { gpu: GpuContext::new(), window: None, pool }
     }
 
-    fn open(&mut self, req: &OpenRequest) {
+    /// Handle an open request: raise the pooled window immediately with a placeholder,
+    /// then enqueue the decode off-thread. The texture swaps in when `DecodeDone`
+    /// arrives — the window never blocks on decode (§5, Phase 2).
+    fn open(&mut self, req: OpenRequest) {
         let Some(ws) = self.window.as_mut() else {
             return;
         };
 
-        // Phase 1 decodes synchronously on the main thread (the async worker pool is
-        // Phase 2). The window is shown regardless of decode outcome so the foreground
-        // handoff is always exercised. honor_icc: lcms2 transforms non-sRGB profiles into
-        // the sRGB working space (best-effort; see texview_decode::icc).
-        let opts = DecodeOptions { max_dim: self.gpu.max_texture_dim(), honor_icc: true };
-        match decode_path(&req.path, &opts) {
-            Ok(img) => {
-                let (w, h) = clamp_window_size(img.width, img.height);
-                let _ = ws.window.request_inner_size(PhysicalSize::new(w, h));
-                ws.set_image(&self.gpu, &img);
-                let name = req
-                    .path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("image");
-                ws.window.set_title(&format!("{name} — texview"));
-                println!(
-                    "texview-daemon: opened {:?} ({}x{}, {})",
-                    req.path, img.width, img.height, img.source_format
-                );
-            }
-            Err(e) => {
-                eprintln!("texview-daemon: failed to open {:?}: {e}", req.path);
-            }
-        }
+        let name = file_name(&req);
 
+        // Show the window now, before decode. Clear any previous image so a reused
+        // window shows the placeholder (a solid clear; the "loading" label is Phase 4)
+        // rather than the wrong file's pixels while the new one decodes.
+        ws.clear_image();
+        ws.window.set_title(&format!("{name} — texview (loading…)"));
         ws.window.set_visible(true);
         ws.window.set_minimized(false);
         if req.flags.activate {
+            // Raise on the click, not on decode-done — the foreground grant is one-shot
+            // and must be spent promptly (§4.1).
             foreground::raise(&ws.window);
         }
         ws.window.request_redraw();
+
+        // Tag the job with a fresh generation; a later open supersedes this decode.
+        // honor_icc: lcms2 transforms non-sRGB profiles into the sRGB working space
+        // (best-effort; see texview_decode::icc).
+        let generation = ws.next_generation();
+        let opts = DecodeOptions { max_dim: self.gpu.max_texture_dim(), honor_icc: true };
+        self.pool.submit(DecodeJob {
+            window_id: ws.window.id(),
+            generation,
+            path: req.path,
+            opts,
+        });
     }
+
+    /// Handle a finished decode. Upload only if it is still the window's latest request
+    /// (stale-drop): a slow PSD that finishes after a newer PNG was opened is discarded.
+    fn decode_done(&mut self, outcome: DecodeOutcome) {
+        let Some(ws) = self.window.as_mut() else {
+            return;
+        };
+        if outcome.window_id != ws.window.id() || outcome.generation != ws.generation() {
+            return; // superseded by a newer open, or a different window — drop it
+        }
+
+        let name = outcome
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("image");
+        match outcome.result {
+            Ok(img) => {
+                let (w, h, fmt) = (img.width, img.height, img.source_format);
+                let (cw, ch) = clamp_window_size(w, h);
+                let _ = ws.window.request_inner_size(PhysicalSize::new(cw, ch));
+                ws.set_image(&self.gpu, img);
+                ws.window.set_title(&format!("{name} — texview"));
+                ws.window.request_redraw();
+                println!("texview-daemon: opened {:?} ({w}x{h}, {fmt})", outcome.path);
+            }
+            Err(e) => {
+                ws.window.set_title(&format!("{name} — texview (failed)"));
+                eprintln!("texview-daemon: failed to open {:?}: {e}", outcome.path);
+            }
+        }
+    }
+}
+
+/// File name of an open request's path, for the window title (falls back to "image").
+fn file_name(req: &OpenRequest) -> String {
+    req.path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image")
+        .to_string()
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -88,7 +129,8 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Open(req) => self.open(&req),
+            UserEvent::Open(req) => self.open(req),
+            UserEvent::DecodeDone(outcome) => self.decode_done(outcome),
         }
     }
 

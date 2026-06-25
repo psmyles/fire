@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod decode_pool;
 mod foreground;
 mod gpu;
 mod ipc_server;
@@ -20,10 +21,13 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
-/// Custom event delivered from the pipe-server thread into the winit event loop.
+/// Custom events delivered into the winit event loop from background threads.
 #[derive(Debug)]
 pub enum UserEvent {
+    /// An open request from the pipe-server thread (a stub forwarded a path).
     Open(OpenRequest),
+    /// A finished decode from a worker thread, ready to upload (or an error).
+    DecodeDone(decode_pool::DecodeOutcome),
 }
 
 fn main() {
@@ -42,7 +46,10 @@ fn main() {
     // Hand the pipe server a proxy so it can wake the loop with each open request.
     ipc_server::spawn(event_loop.create_proxy());
 
-    let mut app = app::App::new();
+    // The decode workers post results back through their own proxy.
+    let pool = decode_pool::DecodePool::new(event_loop.create_proxy());
+
+    let mut app = app::App::new(pool);
     event_loop.run_app(&mut app).expect("event loop error");
 }
 

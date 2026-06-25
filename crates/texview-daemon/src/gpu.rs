@@ -61,6 +61,13 @@ pub struct WindowState {
     sampler: wgpu::Sampler,
     /// `None` until the first image is uploaded; the render pass clears-only until then.
     texture_bind_group: Option<wgpu::BindGroup>,
+    /// Monotonic per-window decode generation. Bumped on each open; a `DecodeDone`
+    /// whose generation is older than this is stale and dropped (so a slow decode can't
+    /// clobber a newer one).
+    generation: u64,
+    /// CPU copy of the currently displayed image, retained for the Phase-4 pixel
+    /// inspector (#16). Device-loss recovery still re-decodes from the path (#11).
+    current_image: Option<DecodedImage>,
 }
 
 impl WindowState {
@@ -166,17 +173,48 @@ impl WindowState {
             bind_group_layout,
             sampler,
             texture_bind_group: None,
+            generation: 0,
+            current_image: None,
         }
     }
 
-    /// Upload a decoded image to a GPU texture and bind it for rendering.
+    /// Bump and return this window's decode generation. The caller tags the decode job
+    /// with the returned value; only a `DecodeDone` matching the latest generation is
+    /// uploaded.
+    pub fn next_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    /// The window's current (latest-issued) decode generation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// CPU pixels of the displayed image, retained for the pixel inspector (#16).
+    /// `None` before the first successful decode. (Read in Phase 4.)
+    #[allow(dead_code)]
+    pub fn current_image(&self) -> Option<&DecodedImage> {
+        self.current_image.as_ref()
+    }
+
+    /// Drop the displayed image so the render pass clears-only — the placeholder shown
+    /// while a freshly-opened file decodes (avoids flashing the previous file's pixels).
+    pub fn clear_image(&mut self) {
+        self.texture_bind_group = None;
+        self.current_image = None;
+    }
+
+    /// Upload a decoded image to a GPU texture, bind it for rendering, and retain the
+    /// CPU buffer for the inspector. Takes ownership: the decoded image lives on in
+    /// `current_image` after upload (#16).
     ///
     /// The texture is always `Rgba8UnormSrgb` for now. Non-8-bit sources (16-bit, and
     /// float EXR/HDR) are CPU-converted to 8-bit sRGB here as a Phase-2 stopgap — for
     /// float that means a fixed Reinhard tonemap. Phase 3 replaces this with a native
     /// float texture plus in-shader exposure + tonemap (Reinhard/ACES) controls.
-    pub fn set_image(&mut self, ctx: &GpuContext, img: &DecodedImage) {
-        let rgba8 = pixels_as_rgba8(img);
+    pub fn set_image(&mut self, ctx: &GpuContext, img: DecodedImage) {
+        let rgba8 = pixels_as_rgba8(&img);
         let size = wgpu::Extent3d {
             width: img.width,
             height: img.height,
@@ -227,6 +265,7 @@ impl WindowState {
             ],
         });
         self.texture_bind_group = Some(bind_group);
+        self.current_image = Some(img);
     }
 
     pub fn resize(&mut self, ctx: &GpuContext, width: u32, height: u32) {
