@@ -321,7 +321,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
         chrome::apply_dark_titlebar(frame, dark);
 
         let dpi = GetDpiForWindow(frame).max(96);
-        let mut ch = Chrome::new(dpi, dark);
+        let ch = Chrome::new(dpi, dark);
 
         // Initial view rect from the frame client size and chrome metrics.
         let (fw, fh) = client_size(frame);

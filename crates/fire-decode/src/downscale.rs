@@ -1,8 +1,8 @@
-//! CPU downscale-to-fit. Anything past the GPU max texture dimension (§6) is shrunk to
-//! fit before upload, recording the original size so the pixel inspector can note that a
-//! read came from the downscaled copy. Nearest-neighbor: this path only triggers for
-//! images larger than ~16384px on an axis (rare), where avoiding a crash matters more
-//! than filter quality; tiled/virtual texturing for gigapixel images is a v2 item.
+//! CPU downscale-to-fit. Anything past the caller's `max_dim` (§6) is shrunk to fit,
+//! recording the original size so the pixel inspector can note that a read came from the
+//! downscaled copy. Nearest-neighbor: this path only triggers for images larger than the
+//! cap (~16384px on an axis by default; rare), where bounding memory matters more than
+//! filter quality; tiled/virtual texturing for gigapixel images is a v2 item.
 
 use crate::DecodedImage;
 

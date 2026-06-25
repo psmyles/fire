@@ -43,7 +43,7 @@ pub struct DecodeOutcome {
     pub result: Result<DecodedImage, DecodeError>,
 }
 
-/// Sender handle to the worker pool; held by the `App` for the daemon's lifetime.
+/// Sender handle to the worker pool; held by the `App` for the window's lifetime.
 pub struct DecodePool {
     tx: Sender<DecodeJob>,
 }

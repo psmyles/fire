@@ -1,8 +1,9 @@
-//! Shared IPC protocol between the launcher stub and the resident daemon.
+//! Shared IPC protocol for single-instance mode: a later launch forwards the file it was
+//! asked to open to the already-running instance.
 //!
-//! Transport (the Windows named pipe) lives in the stub/daemon; this crate owns the
-//! *wire format* so both sides agree byte-for-byte. It is deliberately dependency-free
-//! (no serde) to keep the stub tiny (§15).
+//! Transport (the Windows named pipe) lives in `fire`; this crate owns the *wire format* so
+//! both sides agree byte-for-byte. It is deliberately dependency-free (no serde) so the
+//! forward path adds as little startup cost as possible.
 //!
 //! Framing: one message = `u32` little-endian length prefix + payload.
 //! Payload layout (v1):
@@ -18,11 +19,11 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
-/// Named pipe the daemon listens on and the stub connects to.
+/// Named pipe the running instance listens on and a forwarding launch connects to.
 pub const PIPE_NAME: &str = r"\\.\pipe\fire";
 
 /// Single-instance mutex name. `Local\` scope = per-login session (supports
-/// fast-user-switching); we explicitly do NOT want one machine-wide daemon.
+/// fast-user-switching); we explicitly do NOT want one machine-wide instance.
 pub const MUTEX_NAME: &str = r"Local\fire-singleton";
 
 /// Protocol version byte, bumped on incompatible wire changes.
@@ -35,7 +36,7 @@ pub const MAX_MESSAGE_LEN: u32 = 64 * 1024;
 /// Fixed-size header that precedes the path bytes in a payload.
 const HEADER_LEN: usize = 4;
 
-/// How a newly-opened file should be placed into the daemon's window/session model.
+/// How a newly-opened file should be placed into the running instance's window/session model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WindowMode {
@@ -62,7 +63,7 @@ impl WindowMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenFlags {
     pub window_mode: WindowMode,
-    /// Whether the daemon should foreground/activate the target window.
+    /// Whether the running instance should foreground/activate the target window.
     pub activate: bool,
 }
 
@@ -72,7 +73,7 @@ impl Default for OpenFlags {
     }
 }
 
-/// A request to open one file, sent stub → daemon.
+/// A request to open one file, sent forwarder → running instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenRequest {
     pub path: PathBuf,
@@ -233,7 +234,7 @@ mod tests {
 
     #[test]
     fn empty_path_roundtrips() {
-        // Degenerate but should not panic; daemon validates existence separately.
+        // Degenerate but should not panic; the viewer validates existence separately.
         let req = OpenRequest::new("");
         assert_eq!(roundtrip(&req), req);
     }

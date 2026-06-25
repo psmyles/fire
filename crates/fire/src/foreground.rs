@@ -1,8 +1,9 @@
-//! Foreground activation (§4.1). A background process normally cannot raise its own
-//! window: Windows ignores `SetForegroundWindow` from a process that doesn't own the
-//! foreground. The stub works around this by calling `AllowSetForegroundWindow(daemon)`
-//! just before sending the open request, handing us a one-shot grant. We must therefore
-//! raise the window promptly on receipt, which is what this does.
+//! Foreground activation. A process that doesn't own the foreground normally cannot raise
+//! its own window: Windows ignores `SetForegroundWindow` from it. In single-instance mode a
+//! later launch (which Explorer gave the foreground) works around this by calling
+//! `AllowSetForegroundWindow(owner_pid)` just before forwarding the open request, handing the
+//! running instance a one-shot grant. We must therefore raise the window promptly on receipt,
+//! which is what this does.
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{

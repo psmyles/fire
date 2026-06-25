@@ -6,7 +6,7 @@
 //!
 //! Safety: callers in fire-decode additionally run [`decode_psd`] inside
 //! `std::panic::catch_unwind` on a decode worker, so a malformed PSD cannot take down
-//! the resident daemon (§6/§15). The C++ side also guards its entry points.
+//! the viewer process (§6/§15). The C++ side also guards its entry points.
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]

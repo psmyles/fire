@@ -1,21 +1,19 @@
-//! Pure-CPU image shader — the softbuffer render path's per-pixel pipeline, ported from the
-//! GPU `image.wgsl` fragment shader (and the `cpu-test` prototype) and extended to every
+//! Pure-CPU image shader — the softbuffer render path's per-pixel pipeline, covering every
 //! [`PixelFormat`] including HDR.
 //!
 //! Windowing-agnostic: it shades into a packed `0x00RRGGBB` framebuffer slice, so it is
 //! unit-testable without a window. Per output pixel it inverse-maps into image space, fetches
 //! a *linear* RGBA sample (nearest when magnifying, box-average over the minify footprint),
-//! then runs the common tail matching `image.wgsl`, in order: HDR exposure `×2^stops` →
-//! tonemap (Reinhard/ACES) → channel isolation → checkerboard composite over transparency →
-//! sRGB encode. softbuffer presents raw bytes (no hardware sRGB), so the encode is always done
-//! here. The whole pipeline runs in linear light.
-#![allow(dead_code)] // wired up by render::surface in the next migration step
+//! then runs the common tail, in order: HDR exposure `×2^stops` → tonemap (Reinhard/ACES) →
+//! channel isolation → checkerboard composite over transparency → sRGB encode. softbuffer
+//! presents raw bytes (no hardware sRGB), so the encode is always done here. The whole
+//! pipeline runs in linear light.
 
 use fire_decode::{DecodedImage, PixelFormat};
 
 use crate::render::view::{Channel, DisplayState, Tonemap, ViewState, Viewport};
 
-/// Checkerboard cell size in surface px (matches `image.wgsl` CHECKER_SIZE).
+/// Checkerboard cell size in surface px.
 const CHECKER_SIZE: f32 = 12.0;
 /// Minify box-average footprint cap. Beyond this the source is undersampled (mild shimmer at
 /// extreme zoom-out); kept small and bounded per the no-mip-chain decision.
@@ -187,8 +185,8 @@ fn shade_band(
     }
 }
 
-/// Fetch one source texel as **linear** RGBA, mirroring the per-format handling in
-/// `image.wgsl` (8-bit & 16-bit unorm are sRGB-encoded → linearized; float is already linear).
+/// Fetch one source texel as **linear** RGBA, per pixel format (8-bit & 16-bit unorm are
+/// sRGB-encoded → linearized; float is already linear).
 #[inline]
 fn fetch_linear(img: &DecodedImage, x: usize, y: usize, luts: &Luts) -> [f32; 4] {
     let w = img.width as usize;

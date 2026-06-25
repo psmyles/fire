@@ -1,11 +1,10 @@
 //! Per-window CPU render state: a softbuffer surface over a raw Win32 child window plus the
-//! pan/zoom/fit + channel/exposure/tonemap state driven by input. Replaces the wgpu
-//! `WindowState`; the threaded pixel work lives in [`crate::render::shade`].
+//! pan/zoom/fit + channel/exposure/tonemap state driven by input. The threaded pixel work
+//! lives in [`crate::render::shade`].
 //!
 //! softbuffer presents a packed `0x00RRGGBB` framebuffer to the window via GDI — no GPU
 //! device, no D3D runtime. The decoded image is retained in `current_image` both as the
 //! sampling source for shading and for the pixel inspector (#16).
-#![allow(dead_code)] // input methods are wired up by the win shell in the next step
 
 use std::num::{NonZeroIsize, NonZeroU32};
 use std::rc::Rc;
@@ -52,7 +51,8 @@ pub struct SurfaceState {
     _context: Ctx,
     surface: Surf,
     luts: Luts,
-    /// Packed placeholder color shown before the first image (matches the GPU clear).
+    /// Packed letterbox / no-image backdrop color; overwritten with the theme color via
+    /// [`Self::set_clear`] once the chrome is built.
     clear: u32,
 
     /// Monotonic per-window decode generation; a `DecodeDone` older than this is stale.
@@ -77,7 +77,8 @@ impl SurfaceState {
         let context = softbuffer::Context::new(handle.clone()).expect("softbuffer context");
         let surface = softbuffer::Surface::new(&context, handle.clone()).expect("softbuffer surface");
         let luts = Luts::new();
-        // The GPU cleared to linear (0.05, 0.05, 0.06); encode it for the CPU placeholder.
+        // Neutral near-black placeholder (linear 0.05, 0.05, 0.06), sRGB-encoded; only shown
+        // until the win shell calls set_clear with the theme-aware backdrop.
         let enc = |lin: f32| {
             let i = (lin * 4096.0 + 0.5) as usize;
             luts.srgb[i.min(4096)] as u32

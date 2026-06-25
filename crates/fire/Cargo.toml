@@ -1,18 +1,15 @@
 [package]
-name = "fire-daemon"
+name = "fire"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Ship as `fire.exe` — it's a plain app now, not a daemon. (The crate folder/package rename
-# off "fire-daemon" is a cleanup-step item.)
-[[bin]]
-name = "fire"
-path = "src/main.rs"
+# Builds `fire.exe` — the whole viewer (window, render, decode pool, optional pipe). The
+# default bin (package name + src/main.rs) needs no [[bin]] section.
 
-# notify/arboard are added in the phases that introduce them (UI). crossbeam-channel
-# arrived with the Phase 2 decode worker pool; serde/toml read the startup config.
+# crossbeam-channel carries decode results from the worker pool; serde/toml read the
+# startup config.
 [dependencies]
 fire-ipc.workspace = true
 fire-decode.workspace = true

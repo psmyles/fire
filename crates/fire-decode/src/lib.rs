@@ -1,7 +1,7 @@
 //! Uniform decode core: `bytes -> (pixels, format, bit depth, optional ICC)`.
 //!
-//! All format backends live behind the single [`decode`] entry point so the daemon
-//! never sees per-format detail. Routing is by magic bytes:
+//! All format backends live behind the single [`decode`] entry point so callers
+//! never see per-format detail. Routing is by magic bytes:
 //!   - PSD            -> psd_sdk (C++ FFI) : merged composite, 8-bit RGBA (+ICC)
 //!   - EXR            -> `exr` crate       : 32-bit float RGBA (linear/HDR)
 //!   - zune-supported -> **zune** (hot path): PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL
@@ -15,8 +15,8 @@
 //! less important.
 //!
 //! ICC profiles are extracted here; the lcms2 transform into the working space is
-//! applied by [`icc`]. Images larger than the GPU max texture dimension are
-//! CPU-downscaled to fit ([`downscale`]).
+//! applied by [`icc`]. Images larger than the caller's `max_dim` are CPU-downscaled to
+//! fit ([`downscale`]).
 
 use std::io::Cursor;
 use std::path::Path;
@@ -25,11 +25,11 @@ mod downscale;
 
 /// Upper bound on a decoded source dimension. zune's default cap is 16384, which would
 /// reject any image larger than that on an axis before we ever get a chance to downscale
-/// it to the GPU limit — so we raise the cap well past any realistic image while still
-/// rejecting absurd (corrupt/decode-bomb) headers in the billions.
+/// it to the caller's `max_dim` — so we raise the cap well past any realistic image while
+/// still rejecting absurd (corrupt/decode-bomb) headers in the billions.
 const MAX_DECODE_DIM: usize = 1 << 17; // 131072
 
-/// Pixel layout of a decoded image. Drives the wgpu texture format and whether the
+/// Pixel layout of a decoded image. Drives the per-format CPU sampling path and whether the
 /// HDR exposure/tonemap path applies (float = HDR, linear working space).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -74,7 +74,7 @@ pub struct DecodedImage {
     pub icc: Option<Vec<u8>>,
     /// Human-readable source format name for the status bar (e.g. "PNG", "OpenEXR").
     pub source_format: &'static str,
-    /// If the image was downscaled to fit the GPU max texture dimension, the original
+    /// If the image was downscaled to fit `DecodeOptions::max_dim`, the original
     /// (width, height) before downscaling; the pixel inspector notes this (§6).
     pub downscaled_from: Option<(u32, u32)>,
 }
@@ -82,8 +82,9 @@ pub struct DecodedImage {
 /// Options controlling a decode.
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeOptions {
-    /// Max texture dimension from the live wgpu device `Limits`; images larger than
-    /// this on either axis are CPU-downscaled to fit before upload (§6).
+    /// Max decoded dimension on either axis — a CPU/RAM guard, not a GPU texture limit.
+    /// Images larger than this on either axis are CPU-downscaled to fit (§6). An RGBA8
+    /// bitmap at 16384² is ~1 GiB; float HDR is 4×.
     pub max_dim: u32,
     /// Whether to parse and honor embedded ICC profiles via lcms2.
     pub honor_icc: bool,
@@ -102,7 +103,7 @@ pub enum DecodeError {
     UnknownFormat,
     /// The backend rejected the data as malformed.
     Malformed(String),
-    /// An FFI backend (psd_sdk/lcms2) failed; surfaced so the daemon survives.
+    /// An FFI backend (psd_sdk/lcms2) failed; surfaced so the viewer survives.
     Ffi(String),
     /// I/O or unexpected backend error.
     Other(String),
@@ -171,7 +172,7 @@ pub fn decode(
         icc::apply(&mut img);
     }
 
-    // Fit within the GPU's max texture dimension.
+    // Fit within the caller's max dimension (RAM guard).
     downscale::to_fit(&mut img, opts.max_dim);
 
     Ok(img)
@@ -270,7 +271,7 @@ fn decode_zune(
 
     // Speed is the project's top metric: enable platform intrinsics + unsafe fast paths.
     // Raise the dimension guard well past zune's 16384 default so large sources decode
-    // (the GPU-fit downscale below shrinks anything beyond the device texture limit).
+    // (the downscale pass shrinks anything beyond the caller's max_dim afterwards).
     let opts = DecoderOptions::new_fast()
         .set_max_width(MAX_DECODE_DIM)
         .set_max_height(MAX_DECODE_DIM);
@@ -297,7 +298,7 @@ fn decode_zune(
     let (pixels, pixel_format, bit_depth) = match image.depth() {
         BitDepth::Eight => (frame.flatten::<u8>(), PixelFormat::Rgba8Unorm, 8u8),
         BitDepth::Sixteen => {
-            // GPU stopgap reads Rgba16Unorm as native-endian u16 (§ gpu.rs).
+            // The CPU shader reads Rgba16Unorm back as native-endian u16.
             let u16s = frame.flatten::<u16>();
             let mut out = Vec::with_capacity(u16s.len() * 2);
             for v in u16s {
@@ -434,7 +435,7 @@ mod icc {
             return;
         }
         // FFI safety boundary (§6/§15): a malformed profile must never unwind into and
-        // crash the resident daemon. catch_unwind + best-effort: on any failure we keep
+        // crash the viewer process. catch_unwind + best-effort: on any failure we keep
         // the original pixels (sRGB assumption).
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             transform_to_srgb(img, &icc);
@@ -672,7 +673,7 @@ mod tests {
         assert_eq!(a, 255);
     }
 
-    /// Corrupt input must surface an error, never panic (FFI-free path, but the daemon
+    /// Corrupt input must surface an error, never panic (FFI-free path, but the viewer
     /// relies on this being a clean `Err`).
     #[test]
     fn garbage_input_errors() {

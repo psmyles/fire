@@ -4,9 +4,9 @@
 //! never touches the window or softbuffer — it only posts.
 //!
 //! A single pipe instance is created once and reused across connections (Connect →
-//! read → Disconnect → repeat). Because the pipe *name* therefore exists for the whole
-//! daemon lifetime, a stub never sees "not found" while the daemon is up — at worst a
-//! momentary `ERROR_PIPE_BUSY`, which the stub retries.
+//! read → Disconnect → repeat). Because the pipe *name* therefore exists for as long as the
+//! running instance is up, a forwarding launch never sees "not found" while it is up — at
+//! worst a momentary `ERROR_PIPE_BUSY`, which the forwarder retries.
 
 use std::fs::File;
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, RawHandle};
@@ -63,7 +63,7 @@ fn run(hwnd: isize) {
     }
 
     loop {
-        // Block until a client (the stub) connects.
+        // Block until a client (a forwarding launch) connects.
         let connected = unsafe { ConnectNamedPipe(pipe, ptr::null_mut()) };
         if connected == 0 {
             let err = unsafe { GetLastError() };

@@ -1,50 +1,36 @@
 //! View-transform + display state and the pure geometry behind pan/zoom/fit.
 //!
-//! Everything here is windowing- and GPU-free so it can be unit-tested (the Phase-3
-//! verification calls for exactly this): zoom-to-cursor fixed point, fit centering with
-//! chrome insets, the pan clamp, and the screen↔image round-trip. [`crate::render::uniforms`]
-//! turns this state into the `#[repr(C)]` buffer the shader reads.
+//! Everything here is windowing- and render-free so it can be unit-tested: the
+//! zoom-to-cursor fixed point, fit centering, the pan clamp, and the screen↔image
+//! round-trip. [`crate::render::shade`] consumes this state to map each output pixel back
+//! into the source image.
 
 /// Zoom bounds (screen pixels per image pixel). 0.02 lets a huge image shrink to a
 /// thumbnail; 64× is enough texel-peeping for a viewer.
 pub const MIN_ZOOM: f32 = 0.02;
 pub const MAX_ZOOM: f32 = 64.0;
 
-/// The drawable surface plus the insets reserved for chrome. Phase 3 leaves the insets at
-/// 0; carrying them now means the Phase-4 toolbar/status bar slot in without a view-math
-/// rewrite (§9) — fit and centering already account for the usable region.
+/// The drawable image surface — the child view window's client area, in physical px. The
+/// frame paints the toolbar/status chrome in separate windows, so the surface is exactly
+/// the image region; there are no chrome insets to carry.
 #[derive(Clone, Copy, Debug)]
 pub struct Viewport {
     pub width: f32,
     pub height: f32,
-    pub top_inset: f32,
-    pub bottom_inset: f32,
 }
 
 impl Viewport {
     pub fn new(width: u32, height: u32) -> Self {
-        Self {
-            width: width.max(1) as f32,
-            height: height.max(1) as f32,
-            top_inset: 0.0,
-            bottom_inset: 0.0,
-        }
+        Self { width: width.max(1) as f32, height: height.max(1) as f32 }
     }
 
-    /// Size of the region left for the image after chrome insets.
-    pub fn usable(&self) -> (f32, f32) {
-        let h = (self.height - self.top_inset - self.bottom_inset).max(1.0);
-        (self.width.max(1.0), h)
-    }
-
-    /// Center of the usable region in surface pixels (origin top-left, y down).
+    /// Center of the surface in pixels (origin top-left, y down).
     pub fn center(&self) -> (f32, f32) {
-        let (_, uh) = self.usable();
-        (self.width * 0.5, self.top_inset + uh * 0.5)
+        (self.width * 0.5, self.height * 0.5)
     }
 }
 
-/// Channel-isolation mode (maps to the shader `channel` field).
+/// Channel-isolation mode (selects the per-pixel branch in [`crate::render::shade`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Channel {
     Rgb,
@@ -54,32 +40,11 @@ pub enum Channel {
     A,
 }
 
-impl Channel {
-    pub fn as_u32(self) -> u32 {
-        match self {
-            Channel::Rgb => 0,
-            Channel::R => 1,
-            Channel::G => 2,
-            Channel::B => 3,
-            Channel::A => 4,
-        }
-    }
-}
-
 /// HDR tonemap operator (applies to float sources only, #13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tonemap {
     Reinhard,
     Aces,
-}
-
-impl Tonemap {
-    pub fn as_u32(self) -> u32 {
-        match self {
-            Tonemap::Reinhard => 0,
-            Tonemap::Aces => 1,
-        }
-    }
 }
 
 /// Non-geometric display state, reset to neutral for each new file (#17).
@@ -98,7 +63,7 @@ impl Default for DisplayState {
 }
 
 /// Geometric view state. `zoom` is screen px per image px (1.0 = 1:1). `pan` is the
-/// image-center offset from the usable-region center, in surface pixels (so pan 0 =
+/// image-center offset from the surface center, in surface pixels (so pan 0 =
 /// centered). `fit` records that we're in fit mode, so a resize re-fits rather than
 /// keeping a stale zoom.
 #[derive(Clone, Copy, Debug)]
@@ -115,11 +80,11 @@ impl Default for ViewState {
 }
 
 impl ViewState {
-    /// Fit the whole image within the usable region, centered. Caps at 1:1 so a small
+    /// Fit the whole image within the surface, centered. Caps at 1:1 so a small
     /// image is shown at native resolution (a texture-viewer convention) rather than
     /// upscaled into a blur; zoom in explicitly to go past 100%.
     pub fn fit_to_window(&mut self, image: (u32, u32), vp: &Viewport) {
-        let (uw, uh) = vp.usable();
+        let (uw, uh) = (vp.width, vp.height);
         let (iw, ih) = (image.0.max(1) as f32, image.1.max(1) as f32);
         let z = (uw / iw).min(uh / ih).min(1.0);
         self.zoom = z.clamp(MIN_ZOOM, MAX_ZOOM);
@@ -156,7 +121,7 @@ impl ViewState {
         self.clamp_pan(image, vp);
     }
 
-    /// Zoom about the usable-region center (keyboard zoom).
+    /// Zoom about the surface center (keyboard zoom).
     pub fn zoom_centered(&mut self, factor: f32, image: (u32, u32), vp: &Viewport) {
         let c = vp.center();
         self.zoom_to_cursor(factor, c, image, vp);
@@ -174,12 +139,12 @@ impl ViewState {
         (image.0 as f32 * self.zoom, image.1 as f32 * self.zoom)
     }
 
-    /// Keep the image overlapping the usable region: when it is larger than the region you
-    /// can pan to its edges but not past them; when smaller it stays fully inside. The
-    /// allowed range is `|image_screen - usable| / 2` per axis (symmetric about centered),
-    /// which yields both behaviours with one expression.
+    /// Keep the image overlapping the surface: when it is larger than the surface you can
+    /// pan to its edges but not past them; when smaller it stays fully inside. The allowed
+    /// range is `|image_screen - surface| / 2` per axis (symmetric about centered), which
+    /// yields both behaviours with one expression.
     pub fn clamp_pan(&mut self, image: (u32, u32), vp: &Viewport) {
-        let (uw, uh) = vp.usable();
+        let (uw, uh) = (vp.width, vp.height);
         let (sw, sh) = self.image_screen_size(image);
         let lim_x = (sw - uw).abs() * 0.5;
         let lim_y = (sh - uh).abs() * 0.5;
@@ -234,17 +199,6 @@ mod tests {
         let mut small = ViewState::default();
         small.fit_to_window((100, 100), &v);
         assert_eq!(small.zoom, 1.0);
-    }
-
-    #[test]
-    fn fit_accounts_for_chrome_insets() {
-        let mut v = vp();
-        v.top_inset = 40.0;
-        v.bottom_inset = 60.0; // usable height = 700
-        let mut s = ViewState::default();
-        s.fit_to_window((1000, 1000), &v);
-        // width 1000 / 1000 = 1.0, usable-height 700 / 1000 = 0.7 → min is 0.7.
-        assert!((s.zoom - 0.7).abs() < 1e-6, "zoom = {}", s.zoom);
     }
 
     #[test]
