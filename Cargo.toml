@@ -2,10 +2,11 @@
 resolver = "2"
 members = [
     "crates/fire-ipc",
-    "crates/fire-stub",
     "crates/fire-daemon",
     "crates/fire-decode",
     "crates/psd-sdk-sys",
+    # Throwaway CPU-render viability probe (branch: cpu-rendering-test).
+    "crates/cpu-test",
 ]
 
 [workspace.package]

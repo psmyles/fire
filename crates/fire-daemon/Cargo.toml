@@ -5,23 +5,30 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# egui/notify/arboard/serde/toml are added in the phases that introduce them (UI,
-# config) to keep iteration fast here. crossbeam-channel arrived with the Phase 2
-# decode worker pool.
+# Ship as `fire.exe` — it's a plain app now, not a daemon. (The crate folder/package rename
+# off "fire-daemon" is a cleanup-step item.)
+[[bin]]
+name = "fire"
+path = "src/main.rs"
+
+# notify/arboard are added in the phases that introduce them (UI). crossbeam-channel
+# arrived with the Phase 2 decode worker pool; serde/toml read the startup config.
 [dependencies]
 fire-ipc.workspace = true
 fire-decode.workspace = true
 
-winit.workspace = true
-wgpu.workspace = true
-pollster.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+# CPU framebuffer → window (GDI BitBlt, no D3D), built from a raw Win32 HWND (no winit).
+softbuffer = "0.4"
+# raw-window-handle: only to hand the HWND to softbuffer.
 raw-window-handle.workspace = true
 crossbeam-channel.workspace = true
-# View-transform / shader uniform is a #[repr(C)] Pod struct uploaded as raw bytes.
-bytemuck.workspace = true
 
-# Raw Win32 for the named-pipe server, single-instance mutex, and foreground raise.
-# windows-sys (vs the typed `windows` crate) keeps these low-level calls predictable.
+# Raw Win32: native window/message loop, named-pipe server, single-instance mutex,
+# foreground raise, and the GDI-painted chrome (toolbar/status bar). windows-sys (vs the
+# typed `windows` crate) keeps these calls predictable.
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -29,13 +36,15 @@ windows-sys = { workspace = true, features = [
     "Win32_System_IO",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",            # read the dark-mode preference (AppsUseLightTheme)
+    "Win32_Graphics_Gdi",               # GDI painting of the toolbar/status chrome
+    "Win32_Graphics_Dwm",               # dark title bar (DwmSetWindowAttribute)
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",                   # Per-Monitor-V2 awareness + GetDpiForWindow
 ] }
 
 [build-dependencies]
 # Embeds the Fire .ico + product metadata into the exe (Explorer file icon).
 winresource.workspace = true
-
-[[example]]
-name = "adapter_probe"
-path = "examples/adapter_probe.rs"

@@ -1,71 +1,80 @@
-//! fire-daemon — the resident process.
+//! fire — a native Win32 image viewer (single self-coordinating exe; Explorer launches it
+//! directly with the image path).
 //!
-//! Startup: acquire the single-instance mutex (exit if another daemon owns it), build
-//! the winit event loop with a custom `UserEvent`, spawn the pipe-server thread (which
-//! wakes the loop on each open request), warm the GPU, and run. The pooled window is
-//! created hidden in `resumed` and shown on the first open.
+//! Lifecycle is chosen by config (`InstanceMode`):
+//!   * **NewWindow** (default): just open our own window for the path. No mutex, no pipe,
+//!     nothing listening — each launch is an independent process that exits when its window
+//!     closes.
+//!   * **SingleInstance**: acquire a mutex. If we win, open the window AND serve a pipe so
+//!     later launches reuse this window; if another instance already owns it, forward the
+//!     path to it over the pipe and exit. The pipe lives only inside the running window's
+//!     process — it is not a resident daemon.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
+mod chrome;
+mod config;
 mod decode_pool;
+mod forward;
 mod foreground;
-mod gpu;
 mod ipc_server;
 mod render;
+mod win;
 
+use std::path::PathBuf;
 use std::ptr;
 
-use fire_ipc::{OpenRequest, MUTEX_NAME};
-use winit::event_loop::{ControlFlow, EventLoop};
+use config::{Config, InstanceMode};
+use fire_ipc::MUTEX_NAME;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::System::Threading::CreateMutexW;
-
-/// Custom events delivered into the winit event loop from background threads.
-#[derive(Debug)]
-pub enum UserEvent {
-    /// An open request from the pipe-server thread (a stub forwarded a path).
-    Open(OpenRequest),
-    /// A finished decode from a worker thread, ready to upload (or an error).
-    DecodeDone(decode_pool::DecodeOutcome),
-}
+use windows_sys::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 
 fn main() {
-    // Single-instance: a second daemon detects the mutex and exits quietly.
-    let _instance = match SingleInstance::acquire() {
-        Some(guard) => guard,
-        None => return,
-    };
+    // Declare Per-Monitor-V2 DPI awareness *before* any window exists, so the OS never
+    // bitmap-stretches us: the title bar/non-client area auto-scale, WM_DPICHANGED fires on
+    // monitor moves, and our client chrome scales from GetDpiForWindow. (Doing this in code
+    // rather than a manifest keeps it in one place and avoids manifest-embedding plumbing.)
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
 
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .expect("failed to build event loop");
-    // Idle, event-driven: ~0% CPU until a pipe message or redraw wakes us.
-    event_loop.set_control_flow(ControlFlow::Wait);
+    // Explorer passes the double-clicked file as the first argument.
+    let path: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
+    let cfg = Config::load();
 
-    // Hand the pipe server a proxy so it can wake the loop with each open request.
-    ipc_server::spawn(event_loop.create_proxy());
-
-    // The decode workers post results back through their own proxy.
-    let pool = decode_pool::DecodePool::new(event_loop.create_proxy());
-
-    let mut app = app::App::new(pool);
-    event_loop.run_app(&mut app).expect("event loop error");
+    match cfg.instance_mode {
+        InstanceMode::NewWindow => {
+            // Plain app: our own window, no coordination of any kind.
+            win::run(path, false);
+        }
+        InstanceMode::SingleInstance => match SingleInstance::acquire() {
+            // We're the owner: open the window and serve the pipe for later launches.
+            Some(_guard) => win::run(path, true),
+            // Another window owns the pipe: hand it the path and exit.
+            None => {
+                if let Err(e) = forward::forward(path) {
+                    eprintln!("fire: forward to running instance failed: {e}");
+                }
+            }
+        },
+    }
 }
 
-/// Holds the single-instance mutex for the process lifetime.
+/// Holds the single-instance mutex for the process lifetime (SingleInstance mode only).
 struct SingleInstance(HANDLE);
 
 impl SingleInstance {
-    /// Returns `Some` if we are the first daemon, `None` if another already holds it.
+    /// Returns `Some` if we are the first instance, `None` if another already holds it.
     fn acquire() -> Option<Self> {
         let name: Vec<u16> = MUTEX_NAME.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: name is a valid null-terminated wide string; null attributes are fine.
         let handle = unsafe { CreateMutexW(ptr::null(), 1 /* initial owner */, name.as_ptr()) };
         if handle.is_null() {
-            // Couldn't create the mutex; proceed without the guarantee rather than
-            // refuse to start.
+            // Couldn't create the mutex; proceed without the guarantee rather than refuse.
             return Some(SingleInstance(ptr::null_mut()));
         }
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {

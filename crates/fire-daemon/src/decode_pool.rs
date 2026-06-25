@@ -1,27 +1,28 @@
 //! Off-thread decode worker pool (Option A from the plan — no async runtime).
 //!
-//! Decoding a large PSD/EXR can take tens of milliseconds; doing it on the winit
-//! thread would freeze the window between the click and the image. Instead, `open`
-//! shows the window with a placeholder immediately and hands a [`DecodeJob`] to this
-//! pool. A worker decodes on a background thread and posts the result back to the event
-//! loop as [`UserEvent::DecodeDone`] via the `EventLoopProxy` (workers never touch wgpu
-//! or the window — same discipline as the pipe-server thread).
+//! Decoding a large PSD/EXR can take tens of milliseconds; doing it on the UI thread
+//! would freeze the window between the click and the image. Instead, `open` shows the
+//! window with a placeholder immediately and hands a [`DecodeJob`] to this pool. A worker
+//! decodes on a background thread and posts the result back to the UI thread by
+//! `PostMessage`-ing the window with [`crate::win::WM_APP_DECODE_DONE`] and a boxed
+//! [`DecodeOutcome`] in the LPARAM (workers never touch the window or softbuffer — same
+//! discipline as the pipe-server thread).
 //!
-//! Each job carries the issuing window's monotonic `generation`; the app uploads a
-//! result only if it is still the window's latest generation, so a slow decode can
-//! never clobber a newer one (stale-drop). A superseded job is still decoded — its
-//! result is just dropped on arrival — which wastes a little work but keeps the pool
-//! dead simple (no cancellation plumbing) for v1.
+//! Each job carries the issuing window's monotonic `generation`; the UI uploads a result
+//! only if it is still the window's latest generation, so a slow decode can never clobber
+//! a newer one (stale-drop). A superseded job is still decoded — its result is just
+//! dropped on arrival — which wastes a little work but keeps the pool dead simple.
 
 use std::path::PathBuf;
 use std::thread;
 
 use crossbeam_channel::{unbounded, Sender};
 use fire_decode::{decode_path, DecodeError, DecodeOptions, DecodedImage};
-use winit::event_loop::EventLoopProxy;
-use winit::window::WindowId;
 
-use crate::UserEvent;
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+use crate::win::WM_APP_DECODE_DONE;
 
 /// Plan-adopted default pool size: `min(num_cpus, 4)`.
 const MAX_WORKERS: usize = 4;
@@ -29,36 +30,17 @@ const MAX_WORKERS: usize = 4;
 /// A unit of decode work handed to a worker thread.
 #[derive(Debug)]
 pub struct DecodeJob {
-    /// Window the result is destined for (forward-compat for multi-window, Phase 4).
-    pub window_id: WindowId,
     /// The issuing window's generation at submit time; used for stale-drop.
     pub generation: u64,
     pub path: PathBuf,
     pub opts: DecodeOptions,
 }
 
-/// A finished decode, delivered back to the event loop.
+/// A finished decode, delivered back to the UI thread (boxed, via the message LPARAM).
 pub struct DecodeOutcome {
-    pub window_id: WindowId,
     pub generation: u64,
     pub path: PathBuf,
     pub result: Result<DecodedImage, DecodeError>,
-}
-
-// Hand-rolled so a debug print of the carrying `UserEvent` never dumps the decoded
-// pixel buffer (megabytes) — show dimensions on success instead.
-impl std::fmt::Debug for DecodeOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut d = f.debug_struct("DecodeOutcome");
-        d.field("window_id", &self.window_id)
-            .field("generation", &self.generation)
-            .field("path", &self.path);
-        match &self.result {
-            Ok(img) => d.field("result", &format_args!("Ok({}x{})", img.width, img.height)),
-            Err(e) => d.field("result", &format_args!("Err({e})")),
-        };
-        d.finish()
-    }
 }
 
 /// Sender handle to the worker pool; held by the `App` for the daemon's lifetime.
@@ -67,27 +49,35 @@ pub struct DecodePool {
 }
 
 impl DecodePool {
-    /// Spawn the worker threads. Each posts results back through `proxy`.
-    pub fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+    /// Spawn the worker threads. Each posts results back to `hwnd` (the UI window) via
+    /// `PostMessage`; `hwnd` is passed as an `isize` so it crosses the thread boundary
+    /// (a raw HWND is just an integer).
+    pub fn new(hwnd: isize) -> Self {
         let (tx, rx) = unbounded::<DecodeJob>();
         let workers = worker_count();
         for i in 0..workers {
             let rx = rx.clone();
-            let proxy = proxy.clone();
             thread::Builder::new()
                 .name(format!("fire-decode-{i}"))
                 .spawn(move || {
                     // Exits when the pool (and thus `tx`) is dropped at shutdown.
                     while let Ok(job) = rx.recv() {
                         let result = decode(&job);
-                        let outcome = DecodeOutcome {
-                            window_id: job.window_id,
+                        let outcome = Box::new(DecodeOutcome {
                             generation: job.generation,
                             path: job.path,
                             result,
+                        });
+                        let lparam = Box::into_raw(outcome) as isize;
+                        // SAFETY: the box outlives the post; the UI thread reclaims it in
+                        // the wndproc. If the post fails (window gone), reclaim here so we
+                        // don't leak.
+                        let posted = unsafe {
+                            PostMessageW(hwnd as HWND, WM_APP_DECODE_DONE, 0, lparam)
                         };
-                        if proxy.send_event(UserEvent::DecodeDone(outcome)).is_err() {
-                            break; // event loop is gone; stop working
+                        if posted == 0 {
+                            drop(unsafe { Box::from_raw(lparam as *mut DecodeOutcome) });
+                            break; // window is gone; stop working
                         }
                     }
                 })
