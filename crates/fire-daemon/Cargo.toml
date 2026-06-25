@@ -17,6 +17,8 @@ wgpu.workspace = true
 pollster.workspace = true
 raw-window-handle.workspace = true
 crossbeam-channel.workspace = true
+# View-transform / shader uniform is a #[repr(C)] Pod struct uploaded as raw bytes.
+bytemuck.workspace = true
 
 # Raw Win32 for the named-pipe server, single-instance mutex, and foreground raise.
 # windows-sys (vs the typed `windows` crate) keeps these low-level calls predictable.

@@ -12,6 +12,7 @@ mod decode_pool;
 mod foreground;
 mod gpu;
 mod ipc_server;
+mod render;
 
 use std::ptr;
 

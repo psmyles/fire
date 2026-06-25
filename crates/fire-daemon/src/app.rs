@@ -8,13 +8,20 @@ use fire_decode::DecodeOptions;
 use fire_ipc::OpenRequest;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
+use winit::keyboard::Key;
 use winit::window::{Icon, WindowAttributes, WindowId};
 
 use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool};
 use crate::gpu::{GpuContext, WindowState};
+use crate::render::view::Channel;
 use crate::{foreground, UserEvent};
+
+/// Multiplicative zoom per wheel notch (and per keyboard zoom step).
+const ZOOM_STEP: f32 = 1.15;
+/// Exposure step per keypress, in stops.
+const EXPOSURE_STEP: f32 = 0.25;
 
 pub struct App {
     gpu: GpuContext,
@@ -164,6 +171,46 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => {
                 // Resident: hide instead of exiting so the next open is instant.
                 ws.window.set_visible(false);
+            }
+
+            // --- Phase 3 navigation input -------------------------------------
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    // Trackpads report pixels; normalize to roughly one notch per ~60px.
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
+                };
+                if dy != 0.0 {
+                    ws.zoom_at_cursor(&self.gpu, ZOOM_STEP.powf(dy));
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                ws.on_cursor_moved(&self.gpu, (position.x as f32, position.y as f32));
+            }
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
+                ElementState::Pressed => ws.begin_drag(),
+                ElementState::Released => ws.end_drag(),
+            },
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                // Inline so the `ws` borrow and the shared `&self.gpu` borrow stay on
+                // disjoint fields (a `&mut self` helper here would conflict with `ws`).
+                if let Key::Character(s) = &event.logical_key {
+                    match s.as_str() {
+                        "f" | "F" => ws.fit(&self.gpu),
+                        "1" => ws.one_to_one(&self.gpu),
+                        "r" | "R" => ws.toggle_channel(&self.gpu, Channel::R),
+                        "g" | "G" => ws.toggle_channel(&self.gpu, Channel::G),
+                        "b" | "B" => ws.toggle_channel(&self.gpu, Channel::B),
+                        "a" | "A" => ws.toggle_channel(&self.gpu, Channel::A),
+                        "c" | "C" => ws.set_channel(&self.gpu, Channel::Rgb),
+                        "t" | "T" => ws.toggle_tonemap(&self.gpu),
+                        "]" => ws.adjust_exposure(&self.gpu, EXPOSURE_STEP),
+                        "[" => ws.adjust_exposure(&self.gpu, -EXPOSURE_STEP),
+                        "=" | "+" => ws.zoom_centered(&self.gpu, ZOOM_STEP),
+                        "-" | "_" => ws.zoom_centered(&self.gpu, 1.0 / ZOOM_STEP),
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }
