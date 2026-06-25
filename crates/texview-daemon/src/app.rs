@@ -33,8 +33,9 @@ impl App {
 
         // Phase 1 decodes synchronously on the main thread (the async worker pool is
         // Phase 2). The window is shown regardless of decode outcome so the foreground
-        // handoff is always exercised.
-        let opts = DecodeOptions { max_dim: self.gpu.max_texture_dim(), honor_icc: false };
+        // handoff is always exercised. honor_icc: lcms2 transforms non-sRGB profiles into
+        // the sRGB working space (best-effort; see texview_decode::icc).
+        let opts = DecodeOptions { max_dim: self.gpu.max_texture_dim(), honor_icc: true };
         match decode_path(&req.path, &opts) {
             Ok(img) => {
                 let (w, h) = clamp_window_size(img.width, img.height);

@@ -2636,6 +2636,7 @@ dependencies = [
 name = "texview-decode"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "exr",
  "image",
  "lcms2",

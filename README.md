@@ -46,3 +46,6 @@ the PSD decoder lands in Phase 2.
 Greenfield, under active construction. Phase 0 (workspace + toolchain proof) first;
 the walking-skeleton end-to-end open (stub → pipe → daemon → one PNG on screen with
 foreground activation) is Phase 1.
+
+
+https://commons.wikimedia.org/wiki/File:Fire-dynamic-color.png

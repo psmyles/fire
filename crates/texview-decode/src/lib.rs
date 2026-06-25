@@ -2,24 +2,32 @@
 //!
 //! All format backends live behind the single [`decode`] entry point so the daemon
 //! never sees per-format detail. Routing is by magic bytes:
-//!   - PSD  -> psd_sdk (C++ FFI)        : merged composite, 8-bit RGBA (+ICC)
-//!   - EXR  -> `exr` crate              : 32-bit float RGBA (linear/HDR)
-//!   - else -> `image` crate            : PNG/JPEG/TGA/TIFF/GIF/BMP/WebP/HDR (+ICC)
+//!   - PSD            -> psd_sdk (C++ FFI) : merged composite, 8-bit RGBA (+ICC)
+//!   - EXR            -> `exr` crate       : 32-bit float RGBA (linear/HDR)
+//!   - zune-supported -> **zune** (hot path): PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL
+//!   - else           -> `image` crate     : TIFF/GIF/TGA (formats zune doesn't decode)
+//!
+//! **Decode speed is the project's primary metric** (time-to-first-pixel), so the common
+//! formats run through zune with [`DecoderOptions::new_fast`] (platform intrinsics +
+//! unsafe fast paths enabled). zune output is normalized to interleaved RGBA in the
+//! source bit depth (8/16/float). The `image` crate is kept only as a fallback for the
+//! handful of formats zune has no decoder for (TIFF/GIF/TGA), where decode speed is far
+//! less important.
 //!
 //! ICC profiles are extracted here; the lcms2 transform into the working space is
 //! applied by [`icc`]. Images larger than the GPU max texture dimension are
 //! CPU-downscaled to fit ([`downscale`]).
-//!
-//! Note (deviation from the plan's letter): the `image` crate is used for the LDR hot
-//! path (PNG/JPEG) rather than zune. The architecture treats decode *speed* as
-//! non-critical (cold-start is the latency enemy, and decode runs off the main thread
-//! on a worker, never blocking the window), so swapping in zune is a clean follow-up
-//! optimization of this same interface, not a correctness concern.
 
 use std::io::Cursor;
 use std::path::Path;
 
 mod downscale;
+
+/// Upper bound on a decoded source dimension. zune's default cap is 16384, which would
+/// reject any image larger than that on an axis before we ever get a chance to downscale
+/// it to the GPU limit — so we raise the cap well past any realistic image while still
+/// rejecting absurd (corrupt/decode-bomb) headers in the billions.
+const MAX_DECODE_DIM: usize = 1 << 17; // 131072
 
 /// Pixel layout of a decoded image. Drives the wgpu texture format and whether the
 /// HDR exposure/tonemap path applies (float = HDR, linear working space).
@@ -117,18 +125,30 @@ impl std::error::Error for DecodeError {}
 enum Backend {
     Psd,
     Exr,
+    /// A zune-decodable format; carries zune's detected format for status-bar naming.
+    Zune(zune_image::codecs::ImageFormat),
     Image,
 }
 
 fn sniff(bytes: &[u8]) -> Backend {
+    use zune_core::bytestream::ZCursor;
+    use zune_image::codecs::{guess_format, ImageFormat};
+
     if bytes.starts_with(b"8BPS") {
+        // PSD: psd_sdk gives a better composite than zune-psd, and carries the ICC.
         Backend::Psd
     } else if bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01]) {
-        // OpenEXR magic number.
+        // OpenEXR magic number — handled by the `exr` crate (zune has no EXR decoder).
         Backend::Exr
+    } else if let Some((fmt, _)) = guess_format(ZCursor::new(bytes)) {
+        // zune recognizes it (PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL): the fast path.
+        if fmt == ImageFormat::Unknown {
+            Backend::Image
+        } else {
+            Backend::Zune(fmt)
+        }
     } else {
-        // PNG/JPEG/TGA/TIFF/GIF/BMP/WebP/Radiance-HDR all go through the image crate,
-        // which sniffs them itself.
+        // zune doesn't sniff it (TIFF/GIF/TGA): fall back to the image crate.
         Backend::Image
     }
 }
@@ -142,6 +162,7 @@ pub fn decode(
     let mut img = match sniff(bytes) {
         Backend::Psd => decode_psd(bytes)?,
         Backend::Exr => decode_exr(bytes)?,
+        Backend::Zune(fmt) => decode_zune(bytes, fmt)?,
         Backend::Image => decode_image(bytes)?,
     };
 
@@ -232,9 +253,104 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     })
 }
 
-/// PNG/JPEG/TGA/TIFF/GIF/BMP/WebP/Radiance-HDR via the `image` crate. Extracts the
-/// embedded ICC profile (where the format carries one) and keeps float sources as
-/// 32-bit float RGBA (HDR).
+/// The hot path: zune for PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JPEG-XL. Decoded with
+/// the speed-first options, normalized to interleaved RGBA in the source bit depth, and
+/// carrying the embedded ICC profile where the format exposes one.
+///
+/// v1 takes the first frame only (#18: animated GIF → frame 0).
+fn decode_zune(
+    bytes: &[u8],
+    fmt: zune_image::codecs::ImageFormat,
+) -> Result<DecodedImage, DecodeError> {
+    use zune_core::bit_depth::BitDepth;
+    use zune_core::bytestream::ZCursor;
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+    use zune_image::image::Image;
+
+    // Speed is the project's top metric: enable platform intrinsics + unsafe fast paths.
+    // Raise the dimension guard well past zune's 16384 default so large sources decode
+    // (the GPU-fit downscale below shrinks anything beyond the device texture limit).
+    let opts = DecoderOptions::new_fast()
+        .set_max_width(MAX_DECODE_DIM)
+        .set_max_height(MAX_DECODE_DIM);
+
+    let mut image =
+        Image::read(ZCursor::new(bytes), opts).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+
+    // Source characteristics for the status bar, captured before we normalize to RGBA.
+    let src_channels = image.colorspace().num_components().min(255) as u8;
+    let icc = image.metadata().icc_chunk().cloned();
+
+    // Normalize every colorspace (RGB/Luma/LumaA/CMYK/BGR/…) to interleaved RGBA. This
+    // preserves the source bit depth (8/16/float) and adds an opaque alpha where missing.
+    image
+        .convert_color(ColorSpace::RGBA)
+        .map_err(|e| DecodeError::Other(e.to_string()))?;
+
+    let (width, height) = image.dimensions();
+    let frame = image
+        .frames_ref()
+        .first()
+        .ok_or_else(|| DecodeError::Malformed("image has no frames".into()))?;
+
+    let (pixels, pixel_format, bit_depth) = match image.depth() {
+        BitDepth::Eight => (frame.flatten::<u8>(), PixelFormat::Rgba8Unorm, 8u8),
+        BitDepth::Sixteen => {
+            // GPU stopgap reads Rgba16Unorm as native-endian u16 (§ gpu.rs).
+            let u16s = frame.flatten::<u16>();
+            let mut out = Vec::with_capacity(u16s.len() * 2);
+            for v in u16s {
+                out.extend_from_slice(&v.to_ne_bytes());
+            }
+            (out, PixelFormat::Rgba16Unorm, 16)
+        }
+        BitDepth::Float32 => {
+            // Float sources (Radiance .hdr) are linear/HDR → exposure + tonemap apply.
+            let f32s = frame.flatten::<f32>();
+            let mut out = Vec::with_capacity(f32s.len() * 4);
+            for v in f32s {
+                out.extend_from_slice(&v.to_ne_bytes());
+            }
+            (out, PixelFormat::Rgba32Float, 32)
+        }
+        // BitDepth::Unknown and any future variant.
+        _ => return Err(DecodeError::Malformed("unsupported bit depth".into())),
+    };
+
+    Ok(DecodedImage {
+        pixels,
+        width: width as u32,
+        height: height as u32,
+        format: pixel_format,
+        bit_depth,
+        channels: src_channels,
+        icc,
+        source_format: zune_format_name(fmt),
+        downscaled_from: None,
+    })
+}
+
+fn zune_format_name(f: zune_image::codecs::ImageFormat) -> &'static str {
+    use zune_image::codecs::ImageFormat::*;
+    match f {
+        JPEG => "JPEG",
+        PNG => "PNG",
+        PPM => "PPM",
+        PSD => "PSD",
+        Farbfeld => "Farbfeld",
+        QOI => "QOI",
+        JPEG_XL => "JPEG XL",
+        HDR => "Radiance HDR",
+        BMP => "BMP",
+        WEBP => "WebP",
+        _ => "image",
+    }
+}
+
+/// Fallback for the formats zune has no decoder for: TIFF/GIF/TGA via the `image` crate.
+/// Extracts the embedded ICC profile (where the format carries one) and keeps float
+/// sources as 32-bit float RGBA (HDR). Decode speed here is not critical (rare formats).
 fn decode_image(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     use image::DynamicImage;
 
@@ -299,17 +415,269 @@ fn format_name(f: image::ImageFormat) -> &'static str {
 // --- ICC ---------------------------------------------------------------------
 
 mod icc {
-    //! ICC handling. Phase 2 step here extracts the profile (already stored on
-    //! [`DecodedImage::icc`] by the backends, used by the status bar). The lcms2
-    //! transform into the working space is wired in the next step.
+    //! ICC handling via lcms2 (C FFI). The backends extract the embedded profile onto
+    //! [`DecodedImage::icc`]; here we transform the pixels into the sRGB working space so
+    //! a Display-P3 / Adobe-RGB / etc. image displays with correct color on the (sRGB)
+    //! surface. Best-effort: any failure (bad profile, unsupported layout) leaves the
+    //! pixels untouched, i.e. falls back to assuming the data is already sRGB.
 
-    use crate::DecodedImage;
+    use crate::{DecodedImage, PixelFormat};
 
-    /// Apply the embedded ICC transform in place, if present. Currently a no-op beyond
-    /// the extraction the backends already did; the lcms2 transform lands next.
-    pub fn apply(_img: &mut DecodedImage) {
-        // TODO(Phase 2, next step): build an lcms2 Transform from img.icc into the
-        // working space (sRGB for 8-bit, linear for float) and apply it in place,
-        // inside catch_unwind, best-effort (fall back to sRGB assumption on failure).
+    /// Transform `img`'s pixels from their embedded ICC profile into sRGB, in place.
+    ///
+    /// No-op when there is no profile, for HDR/float data (linear working space; our
+    /// float backends never carry an ICC), or for non-RGB profiles (our pixels are RGBA,
+    /// so a CMYK/Gray profile would be misapplied — we assume sRGB instead).
+    pub fn apply(img: &mut DecodedImage) {
+        let Some(icc) = img.icc.clone() else { return };
+        if img.format.is_hdr() {
+            return;
+        }
+        // FFI safety boundary (§6/§15): a malformed profile must never unwind into and
+        // crash the resident daemon. catch_unwind + best-effort: on any failure we keep
+        // the original pixels (sRGB assumption).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            transform_to_srgb(img, &icc);
+        }));
+    }
+
+    fn transform_to_srgb(img: &mut DecodedImage, icc: &[u8]) {
+        use lcms2::{ColorSpaceSignature, Flags, Intent, PixelFormat as Fmt, Profile, Transform};
+
+        let Ok(src) = Profile::new_icc(icc) else { return };
+        // Only RGB(A) source profiles map cleanly onto our RGBA pixels.
+        if src.color_space() != ColorSpaceSignature::RgbData {
+            return;
+        }
+        let dst = Profile::new_srgb();
+        // Perceptual: the usual choice for displaying photographic images. COPY_ALPHA so
+        // the alpha channel passes through untouched (lcms only transforms color).
+        let intent = Intent::Perceptual;
+
+        match img.format {
+            PixelFormat::Rgba8Unorm => {
+                let t: Transform<[u8; 4], [u8; 4]> = match Transform::new_flags(
+                    &src,
+                    Fmt::RGBA_8,
+                    &dst,
+                    Fmt::RGBA_8,
+                    intent,
+                    Flags::COPY_ALPHA,
+                ) {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                if let Ok(px) = bytemuck::try_cast_slice_mut::<u8, [u8; 4]>(&mut img.pixels) {
+                    t.transform_in_place(px);
+                }
+            }
+            PixelFormat::Rgba16Unorm => {
+                let t: Transform<[u16; 4], [u16; 4]> = match Transform::new_flags(
+                    &src,
+                    Fmt::RGBA_16,
+                    &dst,
+                    Fmt::RGBA_16,
+                    intent,
+                    Flags::COPY_ALPHA,
+                ) {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                // 16-bit pixels are native-endian u16 bytes; cast may fail on alignment,
+                // in which case we skip (sRGB assumption) rather than panic.
+                if let Ok(px) = bytemuck::try_cast_slice_mut::<u8, [u16; 4]>(&mut img.pixels) {
+                    t.transform_in_place(px);
+                }
+            }
+            // Float is handled by the is_hdr() early-out in apply().
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn img8(pixels: Vec<u8>) -> DecodedImage {
+            let n = (pixels.len() / 4) as u32;
+            DecodedImage {
+                pixels,
+                width: n,
+                height: 1,
+                format: PixelFormat::Rgba8Unorm,
+                bit_depth: 8,
+                channels: 4,
+                icc: None,
+                source_format: "test",
+                downscaled_from: None,
+            }
+        }
+
+        #[test]
+        fn no_icc_is_noop() {
+            let mut img = img8(vec![10, 20, 30, 40, 200, 150, 100, 255]);
+            let before = img.pixels.clone();
+            apply(&mut img);
+            assert_eq!(img.pixels, before);
+        }
+
+        #[test]
+        fn srgb_profile_near_identity_and_preserves_alpha() {
+            let icc = lcms2::Profile::new_srgb().icc().unwrap();
+            let mut img = img8(vec![10, 20, 30, 40, 200, 150, 100, 255, 0, 128, 255, 77]);
+            img.icc = Some(icc);
+            let before = img.pixels.clone();
+            apply(&mut img);
+            // sRGB -> sRGB is (near) identity; allow tiny rounding on the color channels.
+            for (i, (a, b)) in img.pixels.iter().zip(&before).enumerate() {
+                assert!(
+                    (*a as i32 - *b as i32).abs() <= 2,
+                    "channel {i} drifted: {a} vs {b}"
+                );
+            }
+            // COPY_ALPHA: alpha bytes (every 4th) preserved exactly.
+            assert_eq!([img.pixels[3], img.pixels[7], img.pixels[11]], [40, 255, 77]);
+        }
+
+        #[test]
+        fn malformed_profile_is_safe_noop() {
+            let mut img = img8(vec![10, 20, 30, 40]);
+            img.icc = Some(vec![0, 1, 2, 3, 4, 5]); // not a valid ICC profile
+            let before = img.pixels.clone();
+            apply(&mut img); // must not panic
+            assert_eq!(img.pixels, before);
+        }
+
+        /// Proves the embedded transfer curve is actually applied (not just channel
+        /// shuffling): a profile identical to sRGB except with a *linear* TRC means a
+        /// mid-gray 128 is linear-light 0.5, which sRGB-encodes to ~188. So the gray must
+        /// move substantially upward after the transform.
+        #[test]
+        fn linear_rgb_profile_applies_tone_curve() {
+            use lcms2::{CIExyY, CIExyYTRIPLE, Profile, ToneCurve};
+
+            let d65 = CIExyY { x: 0.3127, y: 0.3290, Y: 1.0 };
+            let primaries = CIExyYTRIPLE {
+                Red: CIExyY { x: 0.640, y: 0.330, Y: 1.0 },
+                Green: CIExyY { x: 0.300, y: 0.600, Y: 1.0 },
+                Blue: CIExyY { x: 0.150, y: 0.060, Y: 1.0 },
+            };
+            let linear = ToneCurve::new(1.0);
+            let profile = Profile::new_rgb(&d65, &primaries, &[&linear, &linear, &linear]).unwrap();
+            let icc = profile.icc().unwrap();
+
+            let mut img = img8(vec![128, 128, 128, 200]);
+            img.icc = Some(icc);
+            apply(&mut img);
+
+            // Linear 0.5 -> sRGB ~= 188. Allow a generous window; the point is "much higher".
+            assert!(
+                img.pixels[0] >= 175 && img.pixels[0] <= 200,
+                "linear 128 should sRGB-encode to ~188, got {}",
+                img.pixels[0]
+            );
+            // Stays neutral gray and alpha is untouched.
+            assert_eq!(img.pixels[0], img.pixels[1]);
+            assert_eq!(img.pixels[1], img.pixels[2]);
+            assert_eq!(img.pixels[3], 200);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encode `img` to the given format with the `image` crate (test fixtures only).
+    fn encode(img: &image::DynamicImage, fmt: image::ImageFormat) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        img.write_to(&mut buf, fmt).expect("encode fixture");
+        buf.into_inner()
+    }
+
+    /// A lossless RGBA PNG must come back through the zune hot path byte-for-byte.
+    #[test]
+    fn zune_png_rgba_roundtrip() {
+        let mut src = image::RgbaImage::new(2, 2);
+        src.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        src.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
+        src.put_pixel(0, 1, image::Rgba([0, 0, 255, 128]));
+        src.put_pixel(1, 1, image::Rgba([10, 20, 30, 40]));
+        let bytes = encode(&image::DynamicImage::ImageRgba8(src), image::ImageFormat::Png);
+
+        let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.width, out.height), (2, 2));
+        assert_eq!(out.format, PixelFormat::Rgba8Unorm);
+        assert_eq!(out.source_format, "PNG");
+        assert_eq!(out.channels, 4);
+        assert_eq!(
+            out.pixels,
+            vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 128, 10, 20, 30, 40]
+        );
+    }
+
+    /// A grayscale PNG decodes to Luma then expands to RGBA: gray replicated, opaque alpha.
+    /// The reported source channel count stays 1 (for the status bar).
+    #[test]
+    fn zune_grayscale_png_expands_to_rgba() {
+        let mut src = image::GrayImage::new(2, 1);
+        src.put_pixel(0, 0, image::Luma([40]));
+        src.put_pixel(1, 0, image::Luma([200]));
+        let bytes = encode(&image::DynamicImage::ImageLuma8(src), image::ImageFormat::Png);
+
+        let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.width, out.height), (2, 1));
+        assert_eq!(out.format, PixelFormat::Rgba8Unorm);
+        assert_eq!(out.channels, 1);
+        assert_eq!(out.pixels, vec![40, 40, 40, 255, 200, 200, 200, 255]);
+    }
+
+    /// A 16-bit PNG stays 16-bit (precision preserved for the inspector / HDR pipeline).
+    #[test]
+    fn zune_png16_stays_16bit() {
+        let mut src = image::ImageBuffer::<image::Rgba<u16>, _>::new(1, 1);
+        src.put_pixel(0, 0, image::Rgba([0xFFFF, 0x8000, 0x0001, 0xFFFF]));
+        let bytes = encode(&image::DynamicImage::ImageRgba16(src), image::ImageFormat::Png);
+
+        let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.format, PixelFormat::Rgba16Unorm);
+        assert_eq!(out.bit_depth, 16);
+        // Native-endian u16 RGBA.
+        let px: Vec<u16> = out
+            .pixels
+            .chunks_exact(2)
+            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(px, vec![0xFFFF, 0x8000, 0x0001, 0xFFFF]);
+    }
+
+    /// A solid-color JPEG decodes through zune to RGBA8 with the right dims (lossy, so we
+    /// only assert the color is approximately right, and source is reported as 3-channel).
+    #[test]
+    fn zune_jpeg_decodes() {
+        let src = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            16,
+            16,
+            image::Rgb([220, 30, 40]),
+        ));
+        let bytes = encode(&src, image::ImageFormat::Jpeg);
+
+        let out = decode(&bytes, Some("jpg"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.width, out.height), (16, 16));
+        assert_eq!(out.format, PixelFormat::Rgba8Unorm);
+        assert_eq!(out.source_format, "JPEG");
+        assert_eq!(out.channels, 3);
+        let [r, g, b, a] = [out.pixels[0], out.pixels[1], out.pixels[2], out.pixels[3]];
+        assert!(r > 200 && g < 70 && b < 80, "got {r},{g},{b}");
+        assert_eq!(a, 255);
+    }
+
+    /// Corrupt input must surface an error, never panic (FFI-free path, but the daemon
+    /// relies on this being a clean `Err`).
+    #[test]
+    fn garbage_input_errors() {
+        let bytes = b"\x89PNG\r\n\x1a\n garbage that is not a real png body";
+        let r = decode(bytes, Some("png"), &DecodeOptions::default());
+        assert!(r.is_err());
     }
 }

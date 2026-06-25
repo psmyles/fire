@@ -12,3 +12,4 @@ image.workspace = true
 exr.workspace = true
 lcms2.workspace = true
 psd-sdk-sys.workspace = true
+bytemuck.workspace = true
