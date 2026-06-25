@@ -42,7 +42,7 @@ impl App {
         // window shows the placeholder (a solid clear; the "loading" label is Phase 4)
         // rather than the wrong file's pixels while the new one decodes.
         ws.clear_image();
-        ws.window.set_title(&format!("{name} — Fire (loading…)"));
+        ws.window.set_title(&format!("Fire - {name} (loading…)"));
         ws.window.set_visible(true);
         ws.window.set_minimized(false);
         if req.flags.activate {
@@ -86,12 +86,12 @@ impl App {
                 let (cw, ch) = clamp_window_size(w, h);
                 let _ = ws.window.request_inner_size(PhysicalSize::new(cw, ch));
                 ws.set_image(&self.gpu, img);
-                ws.window.set_title(&format!("{name} — Fire"));
+                ws.window.set_title(&format!("Fire - {name}"));
                 ws.window.request_redraw();
                 println!("fire-daemon: opened {:?} ({w}x{h}, {fmt})", outcome.path);
             }
             Err(e) => {
-                ws.window.set_title(&format!("{name} — Fire (failed)"));
+                ws.window.set_title(&format!("Fire - {name} (failed)"));
                 eprintln!("fire-daemon: failed to open {:?}: {e}", outcome.path);
             }
         }
