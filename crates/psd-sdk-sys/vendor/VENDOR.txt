@@ -1,0 +1,4 @@
+psd_sdk vendored from https://github.com/MolecularMatters/psd_sdk
+commit: f51449543273cbf12058ae92b230e0c4209f5066
+License: BSD-2-Clause (see LICENSE)
+Only src/Psd/ is vendored (the library); Samples/bin/build omitted.

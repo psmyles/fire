@@ -1,0 +1,6 @@
+# bindgen (used only by psd-sdk-sys) loads libclang at build time. LLVM is installed
+# at C:\Program Files\LLVM and is on PATH, so bindgen normally finds libclang.dll on
+# its own. This pins the location explicitly so the FFI build is robust even if PATH
+# changes. Adjust if LLVM is installed elsewhere.
+[env]
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"

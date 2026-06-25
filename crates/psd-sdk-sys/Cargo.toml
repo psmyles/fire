@@ -1,0 +1,17 @@
+[package]
+name = "psd-sdk-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+# No `links` key yet — added in Phase 2 once the vendored C++ is compiled, to
+# prevent duplicate native-symbol linkage across the dependency graph.
+
+[dependencies]
+
+[build-dependencies]
+# Present so the workspace resolves the build toolchain now. They do nothing until
+# Phase 2 drops the vendored psd_sdk C++ + the extern "C" wrapper into vendor/.
+cc.workspace = true
+bindgen.workspace = true

@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/texview-ipc",
+    "crates/texview-stub",
+    "crates/texview-daemon",
+    "crates/texview-decode",
+    "crates/psd-sdk-sys",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Centralized version lock — every member inherits these via `workspace = true`.
+# Pinned to the latest mutually-compatible set verified for this project:
+#   egui-winit 0.34 pins winit ^0.30 ; egui-wgpu 0.34 pins wgpu ^29.
+# These are caret requirements; the first `cargo build` resolves exact patch
+# versions into Cargo.lock and proves the set is compatible.
+[workspace.dependencies]
+# --- windowing / GPU / UI ---
+winit = "0.30"
+wgpu = "29"
+egui = "0.34"
+egui-winit = "0.34"
+egui-wgpu = "0.34"
+raw-window-handle = "0.6"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+
+# --- decode ---
+# zune umbrella now; the individually-versioned codec crates (zune-jpeg/png/hdr)
+# are added in Phase 1/2 once their exact versions are confirmed with cargo.
+zune-image = "0.5"
+zune-core = "0.5"
+image = "0.25"
+exr = "1"
+lcms2 = { version = "6", features = ["static"] }
+
+# --- config / fs ---
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+notify = "8"
+
+# --- clipboard ---
+arboard = "3"
+
+# --- worker messaging ---
+crossbeam-channel = "0.5"
+
+# --- Windows platform APIs (pipes, mutex, foreground, registry, shell) ---
+windows = "0.61"
+windows-sys = "0.60"
+
+# --- internal crates ---
+texview-ipc = { path = "crates/texview-ipc" }
+texview-decode = { path = "crates/texview-decode" }
+psd-sdk-sys = { path = "crates/psd-sdk-sys" }
+
+# --- build deps ---
+cc = "1"
+bindgen = "0.71"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# NOTE: panic strategy is left at the default "unwind" (NOT "abort"). The decode
+# crate wraps every C/C++ FFI call (psd_sdk, lcms2) in std::panic::catch_unwind so a
+# malformed file cannot take down the resident daemon (§6/§15). catch_unwind only
+# works with unwinding panics, so panic=abort would silently defeat that safety net.
+strip = true

@@ -1,0 +1,10 @@
+[package]
+name = "texview-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Intentionally minimal — this crate is linked into the tiny stub, so it must stay
+# dependency-light (hand-rolled byte framing, no serde). See decision #7/§15.
