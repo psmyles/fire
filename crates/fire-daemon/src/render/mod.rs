@@ -1,6 +1,6 @@
-//! Render-side view model: the pure pan/zoom/fit math ([`view`]) and the GPU uniform it
-//! feeds ([`uniforms`]). The wgpu surface/pipeline that consumes them lives in
-//! [`crate::gpu`].
+//! Render-side view model: the pure pan/zoom/fit math ([`view`]), the CPU image shader
+//! ([`shade`]), and the softbuffer surface that presents it ([`surface`]).
 
-pub mod uniforms;
+pub mod shade;
+pub mod surface;
 pub mod view;

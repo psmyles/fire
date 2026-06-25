@@ -1,6 +1,7 @@
 //! Named-pipe server (Option A from the plan): one background thread runs a blocking
-//! pipe and forwards each `OpenRequest` to the winit event loop via `EventLoopProxy`.
-//! The thread never touches wgpu or the window — it only `send_event`s.
+//! pipe and forwards each `OpenRequest` to the UI thread by `PostMessage`-ing the window
+//! with [`crate::win::WM_APP_OPEN`] and a boxed `OpenRequest` in the LPARAM. The thread
+//! never touches the window or softbuffer — it only posts.
 //!
 //! A single pipe instance is created once and reused across connections (Connect →
 //! read → Disconnect → repeat). Because the pipe *name* therefore exists for the whole
@@ -11,11 +12,10 @@ use std::fs::File;
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, RawHandle};
 use std::ptr;
 
-use fire_ipc::{read_message, PIPE_NAME};
-use winit::event_loop::EventLoopProxy;
+use fire_ipc::{read_message, OpenRequest, PIPE_NAME};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_PIPE_CONNECTED, HWND, INVALID_HANDLE_VALUE,
 };
 // PIPE_ACCESS_DUPLEX lives under Storage::FileSystem (it's a file open-mode flag);
 // CreateNamedPipeW additionally requires the Win32_Storage_FileSystem feature because
@@ -25,20 +25,22 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use crate::UserEvent;
+use crate::win::WM_APP_OPEN;
 
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
 
-/// Spawn the pipe-server thread. `proxy` wakes the event loop with each open request.
-pub fn spawn(proxy: EventLoopProxy<UserEvent>) {
+/// Spawn the pipe-server thread. Each open request is posted to `hwnd` (the UI window),
+/// passed as an `isize` so it crosses the thread boundary.
+pub fn spawn(hwnd: isize) {
     std::thread::Builder::new()
         .name("fire-pipe-server".into())
-        .spawn(move || run(proxy))
+        .spawn(move || run(hwnd))
         .expect("failed to spawn pipe-server thread");
 }
 
-fn run(proxy: EventLoopProxy<UserEvent>) {
+fn run(hwnd: isize) {
     let name = wide(PIPE_NAME);
     let pipe = unsafe {
         CreateNamedPipeW(
@@ -54,7 +56,7 @@ fn run(proxy: EventLoopProxy<UserEvent>) {
     };
     if pipe == INVALID_HANDLE_VALUE {
         eprintln!(
-            "fire-daemon: CreateNamedPipeW failed (err {})",
+            "fire: CreateNamedPipeW failed (err {})",
             unsafe { GetLastError() }
         );
         return;
@@ -66,7 +68,7 @@ fn run(proxy: EventLoopProxy<UserEvent>) {
         if connected == 0 {
             let err = unsafe { GetLastError() };
             if err != ERROR_PIPE_CONNECTED {
-                eprintln!("fire-daemon: ConnectNamedPipe failed (err {err})");
+                eprintln!("fire: ConnectNamedPipe failed (err {err})");
                 unsafe { DisconnectNamedPipe(pipe) };
                 continue;
             }
@@ -82,11 +84,17 @@ fn run(proxy: EventLoopProxy<UserEvent>) {
 
         match result {
             Ok(req) => {
-                if proxy.send_event(UserEvent::Open(req)).is_err() {
-                    break; // event loop is gone; stop serving
+                let boxed: Box<OpenRequest> = Box::new(req);
+                let lparam = Box::into_raw(boxed) as isize;
+                // SAFETY: the box outlives the post; the UI thread reclaims it in the
+                // wndproc. Reclaim here if the post fails (window gone) so we don't leak.
+                let posted = unsafe { PostMessageW(hwnd as HWND, WM_APP_OPEN, 0, lparam) };
+                if posted == 0 {
+                    drop(unsafe { Box::from_raw(lparam as *mut OpenRequest) });
+                    break; // window is gone; stop serving
                 }
             }
-            Err(e) => eprintln!("fire-daemon: bad pipe message: {e}"),
+            Err(e) => eprintln!("fire: bad pipe message: {e}"),
         }
 
         unsafe { DisconnectNamedPipe(pipe) };
