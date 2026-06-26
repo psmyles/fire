@@ -9,30 +9,36 @@
 //! worker pool) are posted to the frame, which owns the title/size/lifecycle. Both windows
 //! reach the shared [`App`] through their `GWLP_USERDATA`; only the frame owns the box.
 
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr;
 
 use fire_decode::{DecodeOptions, DecodedImage};
 use fire_ipc::OpenRequest;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetDC, InvalidateRect, ReleaseDC, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
+use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, LoadIconW, PostQuitMessage, RegisterClassW,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+    GetMessageW, GetWindowLongPtrW, GetWindowPlacement, LoadCursorW, LoadIconW, PostQuitMessage,
+    RegisterClassW, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
+    SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, WINDOWPLACEMENT,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_KEYDOWN, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE,
+    WM_SETTINGCHANGE, WM_SIZE,
+    WNDCLASSW, WPF_RESTORETOMAXIMIZED, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 /// `WM_MOUSELEAVE` (0x02A3) isn't surfaced by windows-sys under the enabled features; it's a
@@ -46,6 +52,7 @@ use crate::foreground;
 use crate::ipc_server;
 use crate::render::gpu::GpuSurface;
 use crate::render::view::Channel;
+use crate::window_state::WindowState;
 
 /// An open request forwarded by the pipe server; LPARAM is `Box<OpenRequest>`.
 pub const WM_APP_OPEN: u32 = WM_APP + 1;
@@ -113,12 +120,10 @@ impl App {
                 let (w, h, fmt) = (img.width, img.height, img.source_format);
                 self.file_label = name.clone();
                 self.meta = format_meta(&img);
+                // Keep the window at its current (remembered) size; never resize it to the
+                // image. `set_image` fits the image to the current viewport, so every open
+                // lands in fit-to-window mode regardless of the image's pixel dimensions.
                 self.surface.set_image(img);
-                // Resize the frame so the image region (client minus chrome) shows it 1:1
-                // where possible; the resulting WM_SIZE repositions the view and re-fits.
-                let (iw, ih) = clamp_window_size(w, h);
-                let ch = self.chrome.metrics.toolbar_h + self.chrome.metrics.status_h;
-                resize_client(self.frame, iw, ih as i32 + ch);
                 set_title(self.frame, &format!("{}: {name}", crate::product::NAME));
                 self.surface.invalidate();
                 self.invalidate_chrome();
@@ -305,6 +310,15 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
 
         let dark = chrome::system_uses_dark_mode();
 
+        // Restore the remembered size now (so the GPU viewport starts at the right size); the
+        // exact position + maximized state is applied via SetWindowPlacement after the App is
+        // attached (the OS picks the initial position here).
+        let saved = WindowState::load();
+        let (init_w, init_h) = match &saved {
+            Some(s) => (s.width.max(200), s.height.max(150)),
+            None => (1280, 800),
+        };
+
         let title = wide(crate::product::NAME);
         let frame = CreateWindowExW(
             0,
@@ -313,8 +327,8 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            1280,
-            800,
+            init_w,
+            init_h,
             ptr::null_mut(),
             ptr::null_mut(),
             hinstance,
@@ -354,6 +368,12 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
             return;
         }
 
+        // Accept files dropped from Explorer onto either window. A drop can land on the chrome
+        // (frame) or the image region (the view child); WS_CLIPCHILDREN means the view owns its
+        // own client rect, so registering only the frame would miss drops over the image.
+        DragAcceptFiles(frame, 1);
+        DragAcceptFiles(view, 1);
+
         let mut surface = GpuSurface::new(view as isize, hinstance as isize, vw as u32, vh as u32);
         surface.set_clear(ch.view_clear_packed());
         // Workers and the pipe server post to the frame (it owns title/size/lifecycle).
@@ -382,8 +402,17 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
         SetWindowLongPtrW(frame, GWLP_USERDATA, app_raw as isize);
         SetWindowLongPtrW(view, GWLP_USERDATA, app_raw as isize);
 
-        // Always show the frame (even if launched without a file).
-        ShowWindow(frame, SW_SHOW);
+        // Always show the frame (even if launched without a file). The launcher's "Run"
+        // setting (the shortcut's Normal/Minimized/Maximized) wins for the show state;
+        // otherwise we restore the remembered maximized state. With a saved placement we
+        // apply the exact position + show state atomically via SetWindowPlacement.
+        let show = effective_show_cmd(launcher_show_cmd(), saved.as_ref());
+        match &saved {
+            Some(s) => apply_placement(frame, s, show),
+            None => {
+                ShowWindow(frame, show);
+            }
+        }
 
         if serve_pipe {
             ipc_server::spawn(frame as isize);
@@ -486,6 +515,10 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             app.handle_key(wparam as u32);
             0
         }
+        WM_DROPFILES => {
+            handle_drop(app, wparam as HDROP);
+            0
+        }
         WM_APP_OPEN => {
             let req = Box::from_raw(lparam as *mut OpenRequest);
             app.open(*req);
@@ -535,6 +568,8 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             0
         }
         WM_DESTROY => {
+            // Remember where/how the window was before it goes away, to restore next launch.
+            save_window_state(hwnd);
             PostQuitMessage(0);
             0
         }
@@ -610,11 +645,41 @@ unsafe extern "system" fn view_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             app.handle_key(wparam as u32);
             0
         }
+        WM_DROPFILES => {
+            handle_drop(app, wparam as HDROP);
+            0
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
 // --- Win32 helpers ----------------------------------------------------------
+
+/// Open the first file carried by a `WM_DROPFILES` `HDROP`, then release it. Shared by the frame
+/// and view procs since a drop can land on the chrome or the image region. The viewer shows one
+/// image at a time, so extra dropped files are ignored.
+unsafe fn handle_drop(app: &mut App, hdrop: HDROP) {
+    if let Some(path) = drop_first_path(hdrop) {
+        app.open(OpenRequest::new(path));
+    }
+    DragFinish(hdrop);
+}
+
+/// Read file index 0 out of an `HDROP` as a `PathBuf`. Returns `None` if the drop carried no
+/// files or the name couldn't be retrieved. `DragQueryFileW(.., null, 0)` returns the required
+/// length in UTF-16 code units (excluding the NUL); the second call fills the buffer.
+unsafe fn drop_first_path(hdrop: HDROP) -> Option<PathBuf> {
+    let len = DragQueryFileW(hdrop, 0, ptr::null_mut(), 0);
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; len as usize + 1];
+    let copied = DragQueryFileW(hdrop, 0, buf.as_mut_ptr(), buf.len() as u32);
+    if copied == 0 {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_wide(&buf[..copied as usize])))
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -655,29 +720,81 @@ fn client_size(hwnd: HWND) -> (u32, u32) {
     ((rc.right - rc.left).max(1) as u32, (rc.bottom - rc.top).max(1) as u32)
 }
 
-/// Resize the window so its *client* area is `cw`×`ch`.
-fn resize_client(hwnd: isize, cw: u32, ch: i32) {
-    let mut rc = RECT { left: 0, top: 0, right: cw as i32, bottom: ch.max(1) };
-    unsafe {
-        AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, 0);
-        SetWindowPos(
-            hwnd as HWND,
-            ptr::null_mut(),
-            0,
-            0,
-            rc.right - rc.left,
-            rc.bottom - rc.top,
-            SWP_NOMOVE | SWP_NOZORDER,
-        );
+// --- window placement: launcher Run setting + remembered position/size --------
+
+/// The show command the launcher requested via this process's `STARTUPINFO` — the shortcut's
+/// "Run" field (Normal / Minimized / Maximized), or what `CreateProcess` passed as `nCmdShow`.
+/// `None` if the launcher didn't specify one (then we use our remembered state).
+fn launcher_show_cmd() -> Option<i32> {
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    unsafe { GetStartupInfoW(&mut si) };
+    if si.dwFlags & STARTF_USESHOWWINDOW != 0 {
+        Some(si.wShowWindow as i32)
+    } else {
+        None
     }
 }
 
-/// Keep the initial window within a reasonable on-screen size while preserving aspect.
-fn clamp_window_size(w: u32, h: u32) -> (u32, u32) {
-    const MAX_W: f32 = 1600.0;
-    const MAX_H: f32 = 1000.0;
-    let w = w.max(1) as f32;
-    let h = h.max(1) as f32;
-    let scale = (MAX_W / w).min(MAX_H / h).min(1.0);
-    (((w * scale) as u32).max(1), ((h * scale) as u32).max(1))
+/// Resolve the show state to use on launch: an explicit Maximized/Minimized from the launcher
+/// always wins; otherwise restore the remembered maximized state (or show normal).
+fn effective_show_cmd(launcher: Option<i32>, saved: Option<&WindowState>) -> i32 {
+    let saved_max = saved.is_some_and(|s| s.maximized);
+    match launcher {
+        Some(c) if is_maximize(c) => SW_SHOWMAXIMIZED,
+        Some(c) if is_minimize(c) => SW_SHOWMINNOACTIVE,
+        _ if saved_max => SW_SHOWMAXIMIZED,
+        _ => SW_SHOWNORMAL,
+    }
+}
+
+fn is_maximize(cmd: i32) -> bool {
+    cmd == SW_SHOWMAXIMIZED || cmd == SW_MAXIMIZE
+}
+
+fn is_minimize(cmd: i32) -> bool {
+    cmd == SW_SHOWMINIMIZED || cmd == SW_SHOWMINNOACTIVE || cmd == SW_MINIMIZE || cmd == SW_FORCEMINIMIZE
+}
+
+/// Restore the saved restored-rect and apply `show` atomically via `SetWindowPlacement`. Using
+/// the placement API (vs positioning at create time) round-trips the workspace coordinates we
+/// saved exactly, independent of taskbar/work-area offsets, and sets the correct *restore* rect
+/// even when launching maximized.
+unsafe fn apply_placement(frame: HWND, s: &WindowState, show: i32) {
+    let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+    wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    wp.showCmd = show as u32;
+    wp.ptMinPosition = POINT { x: -1, y: -1 };
+    wp.ptMaxPosition = POINT { x: -1, y: -1 };
+    wp.rcNormalPosition = RECT {
+        left: s.x,
+        top: s.y,
+        right: s.x + s.width.max(1),
+        bottom: s.y + s.height.max(1),
+    };
+    SetWindowPlacement(frame, &wp);
+}
+
+/// Capture the frame's *restored* position/size + maximized flag and persist it (best effort).
+/// Called from `WM_DESTROY`; the HWND is still valid there.
+fn save_window_state(frame: HWND) {
+    let mut wp: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+    wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    if unsafe { GetWindowPlacement(frame, &mut wp) } == 0 {
+        return;
+    }
+    let r = wp.rcNormalPosition;
+    // `showCmd` is the *current* state; `WPF_RESTORETOMAXIMIZED` covers "maximized then
+    // minimized" so we still reopen maximized. We never persist a minimized state (reopening
+    // minimized would be a poor surprise) — only the normal rect plus this maximized flag.
+    let maximized =
+        wp.showCmd == SW_SHOWMAXIMIZED as u32 || (wp.flags & WPF_RESTORETOMAXIMIZED) != 0;
+    WindowState {
+        x: r.left,
+        y: r.top,
+        width: (r.right - r.left).max(1),
+        height: (r.bottom - r.top).max(1),
+        maximized,
+    }
+    .save();
 }

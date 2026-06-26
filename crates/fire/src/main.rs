@@ -21,6 +21,7 @@ mod ipc_server;
 mod product;
 mod render;
 mod win;
+mod window_state;
 
 use std::path::PathBuf;
 use std::ptr;

@@ -259,6 +259,14 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
   toggles, exposure, tonemap), and — planned — a folder cursor for ←/→ navigation across
   siblings.
 - **Instance mode:** NewWindow (default) or SingleInstance, per §3.
+- **Window placement:** the frame opens at the size/position it had when last closed — the
+  restored (non-maximized) rect plus a maximized flag are captured on `WM_DESTROY` with
+  `GetWindowPlacement` and persisted to `%APPDATA%\fire\window.toml` (see `window_state.rs`),
+  then re-applied next launch with `SetWindowPlacement` (workspace coordinates round-trip
+  exactly). The window is **never** resized to the image — every open lands in fit-to-window
+  mode (`set_image` fits to the current viewport). The launcher's "Run" setting (the shortcut's
+  Normal/Minimized/Maximized, read from `STARTUPINFO.wShowWindow`) overrides the show state:
+  an explicit Maximized/Minimized wins, otherwise the remembered maximized state is restored.
 - **Settings:** stored as **TOML** in `%APPDATA%`, editable directly; external edits
   hot-reload via the `notify` crate. The in-app settings dialog is native Win32.
 - **Future:** a third mode — compare two images side-by-side in one window, or tabs — is
@@ -272,6 +280,10 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
 - Pan / zoom / fit / 1:1; LMB drag-pan (the image can be pushed fully off any edge — Fit/1:1
   recenters it); mouse-wheel and RMB-vertical-drag zoom, both about the cursor.
 - HDR exposure (stops) + tonemap operator (Reinhard / ACES).
+- Drag-and-drop open: both the frame and the view child register with `DragAcceptFiles`, and
+  each wndproc routes `WM_DROPFILES` through the same `App::open` path as a launch/forward
+  (registering both is required because `WS_CLIPCHILDREN` gives the view its own client rect, so
+  a drop over the image would otherwise miss the frame). The first dropped file is opened.
 - **Pixel inspector** (planned): eyedropper RGBA readout + a zoomed pixel grid at high
   magnification, custom-painted into the view child with GDI `TextOut`/`DrawText` (system
   font — no rasterizer dependency), reading `current_image` via `view.screen_to_image()`.
