@@ -55,6 +55,7 @@ use crate::foreground;
 use crate::ipc_server;
 use crate::render::gpu::GpuSurface;
 use crate::render::view::Channel;
+use crate::watcher::FileWatcher;
 use crate::window_state::WindowState;
 
 /// An open request forwarded by the pipe server; LPARAM is `Box<OpenRequest>`.
@@ -63,6 +64,9 @@ pub const WM_APP_OPEN: u32 = WM_APP + 1;
 pub const WM_APP_DECODE_DONE: u32 = WM_APP + 2;
 /// A finished folder scan from the scan thread; LPARAM is `Box<FolderScan>`.
 pub const WM_APP_FOLDER_SCANNED: u32 = WM_APP + 3;
+/// The displayed image's file changed on disk (hot-reload). WPARAM is the watcher's generation
+/// at arm time (stale-drop); no LPARAM payload — the UI re-decodes its own current path.
+pub const WM_APP_FILE_CHANGED: u32 = WM_APP + 4;
 
 /// A completed sibling-image scan, delivered to the UI thread (boxed, via the message LPARAM).
 /// The win shell turns it into a [`Folder`] cursor once it confirms it's still current.
@@ -101,6 +105,12 @@ struct App {
     /// Sibling-image cursor for ←/→ navigation + the status-bar count. `None` until the
     /// background folder scan for the current image lands (lazy: image first, count after).
     folder: Option<Folder>,
+    /// Full path of the image currently loaded (or loading) — the hot-reload target. `None`
+    /// before the first open.
+    current_path: Option<PathBuf>,
+    /// File-change watcher for hot-reload; `None` when disabled in config. Dropped with the
+    /// `App`, which stops the watch thread.
+    watcher: Option<FileWatcher>,
 }
 
 impl App {
@@ -134,10 +144,34 @@ impl App {
         self.surface.invalidate();
         self.invalidate_chrome();
 
+        self.begin_decode(path, false)
+    }
+
+    /// Bump the generation, remember `path` as the current image, (re)arm the hot-reload watch on
+    /// it, and enqueue the decode. The single chokepoint for both a fresh open and a hot-reload;
+    /// `reload` rides along to `decode_done` so it knows whether to preserve the view. Returns the
+    /// assigned generation.
+    fn begin_decode(&mut self, path: &Path, reload: bool) -> u64 {
         let generation = self.surface.next_generation();
+        self.current_path = Some(path.to_path_buf());
+        if let Some(w) = &self.watcher {
+            w.watch(generation, path);
+        }
         let opts = DecodeOptions { max_dim: MAX_CPU_DIM, honor_icc: true };
-        self.pool.submit(DecodeJob { generation, path: path.to_path_buf(), opts });
+        self.pool.submit(DecodeJob { generation, path: path.to_path_buf(), opts, reload });
         generation
+    }
+
+    /// Hot-reload the current image after its file changed on disk. Re-decodes off-thread *without*
+    /// clearing the current pixels (no blank flash) and tags the job as a reload so the new image
+    /// swaps in preserving the view when its dimensions match. A stale wakeup (the user navigated
+    /// away since the watch was armed) is dropped by generation, like every other cross-thread post.
+    fn reload(&mut self, generation: u64) {
+        if generation != self.surface.generation() {
+            return; // superseded by a newer open/navigate/reload
+        }
+        let Some(path) = self.current_path.clone() else { return };
+        self.begin_decode(&path, true);
     }
 
     /// Move to the previous (`delta = -1`) or next (`delta = +1`) sibling image and load it,
@@ -194,9 +228,17 @@ impl App {
                 self.file_label = name.clone();
                 self.meta = format_meta(&img);
                 // Keep the window at its current (remembered) size; never resize it to the
-                // image. `set_image` fits the image to the current viewport, so every open
-                // lands in fit-to-window mode regardless of the image's pixel dimensions.
-                self.surface.set_image(img);
+                // image. A fresh open fits the image to the current viewport, so every open
+                // lands in fit-to-window mode regardless of the image's pixel dimensions. A
+                // hot-reload at the *same* dimensions instead keeps the current view (zoom/pan/
+                // channel/exposure) so a re-export of the same canvas doesn't yank the user out
+                // of their zoomed-in detail; a reload that changed dimensions re-fits.
+                let same_dims = self.surface.current_image().map(|i| (i.width, i.height)) == Some((w, h));
+                if outcome.reload && same_dims {
+                    self.surface.replace_image_keep_view(img);
+                } else {
+                    self.surface.set_image(img);
+                }
                 set_title(self.frame, &format!("{}: {name}", crate::product::NAME));
                 self.surface.invalidate();
                 self.invalidate_chrome();
@@ -354,7 +396,7 @@ impl App {
 /// Create the frame + child view, wire up the decode pool, optionally serve the pipe
 /// (single-instance mode), open `initial` if given, and run the message loop until the window
 /// is closed (the process then exits — non-resident).
-pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
+pub fn run(initial: Option<PathBuf>, serve_pipe: bool, hot_reload: bool) {
     unsafe {
         let hinstance = GetModuleHandleW(ptr::null());
 
@@ -463,6 +505,9 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
         surface.set_clear(ch.view_clear_packed());
         // Workers and the pipe server post to the frame (it owns title/size/lifecycle).
         let pool = DecodePool::new(frame as isize);
+        // Hot-reload watcher (config-gated); posts WM_APP_FILE_CHANGED to the frame, same as the
+        // pool. None when disabled, so no watch thread is spawned.
+        let watcher = hot_reload.then(|| FileWatcher::spawn(frame as isize));
 
         let mut app = Box::new(App {
             frame: frame as isize,
@@ -474,6 +519,8 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
             meta: String::new(),
             loading: false,
             folder: None,
+            current_path: None,
+            watcher,
         });
         app.relayout();
 
@@ -618,6 +665,10 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
         WM_APP_FOLDER_SCANNED => {
             let scan = Box::from_raw(lparam as *mut FolderScan);
             app.folder_scanned(*scan);
+            0
+        }
+        WM_APP_FILE_CHANGED => {
+            app.reload(wparam as u64);
             0
         }
         WM_DPICHANGED => {

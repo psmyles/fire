@@ -77,6 +77,9 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 - `decode_pool.rs` — off-thread worker pool (no async runtime).
 - `folder.rs` — sibling-image cursor behind ←/→ navigation + the status-bar count; pure scan/
   sort/cursor logic (no Win32, unit-tested), scanned off-thread and posted back to the frame.
+- `watcher.rs` — hot-reload: a per-window thread watches the open image's directory (`notify`) and
+  posts `WM_APP_FILE_CHANGED` when the file's contents change, so the UI re-decodes it. Same
+  off-thread/`PostMessage`/generation-tagged discipline as the decode pool and folder scan.
 - `config.rs` — TOML config from `%APPDATA%\fire\config.toml`; missing/invalid → defaults.
 - `forward.rs` / `ipc_server.rs` / `foreground.rs` — SingleInstance pipe client / server / foreground raise.
 - `build.rs` — precompiles `render/shader.hlsl` to DXBC via `fxc` (embedded with `include_bytes!`) and

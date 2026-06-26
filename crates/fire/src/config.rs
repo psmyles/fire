@@ -20,10 +20,21 @@ pub enum InstanceMode {
     SingleInstance,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Config {
     pub instance_mode: InstanceMode,
+    /// Reload the displayed image automatically when its file changes on disk. On by default;
+    /// set `hot-reload = false` in `config.toml` to disable the file watch entirely.
+    pub hot_reload: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        // `#[serde(default)]` fills any missing field from this, so an absent `hot-reload` key
+        // (or no config file at all) leaves hot-reload enabled.
+        Self { instance_mode: InstanceMode::default(), hot_reload: true }
+    }
 }
 
 impl Config {

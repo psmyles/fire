@@ -8,4 +8,3 @@ context menus entries:
     - copy path
     - show in explorer
 - click on zoom level indicator to alternate between fit an 1:1
-- hot reload files from disk when they change

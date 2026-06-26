@@ -20,6 +20,10 @@ toml.workspace = true
 # crossbeam-channel carries decode results from the worker pool to the UI thread.
 crossbeam-channel.workspace = true
 
+# notify watches the open image's directory so it hot-reloads when the file changes on disk
+# (ReadDirectoryChangesW on Windows); see watcher.rs.
+notify.workspace = true
+
 # Raw Win32: native window/message loop, named-pipe server, single-instance mutex,
 # foreground raise, and the GDI-painted chrome (toolbar/status bar). windows-sys (vs the
 # typed `windows` crate) keeps these calls predictable.

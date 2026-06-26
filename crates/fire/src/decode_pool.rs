@@ -34,6 +34,9 @@ pub struct DecodeJob {
     pub generation: u64,
     pub path: PathBuf,
     pub opts: DecodeOptions,
+    /// True if this is a hot-reload of the displayed file (vs. a fresh open/navigate). The UI
+    /// uses it to keep the current view when the re-decoded image has the same dimensions.
+    pub reload: bool,
 }
 
 /// A finished decode, delivered back to the UI thread (boxed, via the message LPARAM).
@@ -41,6 +44,8 @@ pub struct DecodeOutcome {
     pub generation: u64,
     pub path: PathBuf,
     pub result: Result<DecodedImage, DecodeError>,
+    /// Echoed from the job; see [`DecodeJob::reload`].
+    pub reload: bool,
 }
 
 /// Sender handle to the worker pool; held by the `App` for the window's lifetime.
@@ -67,6 +72,7 @@ impl DecodePool {
                             generation: job.generation,
                             path: job.path,
                             result,
+                            reload: job.reload,
                         });
                         let lparam = Box::into_raw(outcome) as isize;
                         // SAFETY: the box outlives the post; the UI thread reclaims it in

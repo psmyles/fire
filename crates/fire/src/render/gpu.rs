@@ -237,6 +237,20 @@ impl GpuSurface {
         self.view.fit_to_window((w, h), &self.viewport);
     }
 
+    /// Adopt a hot-reloaded image *without* resetting the view: upload the new pixels and keep the
+    /// current pan / zoom / channel / exposure / tonemap. Used when the file changed on disk and
+    /// the re-decode came back at the same dimensions (the "re-export same canvas" case), so the
+    /// user's zoomed-in detail and display state survive the update. The pan is re-clamped
+    /// defensively (a no-op while the dims are unchanged).
+    pub fn replace_image_keep_view(&mut self, img: DecodedImage) {
+        let dims = (img.width, img.height);
+        self.upload_texture(&img);
+        self.current_image = Some(img);
+        if !self.view.fit {
+            self.view.clamp_pan(dims, &self.viewport);
+        }
+    }
+
     /// Upload `img` as a `DEFAULT` texture with a full mip chain generated on the GPU.
     fn upload_texture(&mut self, img: &DecodedImage) {
         let (format, bpp, linear_sample) = match img.format {

@@ -293,6 +293,16 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
 - Folder navigation: ←/→ walk the sibling images in the current file's directory (wrapping at
   both ends), in file-manager natural order (case-insensitive, digit-runs by value so `img2`
   precedes `img10`); the status bar shows the position/count (`3 / 27`).
+- Hot-reload: the displayed image re-decodes automatically when its file changes on disk
+  (`watcher.rs`, on by default; `hot-reload = false` disables it). A per-window thread watches the
+  current image's *directory* non-recursively via the `notify` crate (`ReadDirectoryChangesW`),
+  which survives editors' atomic save-and-rename; it debounces write bursts and gates on a
+  modified-time/size change (so a pure metadata touch — or the viewer's own decode read — can't
+  trigger a reload loop), then posts `WM_APP_FILE_CHANGED` to the frame. The reload keeps the
+  current pixels on screen until the new decode lands (no blank flash) and preserves the view
+  (zoom/pan/channel/exposure) when the new image has the same dimensions, only re-fitting if the
+  dimensions changed. The watch follows ←/→ navigation (it re-targets on every open/load) and is
+  generation-tagged for stale-drop, exactly like decodes and folder scans.
 - Planned: clipboard (`arboard`); "open in configured editor"; configurable background and
   alpha checkerboard.
 

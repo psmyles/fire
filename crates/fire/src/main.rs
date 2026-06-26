@@ -21,6 +21,7 @@ mod foreground;
 mod ipc_server;
 mod product;
 mod render;
+mod watcher;
 mod win;
 mod window_state;
 
@@ -48,15 +49,16 @@ fn main() {
     // Explorer passes the double-clicked file as the first argument.
     let path: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
     let cfg = Config::load();
+    let hot_reload = cfg.hot_reload;
 
     match cfg.instance_mode {
         InstanceMode::NewWindow => {
             // Plain app: our own window, no coordination of any kind.
-            win::run(path, false);
+            win::run(path, false, hot_reload);
         }
         InstanceMode::SingleInstance => match SingleInstance::acquire() {
             // We're the owner: open the window and serve the pipe for later launches.
-            Some(_guard) => win::run(path, true),
+            Some(_guard) => win::run(path, true, hot_reload),
             // Another window owns the pipe: hand it the path and exit.
             None => {
                 if let Err(e) = forward::forward(path) {
