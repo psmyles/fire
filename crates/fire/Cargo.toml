@@ -55,3 +55,6 @@ windows = { workspace = true, features = [
 # build.rs precompiles the viewport HLSL with `fxc` (Windows SDK) and embeds the Fire .ico +
 # product metadata into the exe (Explorer file icon).
 winresource.workspace = true
+# build.rs reads the canonical product metadata from ../../product.json so a single edit there
+# flows into the exe's version resource and the FIRE_* compile-time strings the app displays.
+serde_json.workspace = true

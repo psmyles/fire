@@ -320,9 +320,23 @@ Key dependencies: `windows` (typed COM for the D3D11 device + DXGI flip swapchai
   `libheif`/`libde265`/`dav1d` decoder stack are built/linked via `cc`/`bindgen` build scripts in
   `psd-sdk-sys` and `heif-sys`. The Fire `.ico` + version/product metadata are embedded via
   `winresource`.
-- **Planned: an unsigned installer** (Inno Setup): installs `fire.exe`, registers the `HKCU`
-  file associations, and provides clean uninstall. No `Run`/autostart entry — nothing stays
-  resident. (No code signing yet — expect a SmartScreen prompt on first run.)
+- **`product.json` (repo root) is the single source of product metadata** — name, version,
+  publisher, copyright, homepage, description. `fire`'s `build.rs` reads it to fill the exe's
+  version resource and to re-export the values as `FIRE_*` compile-time env vars the app reads
+  (window title, etc.); the installer build script reads the same file. Bump the version there and
+  it flows into the application and the installer alike — nothing else hardcodes it.
+- **Unsigned installer** (Inno Setup, `installer/fire.iss`): per-user install (no admin, to match
+  the `HKCU` association model), with a wizard page offering Fire as the default viewer per format
+  plus an "All supported image formats" master toggle (default off — never steals associations the
+  user didn't pick). Registers the shared `Fire.Image` ProgID + `OpenWithProgids` + a
+  Default-Programs `Capabilities` block, with clean uninstall. No `Run`/autostart entry — nothing
+  stays resident. (No code signing yet — expect a SmartScreen prompt on first run. Note: Windows
+  protects the per-extension default via a hashed `UserChoice`, so the installer can claim *unset*
+  types outright but cannot silently override a type the user has already assigned.)
+- **Build the installer** with `scripts/build-installer.ps1`: it syncs the Cargo workspace version
+  to `product.json`, regenerates `assets/fire.ico` from `assets/icon.png` (ImageMagick), builds the
+  release exe, writes `installer/product.generated.iss` (the `#define`s from `product.json`), and
+  compiles `installer/fire.iss` with ISCC into `dist/Fire-<version>-Setup.exe`.
 
 ---
 

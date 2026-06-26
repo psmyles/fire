@@ -3,18 +3,63 @@
 //!      compiler), so the bytecode is embedded at build time instead of compiled at startup
 //!      via `D3DCompile`. This drops the runtime `d3dcompiler` dependency, shaves the cold-start
 //!      path, and turns a broken shader into a build error rather than a launch-time panic.
-//!   2. Embed the Fire app icon and version/product metadata into the exe's Windows resources,
-//!      so Explorer shows the flame and Task Manager / file properties read "Fire".
+//!   2. Read the canonical product metadata from `product.json` (repo root) and (a) embed it into
+//!      the exe's Windows version resource + app icon — so Explorer shows the flame and Task
+//!      Manager / file properties read the product name/version — and (b) re-export the same
+//!      strings as `FIRE_*` compile-time env vars the app reads via `env!` (window title, etc.).
+//!      `product.json` is the single source of truth: editing it there flows into the binary, and
+//!      the installer build script reads the same file, so a version bump lives in exactly one place.
 
 use std::path::{Path, PathBuf};
+
+/// Product metadata read from `product.json`. Only the fields the build consumes are pulled.
+struct Product {
+    name: String,
+    version: String,
+    publisher: String,
+    description: String,
+    copyright: String,
+    homepage: String,
+}
 
 fn main() {
     // The crate is Windows-only; both steps need a Windows target and the Windows SDK.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    let product = read_product();
     compile_shaders();
-    embed_resources();
+    embed_resources(&product);
+    export_env(&product);
+}
+
+/// Parse `../../product.json` (repo root) into [`Product`]. Panics with a clear message on a
+/// missing/malformed file or absent field — the metadata is mandatory, not best-effort.
+fn read_product() -> Product {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let path = Path::new(&manifest).join("../../product.json");
+    println!("cargo:rerun-if-changed={}", path.display());
+
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
+
+    let field = |key: &str| -> String {
+        json.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("product.json is missing the string field \"{key}\""))
+            .to_string()
+    };
+
+    Product {
+        name: field("productName"),
+        version: field("version"),
+        publisher: field("publisher"),
+        description: field("description"),
+        copyright: field("copyright"),
+        homepage: field("homepage"),
+    }
 }
 
 /// Compile each entry point of `src/render/shader.hlsl` to a `.dxbc` in `OUT_DIR`, which
@@ -78,18 +123,52 @@ fn find_fxc() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("fxc.exe"))
 }
 
-/// Embed the Fire `.ico` + product metadata into the exe (Explorer file icon, Task Manager name).
-fn embed_resources() {
+/// Embed the Fire `.ico` + product metadata into the exe (Explorer file icon, Task Manager name,
+/// file-properties version tab). Every string comes from `product.json` so the binary's metadata
+/// can never drift from the installer's.
+fn embed_resources(p: &Product) {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let ico = Path::new(&manifest).join("../../assets/fire.ico");
     println!("cargo:rerun-if-changed={}", ico.display());
 
     let mut res = winresource::WindowsResource::new();
+    // set_icon embeds the .ico with resource id "1" (winresource's DEFAULT_APPLICATION_ICON_ID),
+    // which the app loads via LoadIconW(.., MAKEINTRESOURCE(1)) for the window/taskbar icon.
     res.set_icon(ico.to_str().expect("icon path is valid UTF-8"));
-    // ProductName is the product family; FileDescription is the friendly name Task Manager
-    // shows — both "Fire" now that it's a single self-contained app.
-    res.set("ProductName", "Fire");
-    res.set("FileDescription", "Fire");
+    // ProductName is the product family; FileDescription is the friendly name Task Manager shows.
+    res.set("ProductName", &p.name);
+    res.set("FileDescription", &p.name);
+    res.set("CompanyName", &p.publisher);
+    res.set("LegalCopyright", &p.copyright);
+    res.set("Comments", &p.description);
     res.set("OriginalFilename", "fire.exe");
+    res.set("InternalName", "fire");
+    // Override winresource's Cargo-derived version strings + the numeric VS_FIXEDFILEINFO so the
+    // file-properties version matches product.json regardless of the crate's Cargo version.
+    res.set("FileVersion", &p.version);
+    res.set("ProductVersion", &p.version);
+    let packed = packed_version(&p.version);
+    res.set_version_info(winresource::VersionInfo::FILEVERSION, packed);
+    res.set_version_info(winresource::VersionInfo::PRODUCTVERSION, packed);
     res.compile().expect("failed to embed Windows resources");
+}
+
+/// Pack a dotted "major.minor.patch[.build]" string into the u64 VS_FIXEDFILEINFO layout
+/// (`major<<48 | minor<<32 | patch<<16 | build`). Missing components default to 0.
+fn packed_version(version: &str) -> u64 {
+    let mut parts = version.split('.').map(|s| s.parse::<u64>().unwrap_or(0));
+    let mut next = || parts.next().unwrap_or(0);
+    (next() << 48) | (next() << 32) | (next() << 16) | next()
+}
+
+/// Re-export the product strings as compile-time env vars (`FIRE_PRODUCT_NAME`, `FIRE_VERSION`, …)
+/// so the app reads them via `env!` instead of hardcoding "Fire" or `CARGO_PKG_VERSION`. This keeps
+/// every end-user-facing string (window title, future About dialog) sourced from product.json.
+fn export_env(p: &Product) {
+    println!("cargo:rustc-env=FIRE_PRODUCT_NAME={}", p.name);
+    println!("cargo:rustc-env=FIRE_VERSION={}", p.version);
+    println!("cargo:rustc-env=FIRE_PUBLISHER={}", p.publisher);
+    println!("cargo:rustc-env=FIRE_DESCRIPTION={}", p.description);
+    println!("cargo:rustc-env=FIRE_COPYRIGHT={}", p.copyright);
+    println!("cargo:rustc-env=FIRE_HOMEPAGE={}", p.homepage);
 }

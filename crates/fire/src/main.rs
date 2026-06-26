@@ -18,6 +18,7 @@ mod decode_pool;
 mod forward;
 mod foreground;
 mod ipc_server;
+mod product;
 mod render;
 mod win;
 

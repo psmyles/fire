@@ -26,7 +26,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassW,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, LoadCursorW, LoadIconW, PostQuitMessage, RegisterClassW,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOZORDER, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN,
@@ -86,7 +86,7 @@ impl App {
         self.file_label = name.clone();
         self.meta.clear();
         self.loading = true;
-        set_title(self.frame, &format!("Fire — {name} (loading…)"));
+        set_title(self.frame, &format!("{} — {name} (loading…)", crate::product::NAME));
         // SAFETY: frame is live for the App's lifetime.
         unsafe { ShowWindow(self.frame as HWND, SW_SHOW) };
         if req.flags.activate {
@@ -119,7 +119,7 @@ impl App {
                 let (iw, ih) = clamp_window_size(w, h);
                 let ch = self.chrome.metrics.toolbar_h + self.chrome.metrics.status_h;
                 resize_client(self.frame, iw, ih as i32 + ch);
-                set_title(self.frame, &format!("Fire — {name}"));
+                set_title(self.frame, &format!("{} — {name}", crate::product::NAME));
                 self.surface.invalidate();
                 self.invalidate_chrome();
                 eprintln!("fire: opened {name} ({w}x{h}, {fmt})");
@@ -127,7 +127,7 @@ impl App {
             Err(e) => {
                 self.file_label = name.clone();
                 self.meta = format!("failed: {e}");
-                set_title(self.frame, &format!("Fire — {name} (failed)"));
+                set_title(self.frame, &format!("{} — {name} (failed)", crate::product::NAME));
                 self.invalidate_chrome();
                 eprintln!("fire: failed to open {name}: {e}");
             }
@@ -268,6 +268,11 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
     unsafe {
         let hinstance = GetModuleHandleW(ptr::null());
 
+        // The app icon embedded by build.rs (winresource id "1"); used for the frame title bar
+        // and taskbar so the window shows the flame instead of the generic Win32 default. The
+        // integer resource id is passed as a pseudo-pointer, the MAKEINTRESOURCE convention.
+        let app_icon = LoadIconW(hinstance, 1 as *const u16);
+
         // Frame window class (owns chrome + message loop). WS_CLIPCHILDREN is set per-window.
         let frame_class = wide("FireFrameClass");
         RegisterClassW(&WNDCLASSW {
@@ -276,7 +281,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance,
-            hIcon: ptr::null_mut(),
+            hIcon: app_icon,
             hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
             hbrBackground: ptr::null_mut(),
             lpszMenuName: ptr::null(),
@@ -300,7 +305,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
 
         let dark = chrome::system_uses_dark_mode();
 
-        let title = wide("Fire");
+        let title = wide(crate::product::NAME);
         let frame = CreateWindowExW(
             0,
             frame_class.as_ptr(),

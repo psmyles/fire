@@ -37,6 +37,9 @@ lcms2 = { version = "6", features = ["static"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 notify = "8"
+# Build-time only: fire's build.rs parses product.json (the single source of product
+# metadata: name/version/publisher/copyright/homepage). Not linked into the binary.
+serde_json = "1"
 
 # --- clipboard ---
 arboard = "3"
