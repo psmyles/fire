@@ -1,6 +1,6 @@
 //! Native Win32 shell — replaces the winit event loop. The top-level **frame** window owns
 //! the message loop and paints the GDI chrome (toolbar + status bar, see [`crate::chrome`]);
-//! a **child "view" window** in the middle hosts the softbuffer [`SurfaceState`] renderer.
+//! a **child "view" window** in the middle hosts the D3D11 [`GpuSurface`] renderer.
 //! Splitting the two means the frame can repaint its chrome without touching the image and
 //! the image can repaint without redrawing the chrome (`WS_CLIPCHILDREN`), and the surface's
 //! viewport is exactly the image region (no chrome insets to carry).
@@ -43,7 +43,7 @@ use crate::chrome::{self, Action, Chrome, ViewSnapshot};
 use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool};
 use crate::foreground;
 use crate::ipc_server;
-use crate::render::surface::SurfaceState;
+use crate::render::gpu::GpuSurface;
 use crate::render::view::Channel;
 
 /// An open request forwarded by the pipe server; LPARAM is `Box<OpenRequest>`.
@@ -63,9 +63,9 @@ const MAX_CPU_DIM: u32 = 16384;
 struct App {
     /// Top-level frame window: owns the chrome, title, size, and lifecycle.
     frame: isize,
-    /// Child view window: the softbuffer render target (middle region).
+    /// Child view window: the D3D11 render target (middle region).
     view: isize,
-    surface: SurfaceState,
+    surface: GpuSurface,
     pool: DecodePool,
     chrome: Chrome,
     /// Status-bar file name (without the metadata tail).
@@ -282,7 +282,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
             lpszClassName: frame_class.as_ptr(),
         });
 
-        // Child view window class (softbuffer target). No background brush: it paints fully.
+        // Child view window class (D3D11 swapchain target). No background brush: it paints fully.
         let view_class = wide("FireViewClass");
         RegisterClassW(&WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -348,7 +348,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
             return;
         }
 
-        let mut surface = SurfaceState::new(view as isize, hinstance as isize, vw as u32, vh as u32);
+        let mut surface = GpuSurface::new(view as isize, hinstance as isize, vw as u32, vh as u32);
         surface.set_clear(ch.view_clear_packed());
         // Workers and the pipe server post to the frame (it owns title/size/lifecycle).
         let pool = DecodePool::new(frame as isize);
@@ -536,7 +536,7 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
     }
 }
 
-/// Child view proc: softbuffer paint + image navigation (pan/zoom/keys).
+/// Child view proc: D3D11 present + image navigation (pan/zoom/keys).
 unsafe extern "system" fn view_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let app_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
     if app_ptr.is_null() {

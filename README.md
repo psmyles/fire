@@ -27,6 +27,8 @@ cargo build --workspace
 cargo run -p fire -- C:\path\img.png   # open an image
 cargo run -p fire                      # open with no image (drag/drop or forward later)
 cargo test -p fire                     # render/view + decode unit tests
+cargo build -p fire                    # debug build
+cargo build -p fire --release          # release build
 ```
 
 Instance behavior is a config setting (`%APPDATA%\fire`): **NewWindow** (default — every

@@ -7,7 +7,7 @@
 //! so a coherent dark look would need undocumented `uxtheme.dll` ordinal calls. Painting the
 //! chrome ourselves (still native GDI + the system font) gives full color control for both
 //! themes with zero unsupported APIs, and scales cleanly with DPI because we own every metric.
-//! The image view is a separate child window (softbuffer), so it is unaffected by all of this.
+//! The image view is a separate child window (D3D11 swapchain), so it is unaffected by all of this.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -105,7 +105,7 @@ struct Palette {
     btn_active_text: u32,
     separator: u32,
     border: u32,
-    /// Letterbox / no-image backdrop, also a COLORREF; converted to softbuffer packing on use.
+    /// Letterbox / no-image backdrop, also a COLORREF; converted to `0x00RRGGBB` packing on use.
     view_clear: u32,
 }
 
@@ -144,7 +144,7 @@ impl Palette {
         }
     }
 
-    /// The backdrop as softbuffer's `0x00RRGGBB` packing (COLORREF is `0x00BBGGRR`).
+    /// The backdrop as `0x00RRGGBB` packing (COLORREF is `0x00BBGGRR`).
     fn view_clear_packed(&self) -> u32 {
         let c = self.view_clear;
         ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF)
@@ -226,7 +226,7 @@ impl Chrome {
         self.palette = Palette::for_mode(dark);
     }
 
-    /// The backdrop color for the surface, in softbuffer packing.
+    /// The backdrop color for the surface, in `0x00RRGGBB` packing.
     pub fn view_clear_packed(&self) -> u32 {
         self.palette.view_clear_packed()
     }

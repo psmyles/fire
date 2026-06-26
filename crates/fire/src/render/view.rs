@@ -2,8 +2,8 @@
 //!
 //! Everything here is windowing- and render-free so it can be unit-tested: the
 //! zoom-to-cursor fixed point, fit centering, the pan clamp, and the screen↔image
-//! round-trip. [`crate::render::shade`] consumes this state to map each output pixel back
-//! into the source image.
+//! round-trip. [`crate::render::gpu`] feeds this state into the pixel shader's constant
+//! buffer to map each output pixel back into the source image.
 
 /// Zoom bounds (screen pixels per image pixel). 0.02 lets a huge image shrink to a
 /// thumbnail; 64× is enough texel-peeping for a viewer.
@@ -30,7 +30,7 @@ impl Viewport {
     }
 }
 
-/// Channel-isolation mode (selects the per-pixel branch in [`crate::render::shade`]).
+/// Channel-isolation mode (selects the per-pixel branch in the [`crate::render::gpu`] shader).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Channel {
     Rgb,

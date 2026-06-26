@@ -18,9 +18,9 @@ publish = false
 # versions into Cargo.lock and proves the set is compatible.
 [workspace.dependencies]
 # --- windowing / render ---
-# Pure-CPU presentation: softbuffer blits a packed framebuffer to a raw Win32 HWND
-# (no winit, no wgpu, no D3D runtime). raw-window-handle only hands softbuffer the HWND.
-raw-window-handle = "0.6"
+# GPU presentation (D3D11 + a DXGI flip-model swapchain on a raw Win32 HWND, HLSL color
+# pipeline compiled at startup) is provided by the typed `windows` crate; see its entry
+# under "Windows platform APIs" below. No winit, no wgpu, no softbuffer.
 # POD casts in the decode path (slice reinterpretation of 16-bit pixels).
 bytemuck = { version = "1", features = ["derive"] }
 

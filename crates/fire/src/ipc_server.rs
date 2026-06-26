@@ -1,7 +1,7 @@
 //! Named-pipe server (Option A from the plan): one background thread runs a blocking
 //! pipe and forwards each `OpenRequest` to the UI thread by `PostMessage`-ing the window
 //! with [`crate::win::WM_APP_OPEN`] and a boxed `OpenRequest` in the LPARAM. The thread
-//! never touches the window or softbuffer — it only posts.
+//! never touches the window or the renderer — it only posts.
 //!
 //! A single pipe instance is created once and reused across connections (Connect →
 //! read → Disconnect → repeat). Because the pipe *name* therefore exists for as long as the

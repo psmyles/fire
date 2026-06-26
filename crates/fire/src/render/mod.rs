@@ -1,6 +1,5 @@
-//! Render-side view model: the pure pan/zoom/fit math ([`view`]), the CPU image shader
-//! ([`shade`]), and the softbuffer surface that presents it ([`surface`]).
+//! Render-side view model: the pure pan/zoom/fit math ([`view`]) and the GPU image renderer
+//! ([`gpu`]) that presents it via a D3D11 flip-model swapchain.
 
-pub mod shade;
-pub mod surface;
+pub mod gpu;
 pub mod view;

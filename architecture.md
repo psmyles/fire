@@ -4,25 +4,26 @@ A Windows source-format image viewer optimized for *time-to-first-pixel* when
 double-clicking a file in Explorer. Every design choice below traces back to one goal:
 the image should be on screen as close to instantly as possible.
 
-Fire is a **single, self-contained native Win32 application** that renders on the CPU.
-There is no GPU device, no D3D runtime, no resident background daemon, and no separate
-launcher stub.
+Fire is a **single, self-contained native Win32 application** that renders on the GPU via a
+lean **Direct3D 11** device created when the window opens (no warm-up). There is no resident
+background daemon and no separate launcher stub — the GPU device is cheap enough to create on
+launch, so nothing needs to be kept warm.
 
 ---
 
-## 1. Core insight and the pivot
+## 1. Core insight and the pivots
 
 The dominant cost of "double-click → pixels on screen" is **process cold-start plus
 decode**, not draw. A 2K PNG decodes in single-digit milliseconds; the headline cost is
 getting a process to `main()` and a window on screen.
 
-The original design eliminated cold-start with a *resident GPU daemon* (a hidden
-login-started process holding a warm `wgpu` device and a pooled window) fronted by a tiny
+**Original design — a resident GPU daemon.** Cold-start was eliminated with a hidden,
+login-started process holding a warm `wgpu` device and a pooled window, fronted by a tiny
 launcher stub. That choice cascaded a heavy stack — `winit` + `wgpu` + `egui` + a login
-service — all of which existed to support a *cross-platform GPU* app.
+service — all to support a *cross-platform GPU* app, at a resident ~1.1 GB commit charge.
 
-A throwaway pure-CPU prototype (softbuffer) was then measured head-to-head against the
-live GPU daemon on an 8192×4096 PNG:
+**First pivot — drop the daemon (and, at first, the GPU).** A throwaway pure-CPU prototype
+(softbuffer) was measured head-to-head against the live GPU daemon on an 8192×4096 PNG:
 
 | | GPU daemon | CPU path |
 |---|---|---|
@@ -30,15 +31,31 @@ live GPU daemon on an 8192×4096 PNG:
 | Committed (private) | 1,123 MB | **137 MB** |
 | Threaded render | sub-ms | **1.4 ms magnify / 3.4 ms minify avg** (max 8.75 ms) |
 
-Decode (≈392 ms, zune) is identical on both paths and dominates time-to-first-pixel.
-Interaction is indistinguishable; memory is ~½ the working set and ~⅛ the commit charge;
-and **removing the GPU deletes the D3D/driver runtime, the device-loss recovery path, and
-the GPU warm-up that was the entire justification for a resident daemon.**
+Decode (≈392 ms, zune) is identical on both paths and dominates time-to-first-pixel. The
+real lesson was **not "CPU beats GPU"** — it was that a *cold launch of a small native exe is
+cheap enough that no residency is needed*. That deleted the daemon, the launcher stub, and
+the entire winit/wgpu/egui/login-service stack, leaving a lean native Win32 app (the
+XnView-Classic model). The first cut of that app shaded every pixel on the CPU.
 
-So the architecture pivoted: a *Windows-only CPU* viewer can shed winit, wgpu, egui, and
-the daemon/stub split, and become a lean native Win32 app (the XnView-Classic model). A
-cold launch of a small native exe is cheap enough that no residency is needed — the
-process simply lives while it has a window open.
+**Second pivot — bring back a *non-resident* GPU device for presentation.** Pure-CPU shading
+re-runs the whole per-pixel pipeline for *every* surface pixel on *every* pan/zoom event. On a
+large window at a high refresh rate (a 240 Hz monitor), that pegged ~40% of a CPU during fast
+interaction and never felt as smooth as the old GPU build — even after an interactive-resolution
+preview and a prefiltered mip chain. The fix restores GPU-class interaction without bringing
+back anything the first pivot killed:
+
+- The image is uploaded **once** as a D3D11 texture with a hardware-generated mip chain.
+- Pan, zoom, exposure, channel, and tonemap become an **80-byte constant buffer**; each frame
+  is one fullscreen-triangle draw that re-samples the texture — **~0 CPU per frame**.
+- A **DXGI flip-model swapchain** paces presentation to vsync, so interaction is tear-free and
+  smooth at the monitor's true refresh.
+
+Crucially, the D3D11 device is created **when the window opens**, not warmed by a daemon. The
+daemon existed only to amortize GPU warm-up against cold-start; once cold-start proved cheap,
+its justification was gone — and a per-window device created on launch inherits none of its
+residency cost. So the architecture keeps every win of the first pivot (no daemon, no stub,
+lean native Win32, cheap cold start) **and** the smoothness of GPU presentation. winit, wgpu,
+and egui stay gone; the GPU path is a few hundred lines of typed COM against the `windows` crate.
 
 ---
 
@@ -59,7 +76,7 @@ Explorer double-click
 │  │  GDI toolbar (top) · GDI status bar (bottom)            │  │
 │  │  owns message loop, title, size, lifecycle, theme       │  │
 │  │  ┌── child "view" window ───────────────────────────┐   │  │
-│  │  │  softbuffer surface — the image region           │   │  │
+│  │  │  D3D11 swapchain — the image region              │   │  │
 │  │  └──────────────────────────────────────────────────┘   │  │
 │  └─────────────────────────────────────────────────────────┘  │
 │                                                                │
@@ -127,46 +144,62 @@ This path only runs in SingleInstance mode; NewWindow has nothing to forward.
 
 ---
 
-## 5. Rendering pipeline (CPU)
+## 5. Rendering pipeline (GPU)
 
-- **Stack:** pure-CPU **softbuffer**. The decoded image is held in RAM and shaded into a
-  packed `0x00RRGGBB` framebuffer that softbuffer blits to the window via GDI. No GPU
-  device, no swapchain, no shader compilation, and therefore **no device-loss path** to
-  handle.
-- **Window split:** a top-level **frame** window owns the message loop and paints the GDI
-  chrome (toolbar + status bar); a **child "view" window** in the middle is the softbuffer
-  target. `WS_CLIPCHILDREN` lets the frame repaint chrome without touching the image and
-  vice-versa, and makes the view's client rect *exactly* the image region (no chrome insets
-  in the view math).
-- **Threaded shading:** per output pixel, inverse-map into image space and fetch a *linear*
-  RGBA sample. The framebuffer is split into horizontal row bands across
-  `available_parallelism()` via `std::thread::scope`. Cost is O(surface pixels), nearly
-  independent of source resolution.
-- **Sampling:** nearest-neighbor when magnifying; **box-average** over the minify footprint
-  (clamped 1–6 taps) in linear light. No mip chain — we accept mild shimmer below ~0.16
-  zoom in exchange for zero preprocessing and zero extra memory.
-- **Repaint** is driven by `InvalidateRect` → `WM_PAINT`; decode results and forwarded
-  opens reach the UI thread by `PostMessage(frame, WM_APP_*)`.
+- **Stack:** **Direct3D 11** with a **DXGI flip-model swapchain** (`DXGI_SWAP_EFFECT_FLIP_DISCARD`)
+  on the child view window's HWND. The decoded image is uploaded **once** as a GPU texture; a
+  short HLSL vertex+pixel shader (compiled at startup via `D3DCompile`) does the sampling and the
+  whole color pipeline. The device is created lazily at window open — hardware preferred, with
+  the **WARP** software rasterizer as a fallback for RDP/headless — so there is no warm-up daemon.
+- **Window split:** a top-level **frame** window owns the message loop and paints the GDI chrome
+  (toolbar + status bar); a **child "view" window** in the middle owns the swapchain.
+  `WS_CLIPCHILDREN` lets the frame repaint chrome without touching the image and vice-versa, and
+  makes the view's client rect *exactly* the image region (no chrome insets in the view math).
+- **The image is a texture, not a per-frame computation.** On adopt, the decoded pixels are
+  uploaded to a `USAGE_DEFAULT` texture created with a full mip chain
+  (`D3D11_RESOURCE_MISC_GENERATE_MIPS`); `GenerateMips` builds the pyramid on the GPU. Each of the
+  four `PixelFormat`s maps to a native DXGI format (see §5.1). After that, pan / zoom / exposure /
+  channel / tonemap are just values in an **80-byte constant buffer**; the source texture never
+  changes until a new image is opened.
+- **Per-frame work is one draw.** A frame maps the constant buffer (`MAP_WRITE_DISCARD`), writes
+  the view transform + display state, and issues a single **fullscreen-triangle** draw; the pixel
+  shader inverse-maps each output pixel into image space and samples the texture. There is no
+  vertex buffer and no CPU per-pixel work — pan/zoom change a transform, not pixels, so
+  interaction cost is independent of image resolution and of zoom-out factor.
+- **Sampling:** a **point** sampler when magnifying (crisp 1:1 texels) and an **anisotropic +
+  mipmapped** sampler when minifying. Hardware anisotropy + the GPU mip chain replace the
+  CPU-built prefiltered pyramid and the on-the-fly box average entirely, and give better
+  anti-aliasing (anisotropic > trilinear) at no per-frame CPU cost.
+- **Presentation is vsync-paced.** `Present(1, …)` on the flip swapchain blocks to the monitor's
+  refresh, so fast pan/zoom is tear-free and smooth at high refresh rates (e.g. 240 Hz) while the
+  CPU sits near idle. Rendering is **event-driven** — a frame is drawn only on `WM_PAINT` (driven
+  by `InvalidateRect` after an input or a decode), so an idle window costs nothing on either the
+  CPU or the GPU.
+- **Repaint / wakeups:** view changes call `InvalidateRect` → `WM_PAINT` → one present; decode
+  results and forwarded opens reach the UI thread by `PostMessage(frame, WM_APP_*)`.
 
-### 5.1 Per-pixel color pipeline
+### 5.1 Per-pixel color pipeline (HLSL)
 
-Each sample is taken to **linear RGBA** per pixel format, then run through a common tail:
+The pixel shader mirrors what the old CPU shader did, per output pixel, in linear light. The
+source format determines how the texture is uploaded and decoded to linear:
 
-| `PixelFormat` | Buffer (native-endian) | → linear |
+| `PixelFormat` | DXGI texture format | → linear |
 |---|---|---|
-| `Rgba8Unorm` | u8 RGBA | sRGB LUT |
-| `Rgba16Unorm` | u16 RGBA | `/65535`, sRGB→linear |
-| `Rgba16Float` | f16 RGBA | half→f32 (already linear) |
-| `Rgba32Float` | f32 RGBA | read directly (already linear) |
+| `Rgba8Unorm` | `R8G8B8A8_UNORM_SRGB` | hardware sRGB-decode on sample |
+| `Rgba16Unorm` | `R16G16B16A16_UNORM` | shader sRGB→linear (sample already normalized) |
+| `Rgba16Float` | `R16G16B16A16_FLOAT` | already linear |
+| `Rgba32Float` | `R32G32B32A32_FLOAT` | already linear |
 
-Common tail, in order: (minify) average footprint in linear → **HDR only** (float
-formats): exposure `×2^stops`, then tonemap (Reinhard default / ACES toggle) → channel
-isolation (solo R/G/B/A grayscale; alpha shown literally) → checkerboard composite over
-transparency (linear 0.45/0.21) → **always** sRGB-encode via LUT (softbuffer presents raw
-bytes, so the encode is done in software). The whole pipeline runs in linear light. An
-8-bit opaque-RGB magnify fast path skips the linear round-trip for the common case.
+Common tail, in shader order: sample (point/aniso per §5) → **HDR only** (float formats):
+exposure `×2^stops`, then tonemap (Reinhard default / ACES toggle) → channel isolation (solo
+R/G/B/A grayscale; alpha shown literally) → checkerboard composite over transparency (linear
+0.45/0.21).
 
-LUTs (`lin[256]`, `srgb[4097]`) are built once per surface.
+The shader outputs **linear**; the swapchain's render-target view is created as a `*_SRGB` format
+so the hardware does the final sRGB encode on write. (The flip model disallows an `*_SRGB`
+*swapchain* format, so the backbuffer is `R8G8B8A8_UNORM` and only the **RTV** is `_UNORM_SRGB` —
+the standard trick.) The backdrop/letterbox clear color is the theme-aware chrome color, unpacked
+from its `0x00RRGGBB` value and sRGB-decoded to linear on the CPU so it matches.
 
 ---
 
@@ -208,8 +241,10 @@ Notes:
 - **ICC honored:** embedded profiles (PNG `iCCP`, JPEG APP2, TIFF tag, PSD resource) are
   parsed and transformed into the working space via `lcms2`. Files without a profile fall
   back to the sRGB assumption.
-- **HDR display:** tonemap to SDR with an exposure-stops control (works on any monitor).
-  True HDR swapchain output is not applicable to the CPU/GDI present path.
+- **HDR display:** tonemap to SDR in the shader with an exposure-stops control (works on any
+  monitor). The float source is sampled and tonemapped live each frame, so exposure/operator
+  changes are free. A true HDR (scRGB / 10-bit) swapchain is now *possible* with the D3D11 flip
+  swapchain — deferred; current output is tonemap-to-SDR.
 
 ---
 
@@ -278,7 +313,7 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
 ```
 fast-image-viewer/
 ├─ crates/
-│  ├─ fire/           # the viewer exe: Win32 shell, CPU render, decode pool, pipe
+│  ├─ fire/           # the viewer exe: Win32 shell, D3D11 render, decode pool, pipe
 │  ├─ fire-decode/    # uniform decode core (zune/image/exr/psd_sdk/lcms2)
 │  ├─ fire-ipc/       # pipe wire format for single-instance forwarding (shared)
 │  └─ psd-sdk-sys/    # FFI bindings + cc build of psd_sdk
@@ -287,19 +322,20 @@ fast-image-viewer/
 └─ Cargo.toml         # workspace
 ```
 
-Key dependencies: `softbuffer` (CPU present), `raw-window-handle` (hands softbuffer the
-HWND), `windows-sys` (Win32: window/message loop, GDI, DWM, DPI, pipe, mutex, registry),
+Key dependencies: `windows` (typed COM for the D3D11 device + DXGI flip swapchain + HLSL
+compile), `windows-sys` (Win32: window/message loop, GDI, DWM, DPI, pipe, mutex, registry),
 `zune-image`/`image`/`exr`/`lcms2`/`psd_sdk` (decode), `serde`/`toml`/`notify` (config),
-`arboard` (clipboard), `crossbeam-channel` (worker messaging). No winit, wgpu, egui, or
-pollster.
+`arboard` (clipboard), `crossbeam-channel` (worker messaging). No winit, wgpu, egui,
+pollster, or softbuffer.
 
 ---
 
 ## 13. Build and distribution
 
-- `cargo build --release` produces a **single `fire.exe`** — no D3D runtime, no GPU driver
-  coupling, smaller binary. The C++ `psd_sdk` builds via a `cc`/`bindgen` build script in
-  `psd-sdk-sys`. The Fire `.ico` + version/product metadata are embedded via `winresource`.
+- `cargo build --release` produces a **single `fire.exe`**. It links the D3D11/DXGI system DLLs
+  (present on every supported Windows; no redistributable, no bundled runtime) and compiles its
+  HLSL at startup. The C++ `psd_sdk` builds via a `cc`/`bindgen` build script in `psd-sdk-sys`.
+  The Fire `.ico` + version/product metadata are embedded via `winresource`.
 - **Unsigned installer** (Inno Setup) for now: installs `fire.exe`, registers the `HKCU`
   file associations, and provides clean uninstall. No `Run`/autostart entry — there is no
   daemon to start. (No code signing yet — expect a SmartScreen prompt on first run.)
@@ -309,7 +345,7 @@ pollster.
 ## 14. v1 scope vs. deferred
 
 **In v1:** single self-contained native Win32 exe; configurable NewWindow / SingleInstance
-lifecycle with **foreground activation on the forward path (§4.1)**; pure-CPU threaded
+lifecycle with **foreground activation on the forward path (§4.1)**; GPU (D3D11) shader
 render with channel/alpha/gamma/exposure/tonemap; async worker decode; zune + image + exr +
 psd_sdk decoders; ICC honoring via lcms2; tonemap-to-SDR HDR with exposure; downscale-to-fit
 RAM guard; **DPI-aware, dark-mode-aware GDI toolbar + status bar**; open-in-editor +
@@ -324,8 +360,14 @@ Explorer `IThumbnailProvider`; code signing.
 ## 15. Key risks and notes
 
 - **Cold start must stay cheap.** The whole bet of dropping the resident daemon is that a
-  lean native exe reaches first-pixel fast. If a heavy dependency creeps back in, the
-  cold-start cost the daemon was designed to avoid reappears — keep the launch path thin.
+  lean native exe reaches first-pixel fast. Creating the D3D11 device + flip swapchain and
+  compiling the HLSL now happen on the launch path; they are cheap (low-ms) but real, so keep
+  them lean and off the critical path to the first decode where possible. If a heavy dependency
+  creeps back in, the cold-start cost the daemon was designed to avoid reappears.
+- **GPU device loss.** A D3D11 device can be lost (TDR, driver update, GPU reset). The current
+  renderer does **not yet** recreate the device/swapchain on `DXGI_ERROR_DEVICE_REMOVED` — add
+  that recovery path before shipping. WARP is a fallback only at *creation* time (no hardware /
+  RDP), not a mid-session failover.
 - **Foreground lock (§4.1).** Only relevant in SingleInstance mode, but the easiest thing
   to get wrong and the most visible when it is: without the `AllowSetForegroundWindow`
   handoff, a forwarded open silently fails to come to the front.
@@ -335,8 +377,9 @@ Explorer `IThumbnailProvider`; code signing.
 - **ICC + zune tension.** Honoring profiles forces some formats off the zune hot path onto
   the `image` decoder that exposes ICC bytes; verify which formats this affects so you know
   where the fast path actually applies.
-- **Large-image RAM.** The decoded image is retained in RAM (sampling source for shading and
-  the inspector). The `max_dim` guard bounds the worst case; revisit if gigapixel sources
-  become common (tiled/virtual texturing, v2).
+- **Large-image RAM (+ VRAM).** The decoded image is retained in RAM (the texture-upload source
+  and the pixel-inspector backing) *and* lives as a GPU texture with a mip chain (~4/3× its size
+  in VRAM). The `max_dim` guard bounds the worst case; revisit if gigapixel sources become common
+  (tiled/virtual texturing, v2).
 - **First-run UX.** Unsigned installer → SmartScreen warning; document the "More info → Run
   anyway" step until signing is added.

@@ -17,10 +17,7 @@ fire-decode.workspace = true
 serde.workspace = true
 toml.workspace = true
 
-# CPU framebuffer → window (GDI BitBlt, no D3D), built from a raw Win32 HWND (no winit).
-softbuffer = "0.4"
-# raw-window-handle: only to hand the HWND to softbuffer.
-raw-window-handle.workspace = true
+# crossbeam-channel carries decode results from the worker pool to the UI thread.
 crossbeam-channel.workspace = true
 
 # Raw Win32: native window/message loop, named-pipe server, single-instance mutex,
@@ -40,6 +37,18 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",                   # Per-Monitor-V2 awareness + GetDpiForWindow
+] }
+
+# Typed COM bindings for the GPU viewport (D3D11 + DXGI flip-model swapchain, HLSL compiled
+# at startup via D3DCompile). The typed `windows` crate (vs raw windows-sys) makes the COM
+# device/swapchain/resource calls tractable; it's only used by render::gpu.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",          # D3D_DRIVER_TYPE / feature levels / ID3DBlob / topology
+    "Win32_Graphics_Direct3D_Fxc",      # D3DCompile (runtime HLSL → DXBC)
+    "Win32_Graphics_Direct3D11",        # ID3D11Device / context / resources
+    "Win32_Graphics_Dxgi",              # IDXGIFactory2 / swapchain / device / adapter
+    "Win32_Graphics_Dxgi_Common",       # DXGI_FORMAT / sample desc / swap enums
 ] }
 
 [build-dependencies]

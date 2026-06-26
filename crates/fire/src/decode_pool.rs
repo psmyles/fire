@@ -5,7 +5,7 @@
 //! window with a placeholder immediately and hands a [`DecodeJob`] to this pool. A worker
 //! decodes on a background thread and posts the result back to the UI thread by
 //! `PostMessage`-ing the window with [`crate::win::WM_APP_DECODE_DONE`] and a boxed
-//! [`DecodeOutcome`] in the LPARAM (workers never touch the window or softbuffer — same
+//! [`DecodeOutcome`] in the LPARAM (workers never touch the window or the renderer — same
 //! discipline as the pipe-server thread).
 //!
 //! Each job carries the issuing window's monotonic `generation`; the UI uploads a result
