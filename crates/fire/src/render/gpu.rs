@@ -19,12 +19,11 @@ use std::ffi::c_void;
 
 use fire_decode::{DecodedImage, PixelFormat};
 
-use windows::core::{Interface, PCSTR};
+use windows::core::Interface;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
-    ID3DBlob, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0,
-    D3D_FEATURE_LEVEL_11_1, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
@@ -59,7 +58,7 @@ use crate::render::view::{Channel, DisplayState, Tonemap, ViewState, Viewport};
 const ZOOM_DRAG_SENSITIVITY: f32 = 0.01;
 
 /// Per-frame shader constants. Layout matches the HLSL `cbuffer` (16-byte float4 registers);
-/// keep the field order/padding in lockstep with [`SHADER_HLSL`].
+/// keep the field order/padding in lockstep with the `Params` cbuffer in `render/shader.hlsl`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Params {
@@ -84,81 +83,6 @@ struct Params {
     clear_b: f32,
     clear_a: f32,
 }
-
-/// Vertex (fullscreen triangle from `SV_VertexID`) + pixel shader. The pixel shader is a direct
-/// port of the former CPU shader's per-pixel pipeline: inverse-map the surface pixel into image
-/// space, sample (point when magnifying for crisp texels, anisotropic+mips when minifying),
-/// then exposure → tonemap → channel isolation → checker composite, all in linear light. The
-/// `*_SRGB` render target handles the final sRGB encode.
-const SHADER_HLSL: &str = r#"
-Texture2D tex : register(t0);
-SamplerState samp_aniso : register(s0);
-SamplerState samp_point : register(s1);
-
-cbuffer Params : register(b0) {
-    float2 img_size;
-    float2 surf_size;
-    float2 pan;
-    float  inv_zoom;
-    float  exposure;
-    int    channel;        // 0=RGB 1=R 2=G 3=B 4=A
-    int    tonemap;        // 0=Reinhard 1=ACES
-    int    is_hdr;
-    int    has_image;
-    int    linear_sample;  // 1=sample already linear, 0=sRGB-decode rgb in shader
-    int3   _pad;
-    float4 clear_lin;
-};
-
-struct VSOut { float4 pos : SV_Position; };
-
-VSOut vs_main(uint vid : SV_VertexID) {
-    float2 uv = float2((vid << 1) & 2, vid & 2); // (0,0) (2,0) (0,2)
-    VSOut o;
-    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-    return o;
-}
-
-float3 srgb_to_linear(float3 c) {
-    float3 lo = c / 12.92;
-    float3 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);
-    return lerp(hi, lo, step(c, 0.04045));
-}
-float3 reinhard(float3 c) { return c / (1.0 + c); }
-float3 aces(float3 x) {
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
-}
-
-float4 ps_main(float4 pos : SV_Position) : SV_Target {
-    if (has_image == 0) return clear_lin;
-    float2 sp = pos.xy;                       // surface pixel center (origin top-left)
-    float2 ctr = surf_size * 0.5 + pan;
-    float2 f = img_size * 0.5 + (sp - ctr) * inv_zoom;   // image texel coords
-    if (f.x < 0.0 || f.y < 0.0 || f.x >= img_size.x || f.y >= img_size.y)
-        return clear_lin;
-    float2 uv = f / img_size;
-    float4 s = (inv_zoom <= 1.0) ? tex.Sample(samp_point, uv)   // magnify/1:1 → crisp texels
-                                 : tex.Sample(samp_aniso, uv);  // minify → mips + anisotropic
-    float3 rgb = s.rgb;
-    float a = s.a;
-    if (linear_sample == 0) rgb = srgb_to_linear(rgb);
-    if (is_hdr != 0) {
-        rgb *= exposure;
-        rgb = (tonemap == 1) ? aces(rgb) : reinhard(rgb);
-    }
-    if (channel == 1) return float4(rgb.rrr, 1.0);
-    if (channel == 2) return float4(rgb.ggg, 1.0);
-    if (channel == 3) return float4(rgb.bbb, 1.0);
-    if (channel == 4) { float v = srgb_to_linear(float3(a, a, a)).x; return float4(v, v, v, 1.0); }
-    if (a < 0.999) {
-        float2 cell = floor(sp / 12.0);
-        float bg = (fmod(cell.x + cell.y, 2.0) < 0.5) ? 0.45 : 0.21;
-        rgb = bg * (1.0 - a) + rgb * a;
-    }
-    return float4(rgb, 1.0);
-}
-"#;
 
 /// GPU render state for the view window: the D3D11 device/swapchain plus the same pan/zoom/fit
 /// + channel/exposure/tonemap state the CPU surface carried (so the window shell and chrome
@@ -691,52 +615,18 @@ fn create_swapchain(device: &ID3D11Device, hwnd: HWND, w: u32, h: u32) -> IDXGIS
     }
 }
 
-/// Compile the HLSL and create the vertex + pixel shaders.
+/// Create the vertex + pixel shaders from the DXBC that `fxc` precompiled at build time (see
+/// `build.rs`); the bytecode is embedded in the exe, so there is no runtime HLSL compile.
 fn create_shaders(device: &ID3D11Device) -> (ID3D11VertexShader, ID3D11PixelShader) {
-    let vs_blob = compile(c"vs_main", c"vs_5_0");
-    let ps_blob = compile(c"ps_main", c"ps_5_0");
+    const VS_DXBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vs_main.dxbc"));
+    const PS_DXBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ps_main.dxbc"));
     unsafe {
-        let vs_bytes =
-            std::slice::from_raw_parts(vs_blob.GetBufferPointer() as *const u8, vs_blob.GetBufferSize());
-        let ps_bytes =
-            std::slice::from_raw_parts(ps_blob.GetBufferPointer() as *const u8, ps_blob.GetBufferSize());
         let mut vs: Option<ID3D11VertexShader> = None;
         let mut ps: Option<ID3D11PixelShader> = None;
-        device.CreateVertexShader(vs_bytes, None, Some(&mut vs)).expect("CreateVertexShader");
-        device.CreatePixelShader(ps_bytes, None, Some(&mut ps)).expect("CreatePixelShader");
+        device.CreateVertexShader(VS_DXBC, None, Some(&mut vs)).expect("CreateVertexShader");
+        device.CreatePixelShader(PS_DXBC, None, Some(&mut ps)).expect("CreatePixelShader");
         (vs.unwrap(), ps.unwrap())
     }
-}
-
-/// Compile one entry point of [`SHADER_HLSL`] to DXBC via the runtime `D3DCompile`.
-fn compile(entry: &std::ffi::CStr, target: &std::ffi::CStr) -> ID3DBlob {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    let r = unsafe {
-        D3DCompile(
-            SHADER_HLSL.as_ptr() as *const c_void,
-            SHADER_HLSL.len(),
-            PCSTR::null(),
-            None,
-            None,
-            PCSTR(entry.as_ptr() as *const u8),
-            PCSTR(target.as_ptr() as *const u8),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if r.is_err() {
-        let msg = errors
-            .map(|e| unsafe {
-                let bytes = std::slice::from_raw_parts(e.GetBufferPointer() as *const u8, e.GetBufferSize());
-                String::from_utf8_lossy(bytes).into_owned()
-            })
-            .unwrap_or_default();
-        panic!("fire: HLSL compile failed ({}): {msg}", entry.to_string_lossy());
-    }
-    code.unwrap()
 }
 
 /// Two samplers: anisotropic+mips for minify, point for crisp magnify/1:1. Both clamp at edges.

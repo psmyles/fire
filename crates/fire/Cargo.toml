@@ -39,18 +39,19 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_HiDpi",                   # Per-Monitor-V2 awareness + GetDpiForWindow
 ] }
 
-# Typed COM bindings for the GPU viewport (D3D11 + DXGI flip-model swapchain, HLSL compiled
-# at startup via D3DCompile). The typed `windows` crate (vs raw windows-sys) makes the COM
+# Typed COM bindings for the GPU viewport (D3D11 + DXGI flip-model swapchain). The shader is
+# precompiled to DXBC at build time by `fxc` (see build.rs), so no runtime D3DCompile / Fxc
+# feature is needed. The typed `windows` crate (vs raw windows-sys) makes the COM
 # device/swapchain/resource calls tractable; it's only used by render::gpu.
 windows = { workspace = true, features = [
     "Win32_Foundation",
-    "Win32_Graphics_Direct3D",          # D3D_DRIVER_TYPE / feature levels / ID3DBlob / topology
-    "Win32_Graphics_Direct3D_Fxc",      # D3DCompile (runtime HLSL → DXBC)
+    "Win32_Graphics_Direct3D",          # D3D_DRIVER_TYPE / feature levels / topology
     "Win32_Graphics_Direct3D11",        # ID3D11Device / context / resources
     "Win32_Graphics_Dxgi",              # IDXGIFactory2 / swapchain / device / adapter
     "Win32_Graphics_Dxgi_Common",       # DXGI_FORMAT / sample desc / swap enums
 ] }
 
 [build-dependencies]
-# Embeds the Fire .ico + product metadata into the exe (Explorer file icon).
+# build.rs precompiles the viewport HLSL with `fxc` (Windows SDK) and embeds the Fire .ico +
+# product metadata into the exe (Explorer file icon).
 winresource.workspace = true

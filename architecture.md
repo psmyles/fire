@@ -148,8 +148,9 @@ This path only runs in SingleInstance mode; NewWindow has nothing to forward.
 
 - **Stack:** **Direct3D 11** with a **DXGI flip-model swapchain** (`DXGI_SWAP_EFFECT_FLIP_DISCARD`)
   on the child view window's HWND. The decoded image is uploaded **once** as a GPU texture; a
-  short HLSL vertex+pixel shader (compiled at startup via `D3DCompile`) does the sampling and the
-  whole color pipeline. The device is created lazily at window open — hardware preferred, with
+  short HLSL vertex+pixel shader (precompiled to DXBC at build time by `fxc` and embedded in the
+  exe — no runtime `D3DCompile`) does the sampling and the whole color pipeline. The device is
+  created lazily at window open — hardware preferred, with
   the **WARP** software rasterizer as a fallback for RDP/headless — so there is no warm-up daemon.
 - **Window split:** a top-level **frame** window owns the message loop and paints the GDI chrome
   (toolbar + status bar); a **child "view" window** in the middle owns the swapchain.
@@ -333,10 +334,12 @@ pollster, or softbuffer.
 
 ## 13. Build and distribution
 
-- `cargo build --release` produces a **single `fire.exe`**. It links the D3D11/DXGI system DLLs
-  (present on every supported Windows; no redistributable, no bundled runtime) and compiles its
-  HLSL at startup. The C++ `psd_sdk` builds via a `cc`/`bindgen` build script in `psd-sdk-sys`.
-  The Fire `.ico` + version/product metadata are embedded via `winresource`.
+- `cargo build --release` produces a **single `fire.exe`**. It links only the D3D11/DXGI system
+  DLLs (present on every supported Windows; no redistributable, no bundled runtime — and with the
+  shader precompiled at build time, not even `d3dcompiler`). The viewport HLSL is compiled to DXBC
+  by `fxc` (Windows SDK) in `build.rs` and embedded via `include_bytes!`. The C++ `psd_sdk` builds
+  via a `cc`/`bindgen` build script in `psd-sdk-sys`. The Fire `.ico` + version/product metadata
+  are embedded via `winresource`.
 - **Unsigned installer** (Inno Setup) for now: installs `fire.exe`, registers the `HKCU`
   file associations, and provides clean uninstall. No `Run`/autostart entry — there is no
   daemon to start. (No code signing yet — expect a SmartScreen prompt on first run.)
