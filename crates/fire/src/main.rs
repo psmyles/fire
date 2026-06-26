@@ -8,7 +8,7 @@
 //!   * **SingleInstance**: acquire a mutex. If we win, open the window AND serve a pipe so
 //!     later launches reuse this window; if another instance already owns it, forward the
 //!     path to it over the pipe and exit. The pipe lives only inside the running window's
-//!     process — it is not a resident daemon.
+//!     process — nothing stays resident once the window closes.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

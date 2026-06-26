@@ -1,4 +1,4 @@
-//! Native Win32 shell — replaces the winit event loop. The top-level **frame** window owns
+//! Native Win32 shell. The top-level **frame** window owns
 //! the message loop and paints the GDI chrome (toolbar + status bar, see [`crate::chrome`]);
 //! a **child "view" window** in the middle hosts the D3D11 [`GpuSurface`] renderer.
 //! Splitting the two means the frame can repaint its chrome without touching the image and

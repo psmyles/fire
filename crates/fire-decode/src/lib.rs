@@ -193,7 +193,7 @@ pub fn decode(
         Backend::Image => decode_image(bytes)?,
     };
 
-    // Honor an embedded ICC profile by transforming into the working space (Phase 2).
+    // Honor an embedded ICC profile by transforming into the working space.
     if opts.honor_icc {
         icc::apply(&mut img);
     }

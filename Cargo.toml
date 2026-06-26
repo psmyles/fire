@@ -21,13 +21,12 @@ publish = false
 # --- windowing / render ---
 # GPU presentation (D3D11 + a DXGI flip-model swapchain on a raw Win32 HWND, HLSL color
 # pipeline compiled at startup) is provided by the typed `windows` crate; see its entry
-# under "Windows platform APIs" below. No winit, no wgpu, no softbuffer.
+# under "Windows platform APIs" below.
 # POD casts in the decode path (slice reinterpretation of 16-bit pixels).
 bytemuck = { version = "1", features = ["derive"] }
 
 # --- decode ---
-# zune umbrella now; the individually-versioned codec crates (zune-jpeg/png/hdr)
-# are added in Phase 1/2 once their exact versions are confirmed with cargo.
+# zune is the hot-path decoder for the common formats.
 zune-image = "0.5"
 zune-core = "0.5"
 image = "0.25"

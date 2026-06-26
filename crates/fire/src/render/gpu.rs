@@ -1,19 +1,17 @@
 //! GPU viewport: a Direct3D 11 renderer that presents the decoded image through a DXGI
-//! flip-model swapchain on the child "view" window. This replaced the former pure-CPU
-//! softbuffer renderer — the image lives as a GPU texture (with a hardware mip chain), and
-//! pan/zoom/exposure/channel/tonemap are just constant-buffer values, so each frame is one
-//! textured fullscreen triangle: the per-frame CPU cost is ~a 80-byte upload + a draw call,
-//! and the GPU does the sampling/color pipeline the CPU shader used to do per pixel.
+//! flip-model swapchain on the child "view" window. The image lives as a GPU texture (with a
+//! hardware mip chain), and pan/zoom/exposure/channel/tonemap are just constant-buffer
+//! values, so each frame is one textured fullscreen triangle: the per-frame CPU cost is ~an
+//! 80-byte upload + a draw call, and the GPU does the sampling and the whole color pipeline.
 //!
-//! Why this is smoother *and* lower-CPU than the CPU path: panning no longer re-runs the
-//! per-pixel pipeline on the CPU — it changes a transform and the GPU re-samples the texture.
-//! Presentation is vsync-paced through the flip-model swapchain (tear-free at high refresh)
-//! instead of an unsynchronized GDI BitBlt.
+//! Panning changes a transform and the GPU re-samples the texture rather than re-running a
+//! per-pixel pipeline on the CPU. Presentation is vsync-paced through the flip-model swapchain
+//! (tear-free at high refresh), so interaction stays smooth while the CPU sits near idle.
 //!
-//! Color correctness matches the former CPU shader: 8-bit sources upload as `*_UNORM_SRGB` (hardware
-//! sRGB→linear on sample), float sources are already linear, 16-bit unorm is sRGB-decoded in
-//! the shader. The pixel shader outputs **linear** and the render-target view is `*_SRGB`, so
-//! the hardware sRGB-encodes on write — matching the CPU encode. The whole pipeline is linear.
+//! Color: 8-bit sources upload as `*_UNORM_SRGB` (hardware sRGB→linear on sample), float
+//! sources are already linear, 16-bit unorm is sRGB-decoded in the shader. The pixel shader
+//! outputs **linear** and the render-target view is `*_SRGB`, so the hardware sRGB-encodes on
+//! write. The whole pipeline is linear.
 
 use std::ffi::c_void;
 

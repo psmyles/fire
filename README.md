@@ -1,23 +1,23 @@
-# fast-image-viewer
+# Fire
 
-**Fire** — a Windows source-format image viewer optimized for **time-to-first-pixel**
-when double-clicking a file in Explorer. It is a single, self-contained native Win32
-app: the image is decoded off-thread and presented on the CPU (no GPU, no D3D runtime),
-with a custom DPI-aware, dark-mode-aware toolbar and status bar painted with GDI.
+**Fire** — *Fast Image REview* — a Windows source-format image viewer optimized for
+**time-to-first-pixel** when double-clicking a file in Explorer. It is a single,
+self-contained native Win32 app: the image is decoded off-thread and presented on the GPU
+through a lean Direct3D 11 device created when the window opens, with a custom DPI-aware,
+dark-mode-aware toolbar and status bar painted with GDI.
 
-See [architecture.md](architecture.md) for the full design and `.claude/plans/` for the
-phased implementation plan.
+See [architecture.md](architecture.md) for the full design.
 
 ## Workspace
 
 ```
 crates/
-  fire/          the viewer exe — native Win32 window, CPU render, decode pool, optional
+  fire/          the viewer exe — native Win32 window, D3D11 render, decode pool, optional
                  single-instance pipe (the whole app; Explorer launches it directly)
   fire-decode/   uniform decode core: bytes → (pixels, format, bit depth, ICC)
   fire-ipc/      named-pipe wire format for single-instance forwarding, dependency-light
   psd-sdk-sys/   FFI to vendored psd_sdk C++ (cc + bindgen)
-installer/       Inno Setup script (packaging)
+  heif-sys/      FFI to vendored libheif + libde265 + dav1d for AVIF / HEIF / HEIC (cc + bindgen)
 ```
 
 ## Build & dev
@@ -39,11 +39,12 @@ path to the running window over a named pipe and raise it to the foreground).
 
 - Rust stable (1.96+)
 - MSVC C/C++ build tools (VS 2022) + Windows SDK — for `cc` builds and Win32 linkage
-- LLVM / libclang on `PATH` (or `LIBCLANG_PATH` set) — for `psd-sdk-sys` bindgen
+- LLVM / libclang on `PATH` (or `LIBCLANG_PATH` set) — for `psd-sdk-sys` / `heif-sys` bindgen
 
-The Rust crates are fetched automatically by `cargo`. The only external artifact to
-vendor is the `psd_sdk` C++ source (into `crates/psd-sdk-sys/vendor/`), needed for the
-PSD decoder.
+The Rust crates are fetched automatically by `cargo`. The external artifacts to vendor are
+the `psd_sdk` C++ source (into `crates/psd-sdk-sys/vendor/`, for the PSD decoder) and the
+prebuilt static `libheif` + `libde265` + `dav1d` libs (into `crates/heif-sys/vendor/`, for
+AVIF/HEIF/HEIC). See each crate's `vendor/VENDOR.txt` for the recipe.
 
 ## Status
 

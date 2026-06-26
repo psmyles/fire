@@ -1,5 +1,5 @@
 /*
- * C-ABI wrapper over the (to-be-vendored, Phase 2) psd_sdk C++ library.
+ * C-ABI wrapper over the vendored psd_sdk C++ library (Molecular Matters).
  *
  * IMPORTANT: this header is deliberately C-style. It includes only <stdint.h> /
  * <stddef.h>, never <cstdint> or any C++ standard-library header. bindgen parses it
@@ -8,8 +8,8 @@
  * that entirely. The actual psd_sdk C++ (which DOES use the STL) is compiled by MSVC
  * cl.exe via the cc crate, not by clang, so it is unaffected.
  *
- * Phase 0: these are forward declarations only — the C++ implementation lands in
- * Phase 2. The bindings compile now, proving the cargo -> bindgen -> libclang chain.
+ * The implementation lives in wrapper.cpp; these declarations are the FFI surface
+ * bindgen turns into Rust.
  */
 #ifndef FIRE_PSD_WRAPPER_H
 #define FIRE_PSD_WRAPPER_H

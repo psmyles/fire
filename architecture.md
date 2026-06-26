@@ -6,56 +6,35 @@ the image should be on screen as close to instantly as possible.
 
 Fire is a **single, self-contained native Win32 application** that renders on the GPU via a
 lean **Direct3D 11** device created when the window opens (no warm-up). There is no resident
-background daemon and no separate launcher stub — the GPU device is cheap enough to create on
-launch, so nothing needs to be kept warm.
+background process and no separate launcher stub — the GPU device is cheap enough to create
+on launch, so nothing needs to be kept warm.
 
 ---
 
-## 1. Core insight and the pivots
+## 1. Core insight
 
 The dominant cost of "double-click → pixels on screen" is **process cold-start plus
 decode**, not draw. A 2K PNG decodes in single-digit milliseconds; the headline cost is
-getting a process to `main()` and a window on screen.
+getting a process to `main()` and a window on screen. A cold launch of a small native exe is
+cheap enough that **no resident process is needed** to feel instant — so Fire keeps nothing
+warm and creates everything it needs on the launch path. Decode (≈392 ms for an 8192×4096
+PNG via zune) dominates time-to-first-pixel and is the project's primary metric; everything
+else is kept off the critical path to the first pixel.
 
-**Original design — a resident GPU daemon.** Cold-start was eliminated with a hidden,
-login-started process holding a warm `wgpu` device and a pooled window, fronted by a tiny
-launcher stub. That choice cascaded a heavy stack — `winit` + `wgpu` + `egui` + a login
-service — all to support a *cross-platform GPU* app, at a resident ~1.1 GB commit charge.
+Two consequences shape the whole design:
 
-**First pivot — drop the daemon (and, at first, the GPU).** A throwaway pure-CPU prototype
-(softbuffer) was measured head-to-head against the live GPU daemon on an 8192×4096 PNG:
-
-| | GPU daemon | CPU path |
-|---|---|---|
-| Working set | 313 MB | **154 MB** |
-| Committed (private) | 1,123 MB | **137 MB** |
-| Threaded render | sub-ms | **1.4 ms magnify / 3.4 ms minify avg** (max 8.75 ms) |
-
-Decode (≈392 ms, zune) is identical on both paths and dominates time-to-first-pixel. The
-real lesson was **not "CPU beats GPU"** — it was that a *cold launch of a small native exe is
-cheap enough that no residency is needed*. That deleted the daemon, the launcher stub, and
-the entire winit/wgpu/egui/login-service stack, leaving a lean native Win32 app (the
-XnView-Classic model). The first cut of that app shaded every pixel on the CPU.
-
-**Second pivot — bring back a *non-resident* GPU device for presentation.** Pure-CPU shading
-re-runs the whole per-pixel pipeline for *every* surface pixel on *every* pan/zoom event. On a
-large window at a high refresh rate (a 240 Hz monitor), that pegged ~40% of a CPU during fast
-interaction and never felt as smooth as the old GPU build — even after an interactive-resolution
-preview and a prefiltered mip chain. The fix restores GPU-class interaction without bringing
-back anything the first pivot killed:
-
-- The image is uploaded **once** as a D3D11 texture with a hardware-generated mip chain.
-- Pan, zoom, exposure, channel, and tonemap become an **80-byte constant buffer**; each frame
-  is one fullscreen-triangle draw that re-samples the texture — **~0 CPU per frame**.
-- A **DXGI flip-model swapchain** paces presentation to vsync, so interaction is tear-free and
-  smooth at the monitor's true refresh.
-
-Crucially, the D3D11 device is created **when the window opens**, not warmed by a daemon. The
-daemon existed only to amortize GPU warm-up against cold-start; once cold-start proved cheap,
-its justification was gone — and a per-window device created on launch inherits none of its
-residency cost. So the architecture keeps every win of the first pivot (no daemon, no stub,
-lean native Win32, cheap cold start) **and** the smoothness of GPU presentation. winit, wgpu,
-and egui stay gone; the GPU path is a few hundred lines of typed COM against the `windows` crate.
+- **No residency.** There is no background process and no launcher stub. The thing Explorer
+  launches is the whole app; it lives exactly as long as it has a window open.
+- **Non-resident GPU presentation.** Shading every surface pixel on the CPU would re-run the
+  whole per-pixel pipeline on *every* pan/zoom event; on a large window at a high refresh rate
+  (a 240 Hz monitor) that pegs a CPU core during fast interaction. Instead the image is
+  uploaded **once** as a D3D11 texture with a hardware-generated mip chain, and pan / zoom /
+  exposure / channel / tonemap become an **80-byte constant buffer** — each frame is one
+  fullscreen-triangle draw that re-samples the texture (**~0 CPU per frame**). A **DXGI
+  flip-model swapchain** paces presentation to vsync, so interaction is tear-free and smooth at
+  the monitor's true refresh. The device is created **when the window opens**, not warmed ahead
+  of time, so it adds no residency cost; the GPU path is a few hundred lines of typed COM
+  against the `windows` crate.
 
 ---
 
@@ -101,7 +80,7 @@ window is created:
 - **SingleInstance:** the first launch acquires a named mutex, opens its window, *and*
   serves a named pipe. Later launches detect the mutex, forward their path over the pipe to
   the running window (which reuses the one window, reset to fit per file), and exit. The
-  pipe lives only inside the running window's process — it is **not** a resident daemon.
+  pipe lives only inside the running window's process — nothing stays resident.
 
 No autostart, no login residency in either mode. "Residency" is implicit: a process lives
 exactly as long as it has a window open.
@@ -151,7 +130,7 @@ This path only runs in SingleInstance mode; NewWindow has nothing to forward.
   short HLSL vertex+pixel shader (precompiled to DXBC at build time by `fxc` and embedded in the
   exe — no runtime `D3DCompile`) does the sampling and the whole color pipeline. The device is
   created lazily at window open — hardware preferred, with
-  the **WARP** software rasterizer as a fallback for RDP/headless — so there is no warm-up daemon.
+  the **WARP** software rasterizer as a fallback for RDP/headless — so there is no warm-up step.
 - **Window split:** a top-level **frame** window owns the message loop and paints the GDI chrome
   (toolbar + status bar); a **child "view" window** in the middle owns the swapchain.
   `WS_CLIPCHILDREN` lets the frame repaint chrome without touching the image and vice-versa, and
@@ -213,7 +192,8 @@ bytes:
 | Format(s) | Decoder |
 |---|---|
 | PNG, JPEG, `.hdr`, BMP, QOI, PPM, WebP, farbfeld, JXL | **zune** — hot path |
-| TIFF, GIF, TGA | `image` crate (formats zune doesn't decode) |
+| TIFF, GIF, TGA, ICO | `image` crate (formats zune doesn't decode) |
+| AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
 | EXR | `exr` crate (pure Rust) → 32-bit float RGBA |
 | PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite |
 | ICC transforms | **Little CMS** (`lcms2`) over FFI |
@@ -280,7 +260,7 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
   siblings.
 - **Instance mode:** NewWindow (default) or SingleInstance, per §3.
 - **Settings:** stored as **TOML** in `%APPDATA%`, editable directly; external edits
-  hot-reload via the `notify` crate. An in-app settings dialog is native (no egui).
+  hot-reload via the `notify` crate. The in-app settings dialog is native Win32.
 - **Future:** a third mode — compare two images side-by-side in one window, or tabs — is
   anticipated; it reuses the frame/child-view split (one view child per slot).
 
@@ -313,22 +293,21 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
 ## 12. Workspace layout
 
 ```
-fast-image-viewer/
+fire/
 ├─ crates/
 │  ├─ fire/           # the viewer exe: Win32 shell, D3D11 render, decode pool, pipe
-│  ├─ fire-decode/    # uniform decode core (zune/image/exr/psd_sdk/lcms2)
+│  ├─ fire-decode/    # uniform decode core (zune/image/exr/psd_sdk/libheif/lcms2)
 │  ├─ fire-ipc/       # pipe wire format for single-instance forwarding (shared)
-│  └─ psd-sdk-sys/    # FFI bindings + cc build of psd_sdk
+│  ├─ psd-sdk-sys/    # FFI bindings + cc build of psd_sdk
+│  └─ heif-sys/       # FFI bindings + cc/link of libheif (AVIF/HEIF/HEIC)
 ├─ assets/            # fire.ico + icon source
-├─ installer/         # Inno Setup script
 └─ Cargo.toml         # workspace
 ```
 
-Key dependencies: `windows` (typed COM for the D3D11 device + DXGI flip swapchain + HLSL
-compile), `windows-sys` (Win32: window/message loop, GDI, DWM, DPI, pipe, mutex, registry),
-`zune-image`/`image`/`exr`/`lcms2`/`psd_sdk` (decode), `serde`/`toml`/`notify` (config),
-`arboard` (clipboard), `crossbeam-channel` (worker messaging). No winit, wgpu, egui,
-pollster, or softbuffer.
+Key dependencies: `windows` (typed COM for the D3D11 device + DXGI flip swapchain),
+`windows-sys` (Win32: window/message loop, GDI, DWM, DPI, pipe, mutex, registry),
+`zune-image`/`image`/`exr`/`lcms2`/`psd_sdk`/`libheif` (decode), `serde`/`toml`/`notify`
+(config), `arboard` (clipboard), `crossbeam-channel` (worker messaging).
 
 ---
 
@@ -337,12 +316,13 @@ pollster, or softbuffer.
 - `cargo build --release` produces a **single `fire.exe`**. It links only the D3D11/DXGI system
   DLLs (present on every supported Windows; no redistributable, no bundled runtime — and with the
   shader precompiled at build time, not even `d3dcompiler`). The viewport HLSL is compiled to DXBC
-  by `fxc` (Windows SDK) in `build.rs` and embedded via `include_bytes!`. The C++ `psd_sdk` builds
-  via a `cc`/`bindgen` build script in `psd-sdk-sys`. The Fire `.ico` + version/product metadata
-  are embedded via `winresource`.
-- **Unsigned installer** (Inno Setup) for now: installs `fire.exe`, registers the `HKCU`
-  file associations, and provides clean uninstall. No `Run`/autostart entry — there is no
-  daemon to start. (No code signing yet — expect a SmartScreen prompt on first run.)
+  by `fxc` (Windows SDK) in `build.rs` and embedded via `include_bytes!`. The C++ `psd_sdk` and the
+  `libheif`/`libde265`/`dav1d` decoder stack are built/linked via `cc`/`bindgen` build scripts in
+  `psd-sdk-sys` and `heif-sys`. The Fire `.ico` + version/product metadata are embedded via
+  `winresource`.
+- **Planned: an unsigned installer** (Inno Setup): installs `fire.exe`, registers the `HKCU`
+  file associations, and provides clean uninstall. No `Run`/autostart entry — nothing stays
+  resident. (No code signing yet — expect a SmartScreen prompt on first run.)
 
 ---
 
@@ -363,11 +343,10 @@ Explorer `IThumbnailProvider`; code signing.
 
 ## 15. Key risks and notes
 
-- **Cold start must stay cheap.** The whole bet of dropping the resident daemon is that a
-  lean native exe reaches first-pixel fast. Creating the D3D11 device + flip swapchain and
-  compiling the HLSL now happen on the launch path; they are cheap (low-ms) but real, so keep
-  them lean and off the critical path to the first decode where possible. If a heavy dependency
-  creeps back in, the cold-start cost the daemon was designed to avoid reappears.
+- **Cold start must stay cheap.** The whole bet is that a lean native exe reaches first-pixel
+  fast. Creating the D3D11 device + flip swapchain happens on the launch path; it is cheap
+  (low-ms) but real, so keep it lean and off the critical path to the first decode where
+  possible. If a heavy dependency creeps back in, that cold-start cost reappears.
 - **GPU device loss — deliberately unhandled.** A D3D11 device can be lost (TDR, driver update,
   GPU reset). The renderer does **not** recreate the device/swapchain on `DXGI_ERROR_DEVICE_REMOVED`,
   by design: this is a stateless viewer (no unsaved data), so the recovery story is "relaunch."
