@@ -30,8 +30,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOZORDER, SW_SHOW, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSW,
-    WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETTINGCHANGE, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE,
 };
 
 /// `WM_MOUSELEAVE` (0x02A3) isn't surfaced by windows-sys under the enabled features; it's a
@@ -536,7 +537,7 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
     }
 }
 
-/// Child view proc: D3D11 present + image navigation (pan/zoom/keys).
+/// Child view proc: D3D11 present + image navigation (LMB-drag pan, wheel + RMB-drag zoom, keys).
 unsafe extern "system" fn view_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let app_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
     if app_ptr.is_null() {
@@ -562,6 +563,9 @@ unsafe extern "system" fn view_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let x = (lparam & 0xffff) as u16 as i16 as f32;
             let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
             app.surface.on_cursor_moved((x, y));
+            if app.surface.is_zoom_dragging() {
+                app.invalidate_status(); // RMB drag changes the zoom %
+            }
             0
         }
         WM_LBUTTONDOWN => {
@@ -573,6 +577,20 @@ unsafe extern "system" fn view_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         WM_LBUTTONUP => {
             ReleaseCapture();
             app.surface.end_drag();
+            0
+        }
+        WM_RBUTTONDOWN => {
+            let x = (lparam & 0xffff) as u16 as i16 as f32;
+            let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
+            SetCapture(hwnd);
+            SetFocus(hwnd);
+            app.surface.on_cursor_moved((x, y)); // pin the pivot to the press point
+            app.surface.begin_zoom_drag();
+            0
+        }
+        WM_RBUTTONUP => {
+            ReleaseCapture();
+            app.surface.end_zoom_drag();
             0
         }
         WM_MOUSEWHEEL => {

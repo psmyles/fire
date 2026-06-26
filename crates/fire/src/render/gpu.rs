@@ -53,6 +53,11 @@ use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 
 use crate::render::view::{Channel, DisplayState, Tonemap, ViewState, Viewport};
 
+/// Scrubby-zoom sensitivity: an RMB vertical drag multiplies zoom by `exp(dy * this)` per pixel
+/// (~2.7× per 100 px). Exponential-in-pixels so the gesture feels uniform across the zoom range;
+/// drag down (dy > 0) zooms in, up zooms out.
+const ZOOM_DRAG_SENSITIVITY: f32 = 0.01;
+
 /// Per-frame shader constants. Layout matches the HLSL `cbuffer` (16-byte float4 registers);
 /// keep the field order/padding in lockstep with [`SHADER_HLSL`].
 #[repr(C)]
@@ -194,6 +199,11 @@ pub struct GpuSurface {
     display: DisplayState,
     cursor: (f32, f32),
     dragging: bool,
+    /// RMB scrubby-zoom: whether a zoom-drag is active, the pivot (the press point, surface px),
+    /// and the last cursor-y so each move applies an incremental zoom.
+    zoom_dragging: bool,
+    zoom_anchor: (f32, f32),
+    zoom_last_y: f32,
 }
 
 impl GpuSurface {
@@ -231,6 +241,9 @@ impl GpuSurface {
             display: DisplayState::default(),
             cursor: (0.0, 0.0),
             dragging: false,
+            zoom_dragging: false,
+            zoom_anchor: (0.0, 0.0),
+            zoom_last_y: 0.0,
         }
     }
 
@@ -514,6 +527,17 @@ impl GpuSurface {
                 self.view.pan_by(delta, dims, &self.viewport);
                 self.refresh();
             }
+        } else if self.zoom_dragging {
+            // Vertical drag = scrubby zoom about the fixed press anchor (down zooms in, up out).
+            let dy = pos.1 - self.zoom_last_y;
+            self.zoom_last_y = pos.1;
+            if dy != 0.0 {
+                if let Some(dims) = self.image_dims() {
+                    let factor = (dy * ZOOM_DRAG_SENSITIVITY).exp();
+                    self.view.zoom_to_cursor(factor, self.zoom_anchor, dims, &self.viewport);
+                    self.refresh();
+                }
+            }
         }
     }
 
@@ -523,6 +547,22 @@ impl GpuSurface {
 
     pub fn end_drag(&mut self) {
         self.dragging = false;
+    }
+
+    /// Begin an RMB zoom-drag, pivoting on the current cursor (the press point).
+    pub fn begin_zoom_drag(&mut self) {
+        self.zoom_dragging = true;
+        self.zoom_anchor = self.cursor;
+        self.zoom_last_y = self.cursor.1;
+    }
+
+    pub fn end_zoom_drag(&mut self) {
+        self.zoom_dragging = false;
+    }
+
+    /// Whether an RMB zoom-drag is in progress (the shell repaints the zoom % while it is).
+    pub fn is_zoom_dragging(&self) -> bool {
+        self.zoom_dragging
     }
 
     pub fn zoom_at_cursor(&mut self, factor: f32) {

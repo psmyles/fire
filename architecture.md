@@ -288,7 +288,8 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
 ## 10. Viewer features
 
 - Channel isolation (solo R/G/B/A, alpha-as-grayscale).
-- Pan / zoom / fit / 1:1; mouse-wheel zoom-to-cursor; drag-pan.
+- Pan / zoom / fit / 1:1; LMB drag-pan (the image can be pushed fully off any edge — Fit/1:1
+  recenters it); mouse-wheel and RMB-vertical-drag zoom, both about the cursor.
 - HDR exposure (stops) + tonemap operator (Reinhard / ACES).
 - **Pixel inspector** (planned): eyedropper RGBA readout + a zoomed pixel grid at high
   magnification, custom-painted into the view child with GDI `TextOut`/`DrawText` (system
@@ -364,10 +365,11 @@ Explorer `IThumbnailProvider`; code signing.
   compiling the HLSL now happen on the launch path; they are cheap (low-ms) but real, so keep
   them lean and off the critical path to the first decode where possible. If a heavy dependency
   creeps back in, the cold-start cost the daemon was designed to avoid reappears.
-- **GPU device loss.** A D3D11 device can be lost (TDR, driver update, GPU reset). The current
-  renderer does **not yet** recreate the device/swapchain on `DXGI_ERROR_DEVICE_REMOVED` — add
-  that recovery path before shipping. WARP is a fallback only at *creation* time (no hardware /
-  RDP), not a mid-session failover.
+- **GPU device loss — deliberately unhandled.** A D3D11 device can be lost (TDR, driver update,
+  GPU reset). The renderer does **not** recreate the device/swapchain on `DXGI_ERROR_DEVICE_REMOVED`,
+  by design: this is a stateless viewer (no unsaved data), so the recovery story is "relaunch."
+  Re-opening the file is one keystroke and costs nothing a user would notice. WARP remains a
+  fallback only at *creation* time (no hardware / RDP), not a mid-session failover.
 - **Foreground lock (§4.1).** Only relevant in SingleInstance mode, but the easiest thing
   to get wrong and the most visible when it is: without the `AllowSetForegroundWindow`
   handoff, a forwarded open silently fails to come to the front.

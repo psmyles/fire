@@ -139,15 +139,15 @@ impl ViewState {
         (image.0 as f32 * self.zoom, image.1 as f32 * self.zoom)
     }
 
-    /// Keep the image overlapping the surface: when it is larger than the surface you can
-    /// pan to its edges but not past them; when smaller it stays fully inside. The allowed
-    /// range is `|image_screen - surface| / 2` per axis (symmetric about centered), which
-    /// yields both behaviours with one expression.
+    /// Bound the pan so the image stays *reachable* without trapping it inside the surface: you
+    /// can pan until the image is *just* fully off any edge — `(image_screen + surface) / 2` per
+    /// axis, symmetric about centered — but no further, so it can be pushed out of the frame yet
+    /// never flung infinitely into the void. Fit (`F`) or 1:1 recenters it.
     pub fn clamp_pan(&mut self, image: (u32, u32), vp: &Viewport) {
         let (uw, uh) = (vp.width, vp.height);
         let (sw, sh) = self.image_screen_size(image);
-        let lim_x = (sw - uw).abs() * 0.5;
-        let lim_y = (sh - uh).abs() * 0.5;
+        let lim_x = (sw + uw) * 0.5;
+        let lim_y = (sh + uh) * 0.5;
         self.pan = (self.pan.0.clamp(-lim_x, lim_x), self.pan.1.clamp(-lim_y, lim_y));
     }
 
@@ -233,17 +233,20 @@ mod tests {
     }
 
     #[test]
-    fn pan_clamp_lets_you_reach_but_not_pass_large_image_edges() {
+    fn pan_clamp_lets_you_push_image_just_out_of_view() {
         let v = vp();
         let image = (4000u32, 800u32); // wider than the 1000px viewport, same height
         let mut s = ViewState { zoom: 1.0, pan: (0.0, 0.0), fit: false };
-        // Try to pan way past the right edge; clamp pins it to (image_screen - usable)/2.
+        // Pan far right; clamp pins it to (image_screen + surface)/2 — the image is then just
+        // fully off the left edge and can't be pushed further.
         s.pan_by((100_000.0, 0.0), image, &v);
-        let lim_x = (4000.0 - 1000.0) * 0.5;
+        let lim_x = (4000.0 + 1000.0) * 0.5;
         assert!((s.pan.0 - lim_x).abs() < 1e-6, "pan.x = {}", s.pan.0);
-        // Same height as the viewport → no vertical pan room.
-        s.pan_by((0.0, 500.0), image, &v);
-        assert!(s.pan.1.abs() < 1e-6, "pan.y = {}", s.pan.1);
+        // Even when the image is exactly the viewport height, it can now be pushed fully off
+        // vertically (previously this axis had zero pan room).
+        s.pan_by((0.0, 100_000.0), image, &v);
+        let lim_y = (800.0 + 800.0) * 0.5;
+        assert!((s.pan.1 - lim_y).abs() < 1e-6, "pan.y = {}", s.pan.1);
     }
 
     #[test]

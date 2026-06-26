@@ -47,9 +47,9 @@ PSD decoder.
 
 ## Status
 
-Under active construction. The native Win32 CPU viewer (window, threaded decode, pan/zoom/
-fit, channel isolation, HDR exposure/tonemap, DPI-aware dark/light chrome) is in place;
-packaging and the remaining toolbar extras (pixel inspector, settings dialog, folder
-navigation, clipboard) are in progress.
+Under active construction. The native Win32 viewer with a Direct3D 11 GPU viewport (window,
+threaded decode, pan/zoom/fit, channel isolation, HDR exposure/tonemap, DPI-aware dark/light
+chrome) is in place; packaging and the remaining toolbar extras (pixel inspector, settings
+dialog, folder navigation, clipboard) are in progress.
 
 Icon source: https://commons.wikimedia.org/wiki/File:Fire-dynamic-color.png
