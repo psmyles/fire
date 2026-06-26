@@ -256,8 +256,11 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
 ## 9. Window / session model and configuration
 
 - **Session model:** a window holds a current image, view state (zoom, pan, channel
-  toggles, exposure, tonemap), and — planned — a folder cursor for ←/→ navigation across
-  siblings.
+  toggles, exposure, tonemap), and a folder cursor for ←/→ navigation across siblings. The
+  cursor (`folder.rs`) is built off-thread: opening a file scans its directory for sibling
+  images on a background thread that posts the sorted list back (`WM_APP_FOLDER_SCANNED`), so
+  the image shows first and the count fills in after (lazy). It is a snapshot taken at open
+  time, generation-tagged for stale-drop like a decode, and re-scanned only on a fresh open.
 - **Instance mode:** NewWindow (default) or SingleInstance, per §3.
 - **Window placement:** the frame opens at the size/position it had when last closed — the
   restored (non-maximized) rect plus a maximized flag are captured on `WM_DESTROY` with
@@ -287,8 +290,11 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
 - **Pixel inspector** (planned): eyedropper RGBA readout + a zoomed pixel grid at high
   magnification, custom-painted into the view child with GDI `TextOut`/`DrawText` (system
   font — no rasterizer dependency), reading `current_image` via `view.screen_to_image()`.
-- Folder navigation (←/→ walks sibling files); clipboard (`arboard`); "open in configured
-  editor"; configurable background and alpha checkerboard.
+- Folder navigation: ←/→ walk the sibling images in the current file's directory (wrapping at
+  both ends), in file-manager natural order (case-insensitive, digit-runs by value so `img2`
+  precedes `img10`); the status bar shows the position/count (`3 / 27`).
+- Planned: clipboard (`arboard`); "open in configured editor"; configurable background and
+  alpha checkerboard.
 
 ---
 
@@ -362,8 +368,8 @@ RAM guard; **DPI-aware, dark-mode-aware GDI toolbar + status bar**; open-in-edit
 clipboard; association-only Explorer integration; unsigned installer.
 
 **In progress / deferred:** pixel inspector, native settings dialog + background-color
-picker, exposure trackbar, toolbar tooltips, folder ←/→ navigation; compare/tabs mode;
-Explorer `IThumbnailProvider`; code signing.
+picker, exposure trackbar, toolbar tooltips; compare/tabs mode; Explorer
+`IThumbnailProvider`; code signing.
 
 ---
 

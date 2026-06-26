@@ -15,6 +15,7 @@
 mod chrome;
 mod config;
 mod decode_pool;
+mod folder;
 mod forward;
 mod foreground;
 mod ipc_server;

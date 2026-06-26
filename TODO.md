@@ -1,4 +1,3 @@
-- previous next file in folder, show folder image count (can be lazy loaded)
 - fullscreen / minimal mode
 - flipbook viewer
 - custom background colors
@@ -9,5 +8,4 @@ context menus entries:
     - copy path
     - show in explorer
 - click on zoom level indicator to alternate between fit an 1:1
-- accept dragging files into application window to open and show files
 - hot reload files from disk when they change

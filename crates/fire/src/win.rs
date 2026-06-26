@@ -6,12 +6,13 @@
 //! viewport is exactly the image region (no chrome insets to carry).
 //!
 //! Cross-thread wakeups (`WM_APP_OPEN` from the pipe server, `WM_APP_DECODE_DONE` from the
-//! worker pool) are posted to the frame, which owns the title/size/lifecycle. Both windows
-//! reach the shared [`App`] through their `GWLP_USERDATA`; only the frame owns the box.
+//! worker pool, `WM_APP_FOLDER_SCANNED` from the folder-scan thread) are posted to the frame,
+//! which owns the title/size/lifecycle. Both windows reach the shared [`App`] through their
+//! `GWLP_USERDATA`; only the frame owns the box.
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use fire_decode::{DecodeOptions, DecodedImage};
@@ -30,8 +31,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetMessageW, GetWindowLongPtrW, GetWindowPlacement, LoadCursorW, LoadIconW, PostQuitMessage,
-    RegisterClassW, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow,
+    GetMessageW, GetWindowLongPtrW, GetWindowPlacement, LoadCursorW, LoadIconW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+    SetWindowTextW, ShowWindow,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, WINDOWPLACEMENT,
@@ -48,6 +50,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 
 use crate::chrome::{self, Action, Chrome, ViewSnapshot};
 use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool};
+use crate::folder::{self, Folder};
 use crate::foreground;
 use crate::ipc_server;
 use crate::render::gpu::GpuSurface;
@@ -58,6 +61,19 @@ use crate::window_state::WindowState;
 pub const WM_APP_OPEN: u32 = WM_APP + 1;
 /// A finished decode from a worker; LPARAM is `Box<DecodeOutcome>`.
 pub const WM_APP_DECODE_DONE: u32 = WM_APP + 2;
+/// A finished folder scan from the scan thread; LPARAM is `Box<FolderScan>`.
+pub const WM_APP_FOLDER_SCANNED: u32 = WM_APP + 3;
+
+/// A completed sibling-image scan, delivered to the UI thread (boxed, via the message LPARAM).
+/// The win shell turns it into a [`Folder`] cursor once it confirms it's still current.
+struct FolderScan {
+    /// The issuing window's generation at scan time; used for stale-drop (same as decodes).
+    generation: u64,
+    /// The image whose folder was scanned; locates the cursor's starting index.
+    path: PathBuf,
+    /// Sorted sibling image paths in the folder.
+    entries: Vec<PathBuf>,
+}
 
 /// Multiplicative zoom per wheel notch (and per keyboard zoom step).
 const ZOOM_STEP: f32 = 1.15;
@@ -82,13 +98,28 @@ struct App {
     meta: String,
     /// True between an open request and its decode landing (status shows "loading…").
     loading: bool,
+    /// Sibling-image cursor for ←/→ navigation + the status-bar count. `None` until the
+    /// background folder scan for the current image lands (lazy: image first, count after).
+    folder: Option<Folder>,
 }
 
 impl App {
-    /// Handle an open request: show the frame with a placeholder, raise it, and enqueue the
-    /// decode off-thread. The image swaps in when `WM_APP_DECODE_DONE` arrives.
+    /// Handle an open request (launch / drop / forward): load the image, and kick off a fresh
+    /// folder scan so ←/→ navigation and the status-bar count repopulate for the new directory.
     fn open(&mut self, req: OpenRequest) {
-        let name = file_name(&req.path);
+        // Drop the old cursor immediately; the scan below rebuilds it (and the count fills in
+        // after the image shows — lazy). Without this a stale "3 / 27" would linger until then.
+        self.folder = None;
+        let generation = self.load(&req.path, req.flags.activate);
+        self.scan_folder(req.path, generation);
+    }
+
+    /// Show the frame with a placeholder for `path`, raise it if `activate`, and enqueue the
+    /// decode off-thread. The image swaps in when `WM_APP_DECODE_DONE` arrives. Returns the
+    /// generation assigned to this load (used to tag the folder scan for stale-drop). Shared by
+    /// `open` (which also rescans the folder) and `navigate` (which reuses the existing cursor).
+    fn load(&mut self, path: &Path, activate: bool) -> u64 {
+        let name = file_name(path);
         self.surface.clear_image();
         self.file_label = name.clone();
         self.meta.clear();
@@ -96,7 +127,7 @@ impl App {
         set_title(self.frame, &format!("{}: {name} (loading…)", crate::product::NAME));
         // SAFETY: frame is live for the App's lifetime.
         unsafe { ShowWindow(self.frame as HWND, SW_SHOW) };
-        if req.flags.activate {
+        if activate {
             // Spend the one-shot foreground grant promptly (§4.1).
             foreground::raise(self.frame);
         }
@@ -105,7 +136,49 @@ impl App {
 
         let generation = self.surface.next_generation();
         let opts = DecodeOptions { max_dim: MAX_CPU_DIM, honor_icc: true };
-        self.pool.submit(DecodeJob { generation, path: req.path, opts });
+        self.pool.submit(DecodeJob { generation, path: path.to_path_buf(), opts });
+        generation
+    }
+
+    /// Move to the previous (`delta = -1`) or next (`delta = +1`) sibling image and load it,
+    /// reusing the current folder cursor (no rescan). A no-op until the scan has landed or when
+    /// the folder holds only the open image.
+    fn navigate(&mut self, delta: isize) {
+        let path = match self.folder.as_mut() {
+            Some(f) if f.len() > 1 => f.advance(delta),
+            _ => return,
+        };
+        self.load(&path, false);
+    }
+
+    /// Scan `path`'s folder for sibling images off the UI thread, posting the result back via
+    /// `WM_APP_FOLDER_SCANNED`. Mirrors the decode pool's discipline: the worker never touches
+    /// the window or renderer, only `PostMessage`s a boxed payload the wndproc reclaims.
+    fn scan_folder(&self, path: PathBuf, generation: u64) {
+        let frame = self.frame;
+        let _ = std::thread::Builder::new()
+            .name("fire-folder-scan".into())
+            .spawn(move || {
+                let entries = folder::scan(&path);
+                let payload = Box::new(FolderScan { generation, path, entries });
+                let lparam = Box::into_raw(payload) as isize;
+                // SAFETY: the box outlives the post; the UI thread reclaims it in the wndproc.
+                // If the window is gone the post fails — reclaim here so we don't leak.
+                let posted = unsafe { PostMessageW(frame as HWND, WM_APP_FOLDER_SCANNED, 0, lparam) };
+                if posted == 0 {
+                    drop(unsafe { Box::from_raw(lparam as *mut FolderScan) });
+                }
+            });
+    }
+
+    /// Adopt a finished folder scan as the navigation cursor, if it's still current (stale-drop
+    /// by generation, exactly like decodes). Refreshes the status bar so the count appears.
+    fn folder_scanned(&mut self, scan: FolderScan) {
+        if scan.generation != self.surface.generation() {
+            return; // superseded by a newer open
+        }
+        self.folder = Folder::new(scan.entries, &scan.path);
+        self.invalidate_status();
     }
 
     /// Handle a finished decode. Adopt it only if it is still the latest request (stale-drop).
@@ -168,6 +241,10 @@ impl App {
             0xDB => self.surface.adjust_exposure(-EXPOSURE_STEP), // [
             0xBB | 0x6B => self.surface.zoom_centered(ZOOM_STEP), // = / numpad +
             0xBD | 0x6D => self.surface.zoom_centered(1.0 / ZOOM_STEP), // - / numpad -
+            // ← / → walk the folder. navigate() runs its own load + repaint, so return
+            // afterwards rather than falling through to the shared invalidate below.
+            0x25 => return self.navigate(-1), // Left
+            0x27 => return self.navigate(1),  // Right
             0x1B => unsafe {
                 DestroyWindow(self.frame as HWND); // Esc
             },
@@ -192,15 +269,23 @@ impl App {
         } else {
             format!("{}   ·   {}", self.file_label, self.meta)
         };
-        let status_right = if has_image {
-            if is_hdr {
-                format!("EV {:+.2}    {}%", s.exposure(), zoom_pct)
-            } else {
-                format!("{}%", zoom_pct)
+        // Right side: the folder position/count (once the scan lands) followed by the zoom and,
+        // for HDR, the exposure. The count shows whenever a cursor exists, even on a failed
+        // decode (you can still page past a broken file).
+        let mut status_right = String::new();
+        if let Some(f) = &self.folder {
+            status_right.push_str(&format!("{} / {}", f.position(), f.len()));
+        }
+        if has_image {
+            if !status_right.is_empty() {
+                status_right.push_str("    ");
             }
-        } else {
-            String::new()
-        };
+            if is_hdr {
+                status_right.push_str(&format!("EV {:+.2}    {}%", s.exposure(), zoom_pct));
+            } else {
+                status_right.push_str(&format!("{}%", zoom_pct));
+            }
+        }
 
         ViewSnapshot {
             channel: s.channel(),
@@ -388,6 +473,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool) {
             file_label: String::new(),
             meta: String::new(),
             loading: false,
+            folder: None,
         });
         app.relayout();
 
@@ -527,6 +613,11 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
         WM_APP_DECODE_DONE => {
             let outcome = Box::from_raw(lparam as *mut DecodeOutcome);
             app.decode_done(*outcome);
+            0
+        }
+        WM_APP_FOLDER_SCANNED => {
+            let scan = Box::from_raw(lparam as *mut FolderScan);
+            app.folder_scanned(*scan);
             0
         }
         WM_DPICHANGED => {

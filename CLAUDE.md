@@ -75,6 +75,8 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 - `chrome.rs` — GDI-painted toolbar + status bar (no Win32 common controls — they lack dark-mode
   support). Buttons hit-test to the same `Action`s the keybinds drive (one state path).
 - `decode_pool.rs` — off-thread worker pool (no async runtime).
+- `folder.rs` — sibling-image cursor behind ←/→ navigation + the status-bar count; pure scan/
+  sort/cursor logic (no Win32, unit-tested), scanned off-thread and posted back to the frame.
 - `config.rs` — TOML config from `%APPDATA%\fire\config.toml`; missing/invalid → defaults.
 - `forward.rs` / `ipc_server.rs` / `foreground.rs` — SingleInstance pipe client / server / foreground raise.
 - `build.rs` — precompiles `render/shader.hlsl` to DXBC via `fxc` (embedded with `include_bytes!`) and
@@ -110,6 +112,6 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 
 Under active construction; see `TODO.md` and architecture.md §14 for the v1-vs-deferred split. The
 core viewer (window, threaded decode, GPU viewport, pan/zoom/fit, channel isolation, HDR
-exposure/tonemap, DPI/dark chrome) is in place, as is the Inno Setup installer with per-format
-Explorer associations (`installer/`, `scripts/build-installer.ps1`). In progress: pixel inspector,
-settings dialog, folder navigation, clipboard.
+exposure/tonemap, DPI/dark chrome, folder ←/→ navigation) is in place, as is the Inno Setup
+installer with per-format Explorer associations (`installer/`, `scripts/build-installer.ps1`).
+In progress: pixel inspector, settings dialog, clipboard.
