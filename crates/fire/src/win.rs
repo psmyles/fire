@@ -86,7 +86,7 @@ impl App {
         self.file_label = name.clone();
         self.meta.clear();
         self.loading = true;
-        set_title(self.frame, &format!("{} — {name} (loading…)", crate::product::NAME));
+        set_title(self.frame, &format!("{}: {name} (loading…)", crate::product::NAME));
         // SAFETY: frame is live for the App's lifetime.
         unsafe { ShowWindow(self.frame as HWND, SW_SHOW) };
         if req.flags.activate {
@@ -119,7 +119,7 @@ impl App {
                 let (iw, ih) = clamp_window_size(w, h);
                 let ch = self.chrome.metrics.toolbar_h + self.chrome.metrics.status_h;
                 resize_client(self.frame, iw, ih as i32 + ch);
-                set_title(self.frame, &format!("{} — {name}", crate::product::NAME));
+                set_title(self.frame, &format!("{}: {name}", crate::product::NAME));
                 self.surface.invalidate();
                 self.invalidate_chrome();
                 eprintln!("fire: opened {name} ({w}x{h}, {fmt})");
@@ -127,7 +127,7 @@ impl App {
             Err(e) => {
                 self.file_label = name.clone();
                 self.meta = format!("failed: {e}");
-                set_title(self.frame, &format!("{} — {name} (failed)", crate::product::NAME));
+                set_title(self.frame, &format!("{}: {name} (failed)", crate::product::NAME));
                 self.invalidate_chrome();
                 eprintln!("fire: failed to open {name}: {e}");
             }
