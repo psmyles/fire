@@ -1,0 +1,46 @@
+Vendored static libraries for heif-sys
+=======================================
+
+This directory holds prebuilt MSVC static libraries + public headers for the HEIF/AVIF
+decode stack, so `cargo build` works with no native package manager or build tooling
+(no vcpkg / cmake / meson / nasm) on the developer's machine. Only the linked-in machine
+code reaches fire.exe; the rest is dead-stripped by the linker at release time.
+
+Contents
+--------
+  lib/heif.lib       libheif 1.23.0   (HEIF/AVIF container + API, C++)   [LGPL-3.0-only]
+  lib/libde265.lib   libde265 1.1.1   (HEVC decoder, for HEIC/HEIF, C++) [LGPL-3.0-only]
+  lib/dav1d.lib      dav1d            (AV1 decoder, for AVIF, C)         [BSD-2-Clause]
+  include/libheif/*  libheif public C headers
+
+Triplet: x64-windows-static-md  (static libs, dynamic /MD CRT — matches Rust's MSVC ABI).
+
+How these were produced (one-time, on a machine with vcpkg)
+----------------------------------------------------------
+The stock vcpkg libheif port offers AVIF only via aom (large, slower decode) and pulls
+the x265 ENCODER via its default `hevc` feature. We want AVIF via dav1d (small, fast) and
+no encoders, so patch the local port before installing:
+
+  1. ports/libheif/vcpkg.json   : add "dav1d" to the top-level "dependencies" array.
+  2. ports/libheif/portfile.cmake: change  -DWITH_DAV1D=OFF  ->  -DWITH_DAV1D=ON
+  3. Build (the [core] feature set drops the default x265 encoder):
+       vcpkg install "libheif[core]:x64-windows-static-md"
+     vcpkg auto-acquires the nasm/meson/ninja that dav1d needs.
+
+Stripping (why the libs are ~52 MB, not ~220 MB)
+------------------------------------------------
+vcpkg's release build embeds CodeView debug info (/Z7) directly in the .obj files, which
+balloons heif.lib to ~194 MB. The debug info is useless in a vendored lib (and Rust strips
+it from release binaries anyway), so it is removed with llvm-objcopy:
+
+       llvm-objcopy --strip-debug heif.lib     heif.lib
+       llvm-objcopy --strip-debug dav1d.lib    dav1d.lib
+       llvm-objcopy --strip-debug libde265.lib libde265.lib
+
+This only drops .debug$S/.debug$T sections; code, symbols, and the /DEFAULTLIB directives
+(which auto-link the MSVC C++ runtime for libheif/libde265) are preserved.
+
+Updating
+--------
+Re-run the recipe above against a newer vcpkg, re-strip, and replace the files here.
+Keep the triplet at x64-windows-static-md.

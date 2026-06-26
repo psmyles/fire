@@ -8,3 +8,4 @@
 - copy path
 - show in explorer
 - click on zoom level indicator to alternate between fit an 1:1
+- accept dragging files into application window to open and show files

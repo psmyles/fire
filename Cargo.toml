@@ -5,6 +5,7 @@ members = [
     "crates/fire",
     "crates/fire-decode",
     "crates/psd-sdk-sys",
+    "crates/heif-sys",
 ]
 
 [workspace.package]
@@ -52,6 +53,7 @@ windows-sys = "0.60"
 fire-ipc = { path = "crates/fire-ipc" }
 fire-decode = { path = "crates/fire-decode" }
 psd-sdk-sys = { path = "crates/psd-sdk-sys" }
+heif-sys = { path = "crates/heif-sys" }
 
 # --- build deps ---
 cc = "1"

@@ -4,8 +4,9 @@
 //! never see per-format detail. Routing is by magic bytes:
 //!   - PSD            -> psd_sdk (C++ FFI) : merged composite, 8-bit RGBA (+ICC)
 //!   - EXR            -> `exr` crate       : 32-bit float RGBA (linear/HDR)
+//!   - HEIC/HEIF/AVIF -> libheif (C FFI)   : 8-bit RGBA, or 16-bit RGBA for HDR (+ICC)
 //!   - zune-supported -> **zune** (hot path): PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL
-//!   - else           -> `image` crate     : TIFF/GIF/TGA (formats zune doesn't decode)
+//!   - else           -> `image` crate     : TIFF/GIF/TGA/ICO (formats zune doesn't decode)
 //!
 //! **Decode speed is the project's primary metric** (time-to-first-pixel), so the common
 //! formats run through zune with [`DecoderOptions::new_fast`] (platform intrinsics +
@@ -126,9 +127,30 @@ impl std::error::Error for DecodeError {}
 enum Backend {
     Psd,
     Exr,
+    /// HEIC/HEIF/AVIF via libheif; carries the status-bar label for the detected brand.
+    Heif(&'static str),
     /// A zune-decodable format; carries zune's detected format for status-bar naming.
     Zune(zune_image::codecs::ImageFormat),
     Image,
+}
+
+/// Detect an ISOBMFF (HEIF-family) stream by its `ftyp` box brand and map it to a
+/// status-bar label. The layout is `[u32 box-size][b"ftyp"][u32 major-brand][...]`, so
+/// the major brand sits at bytes 8..12. Returns `None` for non-HEIF input.
+fn heif_label(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return None;
+    }
+    match &bytes[8..12] {
+        b"avif" | b"avis" => Some("AVIF"),
+        // HEVC-in-HEIF brands.
+        b"heic" | b"heix" | b"heim" | b"heis" | b"hevc" | b"hevx" | b"hevm" | b"hevs" => {
+            Some("HEIC")
+        }
+        // Generic HEIF (codec announced in compatible brands; libheif sorts it out).
+        b"mif1" | b"msf1" | b"mif2" => Some("HEIF"),
+        _ => None,
+    }
 }
 
 fn sniff(bytes: &[u8]) -> Backend {
@@ -141,6 +163,9 @@ fn sniff(bytes: &[u8]) -> Backend {
     } else if bytes.starts_with(&[0x76, 0x2f, 0x31, 0x01]) {
         // OpenEXR magic number — handled by the `exr` crate (zune has no EXR decoder).
         Backend::Exr
+    } else if let Some(label) = heif_label(bytes) {
+        // HEIC/HEIF/AVIF — the ISOBMFF `ftyp` brands; decoded by libheif.
+        Backend::Heif(label)
     } else if let Some((fmt, _)) = guess_format(ZCursor::new(bytes)) {
         // zune recognizes it (PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL): the fast path.
         if fmt == ImageFormat::Unknown {
@@ -149,7 +174,7 @@ fn sniff(bytes: &[u8]) -> Backend {
             Backend::Zune(fmt)
         }
     } else {
-        // zune doesn't sniff it (TIFF/GIF/TGA): fall back to the image crate.
+        // zune doesn't sniff it (TIFF/GIF/TGA/ICO): fall back to the image crate.
         Backend::Image
     }
 }
@@ -163,6 +188,7 @@ pub fn decode(
     let mut img = match sniff(bytes) {
         Backend::Psd => decode_psd(bytes)?,
         Backend::Exr => decode_exr(bytes)?,
+        Backend::Heif(label) => decode_heif(bytes, label)?,
         Backend::Zune(fmt) => decode_zune(bytes, fmt)?,
         Backend::Image => decode_image(bytes)?,
     };
@@ -250,6 +276,38 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         channels: 4,
         icc: None,
         source_format: "OpenEXR",
+        downscaled_from: None,
+    })
+}
+
+/// HEIC/HEIF/AVIF via libheif (C FFI: libde265 for HEVC, dav1d for AV1). Runs inside
+/// catch_unwind so a panic in the thin wrapper cannot escape; libheif itself reports
+/// malformed input as an error code rather than crashing.
+///
+/// 8-bit sources come back as `Rgba8Unorm`; HDR (10/12-bit) sources as `Rgba16Unorm`
+/// scaled to full range. We treat the decoded values as display-encoded (SDR), so a
+/// true-HDR (PQ/HLG) HEIF will display without tonemapping — acceptable for v1, and most
+/// HEIC (phone photos) is 8-bit SDR, often Display-P3, whose ICC the [`icc`] pass honors.
+fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, DecodeError> {
+    let result = std::panic::catch_unwind(|| heif_sys::decode_heif(bytes))
+        .map_err(|_| DecodeError::Ffi("libheif panicked".into()))?;
+    let img = result.map_err(|e| DecodeError::Ffi(e.to_string()))?;
+
+    let (format, bit_depth) = if img.is_16bit {
+        (PixelFormat::Rgba16Unorm, img.bit_depth)
+    } else {
+        (PixelFormat::Rgba8Unorm, 8)
+    };
+    Ok(DecodedImage {
+        pixels: img.pixels,
+        width: img.width,
+        height: img.height,
+        format,
+        bit_depth,
+        // Report the source channel count for the status bar (4 with alpha, else 3).
+        channels: if img.has_alpha { 4 } else { 3 },
+        icc: img.icc,
+        source_format: label,
         downscaled_from: None,
     })
 }
@@ -349,7 +407,7 @@ fn zune_format_name(f: zune_image::codecs::ImageFormat) -> &'static str {
     }
 }
 
-/// Fallback for the formats zune has no decoder for: TIFF/GIF/TGA via the `image` crate.
+/// Fallback for the formats zune has no decoder for: TIFF/GIF/TGA/ICO via the `image` crate.
 /// Extracts the embedded ICC profile (where the format carries one) and keeps float
 /// sources as 32-bit float RGBA (HDR). Decode speed here is not critical (rare formats).
 fn decode_image(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
@@ -407,6 +465,7 @@ fn format_name(f: image::ImageFormat) -> &'static str {
         Bmp => "BMP",
         Tiff => "TIFF",
         Tga => "TGA",
+        Ico => "ICO",
         WebP => "WebP",
         Hdr => "Radiance HDR",
         _ => "image",
@@ -671,6 +730,24 @@ mod tests {
         let [r, g, b, a] = [out.pixels[0], out.pixels[1], out.pixels[2], out.pixels[3]];
         assert!(r > 200 && g < 70 && b < 80, "got {r},{g},{b}");
         assert_eq!(a, 255);
+    }
+
+    /// An ICO routes to the `image`-crate fallback (zune can't sniff it) and decodes to
+    /// RGBA8 with the right dims and status-bar label. ICO embeds a PNG or BMP per entry;
+    /// the `image` crate picks the largest. Proves the AVIF/HEIF work didn't need to touch
+    /// ICO — it already works through the fallback.
+    #[test]
+    fn ico_decodes_via_fallback() {
+        let mut src = image::RgbaImage::new(4, 4);
+        src.put_pixel(0, 0, image::Rgba([200, 30, 40, 255]));
+        src.put_pixel(3, 3, image::Rgba([10, 20, 30, 128]));
+        let bytes = encode(&image::DynamicImage::ImageRgba8(src), image::ImageFormat::Ico);
+
+        let out = decode(&bytes, Some("ico"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.width, out.height), (4, 4));
+        assert_eq!(out.format, PixelFormat::Rgba8Unorm);
+        assert_eq!(out.source_format, "ICO");
+        assert_eq!([out.pixels[0], out.pixels[1], out.pixels[2], out.pixels[3]], [200, 30, 40, 255]);
     }
 
     /// Corrupt input must surface an error, never panic (FFI-free path, but the viewer
