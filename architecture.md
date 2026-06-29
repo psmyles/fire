@@ -187,7 +187,11 @@ from its `0x00RRGGBB` value and sRGB-decoded to linear on the CPU so it matches.
 
 All decoders live behind a single **`fire-decode`** crate exposing a uniform
 "bytes → (pixels, format, bit depth, optional ICC profile)" interface. Routing is by magic
-bytes:
+bytes, with one exception: **camera raw is routed by file extension** (`decode`'s
+`ext_hint`), because the many TIFF-structured raws (NEF/ARW/DNG/ORF/…) share TIFF's magic
+and can't be told apart from a plain `.tif` by header alone. The few raws with a unique
+signature (CR2's `CR\x02` marker, CR3's `crx ` ISOBMFF brand, RAF's ASCII magic, X3F) are
+also detected by magic so a no-extension open still routes correctly.
 
 | Format(s) | Decoder |
 |---|---|
@@ -196,6 +200,7 @@ bytes:
 | AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
 | EXR | `exr` crate (pure Rust) → 32-bit float RGBA |
 | PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite |
+| Camera raw (CR2/CR3, NEF, ARW, RAF, ORF, RW2, DNG, …) | **`raw`** (pure Rust) → extract the embedded JPEG **preview**, decode via zune |
 | ICC transforms | **Little CMS** (`lcms2`) over FFI |
 
 Notes:
@@ -207,6 +212,17 @@ Notes:
   that exposes the profile, then transformed with `lcms2`.
 - **FFI safety:** every C/C++ boundary (`psd_sdk`, `lcms2`) is wrapped in `catch_unwind`
   and runs on a decode worker, so a malformed file cannot take down the viewer process.
+- **Camera raw = embedded preview, not develop.** A raw file is a per-vendor container
+  around the sensor mosaic plus a full-size, camera-rendered **JPEG preview**. Developing
+  the mosaic (demosaic + white balance + color matrices) is slow and at odds with the
+  time-to-first-pixel goal, so `raw` instead extracts the largest embedded JPEG and decodes
+  *that* through the zune path (ICC/downscale/etc. come for free). It locates the preview by
+  walking the TIFF/EXIF IFD tree (or the RAF header / a whole-file JPEG-marker scan for
+  non-TIFF containers like CR3), validates each candidate by probing its JPEG Start-Of-Frame
+  for the largest dimensions, and applies the file's EXIF orientation so portrait shots are
+  upright. All parsing is pure-Rust and bounds-checked (malformed → "no preview", never a
+  panic). The displayed pixels are therefore 8-bit (the camera's rendering); full raw
+  development is explicitly out of scope (a separate opt-in mode if ever wanted, §14).
 - **Oversized images:** `DecodeOptions::max_dim` is a **CPU/RAM guard**, not a GPU texture
   limit (an RGBA8 bitmap at 16384² is ~1 GiB; float HDR is 4×). It defaults to 16384, is
   configurable, and anything past it is CPU-downscaled to fit, recording the original size
@@ -311,8 +327,9 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
 ## 11. Explorer integration
 
 - **Association only** (no thumbnail handler in v1): register an `HKCU` ProgID, declare
-  supported extensions (`.jpg .jpeg .png .tga .tif .tiff .psd .exr .hdr` …), and point them
-  at `fire.exe`. Appears in "Open with".
+  supported extensions (`.jpg .jpeg .png .tga .tif .tiff .psd .exr .hdr` …, plus camera-raw
+  `.cr2 .cr3 .nef .arw .raf .orf .rw2 .dng` … under an opt-in `assoc\raw` task), and point
+  them at `fire.exe`. Appears in "Open with".
 - Decoders are factored into the standalone `fire-decode` crate, so an `IThumbnailProvider`
   handler can be added later as a separate `cdylib` reusing that core with no rework.
 
@@ -373,13 +390,15 @@ Key dependencies: `windows` (typed COM for the D3D11 device + DXGI flip swapchai
 **In v1:** single self-contained native Win32 exe; configurable NewWindow / SingleInstance
 lifecycle with **foreground activation on the forward path (§4.1)**; GPU (D3D11) shader
 render with channel/alpha/gamma/exposure/tonemap; async worker decode; zune + image + exr +
-psd_sdk decoders; ICC honoring via lcms2; tonemap-to-SDR HDR with exposure; downscale-to-fit
-RAM guard; **DPI-aware, dark-mode-aware GDI toolbar + status bar**; open-in-editor +
-clipboard; association-only Explorer integration; unsigned installer.
+psd_sdk + libheif decoders; camera-raw embedded-preview decode; ICC honoring via lcms2;
+tonemap-to-SDR HDR with exposure; downscale-to-fit RAM guard; **DPI-aware, dark-mode-aware
+GDI toolbar + status bar**; open-in-editor + clipboard; association-only Explorer
+integration; unsigned installer.
 
 **In progress / deferred:** pixel inspector, native settings dialog + background-color
 picker, exposure trackbar, toolbar tooltips; compare/tabs mode; Explorer
-`IThumbnailProvider`; code signing.
+`IThumbnailProvider`; **full raw development** (demosaic the sensor mosaic instead of showing
+the embedded preview — a separate opt-in mode, kept off the fast path); code signing.
 
 ---
 

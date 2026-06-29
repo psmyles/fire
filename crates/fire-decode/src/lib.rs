@@ -1,10 +1,12 @@
 //! Uniform decode core: `bytes -> (pixels, format, bit depth, optional ICC)`.
 //!
 //! All format backends live behind the single [`decode`] entry point so callers
-//! never see per-format detail. Routing is by magic bytes:
+//! never see per-format detail. Routing is by magic bytes (and, for camera raw, the file
+//! extension, since the many TIFF-structured raws can't be told from plain TIFF by header):
 //!   - PSD            -> psd_sdk (C++ FFI) : merged composite, 8-bit RGBA (+ICC)
 //!   - EXR            -> `exr` crate       : 32-bit float RGBA (linear/HDR)
 //!   - HEIC/HEIF/AVIF -> libheif (C FFI)   : 8-bit RGBA, or 16-bit RGBA for HDR (+ICC)
+//!   - camera raw     -> [`raw`] preview   : extract the embedded JPEG, decode via zune
 //!   - zune-supported -> **zune** (hot path): PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL
 //!   - else           -> `image` crate     : TIFF/GIF/TGA/ICO (formats zune doesn't decode)
 //!
@@ -23,6 +25,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 mod downscale;
+mod raw;
 
 /// Upper bound on a decoded source dimension. zune's default cap is 16384, which would
 /// reject any image larger than that on an axis before we ever get a chance to downscale
@@ -131,6 +134,9 @@ enum Backend {
     Heif(&'static str),
     /// A zune-decodable format; carries zune's detected format for status-bar naming.
     Zune(zune_image::codecs::ImageFormat),
+    /// A camera-raw file; carries the status-bar label for the detected raw family. The
+    /// embedded JPEG preview is extracted ([`raw`]) and decoded through the zune path.
+    Raw(&'static str),
     Image,
 }
 
@@ -153,7 +159,7 @@ fn heif_label(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn sniff(bytes: &[u8]) -> Backend {
+fn sniff(bytes: &[u8], ext: Option<&str>) -> Backend {
     use zune_core::bytestream::ZCursor;
     use zune_image::codecs::{guess_format, ImageFormat};
 
@@ -166,6 +172,11 @@ fn sniff(bytes: &[u8]) -> Backend {
     } else if let Some(label) = heif_label(bytes) {
         // HEIC/HEIF/AVIF — the ISOBMFF `ftyp` brands; decoded by libheif.
         Backend::Heif(label)
+    } else if let Some(label) = raw::label(bytes, ext) {
+        // Camera raw (CR2/CR3/NEF/ARW/RAF/DNG/…): display the embedded JPEG preview. Sniffed
+        // before the zune/`image` fallback because TIFF-structured raws share TIFF's magic
+        // and must not be handed to the `image` crate as ordinary TIFFs.
+        Backend::Raw(label)
     } else if let Some((fmt, _)) = guess_format(ZCursor::new(bytes)) {
         // zune recognizes it (PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL): the fast path.
         if fmt == ImageFormat::Unknown {
@@ -182,13 +193,14 @@ fn sniff(bytes: &[u8]) -> Backend {
 /// Decode an in-memory image, choosing a backend by magic bytes.
 pub fn decode(
     bytes: &[u8],
-    _ext_hint: Option<&str>,
+    ext_hint: Option<&str>,
     opts: &DecodeOptions,
 ) -> Result<DecodedImage, DecodeError> {
-    let mut img = match sniff(bytes) {
+    let mut img = match sniff(bytes, ext_hint) {
         Backend::Psd => decode_psd(bytes)?,
         Backend::Exr => decode_exr(bytes)?,
         Backend::Heif(label) => decode_heif(bytes, label)?,
+        Backend::Raw(label) => decode_raw(bytes, label)?,
         Backend::Zune(fmt) => decode_zune(bytes, fmt)?,
         Backend::Image => decode_image(bytes)?,
     };
@@ -310,6 +322,26 @@ fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, Decode
         source_format: label,
         downscaled_from: None,
     })
+}
+
+/// Camera raw via embedded-preview extraction ([`raw`]). The raw container is not decoded;
+/// instead we locate the largest embedded JPEG preview the camera wrote and decode *that*
+/// through the normal zune JPEG path, so ICC handling, downscale, and the rest apply
+/// unchanged. The pixels are the camera's own rendering (white-balanced, 8-bit) — the right
+/// trade for a fast viewer, and we apply the file's EXIF orientation so portrait shots are
+/// upright. Developing the sensor mosaic (demosaic/color matrices) is out of scope (§6).
+///
+/// Pure-Rust and bounds-checked end to end, but the worker pool still wraps the whole decode
+/// in `catch_unwind` as a backstop, same as every other backend.
+fn decode_raw(bytes: &[u8], label: &'static str) -> Result<DecodedImage, DecodeError> {
+    let preview = raw::find_preview(bytes)
+        .ok_or_else(|| DecodeError::Malformed("raw file has no embedded JPEG preview".into()))?;
+    // The preview is a JPEG; reuse the zune path (ICC + bit-depth + naming) then re-label it
+    // as the raw family and orient it.
+    let mut img = decode_zune(preview.jpeg, zune_image::codecs::ImageFormat::JPEG)?;
+    raw::apply_orientation(&mut img, preview.orientation);
+    img.source_format = label;
+    Ok(img)
 }
 
 /// The hot path: zune for PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JPEG-XL. Decoded with
@@ -748,6 +780,50 @@ mod tests {
         assert_eq!(out.format, PixelFormat::Rgba8Unorm);
         assert_eq!(out.source_format, "ICO");
         assert_eq!([out.pixels[0], out.pixels[1], out.pixels[2], out.pixels[3]], [200, 30, 40, 255]);
+    }
+
+    /// A camera-raw file routes to the preview extractor: a synthetic little-endian TIFF
+    /// whose IFD points at an embedded full-size JPEG (with Orientation 8 / rotate-90°-CCW)
+    /// decodes to the preview's pixels, re-labeled as the raw family, oriented upright. This
+    /// exercises the whole wiring: ext-driven sniff -> decode_raw -> zune -> orientation.
+    #[test]
+    fn raw_decodes_embedded_preview_via_ext() {
+        // Embedded preview: a 6(w)x2(h) JPEG. Orientation 8 swaps axes -> 2x6 displayed.
+        let preview = encode(
+            &image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(6, 2, image::Rgb([200, 40, 60]))),
+            image::ImageFormat::Jpeg,
+        );
+
+        let entries: u16 = 3;
+        let ifd_off = 8u32;
+        let ifd_len = 2 + entries as usize * 12 + 4;
+        let jpeg_off = ifd_off as usize + ifd_len;
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&ifd_off.to_le_bytes());
+        tiff.extend_from_slice(&entries.to_le_bytes());
+        let mut entry = |tag: u16, typ: u16, n: u32, val: u32| {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&typ.to_le_bytes());
+            tiff.extend_from_slice(&n.to_le_bytes());
+            tiff.extend_from_slice(&val.to_le_bytes());
+        };
+        entry(0x0112, 3, 1, 8); // Orientation = 8 (rotate 90° CCW)
+        entry(0x0201, 4, 1, jpeg_off as u32);
+        entry(0x0202, 4, 1, preview.len() as u32);
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&preview);
+
+        let out = decode(&tiff, Some("nef"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.source_format, "Nikon NEF");
+        assert_eq!(out.format, PixelFormat::Rgba8Unorm);
+        // Orientation 8 swaps the 6x2 preview to 2x6.
+        assert_eq!((out.width, out.height), (2, 6));
+        // The camera's red is preserved through the JPEG round-trip.
+        let [r, g, b] = [out.pixels[0], out.pixels[1], out.pixels[2]];
+        assert!(r > 180 && g < 90 && b < 100, "got {r},{g},{b}");
     }
 
     /// Corrupt input must surface an error, never panic (FFI-free path, but the viewer

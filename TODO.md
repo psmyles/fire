@@ -1,6 +1,7 @@
 - fullscreen / minimal mode
 - flipbook viewer
 - custom background colors
+- show image outline
 - shortcut editor
 context menus entries:
     - open with.. config

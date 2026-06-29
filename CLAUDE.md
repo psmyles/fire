@@ -54,9 +54,12 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 
 - **`fire`** — the viewer exe. Win32 shell, D3D11 render, decode worker pool, optional named pipe.
 - **`fire-decode`** — uniform decode core. Single `decode`/`decode_path` entry point; routes by
-  magic bytes to zune (hot path) / `image` / `exr` / libheif / psd_sdk, normalizes everything to
-  interleaved RGBA in one of four `PixelFormat`s, extracts ICC, applies lcms2 transforms, and
-  CPU-downscales oversized images. **Decode speed is the project's primary metric.**
+  magic bytes (and, for camera raw, file extension) to zune (hot path) / `image` / `exr` / libheif /
+  psd_sdk / `raw`, normalizes everything to interleaved RGBA in one of four `PixelFormat`s, extracts
+  ICC, applies lcms2 transforms, and CPU-downscales oversized images. Camera raw (CR2/CR3/NEF/ARW/…)
+  is handled by `raw.rs`, which extracts the largest embedded JPEG **preview** (TIFF-IFD walk / RAF
+  header / JPEG-marker scan) and decodes it via zune — full sensor development is out of scope.
+  **Decode speed is the project's primary metric.**
 - **`fire-ipc`** — dependency-light named-pipe wire format (length-prefixed `OpenRequest`) shared by
   the forward path and the server. Kept lean so the SingleInstance forward launch stays cheap.
 - **`psd-sdk-sys`** / **`heif-sys`** — `-sys` FFI crates (bindgen + `cc`) wrapping the vendored C/C++.

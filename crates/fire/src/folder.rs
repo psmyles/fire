@@ -22,6 +22,10 @@ const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "tif", "tiff", "webp", "ico",
     "tga", "qoi", "ppm", "pgm", "pbm", "pnm", "ff", "jxl", "hdr", "exr", "psd", "psb", "heic",
     "heif", "avif",
+    // Camera raw (embedded-preview decode; kept in sync with fire-decode's EXT_LABELS).
+    "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "srw",
+    "dng", "x3f", "3fr", "fff", "iiq", "erf", "mrw", "dcr", "kdc", "mef", "mos", "rwl", "gpr",
+    "raw",
 ];
 
 /// Whether `path`'s extension is one fire decodes (the folder-navigation membership test).
