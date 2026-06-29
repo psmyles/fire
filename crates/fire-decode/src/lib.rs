@@ -470,6 +470,11 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
     let width = dynimg.width();
     let height = dynimg.height();
+    // Report the source channel count for the status bar and alpha-aware UI (RGBA icon,
+    // alpha-channel button, checker backdrop). We always normalize to RGBA below, so the
+    // pixel buffer is 4-wide regardless — but a 24-bit TGA / RGB TIFF carries no alpha and
+    // must not be presented as if it did.
+    let src_channels = dynimg.color().channel_count();
 
     let (pixels, fmt, bit_depth) = match &dynimg {
         // Float sources (Radiance HDR, float TIFF) stay 32-bit float / linear (HDR).
@@ -490,7 +495,7 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         height,
         format: fmt,
         bit_depth,
-        channels: 4,
+        channels: src_channels,
         icc,
         source_format: format.map(format_name).unwrap_or("image"),
         downscaled_from: None,
@@ -854,6 +859,29 @@ mod tests {
             assert_eq!(out.source_format, "TGA");
             assert_eq!(&out.pixels[0..4], &[200, 30, 40, 255]);
         }
+    }
+
+    /// A 24-bit (RGB) TGA carries no alpha; it must report 3 channels so the viewer doesn't
+    /// present it with a checker backdrop / alpha-channel UI. Regression: `decode_image`
+    /// hardcoded `channels: 4`, so every TGA looked like it had an alpha channel.
+    #[test]
+    fn rgb_tga_reports_three_channels() {
+        let mut src = image::RgbImage::new(2, 1);
+        src.put_pixel(0, 0, image::Rgb([200, 30, 40]));
+        src.put_pixel(1, 0, image::Rgb([10, 220, 60]));
+        let bytes = encode(&image::DynamicImage::ImageRgb8(src), image::ImageFormat::Tga);
+
+        let out = decode(&bytes, Some("tga"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.channels, 3, "24-bit RGB TGA must not report an alpha channel");
+        // Still normalized to RGBA pixels with opaque alpha for the GPU upload.
+        assert_eq!(&out.pixels[0..4], &[200, 30, 40, 255]);
+
+        // A genuine 32-bit RGBA TGA still reports 4 channels.
+        let mut rgba = image::RgbaImage::new(1, 1);
+        rgba.put_pixel(0, 0, image::Rgba([1, 2, 3, 128]));
+        let bytes = encode(&image::DynamicImage::ImageRgba8(rgba), image::ImageFormat::Tga);
+        let out = decode(&bytes, Some("tga"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.channels, 4, "32-bit RGBA TGA must report an alpha channel");
     }
 
     /// Corrupt input must surface an error, never panic (FFI-free path, but the viewer
