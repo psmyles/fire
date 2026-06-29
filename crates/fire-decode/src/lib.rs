@@ -202,7 +202,7 @@ pub fn decode(
         Backend::Heif(label) => decode_heif(bytes, label)?,
         Backend::Raw(label) => decode_raw(bytes, label)?,
         Backend::Zune(fmt) => decode_zune(bytes, fmt)?,
-        Backend::Image => decode_image(bytes)?,
+        Backend::Image => decode_image(bytes, ext_hint)?,
     };
 
     // Honor an embedded ICC profile by transforming into the working space.
@@ -442,12 +442,21 @@ fn zune_format_name(f: zune_image::codecs::ImageFormat) -> &'static str {
 /// Fallback for the formats zune has no decoder for: TIFF/GIF/TGA/ICO via the `image` crate.
 /// Extracts the embedded ICC profile (where the format carries one) and keeps float
 /// sources as 32-bit float RGBA (HDR). Decode speed here is not critical (rare formats).
-fn decode_image(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+///
+/// TGA carries no start-of-file magic (only an optional end-of-file `TRUEVISION-XFILE.`
+/// footer), so `with_guessed_format` can't detect it from content. Fall back to the file
+/// extension for any format content-sniffing misses.
+fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, DecodeError> {
     use image::DynamicImage;
 
-    let reader = image::ImageReader::new(Cursor::new(bytes))
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| DecodeError::Other(e.to_string()))?;
+    if reader.format().is_none() {
+        if let Some(fmt) = ext_hint.and_then(image::ImageFormat::from_extension) {
+            reader.set_format(fmt);
+        }
+    }
     let format = reader.format();
     let mut decoder = reader
         .into_decoder()
@@ -824,6 +833,27 @@ mod tests {
         // The camera's red is preserved through the JPEG round-trip.
         let [r, g, b] = [out.pixels[0], out.pixels[1], out.pixels[2]];
         assert!(r > 180 && g < 90 && b < 100, "got {r},{g},{b}");
+    }
+
+    /// TGA has no start-of-file magic, so content sniffing can't identify it — the decoder
+    /// must lean on the file extension. Regression for TGA files failing to open at all.
+    #[test]
+    fn tga_decodes_via_extension_hint() {
+        let mut src = image::RgbaImage::new(2, 1);
+        src.put_pixel(0, 0, image::Rgba([200, 30, 40, 255]));
+        src.put_pixel(1, 0, image::Rgba([10, 220, 60, 255]));
+        let bytes = encode(&image::DynamicImage::ImageRgba8(src), image::ImageFormat::Tga);
+
+        // Without an extension hint the format is unidentifiable (the original bug).
+        assert!(decode(&bytes, None, &DecodeOptions::default()).is_err());
+
+        // With the hint it decodes — and the hint is matched case-insensitively (.TGA).
+        for ext in ["tga", "TGA"] {
+            let out = decode(&bytes, Some(ext), &DecodeOptions::default()).unwrap();
+            assert_eq!((out.width, out.height), (2, 1));
+            assert_eq!(out.source_format, "TGA");
+            assert_eq!(&out.pixels[0..4], &[200, 30, 40, 255]);
+        }
     }
 
     /// Corrupt input must surface an error, never panic (FFI-free path, but the viewer
