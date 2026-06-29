@@ -122,13 +122,15 @@ impl App {
         self.scan_folder(req.path, generation);
     }
 
-    /// Show the frame with a placeholder for `path`, raise it if `activate`, and enqueue the
-    /// decode off-thread. The image swaps in when `WM_APP_DECODE_DONE` arrives. Returns the
-    /// generation assigned to this load (used to tag the folder scan for stale-drop). Shared by
-    /// `open` (which also rescans the folder) and `navigate` (which reuses the existing cursor).
+    /// Show the frame for `path`, raise it if `activate`, and enqueue the decode off-thread. The
+    /// currently displayed image is *kept on screen* until the new one lands (swapped in by
+    /// `WM_APP_DECODE_DONE`), so navigating between folder siblings doesn't flash the empty
+    /// backdrop between frames — the same no-blank-flash discipline hot-reload uses. A failed
+    /// decode clears it (see `decode_done`). Returns the generation assigned to this load (used to
+    /// tag the folder scan for stale-drop). Shared by `open` (which also rescans the folder) and
+    /// `navigate` (which reuses the existing cursor).
     fn load(&mut self, path: &Path, activate: bool) -> u64 {
         let name = file_name(path);
-        self.surface.clear_image();
         self.file_label = name.clone();
         self.meta.clear();
         self.loading = true;
@@ -251,6 +253,11 @@ impl App {
                 self.file_label = name.clone();
                 self.meta = format!("failed: {e}");
                 set_title(self.frame, &format!("{}: {name} (failed)", crate::product::NAME));
+                // We no longer clear in `load` (to avoid the navigation flash), so drop the stale
+                // image here and repaint the backdrop — a failed file shouldn't keep showing the
+                // previously displayed one.
+                self.surface.clear_image();
+                self.surface.invalidate();
                 self.relayout();
                 self.invalidate_chrome();
                 eprintln!("fire: failed to open {name}: {e}");

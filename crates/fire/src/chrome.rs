@@ -186,7 +186,7 @@ impl Palette {
                 btn_active_text: rgb(255, 255, 255),
                 separator: rgb(60, 60, 60),
                 border: rgb(20, 20, 20),
-                view_clear: rgb(32, 32, 34),
+                view_clear: rgb(0, 0, 0),
             }
         } else {
             Palette {
