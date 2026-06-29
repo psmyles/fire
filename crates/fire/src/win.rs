@@ -19,7 +19,9 @@ use fire_decode::{DecodeOptions, DecodedImage};
 use fire_ipc::OpenRequest;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
+use windows_sys::Win32::Graphics::Gdi::{
+    BeginPaint, ClientToScreen, EndPaint, InvalidateRect, PAINTSTRUCT,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -29,15 +31,15 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetMessageW, GetWindowLongPtrW, GetWindowPlacement, LoadCursorW, LoadIconW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
-    SetWindowTextW, ShowWindow,
+    GetMessageW, GetWindowLongPtrW, GetWindowPlacement, KillTimer, LoadCursorW, LoadIconW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPlacement,
+    SetWindowPos, SetWindowTextW, ShowWindow,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, WINDOWPLACEMENT,
-    WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WM_SIZE,
+    WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
     WNDCLASSW, WPF_RESTORETOMAXIMIZED, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
@@ -53,6 +55,7 @@ use crate::foreground;
 use crate::ipc_server;
 use crate::render::gpu::GpuSurface;
 use crate::render::view::Channel;
+use crate::tooltip::Tooltip;
 use crate::watcher::FileWatcher;
 use crate::window_state::WindowState;
 
@@ -77,6 +80,12 @@ struct FolderScan {
     entries: Vec<PathBuf>,
 }
 
+/// Timer id + delay (ms) for the hover-to-show tooltip on the toolbar. The timer is (re)armed when
+/// the hovered button changes and fires once after the cursor rests; killed on any hover change,
+/// leave, or click.
+const TIP_TIMER_ID: usize = 1;
+const TIP_DELAY_MS: u32 = 500;
+
 /// Multiplicative zoom per wheel notch (and per keyboard zoom step).
 const ZOOM_STEP: f32 = 1.15;
 /// Exposure step per keypress / toolbar press, in stops.
@@ -94,6 +103,8 @@ struct App {
     surface: GpuSurface,
     pool: DecodePool,
     chrome: Chrome,
+    /// Hover tooltip for the toolbar buttons (a separate owned popup window).
+    tooltip: Tooltip,
     /// Status-bar file name (without the metadata tail).
     file_label: String,
     /// Status-bar metadata tail (format · dims · depth/channels · ICC).
@@ -417,6 +428,26 @@ impl App {
         let sb = RECT { left: 0, top: h - self.chrome.metrics.status_h, right: w, bottom: h };
         unsafe { InvalidateRect(self.frame as HWND, &sb, 0) };
     }
+
+    /// Show the tooltip for the currently-hovered toolbar button (called when the hover-delay
+    /// timer fires). Anchors the bubble just below the toolbar, left-aligned to the button.
+    fn show_tooltip(&mut self) {
+        let Some(idx) = self.chrome.hover else { return };
+        let snap = self.snapshot();
+        let Some((rect, text)) = self.chrome.button_tooltip(idx, &snap) else { return };
+        // Drop the bubble below the whole toolbar (a small DPI-scaled gap), left-aligned to the
+        // button; convert from frame-client coords to the screen coords the popup wants.
+        let gap = self.chrome.metrics.dpi as i32 * 2 / 96;
+        let mut pt = POINT { x: rect.left, y: self.chrome.metrics.toolbar_h + gap };
+        unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
+        self.tooltip.show(text, pt.x, pt.y);
+    }
+
+    /// Hide the tooltip and cancel any pending hover-delay timer.
+    fn cancel_tooltip(&mut self) {
+        unsafe { KillTimer(self.frame as HWND, TIP_TIMER_ID) };
+        self.tooltip.hide();
+    }
 }
 
 /// Create the frame + child view, wire up the decode pool, optionally serve the pipe
@@ -495,6 +526,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, hot_reload: bool) {
 
         let dpi = GetDpiForWindow(frame).max(96);
         let ch = Chrome::new(dpi, dark);
+        let tooltip = Tooltip::new(frame as isize, dpi, dark);
 
         // Initial view rect from the frame client size and chrome metrics.
         let (fw, fh) = client_size(frame);
@@ -541,6 +573,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, hot_reload: bool) {
             surface,
             pool,
             chrome: ch,
+            tooltip,
             file_label: String::new(),
             meta: String::new(),
             loading: false,
@@ -615,6 +648,7 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             0
         }
         WM_SIZE => {
+            app.cancel_tooltip();
             app.relayout();
             app.reposition_view();
             app.invalidate_chrome();
@@ -623,6 +657,7 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
         WM_LBUTTONDOWN => {
             let x = (lparam & 0xffff) as u16 as i16 as i32;
             let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
+            app.cancel_tooltip();
             let snap = app.snapshot();
             if let Some(action) = app.chrome.hit_test(x, y, &snap) {
                 app.do_action(action);
@@ -640,6 +675,8 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             if hov != app.chrome.hover {
                 app.chrome.hover = hov;
                 app.invalidate_chrome();
+                // The hovered button changed: drop any showing tip and re-arm the hover delay.
+                app.cancel_tooltip();
                 if hov.is_some() {
                     // Ask for WM_MOUSELEAVE so the hover clears when the cursor exits.
                     let mut tme = TRACKMOUSEEVENT {
@@ -649,16 +686,33 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         dwHoverTime: 0,
                     };
                     TrackMouseEvent(&mut tme);
+                    SetTimer(hwnd, TIP_TIMER_ID, TIP_DELAY_MS, None);
                 }
             }
             0
         }
+        WM_TIMER => {
+            if wparam == TIP_TIMER_ID {
+                KillTimer(hwnd, TIP_TIMER_ID);
+                app.show_tooltip();
+            }
+            0
+        }
         WM_MOUSELEAVE => {
+            app.cancel_tooltip();
             if app.chrome.hover.is_some() {
                 app.chrome.hover = None;
                 app.invalidate_chrome();
             }
             0
+        }
+        WM_ACTIVATE => {
+            // Losing activation (alt-tab / click away): drop the topmost tip so it can't linger
+            // over other windows. Still defer to DefWindowProc for the default focus handling.
+            if (wparam & 0xffff) == WA_INACTIVE as usize {
+                app.cancel_tooltip();
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_MOUSEWHEEL => {
             // Delivered to the focused window; the surface zooms about its own tracked cursor,
@@ -713,7 +767,9 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
+            app.cancel_tooltip();
             app.chrome.set_dpi(new_dpi);
+            app.tooltip.set_dpi(new_dpi);
             app.relayout();
             app.reposition_view();
             InvalidateRect(hwnd, ptr::null(), 0);
@@ -724,6 +780,7 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             let dark = chrome::system_uses_dark_mode();
             if dark != app.chrome.dark {
                 app.chrome.set_dark(dark);
+                app.tooltip.set_dark(dark);
                 app.surface.set_clear(app.chrome.view_clear_packed());
                 chrome::apply_dark_titlebar(hwnd, dark);
                 InvalidateRect(hwnd, ptr::null(), 0);

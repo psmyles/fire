@@ -5,5 +5,6 @@ context menus entries:
     - open with.. config
     - copy file
     - copy path
+    - copy file name
     - show in explorer
-- click on zoom level indicator to alternate between fit an 1:1
+

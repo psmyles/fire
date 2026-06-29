@@ -22,6 +22,7 @@ mod foreground;
 mod ipc_server;
 mod product;
 mod render;
+mod tooltip;
 mod watcher;
 mod win;
 mod window_state;

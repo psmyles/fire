@@ -127,6 +127,31 @@ impl ViewSnapshot {
         }
     }
 
+    /// Hover-tooltip text for a button. State-aware where the button is (the zoom toggle
+    /// describes the mode a click switches *to*); the parenthetical is the keyboard shortcut.
+    fn tooltip(&self, a: Action) -> &'static str {
+        match a {
+            Action::Prev => "Previous image  (\u{2190})",
+            Action::Next => "Next image  (\u{2192})",
+            Action::ZoomOut => "Zoom out  (\u{2212})",
+            Action::ZoomIn => "Zoom in  (+)",
+            Action::ZoomToggle => if self.fit { "Actual size 1:1  (1)" } else { "Fit to window  (F)" },
+            Action::Channel(Channel::Rgb) => "All channels  (C)",
+            Action::Channel(Channel::R) => "Red channel  (R)",
+            Action::Channel(Channel::G) => "Green channel  (G)",
+            Action::Channel(Channel::B) => "Blue channel  (B)",
+            Action::Channel(Channel::A) => "Alpha channel  (A)",
+            Action::ToggleTonemap => "Tone map: Reinhard \u{2194} ACES  (T)",
+            Action::ExpUp => "Increase exposure  (])",
+            Action::ExpDown => "Decrease exposure  ([)",
+            Action::ToggleOutline => "Image boundary outline",
+            Action::Background(Background::Black) => "Black backdrop",
+            Action::Background(Background::White) => "White backdrop",
+            Action::Background(Background::Grey) => "Grey backdrop",
+            Action::Background(Background::Checker) => "Checkerboard backdrop",
+        }
+    }
+
     /// The icon to draw for a button — a couple of which depend on live state: the zoom toggle
     /// shows the mode a click switches *to*, and the all-channels button reflects alpha presence.
     fn icon(&self, a: Action) -> Icon {
@@ -369,6 +394,14 @@ impl Chrome {
             .position(|lb| x >= lb.rect.left && x < lb.rect.right && y >= lb.rect.top && y < lb.rect.bottom)
     }
 
+    /// The button rect (frame-client coords) and tooltip text for the button at `idx` — used to
+    /// position and fill the hover tooltip. `None` if the index is stale (e.g. a relayout shrank
+    /// the button set). Shown for disabled buttons too: a greyed control's label is still useful.
+    pub fn button_tooltip(&self, idx: usize, snap: &ViewSnapshot) -> Option<(RECT, &'static str)> {
+        let lb = self.buttons.get(idx)?;
+        Some((lb.rect, snap.tooltip(lb.action)))
+    }
+
     /// Paint the toolbar across the top of the frame client area (`width` px wide).
     pub fn paint_toolbar(&self, hdc: HDC, width: i32, snap: &ViewSnapshot) {
         let m = &self.metrics;
@@ -485,7 +518,7 @@ pub fn apply_dark_titlebar(hwnd: HWND, dark: bool) {
 
 // --- GDI helpers ------------------------------------------------------------
 
-fn create_ui_font(dpi: u32) -> HFONT {
+pub(crate) fn create_ui_font(dpi: u32) -> HFONT {
     // 9pt at the window's DPI; negative height = character height (excludes leading).
     let height = -(9 * dpi as i32 / 72);
     let face = wide("Segoe UI");
