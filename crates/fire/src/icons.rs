@@ -76,6 +76,12 @@ const MASTERS: [&[u8]; 19] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_open_with.a8")),
 ];
 
+/// Compile-time guard that [`Icon`] and [`MASTERS`] stay the same length: [`Icons::draw`] indexes
+/// `masks`/`MASTERS` by `icon as usize`, so a variant added without a corresponding master (or
+/// vice-versa) must fail the build rather than panic in a paint. `OpenWith` must stay the last
+/// `Icon` variant for this check to hold.
+const _: () = assert!(Icon::OpenWith as usize + 1 == MASTERS.len());
+
 /// Per-DPI icon renderer: the downsampled masks for the current physical icon size plus a scratch
 /// 32-bit top-down DIB (with its memory DC) that [`Self::draw`] fills with a tinted, premultiplied
 /// copy of one mask and `AlphaBlend`s onto the toolbar. Rebuilt on DPI change via [`Self::set_size`].

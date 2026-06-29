@@ -202,6 +202,9 @@ impl Drop for Tooltip {
 /// Measure `text` in `font` (px), using a screen DC for `hwnd`.
 unsafe fn measure(hwnd: HWND, font: HFONT, text: &str) -> (i32, i32) {
     let hdc = GetDC(hwnd);
+    if hdc.is_null() {
+        return (0, 0); // no DC → zero size; `show` clamps it and still pops a (tiny) bubble
+    }
     let prev = SelectObject(hdc, font);
     let w: Vec<u16> = text.encode_utf16().collect();
     let mut sz = SIZE { cx: 0, cy: 0 };

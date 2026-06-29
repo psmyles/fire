@@ -86,7 +86,12 @@ impl SingleInstance {
         // SAFETY: name is a valid null-terminated wide string; null attributes are fine.
         let handle = unsafe { CreateMutexW(ptr::null(), 1 /* initial owner */, name.as_ptr()) };
         if handle.is_null() {
-            // Couldn't create the mutex; proceed without the guarantee rather than refuse.
+            // Couldn't create the mutex; proceed without the guarantee rather than refuse, but
+            // surface why single-instance coordination silently degraded to multi-instance.
+            eprintln!(
+                "fire: CreateMutexW failed (err {}); running without the single-instance guarantee",
+                unsafe { GetLastError() }
+            );
             return Some(SingleInstance(ptr::null_mut()));
         }
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {

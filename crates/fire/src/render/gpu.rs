@@ -90,7 +90,7 @@ struct Params {
 }
 
 /// GPU render state for the view window: the D3D11 device/swapchain plus the same pan/zoom/fit
-/// + channel/exposure/tonemap state the CPU surface carried (so the window shell and chrome
+/// and channel/exposure/tonemap state the CPU surface carried (so the window shell and chrome
 /// drive it through an identical API).
 pub struct GpuSurface {
     hwnd: isize,
@@ -283,9 +283,14 @@ impl GpuSurface {
     }
 
     /// Adopt a decoded image: upload it as a GPU texture (hardware mip chain) and reset to fit +
-    /// neutral display state for the new file (#17).
-    pub fn set_image(&mut self, img: DecodedImage) {
+    /// neutral display state for the new file (#17). Returns the GPU error if the upload fails
+    /// (e.g. `E_OUTOFMEMORY` on a very large image) so the caller can report it instead of the
+    /// process aborting; on failure the prior display state is left untouched.
+    pub fn set_image(&mut self, img: DecodedImage) -> windows::core::Result<()> {
         let (w, h) = (img.width, img.height);
+        // Upload first: if the GPU rejects the texture we bail here, before mutating any state,
+        // so a failed adopt can't leave the surface half-updated.
+        self.upload_texture(&img)?;
         // Pick the viewport backdrop: once the user has chosen one this session it sticks across
         // every image; otherwise default to the image's nature — a checker for sources that carry
         // alpha (so transparency reads as transparency), solid black for opaque ones. `channels`
@@ -293,10 +298,10 @@ impl GpuSurface {
         self.background = self.background_override.unwrap_or(
             if matches!(img.channels, 2 | 4) { Background::Checker } else { Background::Black },
         );
-        self.upload_texture(&img);
         self.current_image = Some(img);
         self.display = DisplayState::default();
         self.view.fit_to_window((w, h), &self.viewport);
+        Ok(())
     }
 
     /// Adopt a hot-reloaded image *without* resetting the view: upload the new pixels and keep the
@@ -304,17 +309,21 @@ impl GpuSurface {
     /// the re-decode came back at the same dimensions (the "re-export same canvas" case), so the
     /// user's zoomed-in detail and display state survive the update. The pan is re-clamped
     /// defensively (a no-op while the dims are unchanged).
-    pub fn replace_image_keep_view(&mut self, img: DecodedImage) {
+    pub fn replace_image_keep_view(&mut self, img: DecodedImage) -> windows::core::Result<()> {
         let dims = (img.width, img.height);
-        self.upload_texture(&img);
+        self.upload_texture(&img)?;
         self.current_image = Some(img);
         if !self.view.fit {
             self.view.clamp_pan(dims, &self.viewport);
         }
+        Ok(())
     }
 
-    /// Upload `img` as a `DEFAULT` texture with a full mip chain generated on the GPU.
-    fn upload_texture(&mut self, img: &DecodedImage) {
+    /// Upload `img` as a `DEFAULT` texture with a full mip chain generated on the GPU. Returns the
+    /// GPU error rather than panicking if texture/SRV creation fails — this runs synchronously
+    /// from the wndproc (via `decode_done`), where a panic would unwind across the Win32 boundary
+    /// and abort the process.
+    fn upload_texture(&mut self, img: &DecodedImage) -> windows::core::Result<()> {
         let (format, bpp, linear_sample) = match img.format {
             // 8-bit sources are sRGB-encoded; the `*_SRGB` view decodes to linear on sample.
             PixelFormat::Rgba8Unorm => (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 4u32, 1i32),
@@ -341,9 +350,7 @@ impl GpuSurface {
 
         unsafe {
             let mut tex: Option<ID3D11Texture2D> = None;
-            self.device
-                .CreateTexture2D(&desc, None, Some(&mut tex))
-                .expect("CreateTexture2D");
+            self.device.CreateTexture2D(&desc, None, Some(&mut tex))?;
             let tex = tex.unwrap();
 
             // Level 0 only; the rest are generated.
@@ -357,15 +364,14 @@ impl GpuSurface {
             );
 
             let mut srv: Option<ID3D11ShaderResourceView> = None;
-            self.device
-                .CreateShaderResourceView(&tex, None, Some(&mut srv))
-                .expect("CreateShaderResourceView");
+            self.device.CreateShaderResourceView(&tex, None, Some(&mut srv))?;
             let srv = srv.unwrap();
             self.context.GenerateMips(&srv);
 
             self._tex = Some(tex);
             self.srv = Some(srv);
         }
+        Ok(())
     }
 
     /// Resize the view to a new client size (physical px): resize the swapchain buffers, drop
@@ -377,13 +383,17 @@ impl GpuSurface {
         self.viewport = Viewport::new(width, height);
         self.rtv = None;
         unsafe {
-            let _ = self.swapchain.ResizeBuffers(
+            if let Err(e) = self.swapchain.ResizeBuffers(
                 0,
                 width,
                 height,
                 DXGI_FORMAT_UNKNOWN,
                 DXGI_SWAP_CHAIN_FLAG(0),
-            );
+            ) {
+                // A failed resize leaves the backbuffer at its old size; log it (ensure_rtv will
+                // recreate the RTV from whatever the swapchain reports next paint).
+                eprintln!("fire: swapchain ResizeBuffers failed: {e}");
+            }
         }
         if let Some(dims) = self.image_dims() {
             if self.view.fit {
@@ -410,13 +420,21 @@ impl GpuSurface {
     }
 
     /// (Re)create the render-target view over the current backbuffer, as an `*_SRGB` view so the
-    /// shader's linear output is sRGB-encoded on write.
+    /// shader's linear output is sRGB-encoded on write. On failure (e.g. a device-removed / TDR
+    /// reset) it leaves `rtv` as `None` and logs; `render` then skips drawing this frame rather
+    /// than panicking inside the paint wndproc.
     fn ensure_rtv(&mut self) {
         if self.rtv.is_some() {
             return;
         }
         unsafe {
-            let back: ID3D11Texture2D = self.swapchain.GetBuffer(0).expect("swapchain GetBuffer");
+            let back: ID3D11Texture2D = match self.swapchain.GetBuffer(0) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("fire: swapchain GetBuffer failed: {e}");
+                    return;
+                }
+            };
             let desc = D3D11_RENDER_TARGET_VIEW_DESC {
                 Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
                 ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
@@ -425,9 +443,10 @@ impl GpuSurface {
                 },
             };
             let mut rtv: Option<ID3D11RenderTargetView> = None;
-            self.device
-                .CreateRenderTargetView(&back, Some(&desc), Some(&mut rtv))
-                .expect("CreateRenderTargetView");
+            if let Err(e) = self.device.CreateRenderTargetView(&back, Some(&desc), Some(&mut rtv)) {
+                eprintln!("fire: CreateRenderTargetView failed: {e}");
+                return;
+            }
             self.rtv = rtv;
         }
     }
@@ -506,7 +525,7 @@ impl GpuSurface {
             self.context.VSSetShader(&self.vs, None);
             self.context.PSSetShader(&self.ps, None);
             self.context.PSSetConstantBuffers(0, Some(&[Some(self.cbuffer.clone())]));
-            self.context.PSSetShaderResources(0, Some(&[self.srv.clone()]));
+            self.context.PSSetShaderResources(0, Some(std::slice::from_ref(&self.srv)));
             self.context
                 .PSSetSamplers(0, Some(&[Some(self.samp_aniso.clone()), Some(self.samp_point.clone())]));
             self.context.Draw(3, 0);

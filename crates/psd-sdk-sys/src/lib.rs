@@ -92,7 +92,15 @@ pub fn decode_psd(bytes: &[u8]) -> Result<PsdImage, PsdError> {
         }
 
         let (w, h) = (info.width, info.height);
-        let mut rgba = vec![0u8; w as usize * h as usize * 4];
+        // FFI = validation boundary: reject zero/degenerate dimensions and size the buffer with
+        // checked arithmetic, so a malformed header can never wrap to an undersized allocation
+        // that the C++ merged-image read then overruns.
+        let len = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|n| n.checked_mul(4))
+            .filter(|&n| n != 0)
+            .ok_or(PsdError::InfoFailed)?;
+        let mut rgba = vec![0u8; len];
         let rc = ffi::fire_psd_read_merged_rgba8(handle, rgba.as_mut_ptr(), rgba.len());
         match rc {
             0 => {}

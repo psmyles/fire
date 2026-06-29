@@ -62,9 +62,17 @@ pub fn decode_heif(bytes: &[u8]) -> Result<HeifImage, HeifError> {
             ffi::fire_heif_image_free(&mut out);
             return Err(HeifError(-100));
         }
+        // FFI = validation boundary: a success code must also come with non-zero dimensions.
+        if out.width == 0 || out.height == 0 {
+            ffi::fire_heif_image_free(&mut out);
+            return Err(HeifError(-101));
+        }
 
         let pixels = std::slice::from_raw_parts(out.pixels, out.pixels_len).to_vec();
-        let icc = if !out.icc.is_null() && out.icc_len > 0 {
+        // Cap the C-provided ICC length before trusting it to build a slice. Real profiles are
+        // far smaller; a garbage length just drops the profile rather than reading out of bounds.
+        const MAX_ICC_LEN: usize = 16 * 1024 * 1024;
+        let icc = if !out.icc.is_null() && out.icc_len > 0 && out.icc_len <= MAX_ICC_LEN {
             Some(std::slice::from_raw_parts(out.icc, out.icc_len).to_vec())
         } else {
             None

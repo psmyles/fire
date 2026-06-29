@@ -273,10 +273,18 @@ impl App {
                 // channel/exposure) so a re-export of the same canvas doesn't yank the user out
                 // of their zoomed-in detail; a reload that changed dimensions re-fits.
                 let same_dims = self.surface.current_image().map(|i| (i.width, i.height)) == Some((w, h));
-                if outcome.reload && same_dims {
-                    self.surface.replace_image_keep_view(img);
+                let upload = if outcome.reload && same_dims {
+                    self.surface.replace_image_keep_view(img)
                 } else {
-                    self.surface.set_image(img);
+                    self.surface.set_image(img)
+                };
+                // The image decoded fine but the GPU may still reject the upload (e.g.
+                // `E_OUTOFMEMORY` on a very large texture). Treat that like a decode failure
+                // rather than letting the panic abort the process.
+                if let Err(e) = upload {
+                    eprintln!("fire: GPU upload failed for {name}: {e}");
+                    self.fail_load(&name, format!("failed: GPU upload ({e})"));
+                    return;
                 }
                 set_title(self.frame, &format!("{}: {name}", crate::product::NAME));
                 self.surface.invalidate();
@@ -286,19 +294,24 @@ impl App {
                 eprintln!("fire: opened {name} ({w}x{h}, {fmt})");
             }
             Err(e) => {
-                self.file_label = name.clone();
-                self.meta = format!("failed: {e}");
-                set_title(self.frame, &format!("{}: {name} (failed)", crate::product::NAME));
-                // We no longer clear in `load` (to avoid the navigation flash), so drop the stale
-                // image here and repaint the backdrop — a failed file shouldn't keep showing the
-                // previously displayed one.
-                self.surface.clear_image();
-                self.surface.invalidate();
-                self.relayout();
-                self.invalidate_chrome();
                 eprintln!("fire: failed to open {name}: {e}");
+                self.fail_load(&name, format!("failed: {e}"));
             }
         }
+    }
+
+    /// Shared failure path for a load (failed decode *or* failed GPU upload): show `meta` in the
+    /// status bar, mark the title failed, and drop any stale image. We don't clear in `load` (to
+    /// avoid the navigation flash), so a broken file shouldn't keep showing the previously
+    /// displayed one — that's why this repaints the backdrop here.
+    fn fail_load(&mut self, name: &str, meta: String) {
+        self.file_label = name.to_string();
+        self.meta = meta;
+        set_title(self.frame, &format!("{}: {name} (failed)", crate::product::NAME));
+        self.surface.clear_image();
+        self.surface.invalidate();
+        self.relayout();
+        self.invalidate_chrome();
     }
 
     /// Perform a toolbar action, then repaint the image + chrome.
@@ -568,7 +581,9 @@ pub fn run(
 
         // The app icon embedded by build.rs (winresource id "1"); used for the frame title bar
         // and taskbar so the window shows the flame instead of the generic Win32 default. The
-        // integer resource id is passed as a pseudo-pointer, the MAKEINTRESOURCE convention.
+        // integer resource id is passed as a pseudo-pointer, the MAKEINTRESOURCE convention — not
+        // a real dangling pointer, so clippy's manual_dangling_ptr suggestion doesn't apply.
+        #[allow(clippy::manual_dangling_ptr)]
         let app_icon = LoadIconW(hinstance, 1 as *const u16);
 
         // Frame window class (owns chrome + message loop). WS_CLIPCHILDREN is set per-window.
@@ -735,8 +750,26 @@ pub fn run(
     }
 }
 
-/// Frame window proc: chrome paint, toolbar input, lifecycle, and the cross-thread wakeups.
+/// Frame window proc. A panic must never unwind across this `extern "system"` boundary into the
+/// Win32 dispatcher (that aborts the process), so the real handling lives in
+/// [`frame_wndproc_impl`] behind a `catch_unwind` firewall — the same panic-boundary posture the
+/// decode FFI uses (see [`crate::decode_pool`]). On a caught panic we log and defer to
+/// `DefWindowProc`, leaving the window alive.
 unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        frame_wndproc_impl(hwnd, msg, wparam, lparam)
+    })) {
+        Ok(lr) => lr,
+        Err(_) => {
+            eprintln!("fire: recovered from a panic in frame_wndproc (msg {msg:#06x})");
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
+/// Frame window handling: chrome paint, toolbar input, lifecycle, and the cross-thread wakeups.
+/// Wrapped by [`frame_wndproc`]'s panic firewall.
+unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let app_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
     if app_ptr.is_null() {
         if msg == WM_DESTROY {
@@ -919,8 +952,24 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
     }
 }
 
-/// Child view proc: D3D11 present + image navigation (LMB-drag pan, wheel + RMB-drag zoom, keys).
+/// Child view proc. Same panic firewall as [`frame_wndproc`]: the real handling is in
+/// [`view_wndproc_impl`], behind `catch_unwind`, so a panic in (e.g.) a paint can't unwind into
+/// the Win32 dispatcher and abort.
 unsafe extern "system" fn view_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        view_wndproc_impl(hwnd, msg, wparam, lparam)
+    })) {
+        Ok(lr) => lr,
+        Err(_) => {
+            eprintln!("fire: recovered from a panic in view_wndproc (msg {msg:#06x})");
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
+/// Child view handling: D3D11 present + image navigation (LMB-drag pan, wheel + RMB-drag zoom,
+/// keys). Wrapped by [`view_wndproc`]'s panic firewall.
+unsafe fn view_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let app_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
     if app_ptr.is_null() {
         return DefWindowProcW(hwnd, msg, wparam, lparam);

@@ -259,6 +259,8 @@ fn scan_jpeg_markers(b: &[u8]) -> Vec<(usize, usize)> {
     while i + 3 <= b.len() {
         if b[i] == 0xFF && b[i + 1] == 0xD8 && b[i + 2] == 0xFF {
             out.push((i, b.len() - i));
+            // DoS guard: stop after 256 candidates so a file full of stray `FF D8 FF` bytes
+            // can't build an unbounded list.
             if out.len() >= 256 {
                 break;
             }
@@ -298,7 +300,7 @@ fn collect_tiff(b: &[u8]) -> (Vec<(usize, usize)>, u16) {
     if let Some(off0) = rd_u32(b, 4, le) {
         stack.push(off0);
     }
-    let mut budget = 64u32; // cap total IFDs processed
+    let mut budget = 64u32; // DoS guard: cap total IFDs walked (real files have 1–3)
 
     while let Some(ifd_off) = stack.pop() {
         if budget == 0 {

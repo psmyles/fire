@@ -34,7 +34,7 @@ pub fn forward(path: Option<PathBuf>) -> std::io::Result<()> {
             }
         }
     }
-    write_message(&mut file, &req).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    write_message(&mut file, &req).map_err(std::io::Error::other)
 }
 
 fn connect_once() -> std::io::Result<File> {
