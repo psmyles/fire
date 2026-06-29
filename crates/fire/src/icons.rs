@@ -50,10 +50,11 @@ pub enum Icon {
     White,
     Checker,
     Outline,
+    OpenWith,
 }
 
 /// The embedded A8 masters, indexed by `Icon as usize`. Same order as the enum / `build.rs`.
-const MASTERS: [&[u8]; 18] = [
+const MASTERS: [&[u8]; 19] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_left.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_right.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_zoom_out.a8")),
@@ -72,6 +73,7 @@ const MASTERS: [&[u8]; 18] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_W.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_C.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_outline.a8")),
+    include_bytes!(concat!(env!("OUT_DIR"), "/icon_open_with.a8")),
 ];
 
 /// Per-DPI icon renderer: the downsampled masks for the current physical icon size plus a scratch

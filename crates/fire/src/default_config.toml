@@ -1,0 +1,56 @@
+# Fire configuration
+#
+# Read once at startup. Fire writes this commented template the first time it runs (only if the
+# file is missing) and never modifies it afterward — your edits are safe. Delete the file to
+# regenerate this template. Invalid TOML or unknown keys fall back to the built-in defaults, so a
+# typo can never stop Fire from launching.
+#
+# Location: %APPDATA%\fire\config.toml
+# Format:   TOML (https://toml.io)
+
+# ----------------------------------------------------------------------------------------------
+# instance-mode — how a newly launched Fire relates to one that is already open.
+#
+#   "new-window"      (default) Every image you open gets its own independent window. Nothing
+#                     stays resident in the background.
+#   "single-instance" Keep a single Fire window; opening another image reuses that window
+#                     (the picture swaps in) instead of spawning a new one.
+#
+# instance-mode = "new-window"
+
+# ----------------------------------------------------------------------------------------------
+# hot-reload — automatically re-decode the displayed image when its file changes on disk.
+#
+#   true   (default) Watch the open file and refresh the view when it is re-saved.
+#   false  Disable the file watch entirely.
+#
+# hot-reload = true
+
+# ----------------------------------------------------------------------------------------------
+# [[open-with]] — external applications offered by the "Open in…" button on the toolbar (the
+#                 rightmost button). Each [[open-with]] block adds one menu entry. With no entries
+#                 configured the button is disabled (greyed out).
+#
+# Fields:
+#   name   Required. The label shown in the menu (e.g. "Photoshop").
+#   path   Required. Full path to the program's .exe. Backslashes must be doubled in a normal
+#          TOML string ("C:\\Program Files\\..."), or use a single-quoted literal ('C:\...').
+#   args   Optional. The command-line arguments. The token {path} is replaced with the full path
+#          of the image currently open in Fire. If you omit args, Fire passes just the image path
+#          as the single argument (args = ["{path}"]).
+#
+# Examples (uncomment and edit the paths to match your machine):
+#
+# [[open-with]]
+# name = "Photoshop"
+# path = 'C:\Program Files\Adobe\Adobe Photoshop 2024\Photoshop.exe'
+# args = ["{path}"]
+#
+# [[open-with]]
+# name = "Paint.NET"
+# path = 'C:\Program Files\paint.net\paintdotnet.exe'
+#
+# [[open-with]]
+# name = "Show in folder"
+# path = 'C:\Windows\explorer.exe'
+# args = ["/select,", "{path}"]

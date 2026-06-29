@@ -50,17 +50,22 @@ fn main() {
 
     // Explorer passes the double-clicked file as the first argument.
     let path: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
+    // Drop a commented config.toml on first run (no-op if one already exists), so the settings are
+    // discoverable, then read it.
+    config::ensure_default_config();
     let cfg = Config::load();
     let hot_reload = cfg.hot_reload;
+    let instance_mode = cfg.instance_mode;
+    let open_with = cfg.open_with;
 
-    match cfg.instance_mode {
+    match instance_mode {
         InstanceMode::NewWindow => {
             // Plain app: our own window, no coordination of any kind.
-            win::run(path, false, hot_reload);
+            win::run(path, false, hot_reload, open_with);
         }
         InstanceMode::SingleInstance => match SingleInstance::acquire() {
             // We're the owner: open the window and serve the pipe for later launches.
-            Some(_guard) => win::run(path, true, hot_reload),
+            Some(_guard) => win::run(path, true, hot_reload, open_with),
             // Another window owns the pipe: hand it the path and exit.
             None => {
                 if let Err(e) = forward::forward(path) {

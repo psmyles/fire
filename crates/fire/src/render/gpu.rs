@@ -55,6 +55,11 @@ use crate::render::view::{Background, Channel, DisplayState, Tonemap, ViewState,
 /// drag down (dy > 0) zooms in, up zooms out.
 const ZOOM_DRAG_SENSITIVITY: f32 = 0.01;
 
+/// How far (surface px) the cursor may move during an RMB press before it counts as a zoom-drag
+/// rather than a right-*click*. Below this the gesture opens the context menu; the tiny zoom such a
+/// jiggle would apply (~exp(slop·sensitivity), a couple percent) is imperceptible.
+const ZOOM_DRAG_CLICK_SLOP: f32 = 5.0;
+
 /// Per-frame shader constants. Layout matches the HLSL `cbuffer` (16-byte float4 registers);
 /// keep the field order/padding in lockstep with the `Params` cbuffer in `render/shader.hlsl`.
 #[repr(C)]
@@ -141,6 +146,9 @@ pub struct GpuSurface {
     zoom_dragging: bool,
     zoom_anchor: (f32, f32),
     zoom_last_y: f32,
+    /// Whether the active RMB gesture has moved past [`ZOOM_DRAG_CLICK_SLOP`]; if not, the release
+    /// is treated as a right-click (opens the context menu) rather than the end of a zoom-drag.
+    zoom_dragged: bool,
 }
 
 impl GpuSurface {
@@ -184,6 +192,7 @@ impl GpuSurface {
             zoom_dragging: false,
             zoom_anchor: (0.0, 0.0),
             zoom_last_y: 0.0,
+            zoom_dragged: false,
         }
     }
 
@@ -517,6 +526,13 @@ impl GpuSurface {
                 self.refresh();
             }
         } else if self.zoom_dragging {
+            // Past the click slop this is a real zoom-drag, so the release won't open the menu.
+            if !self.zoom_dragged {
+                let (ax, ay) = (pos.0 - self.zoom_anchor.0, pos.1 - self.zoom_anchor.1);
+                if (ax * ax + ay * ay).sqrt() > ZOOM_DRAG_CLICK_SLOP {
+                    self.zoom_dragged = true;
+                }
+            }
             // Vertical drag = scrubby zoom about the fixed press anchor (down zooms in, up out).
             let dy = pos.1 - self.zoom_last_y;
             self.zoom_last_y = pos.1;
@@ -543,10 +559,15 @@ impl GpuSurface {
         self.zoom_dragging = true;
         self.zoom_anchor = self.cursor;
         self.zoom_last_y = self.cursor.1;
+        self.zoom_dragged = false;
     }
 
-    pub fn end_zoom_drag(&mut self) {
+    /// End an RMB gesture. Returns `true` if it was an actual zoom-drag (the cursor moved past
+    /// [`ZOOM_DRAG_CLICK_SLOP`]); `false` if it was effectively a right-click, so the caller can
+    /// open the context menu instead.
+    pub fn end_zoom_drag(&mut self) -> bool {
         self.zoom_dragging = false;
+        self.zoom_dragged
     }
 
     /// Whether an RMB zoom-drag is in progress (the shell repaints the zoom % while it is).

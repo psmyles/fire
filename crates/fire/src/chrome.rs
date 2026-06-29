@@ -19,6 +19,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
     DT_SINGLELINE, DT_VCENTER, HDC, HFONT, TRANSPARENT,
 };
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
 use crate::icons::{Icon, Icons};
@@ -45,6 +46,11 @@ pub enum Action {
     ToggleOutline,
     /// Choose the viewport backdrop (right-side group).
     Background(Background),
+    /// The far-right button: open the actions popup menu — file actions (show in folder, copy
+    /// file / path / name) plus any configured "Open in…" external apps. The menu itself is built
+    /// and tracked by the win shell (it needs the button's screen rect, and the chosen entry is
+    /// performed there directly — no per-entry `Action`).
+    OpenWithMenu,
 }
 
 /// A toolbar slot: the action it performs and a visual group (groups are separated by a thin
@@ -83,6 +89,9 @@ const RIGHT: &[Slot] = &[
     Slot { action: Action::Background(Background::White), group: 1 },
     Slot { action: Action::Background(Background::Grey), group: 1 },
     Slot { action: Action::Background(Background::Checker), group: 1 },
+    // Laid first (RIGHT is walked in reverse), so the "Open in…" button hugs the far-right corner;
+    // its own group gives it a divider from the backdrop controls.
+    Slot { action: Action::OpenWithMenu, group: 2 },
 ];
 
 /// A live read-only view of display state, built by the win shell each paint so the chrome
@@ -112,6 +121,9 @@ impl ViewSnapshot {
             Action::ZoomOut | Action::ZoomIn | Action::ZoomToggle => self.has_image,
             Action::Channel(_) | Action::Background(_) | Action::ToggleOutline => self.has_image,
             Action::ToggleTonemap | Action::ExpUp | Action::ExpDown => self.is_hdr,
+            // The actions menu (copy / show in folder / open in app) needs an image to act on; the
+            // file actions are always available, so a configured app list is no longer required.
+            Action::OpenWithMenu => self.has_image,
         }
     }
 
@@ -149,6 +161,7 @@ impl ViewSnapshot {
             Action::Background(Background::White) => "White backdrop",
             Action::Background(Background::Grey) => "Grey backdrop",
             Action::Background(Background::Checker) => "Checkerboard backdrop",
+            Action::OpenWithMenu => "Copy, show in folder, or open in app\u{2026}",
         }
     }
 
@@ -174,6 +187,7 @@ impl ViewSnapshot {
             Action::Background(Background::White) => Icon::White,
             Action::Background(Background::Grey) => Icon::G,
             Action::Background(Background::Checker) => Icon::Checker,
+            Action::OpenWithMenu => Icon::OpenWith,
         }
     }
 }
@@ -386,6 +400,12 @@ impl Chrome {
         snap.enabled(action).then_some(action)
     }
 
+    /// The rect (frame-client coords) of the laid button for `action`, if it's currently visible —
+    /// used to anchor the "Open in…" popup menu under its button.
+    pub fn button_rect_for(&self, action: Action) -> Option<RECT> {
+        self.buttons.iter().find(|b| b.action == action).map(|b| b.rect)
+    }
+
     /// The index (into `buttons`) of the button under a point, regardless of enabled state — for
     /// hover.
     pub fn hover_index(&self, x: i32, y: i32) -> Option<usize> {
@@ -513,6 +533,52 @@ pub fn apply_dark_titlebar(hwnd: HWND, dark: bool) {
             &on as *const i32 as *const c_void,
             4,
         );
+    }
+}
+
+/// Make Win32 popup menus (the toolbar actions menu / the view's right-click menu) follow the
+/// dark theme. Unlike the toolbar — which we GDI-paint precisely *because* common controls have no
+/// documented dark mode — a `TrackPopupMenu` menu is system-drawn (border, gutter, rounded corners
+/// and all), so owner-drawing only its item rects would still leave a light frame around them. The
+/// one thing that darkens the whole menu is the same undocumented `uxtheme.dll` ordinal path
+/// File Explorer / Terminal use: opt the process into the dark app mode (`SetPreferredAppMode`,
+/// ordinal 135), mark the owner window dark-allowed (`AllowDarkModeForWindow`, ordinal 133), then
+/// flush the cached menu theme (`FlushMenuThemes`, ordinal 136). Process-global and persistent, so
+/// callers invoke it on theme setup / change rather than per menu. Strictly best-effort: if any
+/// ordinal can't be resolved (older Windows) the menu just stays light, exactly as before.
+pub fn apply_dark_menus(hwnd: HWND, dark: bool) {
+    // uxtheme.dll private ordinals (stable since Win10 1809; SetPreferredAppMode since 1903).
+    const ALLOW_DARK_MODE_FOR_WINDOW: usize = 133;
+    const SET_PREFERRED_APP_MODE: usize = 135;
+    const FLUSH_MENU_THEMES: usize = 136;
+    // PreferredAppMode: Default = 0, AllowDark = 1, ForceDark = 2, ForceLight = 3.
+    const APP_MODE_FORCE_DARK: i32 = 2;
+    const APP_MODE_DEFAULT: i32 = 0;
+
+    // BOOL is plain i32 in windows-sys; spell it out to avoid an import that varies by version.
+    type AllowDarkModeForWindowFn = unsafe extern "system" fn(HWND, i32) -> i32;
+    type SetPreferredAppModeFn = unsafe extern "system" fn(i32) -> i32;
+    type FlushMenuThemesFn = unsafe extern "system" fn();
+
+    unsafe {
+        let lib = LoadLibraryW(wide("uxtheme.dll").as_ptr());
+        if lib.is_null() {
+            return;
+        }
+        // GetProcAddress by ordinal: the ordinal is passed as the pointer value (MAKEINTRESOURCE).
+        if let Some(p) = GetProcAddress(lib, ALLOW_DARK_MODE_FOR_WINDOW as *const u8) {
+            let f: AllowDarkModeForWindowFn = std::mem::transmute(p);
+            f(hwnd, dark as i32);
+        }
+        if let Some(p) = GetProcAddress(lib, SET_PREFERRED_APP_MODE as *const u8) {
+            let f: SetPreferredAppModeFn = std::mem::transmute(p);
+            f(if dark { APP_MODE_FORCE_DARK } else { APP_MODE_DEFAULT });
+        }
+        if let Some(p) = GetProcAddress(lib, FLUSH_MENU_THEMES as *const u8) {
+            let f: FlushMenuThemesFn = std::mem::transmute(p);
+            f();
+        }
+        // Deliberately no FreeLibrary: uxtheme is already loaded process-wide and stays resident.
     }
 }
 

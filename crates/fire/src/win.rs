@@ -11,32 +11,39 @@
 //! `GWLP_USERDATA`; only the frame owns the box.
 
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
 use fire_decode::{DecodeOptions, DecodedImage};
 use fire_ipc::OpenRequest;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, EndPaint, InvalidateRect, PAINTSTRUCT,
 };
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
-use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
+use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, DROPFILES, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    DispatchMessageW, GetClientRect,
     GetMessageW, GetWindowLongPtrW, GetWindowPlacement, KillTimer, LoadCursorW, LoadIconW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPlacement,
-    SetWindowPos, SetWindowTextW, ShowWindow,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW, MSG,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
-    SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, WINDOWPLACEMENT,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW,
+    MF_SEPARATOR, MF_STRING,
+    MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
+    SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
+    TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPLACEMENT,
     WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
     WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
@@ -47,6 +54,21 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// stable message id, so we define it directly. Paired with `TrackMouseEvent`/`TME_LEAVE` to
 /// clear the toolbar hover when the cursor exits the frame.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// Clipboard format ids (stable Win32 values) not surfaced by windows-sys under the enabled
+/// features, so we define them directly — see `copy_text_to_clipboard` / `copy_file_to_clipboard`.
+const CF_UNICODETEXT: u32 = 13;
+const CF_HDROP: u32 = 15;
+
+/// `TrackPopupMenu(TPM_RETURNCMD)` command ids for the toolbar actions popup (see
+/// [`App::actions_menu`]). The fixed file actions take low ids; configured "Open in…" apps take
+/// `OPEN_WITH_ID_BASE + index`, so the two ranges never collide. A 0 return means "dismissed", so
+/// ids start at 1.
+const ID_SHOW_IN_EXPLORER: usize = 1;
+const ID_COPY_FILE: usize = 2;
+const ID_COPY_PATH: usize = 3;
+const ID_COPY_NAME: usize = 4;
+const OPEN_WITH_ID_BASE: usize = 100;
 
 use crate::chrome::{self, Action, Chrome, ViewSnapshot};
 use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool};
@@ -120,6 +142,9 @@ struct App {
     /// File-change watcher for hot-reload; `None` when disabled in config. Dropped with the
     /// `App`, which stops the watch thread.
     watcher: Option<FileWatcher>,
+    /// User-configured external apps for the toolbar's "Open in…" menu (from `config.toml`). Empty
+    /// ⇒ the menu button is disabled.
+    open_with: Vec<crate::config::OpenWithApp>,
 }
 
 impl App {
@@ -299,8 +324,87 @@ impl App {
             Action::ExpDown => self.surface.adjust_exposure(-EXPOSURE_STEP),
             Action::ToggleOutline => self.surface.toggle_outline(),
             Action::Background(bg) => self.surface.set_background(bg),
+            // The actions menu is driven directly from the click handler (it needs the button
+            // rect); it never reaches the shared dispatch. No-op, and skip the repaint below.
+            Action::OpenWithMenu => return,
         }
         self.invalidate_chrome();
+    }
+
+    /// Open the toolbar's actions popup under its button: the fixed file actions (show in folder,
+    /// copy file / path / name) followed by any configured "Open in…" external apps, then perform
+    /// the chosen entry on the current image. A no-op if there's no image (the button is disabled
+    /// then anyway). All on the UI thread — `TrackPopupMenu` runs its own modal pump but touches no
+    /// worker/renderer.
+    fn actions_menu(&mut self) {
+        let Some(rect) = self.chrome.button_rect_for(Action::OpenWithMenu) else { return };
+        // Anchor the menu at the button's bottom-left, in screen coords.
+        let mut pt = POINT { x: rect.left, y: rect.bottom };
+        unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
+        self.show_actions_menu(pt);
+    }
+
+    /// Open the same actions popup at a point in the *view* window's client area — the right-click
+    /// menu over the image (`x`/`y` are the WM_RBUTTONUP coordinates).
+    fn actions_menu_at_view(&mut self, x: i32, y: i32) {
+        let mut pt = POINT { x, y };
+        unsafe { ClientToScreen(self.view as HWND, &mut pt) };
+        self.show_actions_menu(pt);
+    }
+
+    /// Build the actions popup at a screen point, track it, and perform the chosen entry on the
+    /// current image. Shared by [`Self::actions_menu`] (toolbar button) and [`Self::actions_menu_at_view`]
+    /// (right-click). A no-op if there's no image.
+    fn show_actions_menu(&mut self, pt: POINT) {
+        let Some(image) = self.current_path.clone() else { return };
+        unsafe {
+            // The documented idiom so the menu dismisses correctly on an outside click.
+            SetForegroundWindow(self.frame as HWND);
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return;
+            }
+            // Fixed file actions first (always available once an image is open).
+            let show = wide("Show in Explorer");
+            AppendMenuW(menu, MF_STRING, ID_SHOW_IN_EXPLORER, show.as_ptr());
+            let copy_file = wide("Copy File");
+            AppendMenuW(menu, MF_STRING, ID_COPY_FILE, copy_file.as_ptr());
+            let copy_path = wide("Copy Path");
+            AppendMenuW(menu, MF_STRING, ID_COPY_PATH, copy_path.as_ptr());
+            let copy_name = wide("Copy File Name");
+            AppendMenuW(menu, MF_STRING, ID_COPY_NAME, copy_name.as_ptr());
+            // Then the configured external apps, after a divider. Ids start at OPEN_WITH_ID_BASE so
+            // they never collide with the fixed actions above.
+            if !self.open_with.is_empty() {
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                for (i, app) in self.open_with.iter().enumerate() {
+                    let label = wide(&app.name);
+                    AppendMenuW(menu, MF_STRING, OPEN_WITH_ID_BASE + i, label.as_ptr());
+                }
+            }
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON,
+                pt.x,
+                pt.y,
+                0,
+                self.frame as HWND,
+                ptr::null(),
+            );
+            DestroyMenu(menu);
+            match cmd as usize {
+                ID_SHOW_IN_EXPLORER => show_in_explorer(&image),
+                ID_COPY_FILE => copy_file_to_clipboard(self.frame as HWND, &image),
+                ID_COPY_PATH => copy_text_to_clipboard(self.frame as HWND, &image.to_string_lossy()),
+                ID_COPY_NAME => copy_text_to_clipboard(self.frame as HWND, &file_name(&image)),
+                id if id >= OPEN_WITH_ID_BASE => {
+                    if let Some(app) = self.open_with.get(id - OPEN_WITH_ID_BASE) {
+                        launch_external(app, &image);
+                    }
+                }
+                _ => {} // 0 = dismissed, or an unknown id
+            }
+        }
     }
 
     /// Map a virtual-key press to a view command (layout-independent VK codes).
@@ -453,7 +557,12 @@ impl App {
 /// Create the frame + child view, wire up the decode pool, optionally serve the pipe
 /// (single-instance mode), open `initial` if given, and run the message loop until the window
 /// is closed (the process then exits — non-resident).
-pub fn run(initial: Option<PathBuf>, serve_pipe: bool, hot_reload: bool) {
+pub fn run(
+    initial: Option<PathBuf>,
+    serve_pipe: bool,
+    hot_reload: bool,
+    open_with: Vec<crate::config::OpenWithApp>,
+) {
     unsafe {
         let hinstance = GetModuleHandleW(ptr::null());
 
@@ -523,6 +632,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, hot_reload: bool) {
             return;
         }
         chrome::apply_dark_titlebar(frame, dark);
+        chrome::apply_dark_menus(frame, dark);
 
         let dpi = GetDpiForWindow(frame).max(96);
         let ch = Chrome::new(dpi, dark);
@@ -580,6 +690,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, hot_reload: bool) {
             folder: None,
             current_path: None,
             watcher,
+            open_with,
         });
         app.relayout();
 
@@ -660,7 +771,12 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             app.cancel_tooltip();
             let snap = app.snapshot();
             if let Some(action) = app.chrome.hit_test(x, y, &snap) {
-                app.do_action(action);
+                // The actions button opens a popup menu, which needs the button's screen rect, so
+                // it's handled here rather than in the rect-less `do_action`.
+                match action {
+                    Action::OpenWithMenu => app.actions_menu(),
+                    _ => app.do_action(action),
+                }
             }
             0
         }
@@ -783,6 +899,7 @@ unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 app.tooltip.set_dark(dark);
                 app.surface.set_clear(app.chrome.view_clear_packed());
                 chrome::apply_dark_titlebar(hwnd, dark);
+                chrome::apply_dark_menus(hwnd, dark);
                 InvalidateRect(hwnd, ptr::null(), 0);
                 app.surface.invalidate();
             }
@@ -834,8 +951,15 @@ unsafe extern "system" fn view_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             0
         }
         WM_LBUTTONDOWN => {
+            let x = (lparam & 0xffff) as u16 as i16 as f32;
+            let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
             SetCapture(hwnd);
             SetFocus(hwnd); // take keyboard focus so nav keys reach this window
+            // Sync the pan origin to the press point so the first move's delta is measured from
+            // here, not a stale position. Matters after the context menu (or any gap where the
+            // view saw no WM_MOUSEMOVE): without this, the cursor is still at the right-click
+            // point and the first drag lurches the image toward the click. (RMB does the same.)
+            app.surface.on_cursor_moved((x, y));
             app.surface.begin_drag();
             0
         }
@@ -855,7 +979,13 @@ unsafe extern "system" fn view_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_RBUTTONUP => {
             ReleaseCapture();
-            app.surface.end_zoom_drag();
+            // A right *click* (the gesture never moved past the zoom-drag slop) opens the actions
+            // menu at the cursor; an actual zoom-drag just ends.
+            if !app.surface.end_zoom_drag() {
+                let x = (lparam & 0xffff) as u16 as i16 as i32;
+                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
+                app.actions_menu_at_view(x, y);
+            }
             0
         }
         WM_MOUSEWHEEL => {
@@ -908,6 +1038,92 @@ unsafe fn drop_first_path(hdrop: HDROP) -> Option<PathBuf> {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Launch a configured external app on `image` (the "Open in…" menu action). Best-effort: the child
+/// runs detached (we never `wait`), and any failure is logged, never fatal — a bad `path` must not
+/// take down the viewer. Each arg is one argv element (no shell), so there's no quoting/injection.
+fn launch_external(app: &crate::config::OpenWithApp, image: &Path) {
+    match std::process::Command::new(&app.path).args(app.resolved_args(image)).spawn() {
+        Ok(_child) => {}
+        Err(e) => eprintln!("fire: failed to launch {} ({}): {e}", app.name, app.path),
+    }
+}
+
+/// Open Explorer with `image` selected ("Show in Explorer"). Best-effort: a failure is logged, never
+/// fatal. `raw_arg` writes the canonical `/select,"<path>"` form verbatim — Explorer's switch parser
+/// wants exactly that (a normal quoted arg would wrap the whole `/select,…` token and break it).
+fn show_in_explorer(image: &Path) {
+    use std::os::windows::process::CommandExt;
+    let arg = format!("/select,\"{}\"", image.display());
+    if let Err(e) = std::process::Command::new("explorer.exe").raw_arg(arg).spawn() {
+        eprintln!("fire: failed to show {} in Explorer: {e}", image.display());
+    }
+}
+
+/// Put UTF-16 `text` on the clipboard as `CF_UNICODETEXT` (the "Copy Path" / "Copy File Name"
+/// actions). Best-effort: on any failure we free our own allocation — clipboard ownership of the
+/// `HGLOBAL` only transfers once `SetClipboardData` succeeds — and bail without disturbing the
+/// existing clipboard contents beyond the `EmptyClipboard` we already issued.
+fn copy_text_to_clipboard(owner: HWND, text: &str) {
+    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = utf16.len() * std::mem::size_of::<u16>();
+    unsafe {
+        if OpenClipboard(owner) == 0 {
+            return;
+        }
+        EmptyClipboard();
+        let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if !h.is_null() {
+            let dst = GlobalLock(h) as *mut u16;
+            if !dst.is_null() {
+                ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
+                GlobalUnlock(h);
+                if SetClipboardData(CF_UNICODETEXT, h).is_null() {
+                    GlobalFree(h); // ownership didn't transfer; release it
+                }
+            } else {
+                GlobalFree(h);
+            }
+        }
+        CloseClipboard();
+    }
+}
+
+/// Put `image` on the clipboard as `CF_HDROP` (the "Copy File" action), so it can be pasted into
+/// Explorer or another app as the file itself. Layout per the `DROPFILES` contract: the header,
+/// then the wide path (with its NUL), then one extra NUL ending the (single-entry) list. Same
+/// best-effort ownership rule as [`copy_text_to_clipboard`].
+fn copy_file_to_clipboard(owner: HWND, image: &Path) {
+    let path: Vec<u16> = image.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let header = std::mem::size_of::<DROPFILES>();
+    // header + the path (incl. its NUL) + one extra NUL ending the double-NUL-terminated list.
+    let bytes = header + (path.len() + 1) * std::mem::size_of::<u16>();
+    unsafe {
+        if OpenClipboard(owner) == 0 {
+            return;
+        }
+        EmptyClipboard();
+        let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if !h.is_null() {
+            let base = GlobalLock(h) as *mut u8;
+            if !base.is_null() {
+                ptr::write_bytes(base, 0, bytes); // zero the header fields + the trailing NUL
+                let df = base as *mut DROPFILES;
+                (*df).pFiles = header as u32; // byte offset from the header to the path list
+                (*df).fWide = 1; // paths are UTF-16
+                let dst = base.add(header) as *mut u16;
+                ptr::copy_nonoverlapping(path.as_ptr(), dst, path.len());
+                GlobalUnlock(h);
+                if SetClipboardData(CF_HDROP, h).is_null() {
+                    GlobalFree(h);
+                }
+            } else {
+                GlobalFree(h);
+            }
+        }
+        CloseClipboard();
+    }
 }
 
 fn file_name(path: &std::path::Path) -> String {

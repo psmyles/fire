@@ -36,6 +36,8 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",            # read the dark-mode preference (AppsUseLightTheme)
+    "Win32_System_DataExchange",        # clipboard (Copy File / Path / Name from the actions menu)
+    "Win32_System_Memory",              # GlobalAlloc/Lock for the clipboard payloads
     "Win32_Graphics_Gdi",               # GDI painting of the toolbar/status chrome
     "Win32_Graphics_Dwm",               # dark title bar (DwmSetWindowAttribute)
     "Win32_UI_WindowsAndMessaging",
