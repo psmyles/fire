@@ -48,7 +48,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows_sys::Win32::Foundation::HWND as SysHwnd;
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 
-use crate::render::view::{Channel, DisplayState, Tonemap, ViewState, Viewport};
+use crate::render::view::{Background, Channel, DisplayState, Tonemap, ViewState, Viewport};
 
 /// Scrubby-zoom sensitivity: an RMB vertical drag multiplies zoom by `exp(dy * this)` per pixel
 /// (~2.7× per 100 px). Exponential-in-pixels so the gesture feels uniform across the zoom range;
@@ -73,8 +73,10 @@ struct Params {
     is_hdr: i32,
     has_image: i32,
     linear_sample: i32,
-    _pad0: i32,
-    _pad1: i32,
+    /// Viewport backdrop mode (0=black 1=white 2=grey 3=checker); see [`Background`].
+    background: i32,
+    /// 1 → draw a 1px outline around the image boundary.
+    outline: i32,
     _pad2: i32,
     clear_r: f32,
     clear_g: f32,
@@ -107,9 +109,22 @@ pub struct GpuSurface {
     /// sRGB-decode (16-bit unorm).
     linear_sample: i32,
 
-    /// Letterbox / no-image backdrop, packed sRGB and its linear form (for the `*_SRGB` RTV).
+    /// No-image backdrop (empty window), packed sRGB and its linear form (for the `*_SRGB` RTV).
+    /// Once an image is loaded the [`Background`] mode owns the viewport instead.
     clear: u32,
     clear_lin: [f32; 4],
+
+    /// Viewport backdrop while an image is shown; defaults per-image (opaque → black, alpha →
+    /// checker) and is overridden by the toolbar's background buttons.
+    background: Background,
+    /// The user's explicit backdrop pick, if any. Once set via the toolbar it sticks for the rest
+    /// of the session (every later image adopts it instead of its per-type default); `None` until
+    /// the user chooses, so each image still gets its natural default before the first override.
+    background_override: Option<Background>,
+
+    /// Draw a 1px outline around the image boundary (toolbar toggle). On by default for every
+    /// image type; the pick persists across navigation, like the backdrop.
+    outline: bool,
 
     /// Monotonic per-window decode generation; a `DecodeDone` older than this is stale.
     generation: u64,
@@ -156,6 +171,9 @@ impl GpuSurface {
             linear_sample: 1,
             clear: 0,
             clear_lin: [0.0, 0.0, 0.0, 1.0],
+            background: Background::Black,
+            background_override: None,
+            outline: true,
             generation: 0,
             current_image: None,
             viewport: Viewport::new(width, height),
@@ -216,6 +234,34 @@ impl GpuSurface {
         self.current_image.as_ref().is_some_and(|i| i.format.is_hdr())
     }
 
+    /// Whether the current image carries a real alpha channel (gray+A or RGBA source) — drives the
+    /// RGB↔RGBA toolbar icon and the default backdrop.
+    pub fn has_alpha(&self) -> bool {
+        self.current_image.as_ref().is_some_and(|i| matches!(i.channels, 2 | 4))
+    }
+
+    pub fn background(&self) -> Background {
+        self.background
+    }
+
+    /// Set the viewport backdrop (toolbar override) and repaint. Records the pick so it persists
+    /// across image navigation for the rest of the session (see [`Self::background_override`]).
+    pub fn set_background(&mut self, bg: Background) {
+        self.background = bg;
+        self.background_override = Some(bg);
+        self.refresh();
+    }
+
+    pub fn outline(&self) -> bool {
+        self.outline
+    }
+
+    /// Toggle the image-boundary outline and repaint.
+    pub fn toggle_outline(&mut self) {
+        self.outline = !self.outline;
+        self.refresh();
+    }
+
     fn image_dims(&self) -> Option<(u32, u32)> {
         self.current_image.as_ref().map(|i| (i.width, i.height))
     }
@@ -231,6 +277,13 @@ impl GpuSurface {
     /// neutral display state for the new file (#17).
     pub fn set_image(&mut self, img: DecodedImage) {
         let (w, h) = (img.width, img.height);
+        // Pick the viewport backdrop: once the user has chosen one this session it sticks across
+        // every image; otherwise default to the image's nature — a checker for sources that carry
+        // alpha (so transparency reads as transparency), solid black for opaque ones. `channels`
+        // 2 (gray+A) / 4 (RGBA) mark a real alpha channel.
+        self.background = self.background_override.unwrap_or(
+            if matches!(img.channels, 2 | 4) { Background::Checker } else { Background::Black },
+        );
         self.upload_texture(&img);
         self.current_image = Some(img);
         self.display = DisplayState::default();
@@ -406,8 +459,8 @@ impl GpuSurface {
             is_hdr: is_hdr as i32,
             has_image,
             linear_sample: self.linear_sample,
-            _pad0: 0,
-            _pad1: 0,
+            background: background_code(self.background),
+            outline: self.outline as i32,
             _pad2: 0,
             clear_r: self.clear_lin[0],
             clear_g: self.clear_lin[1],
@@ -561,6 +614,16 @@ fn channel_code(ch: Channel) -> i32 {
         Channel::G => 2,
         Channel::B => 3,
         Channel::A => 4,
+    }
+}
+
+/// Backdrop mode → shader code (must match the `background` branch in `shader.hlsl`).
+fn background_code(bg: Background) -> i32 {
+    match bg {
+        Background::Black => 0,
+        Background::White => 1,
+        Background::Grey => 2,
+        Background::Checker => 3,
     }
 }
 

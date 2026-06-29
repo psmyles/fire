@@ -16,46 +16,73 @@ use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND, RECT, SIZE};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetTextExtentPoint32W,
-    SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, TRANSPARENT,
+    SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, HDC, HFONT, TRANSPARENT,
 };
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
-use crate::render::view::{Channel, Tonemap};
+use crate::icons::{Icon, Icons};
+use crate::render::view::{Background, Channel, Tonemap};
 
 /// A toolbar command, produced by hit-testing a click and consumed by the win shell.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    /// Previous / next sibling image in the folder (←/→).
+    Prev,
+    Next,
+    ZoomOut,
+    ZoomIn,
+    /// Single button toggling fit-to-window ↔ 1:1 (the icon shows what a click will do).
+    ZoomToggle,
     /// Set/toggle channel isolation (RGB resets; R/G/B/A solo-toggle).
     Channel(Channel),
-    Fit,
-    OneToOne,
     /// Reinhard ↔ ACES (HDR only).
     ToggleTonemap,
     /// Exposure +/- one step (HDR only).
     ExpUp,
     ExpDown,
+    /// Toggle the 1px image-boundary outline (right-side group).
+    ToggleOutline,
+    /// Choose the viewport backdrop (right-side group).
+    Background(Background),
 }
 
-/// A toolbar button: a label, the action it performs, and a visual group (groups are
-/// separated by a thin divider).
-struct Button {
+/// A toolbar slot: the action it performs and a visual group (groups are separated by a thin
+/// divider). Slots are laid out into [`LaidButton`]s by [`Chrome::relayout`].
+struct Slot {
     action: Action,
-    label: &'static str,
     group: u8,
 }
 
-const BUTTONS: &[Button] = &[
-    Button { action: Action::Channel(Channel::Rgb), label: "RGB", group: 0 },
-    Button { action: Action::Channel(Channel::R), label: "R", group: 0 },
-    Button { action: Action::Channel(Channel::G), label: "G", group: 0 },
-    Button { action: Action::Channel(Channel::B), label: "B", group: 0 },
-    Button { action: Action::Channel(Channel::A), label: "A", group: 0 },
-    Button { action: Action::Fit, label: "Fit", group: 1 },
-    Button { action: Action::OneToOne, label: "1:1", group: 1 },
-    Button { action: Action::ToggleTonemap, label: "ACES", group: 2 },
-    Button { action: Action::ExpDown, label: "EV −", group: 2 },
-    Button { action: Action::ExpUp, label: "EV +", group: 2 },
+/// The HDR group (tonemap + exposure). Laid out only for float sources; hidden otherwise so the
+/// toolbar doesn't carry inert controls for LDR images.
+const HDR_GROUP: u8 = 3;
+
+/// Left-docked controls, in order: navigate · zoom · channel isolation · HDR (float only).
+const LEFT: &[Slot] = &[
+    Slot { action: Action::Prev, group: 0 },
+    Slot { action: Action::Next, group: 0 },
+    Slot { action: Action::ZoomOut, group: 1 },
+    Slot { action: Action::ZoomToggle, group: 1 },
+    Slot { action: Action::ZoomIn, group: 1 },
+    Slot { action: Action::Channel(Channel::Rgb), group: 2 },
+    Slot { action: Action::Channel(Channel::R), group: 2 },
+    Slot { action: Action::Channel(Channel::G), group: 2 },
+    Slot { action: Action::Channel(Channel::B), group: 2 },
+    Slot { action: Action::Channel(Channel::A), group: 2 },
+    Slot { action: Action::ToggleTonemap, group: HDR_GROUP },
+    Slot { action: Action::ExpUp, group: HDR_GROUP },
+    Slot { action: Action::ExpDown, group: HDR_GROUP },
+];
+
+/// Right-docked controls: the outline toggle, then the viewport backdrop group. Drawn far-right,
+/// in this visual (left→right) order; a divider separates the groups like the left side.
+const RIGHT: &[Slot] = &[
+    Slot { action: Action::ToggleOutline, group: 0 },
+    Slot { action: Action::Background(Background::Black), group: 1 },
+    Slot { action: Action::Background(Background::White), group: 1 },
+    Slot { action: Action::Background(Background::Grey), group: 1 },
+    Slot { action: Action::Background(Background::Checker), group: 1 },
 ];
 
 /// A live read-only view of display state, built by the win shell each paint so the chrome
@@ -63,32 +90,65 @@ const BUTTONS: &[Button] = &[
 pub struct ViewSnapshot {
     pub channel: Channel,
     pub fit: bool,
-    pub zoom_pct: u32,
     pub tonemap: Tonemap,
     pub is_hdr: bool,
     pub has_image: bool,
+    /// Source carries a real alpha channel (drives the RGB↔RGBA icon).
+    pub has_alpha: bool,
+    pub background: Background,
+    /// Image-boundary outline is on (drives the toggle button's highlight).
+    pub outline: bool,
+    /// A folder cursor with more than one image exists (enables ←/→).
+    pub can_navigate: bool,
     pub status_left: String,
     pub status_right: String,
 }
 
 impl ViewSnapshot {
-    /// Whether a button is interactive: channel/fit/1:1 need an image; the HDR controls need
-    /// a float source.
+    /// Whether a button is interactive in the current state (others are drawn dimmed).
     fn enabled(&self, a: Action) -> bool {
         match a {
-            Action::Channel(_) | Action::Fit | Action::OneToOne => self.has_image,
+            Action::Prev | Action::Next => self.can_navigate,
+            Action::ZoomOut | Action::ZoomIn | Action::ZoomToggle => self.has_image,
+            Action::Channel(_) | Action::Background(_) | Action::ToggleOutline => self.has_image,
             Action::ToggleTonemap | Action::ExpUp | Action::ExpDown => self.is_hdr,
         }
     }
 
-    /// Whether a toggle button is in its "on" state (drawn highlighted).
+    /// Whether a toggle button is in its "on" state (drawn highlighted). Momentary buttons
+    /// (navigation, zoom steps, the fit/1:1 toggle, exposure) never latch.
     fn active(&self, a: Action) -> bool {
         match a {
             Action::Channel(c) => self.channel == c,
-            Action::Fit => self.fit,
-            Action::OneToOne => !self.fit && self.zoom_pct == 100,
             Action::ToggleTonemap => self.tonemap == Tonemap::Aces,
-            Action::ExpUp | Action::ExpDown => false,
+            Action::Background(b) => self.background == b,
+            Action::ToggleOutline => self.outline,
+            _ => false,
+        }
+    }
+
+    /// The icon to draw for a button — a couple of which depend on live state: the zoom toggle
+    /// shows the mode a click switches *to*, and the all-channels button reflects alpha presence.
+    fn icon(&self, a: Action) -> Icon {
+        match a {
+            Action::Prev => Icon::Left,
+            Action::Next => Icon::Right,
+            Action::ZoomOut => Icon::ZoomOut,
+            Action::ZoomIn => Icon::ZoomIn,
+            Action::ZoomToggle => if self.fit { Icon::OneToOne } else { Icon::Fit },
+            Action::Channel(Channel::Rgb) => if self.has_alpha { Icon::Rgba } else { Icon::Rgb },
+            Action::Channel(Channel::R) => Icon::R,
+            Action::Channel(Channel::G) => Icon::G,
+            Action::Channel(Channel::B) => Icon::B,
+            Action::Channel(Channel::A) => Icon::A,
+            Action::ToggleTonemap => Icon::Aces,
+            Action::ExpUp => Icon::EvUp,
+            Action::ExpDown => Icon::EvDown,
+            Action::ToggleOutline => Icon::Outline,
+            Action::Background(Background::Black) => Icon::B,
+            Action::Background(Background::White) => Icon::White,
+            Action::Background(Background::Grey) => Icon::G,
+            Action::Background(Background::Checker) => Icon::Checker,
         }
     }
 }
@@ -151,14 +211,15 @@ impl Palette {
     }
 }
 
-/// DPI-scaled chrome metrics (logical values are 96-dpi pixels). Owns the UI font.
+/// DPI-scaled chrome metrics (logical values are 96-dpi pixels). Owns the UI font (status bar).
 pub struct Metrics {
     pub dpi: u32,
     pub toolbar_h: i32,
     pub status_h: i32,
-    btn_h: i32,
-    btn_pad_x: i32,
-    btn_min_w: i32,
+    /// Square button edge.
+    btn: i32,
+    /// Icon edge (centered in the button); also the icon-mask render size.
+    icon: i32,
     gap: i32,
     sep: i32,
     margin: i32,
@@ -172,52 +233,59 @@ impl Metrics {
             dpi,
             toolbar_h: s(36),
             status_h: s(24),
-            btn_h: s(26),
-            btn_pad_x: s(10),
-            btn_min_w: s(26),
-            gap: s(3),
-            sep: s(12),
+            btn: s(28),
+            icon: s(20),
+            gap: s(4),
+            sep: s(14),
             margin: s(8),
             font: create_ui_font(dpi),
         }
     }
 }
 
-/// A laid-out toolbar button (rect in frame-client coords + index into [`BUTTONS`]).
+/// A laid-out toolbar button (rect in frame-client coords + the action it fires).
 struct LaidButton {
     rect: RECT,
-    idx: usize,
+    action: Action,
 }
 
-/// The frame's chrome: metrics, palette, the laid-out toolbar, and the hovered button.
+/// The frame's chrome: metrics, palette, the per-DPI icon renderer, the laid-out toolbar, and
+/// the hovered button.
 pub struct Chrome {
     pub metrics: Metrics,
     pub dark: bool,
     palette: Palette,
+    icons: Icons,
     buttons: Vec<LaidButton>,
     seps: Vec<i32>,
+    /// Index into `buttons` of the hovered button.
     pub hover: Option<usize>,
 }
 
 impl Chrome {
     pub fn new(dpi: u32, dark: bool) -> Self {
+        let metrics = Metrics::new(dpi);
+        let icons = Icons::new(metrics.icon);
         Chrome {
-            metrics: Metrics::new(dpi),
+            metrics,
             dark,
             palette: Palette::for_mode(dark),
+            icons,
             buttons: Vec::new(),
             seps: Vec::new(),
             hover: None,
         }
     }
 
-    /// Rebuild metrics + font for a new DPI (after a `WM_DPICHANGED`). No-op if unchanged.
+    /// Rebuild metrics + font + icon masks for a new DPI (after a `WM_DPICHANGED`). No-op if
+    /// unchanged.
     pub fn set_dpi(&mut self, dpi: u32) {
         if dpi == self.metrics.dpi {
             return;
         }
         unsafe { DeleteObject(self.metrics.font) };
         self.metrics = Metrics::new(dpi);
+        self.icons.set_size(self.metrics.icon);
     }
 
     /// Switch palettes when the system theme changes.
@@ -231,46 +299,74 @@ impl Chrome {
         self.palette.view_clear_packed()
     }
 
-    /// Recompute button rects for the current font (call on size/DPI change). Needs an HDC to
-    /// measure text; the caller provides one with our font selectable.
-    pub fn relayout(&mut self, hdc: HDC) {
+    /// Recompute button rects for the current metrics + visible button set (call on size/DPI
+    /// change, and whenever HDR-ness changes so the float-only group appears/disappears). `width`
+    /// is the frame client width, used to right-dock the background group. Clears the hover, which
+    /// a relayout can invalidate.
+    pub fn relayout(&mut self, width: i32, snap: &ViewSnapshot) {
         self.buttons.clear();
         self.seps.clear();
+        self.hover = None;
         let m = &self.metrics;
-        let prev = unsafe { SelectObject(hdc, m.font) };
-        let btn_y = (m.toolbar_h - m.btn_h) / 2;
+        let btn_y = (m.toolbar_h - m.btn) / 2;
+
+        // Left group: pack left→right, a divider between visual groups. The HDR group is laid out
+        // only for float sources.
         let mut x = m.margin;
         let mut prev_group: Option<u8> = None;
-        for (i, b) in BUTTONS.iter().enumerate() {
-            if prev_group.is_some_and(|g| g != b.group) {
+        for slot in LEFT {
+            if slot.group == HDR_GROUP && !snap.is_hdr {
+                continue;
+            }
+            // The alpha-isolation button only makes sense for a source that has an alpha channel.
+            if slot.action == Action::Channel(Channel::A) && !snap.has_alpha {
+                continue;
+            }
+            if prev_group.is_some_and(|g| g != slot.group) {
                 self.seps.push(x + m.sep / 2);
                 x += m.sep;
             }
-            prev_group = Some(b.group);
-            let tw = text_width(hdc, b.label);
-            let bw = (tw + 2 * m.btn_pad_x).max(m.btn_min_w);
+            prev_group = Some(slot.group);
             self.buttons.push(LaidButton {
-                rect: RECT { left: x, top: btn_y, right: x + bw, bottom: btn_y + m.btn_h },
-                idx: i,
+                rect: RECT { left: x, top: btn_y, right: x + m.btn, bottom: btn_y + m.btn },
+                action: slot.action,
             });
-            x += bw + m.gap;
+            x += m.btn + m.gap;
         }
-        unsafe { SelectObject(hdc, prev) };
+
+        // Right group: pack right→left from the far edge so the backdrop controls hug the corner.
+        // Dividers go between visual groups, mirroring the left side (here the gap is opened to
+        // the *left* of each new group as we walk leftward).
+        let mut rx = width - m.margin;
+        let mut prev_group: Option<u8> = None;
+        for slot in RIGHT.iter().rev() {
+            if prev_group.is_some_and(|g| g != slot.group) {
+                rx -= m.sep;
+                self.seps.push(rx + m.sep / 2);
+            }
+            prev_group = Some(slot.group);
+            let left = rx - m.btn;
+            self.buttons.push(LaidButton {
+                rect: RECT { left, top: btn_y, right: rx, bottom: btn_y + m.btn },
+                action: slot.action,
+            });
+            rx = left - m.gap;
+        }
     }
 
     /// Map a point (frame-client coords) to the button action under it, if any and enabled.
     pub fn hit_test(&self, x: i32, y: i32, snap: &ViewSnapshot) -> Option<Action> {
         let idx = self.hover_index(x, y)?;
-        let action = BUTTONS[idx].action;
+        let action = self.buttons[idx].action;
         snap.enabled(action).then_some(action)
     }
 
-    /// The index of the button under a point (regardless of enabled state) — for hover.
+    /// The index (into `buttons`) of the button under a point, regardless of enabled state — for
+    /// hover.
     pub fn hover_index(&self, x: i32, y: i32) -> Option<usize> {
         self.buttons
             .iter()
-            .find(|lb| x >= lb.rect.left && x < lb.rect.right && y >= lb.rect.top && y < lb.rect.bottom)
-            .map(|lb| lb.idx)
+            .position(|lb| x >= lb.rect.left && x < lb.rect.right && y >= lb.rect.top && y < lb.rect.bottom)
     }
 
     /// Paint the toolbar across the top of the frame client area (`width` px wide).
@@ -279,25 +375,23 @@ impl Chrome {
         let p = &self.palette;
         fill(hdc, &RECT { left: 0, top: 0, right: width, bottom: m.toolbar_h }, p.toolbar_bg);
 
-        let prev = unsafe { SelectObject(hdc, m.font) };
-        unsafe { SetBkMode(hdc, TRANSPARENT as i32) };
-
         for &sx in &self.seps {
             let r = RECT {
                 left: sx,
-                top: m.toolbar_h / 2 - m.btn_h / 3,
+                top: m.toolbar_h / 2 - m.btn / 3,
                 right: sx + 1,
-                bottom: m.toolbar_h / 2 + m.btn_h / 3,
+                bottom: m.toolbar_h / 2 + m.btn / 3,
             };
             fill(hdc, &r, p.separator);
         }
 
-        for lb in &self.buttons {
-            let action = BUTTONS[lb.idx].action;
+        for (i, lb) in self.buttons.iter().enumerate() {
+            let action = lb.action;
             let enabled = snap.enabled(action);
             let active = enabled && snap.active(action);
-            let hovered = enabled && self.hover == Some(lb.idx);
-            let mut r = lb.rect;
+            let hovered = enabled && self.hover == Some(i);
+            let r = lb.rect;
+            // The icon tint mirrors the old text color: active (on accent), hover, normal, dimmed.
             let color = if active {
                 fill(hdc, &r, p.btn_active);
                 p.btn_active_text
@@ -309,12 +403,12 @@ impl Chrome {
             } else {
                 p.text_dim
             };
-            unsafe { SetTextColor(hdc, color) };
-            draw_text(hdc, BUTTONS[lb.idx].label, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            let cx = (r.left + r.right) / 2;
+            let cy = (r.top + r.bottom) / 2;
+            self.icons.draw(hdc, snap.icon(action), cx, cy, color);
         }
 
         fill(hdc, &RECT { left: 0, top: m.toolbar_h - 1, right: width, bottom: m.toolbar_h }, p.border);
-        unsafe { SelectObject(hdc, prev) };
     }
 
     /// Paint the status bar across the bottom of the frame client area.

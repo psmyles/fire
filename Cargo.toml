@@ -63,6 +63,10 @@ bindgen = "0.71"
 # Embeds the Fire .ico + version/product metadata into fire.exe (Explorer file
 # icon, taskbar fallback, file-properties "Product name").
 winresource = "0.1"
+# Build-time only: fire's build.rs rasterizes the toolbar SVGs (assets/icons/) to A8
+# coverage masks embedded in the exe. resvg re-exports usvg + tiny-skia, so this one
+# dep covers parse + render. Not linked into the binary (build script only).
+resvg = "0.45"
 
 [profile.release]
 opt-level = 3

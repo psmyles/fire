@@ -29,8 +29,60 @@ fn main() {
     }
     let product = read_product();
     compile_shaders();
+    rasterize_icons();
     embed_resources(&product);
     export_env(&product);
+}
+
+/// Master rasterization size (px) for each toolbar icon. The icon module embeds these square A8
+/// coverage masks and downsamples them to the exact physical icon size per DPI at runtime, so a
+/// single high-res master gives crisp icons at any scale. Keep in sync with `icons::MASTER`.
+const ICON_MASTER: u32 = 64;
+
+/// The toolbar SVG icons (in `../../assets/icons/`), by file stem. Each is rasterized to an
+/// `<stem>.a8` file in `OUT_DIR` (a row-major `ICON_MASTER`²-byte coverage mask) that the icon
+/// module embeds via `include_bytes!`. The list is the source of truth for the `icons::Icon` enum;
+/// a missing SVG is a build error (the metadata is mandatory, like the shaders).
+const ICON_STEMS: &[&str] = &[
+    "icon_left", "icon_right", "icon_zoom_out", "icon_zoom_in", "icon_fit", "icon_1_1", "icon_RGB",
+    "icon_rgba", "icon_R", "icon_G", "icon_B", "icon_A", "icon_aces", "icon_ev+", "icon_ev-",
+    "icon_W", "icon_C", "icon_outline",
+];
+
+/// Rasterize each toolbar SVG to a square A8 coverage mask in `OUT_DIR`. The SVGs are single-color
+/// (white) on transparent, so the rendered alpha channel *is* the coverage the chrome tints per
+/// button state. Done at build time (resvg is a build-dep only) so no SVG rasterizer ships in the
+/// exe and a malformed icon is a build error, not a launch panic — the same posture as the shaders.
+fn rasterize_icons() {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let icons = Path::new(&manifest).join("../../assets/icons");
+    println!("cargo:rerun-if-changed={}", icons.display());
+
+    let opt = resvg::usvg::Options::default();
+    for stem in ICON_STEMS {
+        let svg = icons.join(format!("{stem}.svg"));
+        println!("cargo:rerun-if-changed={}", svg.display());
+        let data = std::fs::read(&svg)
+            .unwrap_or_else(|e| panic!("failed to read icon {}: {e}", svg.display()));
+        let tree = resvg::usvg::Tree::from_data(&data, &opt)
+            .unwrap_or_else(|e| panic!("{} is not valid SVG: {e}", svg.display()));
+
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(ICON_MASTER, ICON_MASTER)
+            .expect("allocate icon pixmap");
+        let size = tree.size();
+        let transform = resvg::tiny_skia::Transform::from_scale(
+            ICON_MASTER as f32 / size.width(),
+            ICON_MASTER as f32 / size.height(),
+        );
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+        // Keep only the alpha (coverage) byte of each RGBA texel — the mask the chrome tints.
+        let alpha: Vec<u8> = pixmap.data().chunks_exact(4).map(|px| px[3]).collect();
+        let out = Path::new(&out_dir).join(format!("{stem}.a8"));
+        std::fs::write(&out, &alpha)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", out.display()));
+    }
 }
 
 /// Parse `../../product.json` (repo root) into [`Product`]. Panics with a clear message on a

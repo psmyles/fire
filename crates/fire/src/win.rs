@@ -19,9 +19,7 @@ use fire_decode::{DecodeOptions, DecodedImage};
 use fire_ipc::OpenRequest;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetDC, InvalidateRect, ReleaseDC, PAINTSTRUCT,
-};
+use windows_sys::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -142,6 +140,8 @@ impl App {
             foreground::raise(self.frame);
         }
         self.surface.invalidate();
+        // No image yet → the HDR group (if it was showing) must drop out of the layout now.
+        self.relayout();
         self.invalidate_chrome();
 
         self.begin_decode(path, false)
@@ -226,7 +226,8 @@ impl App {
             Ok(img) => {
                 let (w, h, fmt) = (img.width, img.height, img.source_format);
                 self.file_label = name.clone();
-                self.meta = format_meta(&img);
+                let file_size = std::fs::metadata(&outcome.path).map(|m| m.len()).ok();
+                self.meta = format_meta(&img, file_size);
                 // Keep the window at its current (remembered) size; never resize it to the
                 // image. A fresh open fits the image to the current viewport, so every open
                 // lands in fit-to-window mode regardless of the image's pixel dimensions. A
@@ -241,6 +242,8 @@ impl App {
                 }
                 set_title(self.frame, &format!("{}: {name}", crate::product::NAME));
                 self.surface.invalidate();
+                // A float source brings in the HDR group; an LDR one drops it — relayout either way.
+                self.relayout();
                 self.invalidate_chrome();
                 eprintln!("fire: opened {name} ({w}x{h}, {fmt})");
             }
@@ -248,6 +251,7 @@ impl App {
                 self.file_label = name.clone();
                 self.meta = format!("failed: {e}");
                 set_title(self.frame, &format!("{}: {name} (failed)", crate::product::NAME));
+                self.relayout();
                 self.invalidate_chrome();
                 eprintln!("fire: failed to open {name}: {e}");
             }
@@ -257,13 +261,26 @@ impl App {
     /// Perform a toolbar action, then repaint the image + chrome.
     fn do_action(&mut self, action: Action) {
         match action {
+            // Navigation runs its own load + repaint (and relayout), so return without the shared
+            // invalidate below — like the ←/→ keys.
+            Action::Prev => return self.navigate(-1),
+            Action::Next => return self.navigate(1),
+            Action::ZoomOut => self.surface.zoom_centered(1.0 / ZOOM_STEP),
+            Action::ZoomIn => self.surface.zoom_centered(ZOOM_STEP),
+            Action::ZoomToggle => {
+                if self.surface.is_fit() {
+                    self.surface.one_to_one();
+                } else {
+                    self.surface.fit();
+                }
+            }
             Action::Channel(Channel::Rgb) => self.surface.set_channel(Channel::Rgb),
             Action::Channel(c) => self.surface.toggle_channel(c),
-            Action::Fit => self.surface.fit(),
-            Action::OneToOne => self.surface.one_to_one(),
             Action::ToggleTonemap => self.surface.toggle_tonemap(),
             Action::ExpUp => self.surface.adjust_exposure(EXPOSURE_STEP),
             Action::ExpDown => self.surface.adjust_exposure(-EXPOSURE_STEP),
+            Action::ToggleOutline => self.surface.toggle_outline(),
+            Action::Background(bg) => self.surface.set_background(bg),
         }
         self.invalidate_chrome();
     }
@@ -332,10 +349,13 @@ impl App {
         ViewSnapshot {
             channel: s.channel(),
             fit: s.is_fit(),
-            zoom_pct,
             tonemap: s.tonemap(),
             is_hdr,
             has_image,
+            has_alpha: s.has_alpha(),
+            background: s.background(),
+            outline: s.outline(),
+            can_navigate: self.folder.as_ref().is_some_and(|f| f.len() > 1),
             status_left,
             status_right,
         }
@@ -365,13 +385,12 @@ impl App {
         }
     }
 
-    /// Recompute the toolbar layout for the current DPI/size (needs a measuring HDC).
+    /// Recompute the toolbar layout for the current DPI/size and visible button set (the HDR group
+    /// shows only for float sources, so this also re-runs when an image is adopted/cleared).
     fn relayout(&mut self) {
-        unsafe {
-            let hdc = GetDC(self.frame as HWND);
-            self.chrome.relayout(hdc);
-            ReleaseDC(self.frame as HWND, hdc);
-        }
+        let (w, _) = self.client();
+        let snap = self.snapshot();
+        self.chrome.relayout(w, &snap);
     }
 
     /// Invalidate the toolbar + status strips (the chrome) without disturbing the view child.
@@ -831,8 +850,8 @@ fn file_name(path: &std::path::Path) -> String {
     path.file_name().and_then(|s| s.to_str()).unwrap_or("image").to_string()
 }
 
-/// Status-bar metadata tail: "PNG   2048×1024   8-bit RGBA   ICC".
-fn format_meta(img: &DecodedImage) -> String {
+/// Status-bar metadata tail: "PNG   2048×1024   8-bit RGBA   1.4 MB   ICC".
+fn format_meta(img: &DecodedImage, file_size: Option<u64>) -> String {
     let ch = match img.channels {
         1 => "Gray",
         2 => "Gray+A",
@@ -841,6 +860,9 @@ fn format_meta(img: &DecodedImage) -> String {
         _ => "·",
     };
     let mut s = format!("{}   {}×{}   {}-bit {}", img.source_format, img.width, img.height, img.bit_depth, ch);
+    if let Some(bytes) = file_size {
+        s.push_str(&format!("   {}", human_size(bytes)));
+    }
     if img.icc.is_some() {
         s.push_str("   ICC");
     }
@@ -848,6 +870,19 @@ fn format_meta(img: &DecodedImage) -> String {
         s.push_str(&format!("   (from {ow}×{oh})"));
     }
     s
+}
+
+/// Format a byte count as a compact size string (B / KB / MB / GB, binary units).
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    match bytes {
+        b if b >= GB => format!("{:.1} GB", b as f64 / GB as f64),
+        b if b >= MB => format!("{:.1} MB", b as f64 / MB as f64),
+        b if b >= KB => format!("{:.0} KB", b as f64 / KB as f64),
+        b => format!("{b} B"),
+    }
 }
 
 fn set_title(hwnd: isize, title: &str) {

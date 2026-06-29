@@ -10,6 +10,11 @@
 pub const MIN_ZOOM: f32 = 0.02;
 pub const MAX_ZOOM: f32 = 64.0;
 
+/// Letterbox gutter (physical px per side) reserved by fit-to-window. Fitting shrinks the
+/// image to the surface *minus this inset on every edge*, guaranteeing room for the 1px
+/// screen-space image outline (drawn just outside the boundary) on the constraining axis too.
+pub const FIT_GUTTER: f32 = 1.0;
+
 /// The drawable image surface — the child view window's client area, in physical px. The
 /// frame paints the toolbar/status chrome in separate windows, so the surface is exactly
 /// the image region; there are no chrome insets to carry.
@@ -45,6 +50,19 @@ pub enum Channel {
 pub enum Tonemap {
     Reinhard,
     Aces,
+}
+
+/// Viewport backdrop: fills the letterbox around the image and shows through transparent pixels.
+/// The default tracks the image (opaque → [`Background::Black`], has-alpha → [`Background::Checker`]);
+/// the toolbar's right-side group overrides it. Maps to the `background` branch in the shader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Background {
+    Black,
+    White,
+    /// Neutral 40% grey (sRGB).
+    Grey,
+    /// Photoshop-style light/dark checkerboard (the transparency indicator).
+    Checker,
 }
 
 /// Non-geometric display state, reset to neutral for each new file (#17).
@@ -84,7 +102,9 @@ impl ViewState {
     /// image is shown at native resolution (a texture-viewer convention) rather than
     /// upscaled into a blur; zoom in explicitly to go past 100%.
     pub fn fit_to_window(&mut self, image: (u32, u32), vp: &Viewport) {
-        let (uw, uh) = (vp.width, vp.height);
+        // Fit into the surface minus a 1px gutter on every side so the outside outline always
+        // has room; still cap at 1:1 (a small image already sits inside the surface with gutter).
+        let (uw, uh) = ((vp.width - 2.0 * FIT_GUTTER).max(1.0), (vp.height - 2.0 * FIT_GUTTER).max(1.0));
         let (iw, ih) = (image.0.max(1) as f32, image.1.max(1) as f32);
         let z = (uw / iw).min(uh / ih).min(1.0);
         self.zoom = z.clamp(MIN_ZOOM, MAX_ZOOM);
@@ -188,11 +208,12 @@ mod tests {
     #[test]
     fn fit_shrinks_large_image_and_caps_small_at_one_to_one() {
         let v = vp();
-        // Large image: limited by the tighter axis. 1000/4000 = 0.25 (width) is smaller
-        // than 800/2000 = 0.4 (height), so width constrains the fit.
+        // Large image: limited by the tighter axis, fitting into the surface minus a 1px
+        // gutter per side. 998/4000 = 0.2495 (width) is smaller than 798/2000 = 0.399
+        // (height), so width constrains the fit.
         let mut large = ViewState::default();
         large.fit_to_window((4000, 2000), &v);
-        assert!((large.zoom - 0.25).abs() < 1e-6, "zoom = {}", large.zoom);
+        assert!((large.zoom - 0.2495).abs() < 1e-6, "zoom = {}", large.zoom);
         assert_eq!(large.pan, (0.0, 0.0));
         assert!(large.fit);
         // Small image: capped at 1:1, never upscaled.

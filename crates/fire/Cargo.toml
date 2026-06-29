@@ -63,3 +63,6 @@ winresource.workspace = true
 # build.rs reads the canonical product metadata from ../../product.json so a single edit there
 # flows into the exe's version resource and the FIRE_* compile-time strings the app displays.
 serde_json.workspace = true
+# build.rs rasterizes the toolbar SVGs (../../assets/icons/) to A8 coverage masks (one master
+# per icon, embedded via include_bytes!); the icon module downsamples them per-DPI at runtime.
+resvg.workspace = true
