@@ -477,6 +477,7 @@ mod tests {
             channels: 4,
             icc: None,
             source_format: "test",
+            alpha_opaque: false,
             downscaled_from: None,
         }
     }

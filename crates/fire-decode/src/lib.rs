@@ -72,8 +72,18 @@ pub struct DecodedImage {
     pub format: PixelFormat,
     /// Bits per channel of the *source* (for the status bar), independent of `format`.
     pub bit_depth: u8,
-    /// Channel count of the source (1=gray, 3=RGB, 4=RGBA, ...).
+    /// The source's true channel count (1=gray, 2=gray+A, 3=RGB, 4=RGBA), for the status bar and
+    /// the RGB↔RGBA toolbar icon. Reported faithfully even when an alpha channel is fully opaque —
+    /// a 32-bit PNG screenshot still reads "RGBA" and keeps an inspectable alpha channel; whether
+    /// that alpha actually carries transparency is a separate signal ([`alpha_opaque`](Self::alpha_opaque)).
     pub channels: u8,
+    /// Whether a declared alpha channel (`channels` 2 or 4) is entirely opaque — every sample
+    /// fully opaque, so there is no transparency to composite. Set by [`decode`] from a scan of the
+    /// final (post-ICC, post-downscale) buffer; the viewer uses it to skip the default checker
+    /// backdrop for, e.g., a screenshot whose alpha is uniformly `0xff`, while still reporting the
+    /// true format and letting the user isolate the (all-white) alpha channel. `false` whenever
+    /// there is no alpha channel.
+    pub alpha_opaque: bool,
     /// Embedded ICC profile bytes, if the backend surfaced one.
     pub icc: Option<Vec<u8>>,
     /// Human-readable source format name for the status bar (e.g. "PNG", "OpenEXR").
@@ -213,7 +223,37 @@ pub fn decode(
     // Fit within the caller's max dimension (RAM guard).
     downscale::to_fit(&mut img, opts.max_dim);
 
+    // Flag a declared-but-fully-opaque alpha channel. The container format (`channels`) is left
+    // truthful — a 32-bit PNG screenshot still reports RGBA and keeps an inspectable alpha — but
+    // the viewer reads this to avoid defaulting to the checker backdrop when there is no actual
+    // transparency to reveal. Scanned on the final (post-ICC, post-downscale) buffer, i.e. exactly
+    // what is displayed; the scan short-circuits on the first transparent sample.
+    img.alpha_opaque = matches!(img.channels, 2 | 4) && alpha_is_opaque(&img);
+
     Ok(img)
+}
+
+/// Whether the normalized RGBA buffer is fully opaque (every alpha sample at its max). A cheap
+/// linear scan over just the alpha lane that short-circuits on the first transparent sample;
+/// run once per decode off the UI thread (see [`decode`]).
+fn alpha_is_opaque(img: &DecodedImage) -> bool {
+    let px = &img.pixels;
+    match img.format {
+        // 8-bit: 4 bytes/px, alpha is byte 3; opaque == 0xff.
+        PixelFormat::Rgba8Unorm => px.chunks_exact(4).all(|p| p[3] == 0xff),
+        // 16-bit unorm (native-endian u16): 8 bytes/px, alpha is bytes 6..8; opaque == 0xffff.
+        PixelFormat::Rgba16Unorm => px.chunks_exact(8).all(|p| p[6] == 0xff && p[7] == 0xff),
+        // 16-bit half-float: opaque == 1.0 == 0x3c00. No decode path emits this today, but keep
+        // the lane handling exhaustive over PixelFormat.
+        PixelFormat::Rgba16Float => {
+            px.chunks_exact(8).all(|p| u16::from_ne_bytes([p[6], p[7]]) == 0x3c00)
+        }
+        // 32-bit float (linear/HDR): 16 bytes/px, alpha is the 4th f32. Opaque == 1.0; values
+        // above 1.0 count as opaque, NaN does not (keeping the alpha channel is the safe default).
+        PixelFormat::Rgba32Float => {
+            px.chunks_exact(16).all(|p| f32::from_ne_bytes([p[12], p[13], p[14], p[15]]) >= 1.0)
+        }
+    }
 }
 
 /// Convenience wrapper: read a file and decode it (used by the decode worker).
@@ -240,6 +280,7 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         channels: psd.channels.min(255) as u8,
         icc: psd.icc,
         source_format: "PSD",
+        alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
     })
 }
@@ -288,6 +329,7 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         channels: 4,
         icc: None,
         source_format: "OpenEXR",
+        alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
     })
 }
@@ -320,6 +362,7 @@ fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, Decode
         channels: if img.has_alpha { 4 } else { 3 },
         icc: img.icc,
         source_format: label,
+        alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
     })
 }
@@ -418,6 +461,7 @@ fn decode_zune(
         channels: src_channels,
         icc,
         source_format: zune_format_name(fmt),
+        alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
     })
 }
@@ -498,6 +542,7 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         channels: src_channels,
         icc,
         source_format: format.map(format_name).unwrap_or("image"),
+        alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
     })
 }
@@ -615,6 +660,7 @@ mod icc {
                 channels: 4,
                 icc: None,
                 source_format: "test",
+                alpha_opaque: false,
                 downscaled_from: None,
             }
         }
@@ -720,6 +766,46 @@ mod tests {
             out.pixels,
             vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 128, 10, 20, 30, 40]
         );
+    }
+
+    /// A 32-bit RGBA PNG whose alpha is uniformly opaque (e.g. a Windows screenshot) still reports
+    /// its true RGBA channel count — the status bar and alpha-channel inspection stay intact — but
+    /// is flagged `alpha_opaque` so the viewer doesn't default to the checker backdrop. A single
+    /// transparent sample clears the flag. Regression: opaque RGBA screenshots showed transparency.
+    #[test]
+    fn opaque_rgba_png_flags_alpha_opaque_but_keeps_channels() {
+        let mut src = image::RgbaImage::new(2, 1);
+        src.put_pixel(0, 0, image::Rgba([200, 30, 40, 255]));
+        src.put_pixel(1, 0, image::Rgba([10, 220, 60, 255]));
+        let bytes = encode(&image::DynamicImage::ImageRgba8(src), image::ImageFormat::Png);
+
+        let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.channels, 4, "an all-opaque RGBA PNG still reports its true RGBA format");
+        assert!(out.alpha_opaque, "all-opaque alpha => no transparency to composite");
+        assert_eq!(out.format, PixelFormat::Rgba8Unorm);
+        assert_eq!(&out.pixels[0..4], &[200, 30, 40, 255]);
+
+        // A single transparent pixel makes it genuinely transparent: flag clears.
+        let mut src = image::RgbaImage::new(2, 1);
+        src.put_pixel(0, 0, image::Rgba([200, 30, 40, 255]));
+        src.put_pixel(1, 0, image::Rgba([10, 220, 60, 254]));
+        let bytes = encode(&image::DynamicImage::ImageRgba8(src), image::ImageFormat::Png);
+        let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.channels, 4);
+        assert!(!out.alpha_opaque, "a single non-opaque sample is real transparency");
+    }
+
+    /// The opaque-alpha flag also covers 16-bit RGBA (alpha at full `0xffff`).
+    #[test]
+    fn opaque_rgba16_png_flags_alpha_opaque() {
+        let mut src = image::ImageBuffer::<image::Rgba<u16>, _>::new(1, 1);
+        src.put_pixel(0, 0, image::Rgba([0xFFFF, 0x8000, 0x0001, 0xFFFF]));
+        let bytes = encode(&image::DynamicImage::ImageRgba16(src), image::ImageFormat::Png);
+
+        let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.format, PixelFormat::Rgba16Unorm);
+        assert_eq!(out.channels, 4, "an all-opaque 16-bit RGBA PNG still reports RGBA");
+        assert!(out.alpha_opaque, "all-opaque 16-bit alpha => flagged");
     }
 
     /// A grayscale PNG decodes to Luma then expands to RGBA: gray replicated, opaque alpha.

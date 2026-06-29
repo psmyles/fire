@@ -243,8 +243,11 @@ impl GpuSurface {
         self.current_image.as_ref().is_some_and(|i| i.format.is_hdr())
     }
 
-    /// Whether the current image carries a real alpha channel (gray+A or RGBA source) — drives the
-    /// RGB↔RGBA toolbar icon and the default backdrop.
+    /// Whether the current image carries an alpha channel (gray+A or RGBA source) — drives the
+    /// RGB↔RGBA toolbar icon and keeps the alpha-channel isolation control available. This is true
+    /// even when the alpha is entirely opaque, so the user can always inspect it; whether that
+    /// alpha actually holds transparency (and thus defaults to the checker backdrop) is a separate
+    /// signal handled in [`Self::set_image`] via `DecodedImage::alpha_opaque`.
     pub fn has_alpha(&self) -> bool {
         self.current_image.as_ref().is_some_and(|i| matches!(i.channels, 2 | 4))
     }
@@ -292,12 +295,15 @@ impl GpuSurface {
         // so a failed adopt can't leave the surface half-updated.
         self.upload_texture(&img)?;
         // Pick the viewport backdrop: once the user has chosen one this session it sticks across
-        // every image; otherwise default to the image's nature — a checker for sources that carry
-        // alpha (so transparency reads as transparency), solid black for opaque ones. `channels`
-        // 2 (gray+A) / 4 (RGBA) mark a real alpha channel.
-        self.background = self.background_override.unwrap_or(
-            if matches!(img.channels, 2 | 4) { Background::Checker } else { Background::Black },
-        );
+        // every image; otherwise default to the image's nature — a checker only when there is real
+        // transparency to read as transparency, solid black otherwise. An RGBA/gray+A source whose
+        // alpha is entirely opaque (e.g. a 32-bit screenshot) carries no transparency, so it gets
+        // black like an opaque image — but it keeps its true format and an inspectable alpha
+        // channel (`alpha_opaque`); the user can still isolate the all-white alpha.
+        let has_transparency = matches!(img.channels, 2 | 4) && !img.alpha_opaque;
+        self.background = self
+            .background_override
+            .unwrap_or(if has_transparency { Background::Checker } else { Background::Black });
         self.current_image = Some(img);
         self.display = DisplayState::default();
         self.view.fit_to_window((w, h), &self.viewport);
