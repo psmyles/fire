@@ -39,8 +39,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetMessageW, GetWindowLongPtrW, GetWindowPlacement, KillTimer, LoadCursorW, LoadIconW,
     PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
     SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW,
-    MF_SEPARATOR, MF_STRING,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW,
+    MF_POPUP, MF_SEPARATOR, MF_STRING,
     MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPLACEMENT,
@@ -61,9 +61,10 @@ const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
 
 /// `TrackPopupMenu(TPM_RETURNCMD)` command ids for the toolbar actions popup (see
-/// [`App::actions_menu`]). The fixed file actions take low ids; configured "Open in…" apps take
-/// `OPEN_WITH_ID_BASE + index`, so the two ranges never collide. A 0 return means "dismissed", so
-/// ids start at 1.
+/// [`App::actions_menu`]). The fixed file actions take low ids; configured "Open in…" *leaf* apps
+/// take `OPEN_WITH_ID_BASE + index`, where `index` is the leaf's position in a pre-order walk of the
+/// (possibly nested) menu tree — submenus carry no id of their own. The two ranges never collide. A
+/// 0 return means "dismissed", so ids start at 1.
 const ID_SHOW_IN_EXPLORER: usize = 1;
 const ID_COPY_FILE: usize = 2;
 const ID_COPY_PATH: usize = 3;
@@ -142,9 +143,9 @@ struct App {
     /// File-change watcher for hot-reload; `None` when disabled in config. Dropped with the
     /// `App`, which stops the watch thread.
     watcher: Option<FileWatcher>,
-    /// User-configured external apps for the toolbar's "Open in…" menu (from `config.toml`). Empty
-    /// ⇒ the menu button is disabled.
-    open_with: Vec<crate::config::OpenWithApp>,
+    /// User-configured entries for the toolbar's "Open in…" menu (from `config.toml`) — external
+    /// apps and/or nested submenus. Empty ⇒ the menu button is disabled.
+    open_with: Vec<crate::config::MenuEntry>,
 }
 
 impl App {
@@ -386,14 +387,14 @@ impl App {
             AppendMenuW(menu, MF_STRING, ID_COPY_PATH, copy_path.as_ptr());
             let copy_name = wide("Copy File Name");
             AppendMenuW(menu, MF_STRING, ID_COPY_NAME, copy_name.as_ptr());
-            // Then the configured external apps, after a divider. Ids start at OPEN_WITH_ID_BASE so
-            // they never collide with the fixed actions above.
+            // Then the configured "Open in…" tree, after a divider. Submenus become nested popups;
+            // each leaf app gets an id of OPEN_WITH_ID_BASE + its pre-order index, collected into
+            // `leaves` so the returned command id maps straight back to the app to launch. Ids start
+            // at OPEN_WITH_ID_BASE so they never collide with the fixed actions above.
+            let mut leaves: Vec<&crate::config::MenuEntry> = Vec::new();
             if !self.open_with.is_empty() {
                 AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-                for (i, app) in self.open_with.iter().enumerate() {
-                    let label = wide(&app.name);
-                    AppendMenuW(menu, MF_STRING, OPEN_WITH_ID_BASE + i, label.as_ptr());
-                }
+                build_open_with_menu(menu, &self.open_with, &mut leaves);
             }
             let cmd = TrackPopupMenu(
                 menu,
@@ -404,14 +405,14 @@ impl App {
                 self.frame as HWND,
                 ptr::null(),
             );
-            DestroyMenu(menu);
+            DestroyMenu(menu); // recursive — also frees the nested submenu popups appended above
             match cmd as usize {
                 ID_SHOW_IN_EXPLORER => show_in_explorer(&image),
                 ID_COPY_FILE => copy_file_to_clipboard(self.frame as HWND, &image),
                 ID_COPY_PATH => copy_text_to_clipboard(self.frame as HWND, &image.to_string_lossy()),
                 ID_COPY_NAME => copy_text_to_clipboard(self.frame as HWND, &file_name(&image)),
                 id if id >= OPEN_WITH_ID_BASE => {
-                    if let Some(app) = self.open_with.get(id - OPEN_WITH_ID_BASE) {
+                    if let Some(app) = leaves.get(id - OPEN_WITH_ID_BASE) {
                         launch_external(app, &image);
                     }
                 }
@@ -575,7 +576,7 @@ pub fn run(
     serve_pipe: bool,
     hot_reload: bool,
     fit_upscale: bool,
-    open_with: Vec<crate::config::OpenWithApp>,
+    open_with: Vec<crate::config::MenuEntry>,
 ) {
     unsafe {
         let hinstance = GetModuleHandleW(ptr::null());
@@ -1091,13 +1092,52 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Recursively append the "Open in…" `entries` to `menu`: a submenu (an entry with children) becomes
+/// a nested `MF_POPUP`, and a leaf app (an entry with a `path`) becomes a command item whose id is
+/// `OPEN_WITH_ID_BASE + leaves.len()`. `leaves` accumulates the launch targets in command-id order,
+/// so [`App::show_actions_menu`] can map the returned id straight back to the app. Malformed entries
+/// (neither `path` nor `items`) are skipped. The created submenu popups are owned by `menu` once
+/// appended, so the caller's single `DestroyMenu(menu)` frees them all.
+///
+/// # Safety
+/// `menu` must be a valid menu handle; called only from inside the `unsafe` block in
+/// [`App::show_actions_menu`].
+unsafe fn build_open_with_menu<'a>(
+    menu: HMENU,
+    entries: &'a [crate::config::MenuEntry],
+    leaves: &mut Vec<&'a crate::config::MenuEntry>,
+) {
+    for entry in entries {
+        let label = wide(&entry.name);
+        if entry.is_submenu() {
+            let sub = unsafe { CreatePopupMenu() };
+            if sub.is_null() {
+                continue; // out of menu handles; skip this submenu rather than abort the whole menu
+            }
+            unsafe {
+                build_open_with_menu(sub, &entry.items, leaves);
+                // MF_POPUP reinterprets the id argument as the submenu handle; ownership transfers
+                // to `menu`, so `sub` needs no separate DestroyMenu.
+                AppendMenuW(menu, MF_POPUP, sub as usize, label.as_ptr());
+            }
+        } else if entry.path.is_some() {
+            let id = OPEN_WITH_ID_BASE + leaves.len();
+            leaves.push(entry);
+            unsafe { AppendMenuW(menu, MF_STRING, id, label.as_ptr()) };
+        }
+        // else: malformed entry (no `path`, no `items`) — silently skipped.
+    }
+}
+
 /// Launch a configured external app on `image` (the "Open in…" menu action). Best-effort: the child
 /// runs detached (we never `wait`), and any failure is logged, never fatal — a bad `path` must not
-/// take down the viewer. Each arg is one argv element (no shell), so there's no quoting/injection.
-fn launch_external(app: &crate::config::OpenWithApp, image: &Path) {
-    match std::process::Command::new(&app.path).args(app.resolved_args(image)).spawn() {
+/// take down the viewer. Each arg is one argv element (no shell), so there's no quoting/injection. A
+/// no-op for a submenu entry (no `path`), which never reaches here.
+fn launch_external(app: &crate::config::MenuEntry, image: &Path) {
+    let Some(path) = app.path.as_deref() else { return };
+    match std::process::Command::new(path).args(app.resolved_args(image)).spawn() {
         Ok(_child) => {}
-        Err(e) => eprintln!("fire: failed to launch {} ({}): {e}", app.name, app.path),
+        Err(e) => eprintln!("fire: failed to launch {} ({}): {e}", app.name, path),
     }
 }
 

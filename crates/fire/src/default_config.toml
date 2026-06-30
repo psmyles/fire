@@ -42,11 +42,13 @@
 # fit-upscale = true
 
 # ----------------------------------------------------------------------------------------------
-# [[open-with]] — external applications offered by the "Open in…" button on the toolbar (the
-#                 rightmost button). Each [[open-with]] block adds one menu entry. With no entries
-#                 configured the button is disabled (greyed out).
+# [[open-with]] — entries for the "Open in…" button on the toolbar (the rightmost button) and the
+#                 right-click menu over the image. Each [[open-with]] block adds one entry. With no
+#                 entries configured the button is disabled (greyed out).
 #
-# Fields:
+# An entry is either a LEAF that launches a program, or a SUBMENU that nests further entries.
+#
+# Leaf fields:
 #   name   Required. The label shown in the menu (e.g. "Photoshop").
 #   path   Required. Full path to the program's .exe. Backslashes must be doubled in a normal
 #          TOML string ("C:\\Program Files\\..."), or use a single-quoted literal ('C:\...').
@@ -54,7 +56,13 @@
 #          of the image currently open in Fire. If you omit args, Fire passes just the image path
 #          as the single argument (args = ["{path}"]).
 #
-# Examples (uncomment and edit the paths to match your machine):
+# Submenu fields:
+#   name   Required. The label shown for the submenu.
+#   items  Required. The child entries, written as [[open-with.items]] blocks. Each child is itself
+#          a leaf or a submenu, so submenus can nest to any depth ([[open-with.items.items]], …).
+#          An entry with `items` is always a submenu; any `path`/`args` on it are ignored.
+#
+# Leaf examples (uncomment and edit the paths to match your machine):
 #
 # [[open-with]]
 # name = "Photoshop"
@@ -69,3 +77,46 @@
 # name = "Show in folder"
 # path = 'C:\Windows\explorer.exe'
 # args = ["/select,", "{path}"]
+#
+# Submenu example — "Open in" grouping three editors, then an "ImageMagick" submenu with nested
+# "Convert" and "Rotate" submenus. Note how the indentation mirrors the table-path nesting; the
+# whitespace is cosmetic, what matters is the dotted [[open-with.items.items]] paths.
+#
+# [[open-with]]
+# name = "Open in"
+#   [[open-with.items]]
+#   name = "Photoshop"
+#   path = 'C:\Program Files\Adobe\Adobe Photoshop 2024\Photoshop.exe'
+#   [[open-with.items]]
+#   name = "XnView"
+#   path = 'C:\Program Files\XnView\xnview.exe'
+#   [[open-with.items]]
+#   name = "Paint.NET"
+#   path = 'C:\Program Files\paint.net\paintdotnet.exe'
+#
+# [[open-with]]
+# name = "ImageMagick"
+#   [[open-with.items]]
+#   name = "Convert"
+#     [[open-with.items.items]]
+#     name = "JPG"
+#     path = 'C:\Program Files\ImageMagick\magick.exe'
+#     args = ["{path}", "{path}.jpg"]
+#     [[open-with.items.items]]
+#     name = "PNG"
+#     path = 'C:\Program Files\ImageMagick\magick.exe'
+#     args = ["{path}", "{path}.png"]
+#     [[open-with.items.items]]
+#     name = "TGA"
+#     path = 'C:\Program Files\ImageMagick\magick.exe'
+#     args = ["{path}", "{path}.tga"]
+#   [[open-with.items]]
+#   name = "Rotate"
+#     [[open-with.items.items]]
+#     name = "90° clockwise"
+#     path = 'C:\Program Files\ImageMagick\magick.exe'
+#     args = ["{path}", "-rotate", "90", "{path}"]
+#     [[open-with.items.items]]
+#     name = "90° anti-clockwise"
+#     path = 'C:\Program Files\ImageMagick\magick.exe'
+#     args = ["{path}", "-rotate", "-90", "{path}"]

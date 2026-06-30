@@ -25,23 +25,38 @@ pub enum InstanceMode {
     SingleInstance,
 }
 
-/// One external application offered in the toolbar's "Open in…" menu (`[[open-with]]` table).
+/// One entry in the toolbar's "Open in…" menu tree (`[[open-with]]`). An entry is either a **leaf**
+/// that launches an external program (`path` set) or a **submenu** that nests further entries
+/// (`items` non-empty), and submenus can nest to any depth — `[[open-with.items]]`,
+/// `[[open-with.items.items]]`, and so on. If an entry has both `items` and `path`, the submenu
+/// wins: it is shown as a submenu and `path`/`args` are ignored. An entry with neither is malformed
+/// and skipped.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub struct OpenWithApp {
+pub struct MenuEntry {
     /// Label shown in the menu.
     pub name: String,
-    /// Full path to the program's executable.
-    pub path: String,
-    /// Launch arguments; the token `{path}` is replaced with the current image's path. When empty,
-    /// the image path is passed as the sole argument.
+    /// Leaf only: full path to the program's executable. Mutually exclusive with `items`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Leaf only: launch arguments; the token `{path}` is replaced with the current image's path.
+    /// When empty, the image path is passed as the sole argument.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Submenu only: nested entries. When non-empty this entry is a submenu (and `path`/`args` are
+    /// ignored).
+    #[serde(default)]
+    pub items: Vec<MenuEntry>,
 }
 
-impl OpenWithApp {
-    /// The argument vector to launch with for `image`: each `args` entry with `{path}` expanded, or
-    /// just the image path when `args` is empty.
+impl MenuEntry {
+    /// Whether this entry is a submenu (has children). A submenu's `path`/`args` are ignored.
+    pub fn is_submenu(&self) -> bool {
+        !self.items.is_empty()
+    }
+
+    /// The argument vector to launch a leaf entry with for `image`: each `args` entry with `{path}`
+    /// expanded, or just the image path when `args` is empty.
     pub fn resolved_args(&self, image: &Path) -> Vec<String> {
         let p = image.to_string_lossy();
         if self.args.is_empty() {
@@ -64,9 +79,9 @@ pub struct Config {
     /// convention). Note this governs only the explicit command — images always *open* fitted
     /// without upscaling, so a small image is shown at 100% on load and folder navigation.
     pub fit_upscale: bool,
-    /// User-defined external apps for the toolbar's "Open in…" menu. Empty (button disabled) unless
-    /// the user adds `[[open-with]]` blocks.
-    pub open_with: Vec<OpenWithApp>,
+    /// User-defined entries for the toolbar's "Open in…" menu — external apps and/or nested
+    /// submenus. Empty (button disabled) unless the user adds `[[open-with]]` blocks.
+    pub open_with: Vec<MenuEntry>,
 }
 
 impl Default for Config {
@@ -112,4 +127,76 @@ pub fn ensure_default_config() {
 fn config_path() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
     Some(PathBuf::from(appdata).join("fire").join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plain leaf `[[open-with]]` block (the pre-submenu format) still parses: a leaf is just an
+    /// entry with a `path` and no `items`.
+    #[test]
+    fn open_with_leaf_back_compat() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[open-with]]
+            name = "Photoshop"
+            path = 'C:\ps.exe'
+            args = ["{path}"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.open_with.len(), 1);
+        let e = &cfg.open_with[0];
+        assert!(!e.is_submenu());
+        assert_eq!(e.path.as_deref(), Some(r"C:\ps.exe"));
+        assert_eq!(e.resolved_args(Path::new(r"D:\img.png")), vec![r"D:\img.png"]);
+    }
+
+    /// Nested `[[open-with.items]]` / `[[open-with.items.items]]` parses into the submenu tree, and
+    /// `is_submenu()` distinguishes branches from leaves at every level.
+    #[test]
+    fn open_with_nested_submenus() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[open-with]]
+            name = "ImageMagick"
+              [[open-with.items]]
+              name = "Convert"
+                [[open-with.items.items]]
+                name = "JPG"
+                path = 'C:\magick.exe'
+                args = ["{path}", "{path}.jpg"]
+                [[open-with.items.items]]
+                name = "PNG"
+                path = 'C:\magick.exe'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.open_with.len(), 1);
+        let im = &cfg.open_with[0];
+        assert!(im.is_submenu());
+        assert_eq!(im.items.len(), 1);
+
+        let convert = &im.items[0];
+        assert!(convert.is_submenu());
+        assert_eq!(convert.items.len(), 2);
+
+        let jpg = &convert.items[0];
+        assert!(!jpg.is_submenu());
+        assert_eq!(
+            jpg.resolved_args(Path::new(r"D:\a.tga")),
+            vec![r"D:\a.tga", r"D:\a.tga.jpg"]
+        );
+        // A leaf with no `args` falls back to passing the image path alone.
+        assert_eq!(convert.items[1].resolved_args(Path::new(r"D:\a.tga")), vec![r"D:\a.tga"]);
+    }
+
+    /// The shipped default template is valid TOML and deserializes (its `[[open-with]]` examples are
+    /// all commented out, so it yields an empty menu).
+    #[test]
+    fn default_template_parses() {
+        let cfg: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert!(cfg.open_with.is_empty());
+    }
 }
