@@ -27,8 +27,12 @@
   #define MyOutputDir "dist"
 #endif
 
-; ProgID that all Fire-associated image types point at (one shared class, so registration and
-; cleanup stay uniform). Versionless on purpose — there is only ever one installed Fire.
+; "Fire.Image" was the original single shared ProgID. It is now legacy: kept only so the
+; installer can delete it on upgrade (the Registry section below removes it). Each format now
+; gets its OWN ProgID ("Fire.png", "Fire.tga", …) whose friendly type name — the class key's
+; default value, which the shell reads for Explorer's "Type" column — names the format ("PNG
+; image", "Truevision TGA image", …) instead of one undifferentiated "Fire Image". Versionless
+; on purpose: there is only ever one installed Fire.
 #define FireProgId "Fire.Image"
 
 [Setup]
@@ -105,11 +109,10 @@ Name: "assoc\raw";      Description: "Camera raw — embedded preview (.cr2, .cr
 Name: "desktopicon";    Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Registry]
-; --- the shared ProgID (always registered; uninstalled wholesale) ---
-Root: HKCU; Subkey: "Software\Classes\{#FireProgId}"; ValueType: string; ValueName: ""; ValueData: "{#MyAppName} Image"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\{#FireProgId}\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"
-Root: HKCU; Subkey: "Software\Classes\{#FireProgId}\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"
-Root: HKCU; Subkey: "Software\Classes\{#FireProgId}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""
+; --- remove the legacy single shared ProgID from older installs -------------------------
+; Every format now has its own ProgID (below); "Fire.Image" is obsolete. deletekey is a
+; no-op on fresh installs (key absent) and, on upgrade, clears the old "Fire Image" type.
+Root: HKCU; Subkey: "Software\Classes\{#FireProgId}"; ValueType: none; Flags: deletekey
 
 ; --- Default Programs capabilities (so Fire appears in Settings > Default apps) ---
 Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#MyAppName}"; Flags: uninsdeletekey
@@ -117,210 +120,286 @@ Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities"; ValueType: string; Val
 Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: "{app}\{#MyAppExe},0"
 Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: "Software\{#MyAppName}\Capabilities"; Flags: uninsdeletevalue
 
-; --- per-format associations -------------------------------------------------------------
-; For every extension of a selected format we write three things:
-;   1) OpenWithProgids — adds Fire to the file's "Open with" list (additive, always safe).
-;   2) the .ext default ProgID — makes Fire the default where Windows has no protected
-;      UserChoice yet (it never overrides an explicit user choice, by design).
-;   3) Capabilities\FileAssociations — lists the type under Fire in Default apps.
+; --- per-format ProgIDs + associations ---------------------------------------------------
+; For each selected format we register one ProgID class carrying:
+;   - its friendly type name (the class key's default value) — this is what Explorer shows
+;     in the "Type" column, so each format reads as e.g. "PNG image" / "Truevision TGA image";
+;   - DefaultIcon (the Fire icon) and shell\open\command.
+; And for every extension of that format:
+;   - OpenWithProgids — adds Fire to the file's "Open with" list (additive, always safe).
+;   - the .ext default ProgID — makes Fire the default where Windows has no protected
+;     UserChoice yet (it never overrides an explicit user choice, by design).
+;   - Capabilities\FileAssociations — lists the type under Fire in Default apps.
 
-; PNG
-Root: HKCU; Subkey: "Software\Classes\.png\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\png
-Root: HKCU; Subkey: "Software\Classes\.png"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\png
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".png"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\png
+; PNG image — Fire.png
+Root: HKCU; Subkey: "Software\Classes\Fire.png"; ValueType: string; ValueName: ""; ValueData: "PNG image"; Flags: uninsdeletekey; Tasks: assoc\png
+Root: HKCU; Subkey: "Software\Classes\Fire.png\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\png
+Root: HKCU; Subkey: "Software\Classes\Fire.png\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\png
+Root: HKCU; Subkey: "Software\Classes\Fire.png\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\png
+Root: HKCU; Subkey: "Software\Classes\.png\OpenWithProgids"; ValueType: none; ValueName: "Fire.png"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\png
+Root: HKCU; Subkey: "Software\Classes\.png"; ValueType: string; ValueName: ""; ValueData: "Fire.png"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\png
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".png"; ValueData: "Fire.png"; Flags: uninsdeletevalue; Tasks: assoc\png
 
-; JPEG
-Root: HKCU; Subkey: "Software\Classes\.jpg\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\Classes\.jpg"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\Classes\.jpeg\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\Classes\.jpeg"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\Classes\.jpe\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\Classes\.jpe"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\Classes\.jfif\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\Classes\.jfif"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jpg"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jpeg"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jpe"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\jpeg
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jfif"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\jpeg
+; JPEG image — Fire.jpeg
+Root: HKCU; Subkey: "Software\Classes\Fire.jpeg"; ValueType: string; ValueName: ""; ValueData: "JPEG image"; Flags: uninsdeletekey; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\Fire.jpeg\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\Fire.jpeg\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\Fire.jpeg\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\.jpg\OpenWithProgids"; ValueType: none; ValueName: "Fire.jpeg"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\.jpg"; ValueType: string; ValueName: ""; ValueData: "Fire.jpeg"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\.jpeg\OpenWithProgids"; ValueType: none; ValueName: "Fire.jpeg"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\.jpeg"; ValueType: string; ValueName: ""; ValueData: "Fire.jpeg"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\.jpe\OpenWithProgids"; ValueType: none; ValueName: "Fire.jpeg"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\.jpe"; ValueType: string; ValueName: ""; ValueData: "Fire.jpeg"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\.jfif\OpenWithProgids"; ValueType: none; ValueName: "Fire.jpeg"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\Classes\.jfif"; ValueType: string; ValueName: ""; ValueData: "Fire.jpeg"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jpg"; ValueData: "Fire.jpeg"; Flags: uninsdeletevalue; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jpeg"; ValueData: "Fire.jpeg"; Flags: uninsdeletevalue; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jpe"; ValueData: "Fire.jpeg"; Flags: uninsdeletevalue; Tasks: assoc\jpeg
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jfif"; ValueData: "Fire.jpeg"; Flags: uninsdeletevalue; Tasks: assoc\jpeg
 
-; GIF
-Root: HKCU; Subkey: "Software\Classes\.gif\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\gif
-Root: HKCU; Subkey: "Software\Classes\.gif"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\gif
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".gif"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\gif
+; GIF image — Fire.gif
+Root: HKCU; Subkey: "Software\Classes\Fire.gif"; ValueType: string; ValueName: ""; ValueData: "GIF image"; Flags: uninsdeletekey; Tasks: assoc\gif
+Root: HKCU; Subkey: "Software\Classes\Fire.gif\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\gif
+Root: HKCU; Subkey: "Software\Classes\Fire.gif\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\gif
+Root: HKCU; Subkey: "Software\Classes\Fire.gif\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\gif
+Root: HKCU; Subkey: "Software\Classes\.gif\OpenWithProgids"; ValueType: none; ValueName: "Fire.gif"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\gif
+Root: HKCU; Subkey: "Software\Classes\.gif"; ValueType: string; ValueName: ""; ValueData: "Fire.gif"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\gif
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".gif"; ValueData: "Fire.gif"; Flags: uninsdeletevalue; Tasks: assoc\gif
 
-; BMP
-Root: HKCU; Subkey: "Software\Classes\.bmp\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\bmp
-Root: HKCU; Subkey: "Software\Classes\.bmp"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\bmp
-Root: HKCU; Subkey: "Software\Classes\.dib\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\bmp
-Root: HKCU; Subkey: "Software\Classes\.dib"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\bmp
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".bmp"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\bmp
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".dib"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\bmp
+; Bitmap image — Fire.bmp
+Root: HKCU; Subkey: "Software\Classes\Fire.bmp"; ValueType: string; ValueName: ""; ValueData: "Bitmap image"; Flags: uninsdeletekey; Tasks: assoc\bmp
+Root: HKCU; Subkey: "Software\Classes\Fire.bmp\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\bmp
+Root: HKCU; Subkey: "Software\Classes\Fire.bmp\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\bmp
+Root: HKCU; Subkey: "Software\Classes\Fire.bmp\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\bmp
+Root: HKCU; Subkey: "Software\Classes\.bmp\OpenWithProgids"; ValueType: none; ValueName: "Fire.bmp"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\bmp
+Root: HKCU; Subkey: "Software\Classes\.bmp"; ValueType: string; ValueName: ""; ValueData: "Fire.bmp"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\bmp
+Root: HKCU; Subkey: "Software\Classes\.dib\OpenWithProgids"; ValueType: none; ValueName: "Fire.bmp"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\bmp
+Root: HKCU; Subkey: "Software\Classes\.dib"; ValueType: string; ValueName: ""; ValueData: "Fire.bmp"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\bmp
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".bmp"; ValueData: "Fire.bmp"; Flags: uninsdeletevalue; Tasks: assoc\bmp
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".dib"; ValueData: "Fire.bmp"; Flags: uninsdeletevalue; Tasks: assoc\bmp
 
-; TIFF
-Root: HKCU; Subkey: "Software\Classes\.tif\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tiff
-Root: HKCU; Subkey: "Software\Classes\.tif"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tiff
-Root: HKCU; Subkey: "Software\Classes\.tiff\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tiff
-Root: HKCU; Subkey: "Software\Classes\.tiff"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tiff
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tif"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\tiff
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tiff"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\tiff
+; TIFF image — Fire.tiff
+Root: HKCU; Subkey: "Software\Classes\Fire.tiff"; ValueType: string; ValueName: ""; ValueData: "TIFF image"; Flags: uninsdeletekey; Tasks: assoc\tiff
+Root: HKCU; Subkey: "Software\Classes\Fire.tiff\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\tiff
+Root: HKCU; Subkey: "Software\Classes\Fire.tiff\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\tiff
+Root: HKCU; Subkey: "Software\Classes\Fire.tiff\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\tiff
+Root: HKCU; Subkey: "Software\Classes\.tif\OpenWithProgids"; ValueType: none; ValueName: "Fire.tiff"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tiff
+Root: HKCU; Subkey: "Software\Classes\.tif"; ValueType: string; ValueName: ""; ValueData: "Fire.tiff"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tiff
+Root: HKCU; Subkey: "Software\Classes\.tiff\OpenWithProgids"; ValueType: none; ValueName: "Fire.tiff"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tiff
+Root: HKCU; Subkey: "Software\Classes\.tiff"; ValueType: string; ValueName: ""; ValueData: "Fire.tiff"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tiff
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tif"; ValueData: "Fire.tiff"; Flags: uninsdeletevalue; Tasks: assoc\tiff
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tiff"; ValueData: "Fire.tiff"; Flags: uninsdeletevalue; Tasks: assoc\tiff
 
-; WebP
-Root: HKCU; Subkey: "Software\Classes\.webp\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\webp
-Root: HKCU; Subkey: "Software\Classes\.webp"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\webp
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".webp"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\webp
+; WebP image — Fire.webp
+Root: HKCU; Subkey: "Software\Classes\Fire.webp"; ValueType: string; ValueName: ""; ValueData: "WebP image"; Flags: uninsdeletekey; Tasks: assoc\webp
+Root: HKCU; Subkey: "Software\Classes\Fire.webp\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\webp
+Root: HKCU; Subkey: "Software\Classes\Fire.webp\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\webp
+Root: HKCU; Subkey: "Software\Classes\Fire.webp\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\webp
+Root: HKCU; Subkey: "Software\Classes\.webp\OpenWithProgids"; ValueType: none; ValueName: "Fire.webp"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\webp
+Root: HKCU; Subkey: "Software\Classes\.webp"; ValueType: string; ValueName: ""; ValueData: "Fire.webp"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\webp
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".webp"; ValueData: "Fire.webp"; Flags: uninsdeletevalue; Tasks: assoc\webp
 
-; ICO
-Root: HKCU; Subkey: "Software\Classes\.ico\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\ico
-Root: HKCU; Subkey: "Software\Classes\.ico"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\ico
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ico"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\ico
+; Icon — Fire.ico
+Root: HKCU; Subkey: "Software\Classes\Fire.ico"; ValueType: string; ValueName: ""; ValueData: "Icon"; Flags: uninsdeletekey; Tasks: assoc\ico
+Root: HKCU; Subkey: "Software\Classes\Fire.ico\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\ico
+Root: HKCU; Subkey: "Software\Classes\Fire.ico\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\ico
+Root: HKCU; Subkey: "Software\Classes\Fire.ico\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\ico
+Root: HKCU; Subkey: "Software\Classes\.ico\OpenWithProgids"; ValueType: none; ValueName: "Fire.ico"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\ico
+Root: HKCU; Subkey: "Software\Classes\.ico"; ValueType: string; ValueName: ""; ValueData: "Fire.ico"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\ico
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ico"; ValueData: "Fire.ico"; Flags: uninsdeletevalue; Tasks: assoc\ico
 
-; TGA
-Root: HKCU; Subkey: "Software\Classes\.tga\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tga
-Root: HKCU; Subkey: "Software\Classes\.tga"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tga
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tga"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\tga
+; Truevision TGA image — Fire.tga
+Root: HKCU; Subkey: "Software\Classes\Fire.tga"; ValueType: string; ValueName: ""; ValueData: "Truevision TGA image"; Flags: uninsdeletekey; Tasks: assoc\tga
+Root: HKCU; Subkey: "Software\Classes\Fire.tga\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\tga
+Root: HKCU; Subkey: "Software\Classes\Fire.tga\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\tga
+Root: HKCU; Subkey: "Software\Classes\Fire.tga\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\tga
+Root: HKCU; Subkey: "Software\Classes\.tga\OpenWithProgids"; ValueType: none; ValueName: "Fire.tga"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tga
+Root: HKCU; Subkey: "Software\Classes\.tga"; ValueType: string; ValueName: ""; ValueData: "Fire.tga"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\tga
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tga"; ValueData: "Fire.tga"; Flags: uninsdeletevalue; Tasks: assoc\tga
 
-; QOI
-Root: HKCU; Subkey: "Software\Classes\.qoi\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\qoi
-Root: HKCU; Subkey: "Software\Classes\.qoi"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\qoi
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".qoi"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\qoi
+; QOI image — Fire.qoi
+Root: HKCU; Subkey: "Software\Classes\Fire.qoi"; ValueType: string; ValueName: ""; ValueData: "QOI image"; Flags: uninsdeletekey; Tasks: assoc\qoi
+Root: HKCU; Subkey: "Software\Classes\Fire.qoi\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\qoi
+Root: HKCU; Subkey: "Software\Classes\Fire.qoi\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\qoi
+Root: HKCU; Subkey: "Software\Classes\Fire.qoi\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\qoi
+Root: HKCU; Subkey: "Software\Classes\.qoi\OpenWithProgids"; ValueType: none; ValueName: "Fire.qoi"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\qoi
+Root: HKCU; Subkey: "Software\Classes\.qoi"; ValueType: string; ValueName: ""; ValueData: "Fire.qoi"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\qoi
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".qoi"; ValueData: "Fire.qoi"; Flags: uninsdeletevalue; Tasks: assoc\qoi
 
-; Netpbm
-Root: HKCU; Subkey: "Software\Classes\.ppm\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\Classes\.ppm"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\Classes\.pgm\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\Classes\.pgm"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\Classes\.pbm\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\Classes\.pbm"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\Classes\.pnm\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\Classes\.pnm"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ppm"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pgm"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pbm"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\netpbm
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pnm"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\netpbm
+; Netpbm image — Fire.netpbm
+Root: HKCU; Subkey: "Software\Classes\Fire.netpbm"; ValueType: string; ValueName: ""; ValueData: "Netpbm image"; Flags: uninsdeletekey; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\Fire.netpbm\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\Fire.netpbm\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\Fire.netpbm\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\.ppm\OpenWithProgids"; ValueType: none; ValueName: "Fire.netpbm"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\.ppm"; ValueType: string; ValueName: ""; ValueData: "Fire.netpbm"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\.pgm\OpenWithProgids"; ValueType: none; ValueName: "Fire.netpbm"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\.pgm"; ValueType: string; ValueName: ""; ValueData: "Fire.netpbm"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\.pbm\OpenWithProgids"; ValueType: none; ValueName: "Fire.netpbm"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\.pbm"; ValueType: string; ValueName: ""; ValueData: "Fire.netpbm"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\.pnm\OpenWithProgids"; ValueType: none; ValueName: "Fire.netpbm"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\Classes\.pnm"; ValueType: string; ValueName: ""; ValueData: "Fire.netpbm"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ppm"; ValueData: "Fire.netpbm"; Flags: uninsdeletevalue; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pgm"; ValueData: "Fire.netpbm"; Flags: uninsdeletevalue; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pbm"; ValueData: "Fire.netpbm"; Flags: uninsdeletevalue; Tasks: assoc\netpbm
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pnm"; ValueData: "Fire.netpbm"; Flags: uninsdeletevalue; Tasks: assoc\netpbm
 
-; Farbfeld
-Root: HKCU; Subkey: "Software\Classes\.ff\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\farbfeld
-Root: HKCU; Subkey: "Software\Classes\.ff"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\farbfeld
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ff"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\farbfeld
+; Farbfeld image — Fire.farbfeld
+Root: HKCU; Subkey: "Software\Classes\Fire.farbfeld"; ValueType: string; ValueName: ""; ValueData: "Farbfeld image"; Flags: uninsdeletekey; Tasks: assoc\farbfeld
+Root: HKCU; Subkey: "Software\Classes\Fire.farbfeld\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\farbfeld
+Root: HKCU; Subkey: "Software\Classes\Fire.farbfeld\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\farbfeld
+Root: HKCU; Subkey: "Software\Classes\Fire.farbfeld\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\farbfeld
+Root: HKCU; Subkey: "Software\Classes\.ff\OpenWithProgids"; ValueType: none; ValueName: "Fire.farbfeld"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\farbfeld
+Root: HKCU; Subkey: "Software\Classes\.ff"; ValueType: string; ValueName: ""; ValueData: "Fire.farbfeld"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\farbfeld
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ff"; ValueData: "Fire.farbfeld"; Flags: uninsdeletevalue; Tasks: assoc\farbfeld
 
-; JPEG XL
-Root: HKCU; Subkey: "Software\Classes\.jxl\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jxl
-Root: HKCU; Subkey: "Software\Classes\.jxl"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jxl
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jxl"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\jxl
+; JPEG XL image — Fire.jxl
+Root: HKCU; Subkey: "Software\Classes\Fire.jxl"; ValueType: string; ValueName: ""; ValueData: "JPEG XL image"; Flags: uninsdeletekey; Tasks: assoc\jxl
+Root: HKCU; Subkey: "Software\Classes\Fire.jxl\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\jxl
+Root: HKCU; Subkey: "Software\Classes\Fire.jxl\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\jxl
+Root: HKCU; Subkey: "Software\Classes\Fire.jxl\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\jxl
+Root: HKCU; Subkey: "Software\Classes\.jxl\OpenWithProgids"; ValueType: none; ValueName: "Fire.jxl"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jxl
+Root: HKCU; Subkey: "Software\Classes\.jxl"; ValueType: string; ValueName: ""; ValueData: "Fire.jxl"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\jxl
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jxl"; ValueData: "Fire.jxl"; Flags: uninsdeletevalue; Tasks: assoc\jxl
 
-; Radiance HDR
-Root: HKCU; Subkey: "Software\Classes\.hdr\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\hdr
-Root: HKCU; Subkey: "Software\Classes\.hdr"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\hdr
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".hdr"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\hdr
+; Radiance HDR image — Fire.hdr
+Root: HKCU; Subkey: "Software\Classes\Fire.hdr"; ValueType: string; ValueName: ""; ValueData: "Radiance HDR image"; Flags: uninsdeletekey; Tasks: assoc\hdr
+Root: HKCU; Subkey: "Software\Classes\Fire.hdr\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\hdr
+Root: HKCU; Subkey: "Software\Classes\Fire.hdr\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\hdr
+Root: HKCU; Subkey: "Software\Classes\Fire.hdr\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\hdr
+Root: HKCU; Subkey: "Software\Classes\.hdr\OpenWithProgids"; ValueType: none; ValueName: "Fire.hdr"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\hdr
+Root: HKCU; Subkey: "Software\Classes\.hdr"; ValueType: string; ValueName: ""; ValueData: "Fire.hdr"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\hdr
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".hdr"; ValueData: "Fire.hdr"; Flags: uninsdeletevalue; Tasks: assoc\hdr
 
-; OpenEXR
-Root: HKCU; Subkey: "Software\Classes\.exr\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\exr
-Root: HKCU; Subkey: "Software\Classes\.exr"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\exr
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".exr"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\exr
+; OpenEXR image — Fire.exr
+Root: HKCU; Subkey: "Software\Classes\Fire.exr"; ValueType: string; ValueName: ""; ValueData: "OpenEXR image"; Flags: uninsdeletekey; Tasks: assoc\exr
+Root: HKCU; Subkey: "Software\Classes\Fire.exr\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\exr
+Root: HKCU; Subkey: "Software\Classes\Fire.exr\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\exr
+Root: HKCU; Subkey: "Software\Classes\Fire.exr\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\exr
+Root: HKCU; Subkey: "Software\Classes\.exr\OpenWithProgids"; ValueType: none; ValueName: "Fire.exr"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\exr
+Root: HKCU; Subkey: "Software\Classes\.exr"; ValueType: string; ValueName: ""; ValueData: "Fire.exr"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\exr
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".exr"; ValueData: "Fire.exr"; Flags: uninsdeletevalue; Tasks: assoc\exr
 
-; Photoshop
-Root: HKCU; Subkey: "Software\Classes\.psd\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\psd
-Root: HKCU; Subkey: "Software\Classes\.psd"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\psd
-Root: HKCU; Subkey: "Software\Classes\.psb\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\psd
-Root: HKCU; Subkey: "Software\Classes\.psb"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\psd
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".psd"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\psd
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".psb"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\psd
+; Photoshop image — Fire.psd
+Root: HKCU; Subkey: "Software\Classes\Fire.psd"; ValueType: string; ValueName: ""; ValueData: "Photoshop image"; Flags: uninsdeletekey; Tasks: assoc\psd
+Root: HKCU; Subkey: "Software\Classes\Fire.psd\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\psd
+Root: HKCU; Subkey: "Software\Classes\Fire.psd\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\psd
+Root: HKCU; Subkey: "Software\Classes\Fire.psd\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\psd
+Root: HKCU; Subkey: "Software\Classes\.psd\OpenWithProgids"; ValueType: none; ValueName: "Fire.psd"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\psd
+Root: HKCU; Subkey: "Software\Classes\.psd"; ValueType: string; ValueName: ""; ValueData: "Fire.psd"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\psd
+Root: HKCU; Subkey: "Software\Classes\.psb\OpenWithProgids"; ValueType: none; ValueName: "Fire.psd"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\psd
+Root: HKCU; Subkey: "Software\Classes\.psb"; ValueType: string; ValueName: ""; ValueData: "Fire.psd"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\psd
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".psd"; ValueData: "Fire.psd"; Flags: uninsdeletevalue; Tasks: assoc\psd
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".psb"; ValueData: "Fire.psd"; Flags: uninsdeletevalue; Tasks: assoc\psd
 
-; HEIF / HEIC
-Root: HKCU; Subkey: "Software\Classes\.heic\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\heif
-Root: HKCU; Subkey: "Software\Classes\.heic"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\heif
-Root: HKCU; Subkey: "Software\Classes\.heif\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\heif
-Root: HKCU; Subkey: "Software\Classes\.heif"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\heif
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".heic"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\heif
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".heif"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\heif
+; HEIF image — Fire.heif
+Root: HKCU; Subkey: "Software\Classes\Fire.heif"; ValueType: string; ValueName: ""; ValueData: "HEIF image"; Flags: uninsdeletekey; Tasks: assoc\heif
+Root: HKCU; Subkey: "Software\Classes\Fire.heif\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\heif
+Root: HKCU; Subkey: "Software\Classes\Fire.heif\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\heif
+Root: HKCU; Subkey: "Software\Classes\Fire.heif\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\heif
+Root: HKCU; Subkey: "Software\Classes\.heic\OpenWithProgids"; ValueType: none; ValueName: "Fire.heif"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\heif
+Root: HKCU; Subkey: "Software\Classes\.heic"; ValueType: string; ValueName: ""; ValueData: "Fire.heif"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\heif
+Root: HKCU; Subkey: "Software\Classes\.heif\OpenWithProgids"; ValueType: none; ValueName: "Fire.heif"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\heif
+Root: HKCU; Subkey: "Software\Classes\.heif"; ValueType: string; ValueName: ""; ValueData: "Fire.heif"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\heif
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".heic"; ValueData: "Fire.heif"; Flags: uninsdeletevalue; Tasks: assoc\heif
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".heif"; ValueData: "Fire.heif"; Flags: uninsdeletevalue; Tasks: assoc\heif
 
-; AVIF
-Root: HKCU; Subkey: "Software\Classes\.avif\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\avif
-Root: HKCU; Subkey: "Software\Classes\.avif"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\avif
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".avif"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\avif
+; AVIF image — Fire.avif
+Root: HKCU; Subkey: "Software\Classes\Fire.avif"; ValueType: string; ValueName: ""; ValueData: "AVIF image"; Flags: uninsdeletekey; Tasks: assoc\avif
+Root: HKCU; Subkey: "Software\Classes\Fire.avif\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\avif
+Root: HKCU; Subkey: "Software\Classes\Fire.avif\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\avif
+Root: HKCU; Subkey: "Software\Classes\Fire.avif\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\avif
+Root: HKCU; Subkey: "Software\Classes\.avif\OpenWithProgids"; ValueType: none; ValueName: "Fire.avif"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\avif
+Root: HKCU; Subkey: "Software\Classes\.avif"; ValueType: string; ValueName: ""; ValueData: "Fire.avif"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\avif
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".avif"; ValueData: "Fire.avif"; Flags: uninsdeletevalue; Tasks: assoc\avif
 
-; Camera raw (embedded JPEG preview; see fire-decode/src/raw.rs EXT_LABELS)
-Root: HKCU; Subkey: "Software\Classes\.cr2\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.cr2"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".cr2"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.cr3\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.cr3"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".cr3"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.crw\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.crw"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".crw"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.nef\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.nef"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".nef"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.nrw\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.nrw"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".nrw"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.arw\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.arw"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".arw"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.srf\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.srf"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".srf"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.sr2\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.sr2"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".sr2"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.raf\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.raf"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".raf"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.orf\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.orf"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".orf"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.rw2\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.rw2"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".rw2"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.pef\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.pef"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pef"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.srw\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.srw"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".srw"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.dng\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.dng"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".dng"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.x3f\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.x3f"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".x3f"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.3fr\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.3fr"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".3fr"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.fff\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.fff"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".fff"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.iiq\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.iiq"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".iiq"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.erf\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.erf"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".erf"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.mrw\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.mrw"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".mrw"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.dcr\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.dcr"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".dcr"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.kdc\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.kdc"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".kdc"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.mef\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.mef"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".mef"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.mos\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.mos"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".mos"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.rwl\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.rwl"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".rwl"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.gpr\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.gpr"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".gpr"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.raw\OpenWithProgids"; ValueType: none; ValueName: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\Classes\.raw"; ValueType: string; ValueName: ""; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
-Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".raw"; ValueData: "{#FireProgId}"; Flags: uninsdeletevalue; Tasks: assoc\raw
+; Camera raw image — Fire.raw
+Root: HKCU; Subkey: "Software\Classes\Fire.raw"; ValueType: string; ValueName: ""; ValueData: "Camera raw image"; Flags: uninsdeletekey; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\Fire.raw\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\Fire.raw\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\Fire.raw\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.cr2\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.cr2"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.cr3\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.cr3"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.crw\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.crw"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.nef\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.nef"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.nrw\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.nrw"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.arw\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.arw"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.srf\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.srf"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.sr2\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.sr2"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.raf\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.raf"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.orf\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.orf"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.rw2\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.rw2"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.pef\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.pef"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.srw\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.srw"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.dng\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.dng"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.x3f\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.x3f"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.3fr\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.3fr"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.fff\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.fff"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.iiq\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.iiq"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.erf\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.erf"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.mrw\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.mrw"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.dcr\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.dcr"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.kdc\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.kdc"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.mef\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.mef"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.mos\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.mos"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.rwl\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.rwl"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.gpr\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.gpr"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.raw\OpenWithProgids"; ValueType: none; ValueName: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\Classes\.raw"; ValueType: string; ValueName: ""; ValueData: "Fire.raw"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".cr2"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".cr3"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".crw"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".nef"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".nrw"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".arw"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".srf"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".sr2"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".raf"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".orf"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".rw2"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pef"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".srw"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".dng"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".x3f"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".3fr"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".fff"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".iiq"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".erf"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".mrw"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".dcr"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".kdc"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".mef"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".mos"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".rwl"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".gpr"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".raw"; ValueData: "Fire.raw"; Flags: uninsdeletevalue; Tasks: assoc\raw
 
 [Run]
 Filename: "{app}\{#MyAppExe}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent

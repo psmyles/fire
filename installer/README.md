@@ -31,10 +31,12 @@ Flags: `-SkipBuild` (reuse the existing `target/release/fire.exe`), `-SkipIcon`.
 - A wizard page to set Fire as the default viewer, with a checkbox **per format** plus an **"All
   supported image formats"** master toggle. All off by default — an install never silently steals
   associations the user didn't pick.
-- For each selected format it writes (under `HKCU`): the shared `Fire.Image` ProgID, an
-  `OpenWithProgids` entry (adds Fire to "Open with"), the `.ext` default ProgID, and a
-  Default-Programs `Capabilities` entry so Fire shows up in **Settings → Default apps**. Uninstall
-  removes all of it.
+- For each selected format it writes (under `HKCU`): a per-format `Fire.<format>` ProgID (e.g.
+  `Fire.png`, `Fire.tga`) whose friendly type name is what Explorer shows in the **Type** column
+  ("PNG image", "Truevision TGA image", …), an `OpenWithProgids` entry (adds Fire to "Open with"),
+  the `.ext` default ProgID, and a Default-Programs `Capabilities` entry so Fire shows up in
+  **Settings → Default apps**. Uninstall removes all of it. (The old single shared `Fire.Image`
+  ProgID — which made every type read "Fire Image" — is deleted on install.)
 
 > **Note on "default":** Windows 10/11 protect the per-extension default with a hashed `UserChoice`.
 > The installer can make Fire the default for types that have no choice set yet, but it cannot
