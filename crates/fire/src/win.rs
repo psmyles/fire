@@ -574,6 +574,7 @@ pub fn run(
     initial: Option<PathBuf>,
     serve_pipe: bool,
     hot_reload: bool,
+    fit_upscale: bool,
     open_with: Vec<crate::config::OpenWithApp>,
 ) {
     unsafe {
@@ -684,7 +685,8 @@ pub fn run(
         DragAcceptFiles(frame, 1);
         DragAcceptFiles(view, 1);
 
-        let mut surface = GpuSurface::new(view as isize, hinstance as isize, vw as u32, vh as u32);
+        let mut surface =
+            GpuSurface::new(view as isize, hinstance as isize, vw as u32, vh as u32, fit_upscale);
         surface.set_clear(ch.view_clear_packed());
         // Workers and the pipe server post to the frame (it owns title/size/lifecycle).
         let pool = DecodePool::new(frame as isize);

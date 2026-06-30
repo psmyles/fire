@@ -89,27 +89,35 @@ pub struct ViewState {
     pub zoom: f32,
     pub pan: (f32, f32),
     pub fit: bool,
+    /// While in fit mode, whether the current fit also scales small images *up* to fill the
+    /// surface. Remembered so a window resize re-fits with the same rule the active fit used: the
+    /// per-image load fits *without* upscaling (small images open at 1:1), while the explicit
+    /// "fit to window" command can fill the surface. Meaningless when `fit` is false.
+    pub fit_upscale: bool,
 }
 
 impl Default for ViewState {
     fn default() -> Self {
-        Self { zoom: 1.0, pan: (0.0, 0.0), fit: true }
+        Self { zoom: 1.0, pan: (0.0, 0.0), fit: true, fit_upscale: false }
     }
 }
 
 impl ViewState {
-    /// Fit the whole image within the surface, centered. Caps at 1:1 so a small
-    /// image is shown at native resolution (a texture-viewer convention) rather than
-    /// upscaled into a blur; zoom in explicitly to go past 100%.
-    pub fn fit_to_window(&mut self, image: (u32, u32), vp: &Viewport) {
-        // Fit into the surface minus a 1px gutter on every side so the outside outline always
-        // has room; still cap at 1:1 (a small image already sits inside the surface with gutter).
+    /// Fit the whole image within the surface, centered. When `upscale` is false a small image is
+    /// left at native 1:1 (the texture-viewer convention) rather than blown up into a blur — zoom in
+    /// explicitly to go past 100%; when true the image is also scaled *up* to fill the surface, so
+    /// fit always means "fit to window" regardless of the image's size (the `fit-upscale` config key).
+    pub fn fit_to_window(&mut self, image: (u32, u32), vp: &Viewport, upscale: bool) {
+        // Fit into the surface minus a 1px gutter on every side so the outside outline always has room.
         let (uw, uh) = ((vp.width - 2.0 * FIT_GUTTER).max(1.0), (vp.height - 2.0 * FIT_GUTTER).max(1.0));
         let (iw, ih) = (image.0.max(1) as f32, image.1.max(1) as f32);
-        let z = (uw / iw).min(uh / ih).min(1.0);
+        let z = (uw / iw).min(uh / ih);
+        // Without upscaling, never go past 1:1 (a small image already sits inside the surface).
+        let z = if upscale { z } else { z.min(1.0) };
         self.zoom = z.clamp(MIN_ZOOM, MAX_ZOOM);
         self.pan = (0.0, 0.0);
         self.fit = true;
+        self.fit_upscale = upscale;
     }
 
     /// 1:1 — one image pixel per surface pixel, centered.
@@ -210,16 +218,36 @@ mod tests {
         let v = vp();
         // Large image: limited by the tighter axis, fitting into the surface minus a 1px
         // gutter per side. 998/4000 = 0.2495 (width) is smaller than 798/2000 = 0.399
-        // (height), so width constrains the fit.
+        // (height), so width constrains the fit. A large image shrinks the same with or
+        // without upscaling.
         let mut large = ViewState::default();
-        large.fit_to_window((4000, 2000), &v);
+        large.fit_to_window((4000, 2000), &v, false);
         assert!((large.zoom - 0.2495).abs() < 1e-6, "zoom = {}", large.zoom);
         assert_eq!(large.pan, (0.0, 0.0));
         assert!(large.fit);
-        // Small image: capped at 1:1, never upscaled.
+        // Small image, no upscale: capped at 1:1, never enlarged.
         let mut small = ViewState::default();
-        small.fit_to_window((100, 100), &v);
+        small.fit_to_window((100, 100), &v, false);
         assert_eq!(small.zoom, 1.0);
+        assert!(!small.fit_upscale, "fit records that it did not upscale");
+    }
+
+    #[test]
+    fn fit_upscales_small_image_to_fill_the_window() {
+        let v = vp();
+        // Small image with upscaling on: scaled up to fill the surface (minus the gutter),
+        // constrained by the tighter axis. 998/100 = 9.98 (width) vs 798/100 = 7.98 (height),
+        // so height constrains and the image is enlarged ~8×.
+        let mut small = ViewState::default();
+        small.fit_to_window((100, 100), &v, true);
+        assert!((small.zoom - 7.98).abs() < 1e-6, "zoom = {}", small.zoom);
+        assert_eq!(small.pan, (0.0, 0.0));
+        assert!(small.fit);
+        assert!(small.fit_upscale, "fit records that it upscaled");
+        // A tiny image's fit zoom is still clamped to MAX_ZOOM.
+        let mut tiny = ViewState::default();
+        tiny.fit_to_window((1, 1), &v, true);
+        assert_eq!(tiny.zoom, MAX_ZOOM);
     }
 
     #[test]
@@ -227,7 +255,7 @@ mod tests {
         let v = vp();
         let image = (2000u32, 1500u32);
         let mut s = ViewState::default();
-        s.fit_to_window(image, &v);
+        s.fit_to_window(image, &v, false);
         let cursor = (700.0, 300.0);
         // The image pixel under the cursor before zooming...
         let before = s.screen_to_image(cursor, image, &v);
@@ -243,7 +271,7 @@ mod tests {
     fn screen_image_round_trip() {
         let v = vp();
         let image = (1234u32, 567u32);
-        let mut s = ViewState { zoom: 1.7, pan: (-30.0, 45.0), fit: false };
+        let mut s = ViewState { zoom: 1.7, pan: (-30.0, 45.0), fit: false, fit_upscale: false };
         s.clamp_pan(image, &v);
         for &p in &[(0.0, 0.0), (640.0, 360.0), (999.0, 799.0)] {
             let img = s.screen_to_image(p, image, &v);
@@ -257,7 +285,7 @@ mod tests {
     fn pan_clamp_lets_you_push_image_just_out_of_view() {
         let v = vp();
         let image = (4000u32, 800u32); // wider than the 1000px viewport, same height
-        let mut s = ViewState { zoom: 1.0, pan: (0.0, 0.0), fit: false };
+        let mut s = ViewState { zoom: 1.0, pan: (0.0, 0.0), fit: false, fit_upscale: false };
         // Pan far right; clamp pins it to (image_screen + surface)/2 — the image is then just
         // fully off the left edge and can't be pushed further.
         s.pan_by((100_000.0, 0.0), image, &v);
@@ -273,7 +301,7 @@ mod tests {
     #[test]
     fn one_to_one_centers_at_unit_zoom() {
         let mut s = ViewState::default();
-        s.fit_to_window((4000, 4000), &vp());
+        s.fit_to_window((4000, 4000), &vp(), false);
         s.one_to_one();
         assert_eq!(s.zoom, 1.0);
         assert_eq!(s.pan, (0.0, 0.0));

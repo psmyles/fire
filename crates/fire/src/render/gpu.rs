@@ -138,6 +138,11 @@ pub struct GpuSurface {
 
     viewport: Viewport,
     view: ViewState,
+    /// Whether the explicit "fit to window" command (`F` / toolbar) scales *small* images up to
+    /// fill the surface (the `fit-upscale` config key). False keeps the texture-viewer cap at 1:1.
+    /// This governs only the explicit command — images always *open* (and re-open on folder
+    /// navigation) fitted without upscaling, so a small image is shown at 100% on load.
+    fit_upscale: bool,
     display: DisplayState,
     cursor: (f32, f32),
     dragging: bool,
@@ -154,7 +159,7 @@ pub struct GpuSurface {
 impl GpuSurface {
     /// Build the D3D11 device + flip-model swapchain on the child view HWND. `_hinstance` is
     /// unused (D3D needs only the HWND); kept for signature parity with the CPU surface.
-    pub fn new(hwnd: isize, _hinstance: isize, width: u32, height: u32) -> Self {
+    pub fn new(hwnd: isize, _hinstance: isize, width: u32, height: u32, fit_upscale: bool) -> Self {
         let (device, context) = create_device();
         let win_hwnd = HWND(hwnd as *mut c_void);
         let swapchain = create_swapchain(&device, win_hwnd, width.max(1), height.max(1));
@@ -186,6 +191,7 @@ impl GpuSurface {
             current_image: None,
             viewport: Viewport::new(width, height),
             view: ViewState::default(),
+            fit_upscale,
             display: DisplayState::default(),
             cursor: (0.0, 0.0),
             dragging: false,
@@ -306,7 +312,10 @@ impl GpuSurface {
             .unwrap_or(if has_transparency { Background::Checker } else { Background::Black });
         self.current_image = Some(img);
         self.display = DisplayState::default();
-        self.view.fit_to_window((w, h), &self.viewport);
+        // Every newly opened image (including folder ←/→ navigation) fits *without* upscaling: a
+        // large image shrinks to fit, a small one shows at native 1:1. The explicit fit command
+        // (`F` / toolbar) can still fill the surface — see `fit_upscale` / `fit`.
+        self.view.fit_to_window((w, h), &self.viewport, false);
         Ok(())
     }
 
@@ -403,7 +412,9 @@ impl GpuSurface {
         }
         if let Some(dims) = self.image_dims() {
             if self.view.fit {
-                self.view.fit_to_window(dims, &self.viewport);
+                // Re-fit with the rule the active fit used (load = no upscale, explicit fit =
+                // `fit_upscale`), so a resize doesn't silently switch a small image's scaling.
+                self.view.fit_to_window(dims, &self.viewport, self.view.fit_upscale);
             } else {
                 self.view.clamp_pan(dims, &self.viewport);
             }
@@ -616,7 +627,7 @@ impl GpuSurface {
 
     pub fn fit(&mut self) {
         if let Some(dims) = self.image_dims() {
-            self.view.fit_to_window(dims, &self.viewport);
+            self.view.fit_to_window(dims, &self.viewport, self.fit_upscale);
             self.refresh();
         }
     }

@@ -58,6 +58,12 @@ pub struct Config {
     /// Reload the displayed image automatically when its file changes on disk. On by default;
     /// set `hot-reload = false` in `config.toml` to disable the file watch entirely.
     pub hot_reload: bool,
+    /// Whether the explicit "fit to window" command (`F` / toolbar) also scales images *smaller*
+    /// than the window up to fill it. On by default, so the fit command always fills regardless of
+    /// image size; set `fit-upscale = false` to cap it at native 1:1 (the texture-viewer
+    /// convention). Note this governs only the explicit command — images always *open* fitted
+    /// without upscaling, so a small image is shown at 100% on load and folder navigation.
+    pub fit_upscale: bool,
     /// User-defined external apps for the toolbar's "Open in…" menu. Empty (button disabled) unless
     /// the user adds `[[open-with]]` blocks.
     pub open_with: Vec<OpenWithApp>,
@@ -66,8 +72,14 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         // `#[serde(default)]` fills any missing field from this, so an absent `hot-reload` key
-        // (or no config file at all) leaves hot-reload enabled and the open-with list empty.
-        Self { instance_mode: InstanceMode::default(), hot_reload: true, open_with: Vec::new() }
+        // (or no config file at all) leaves hot-reload enabled, fit-upscale enabled, and the
+        // open-with list empty.
+        Self {
+            instance_mode: InstanceMode::default(),
+            hot_reload: true,
+            fit_upscale: true,
+            open_with: Vec::new(),
+        }
     }
 }
 

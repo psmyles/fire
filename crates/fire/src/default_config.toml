@@ -27,6 +27,21 @@
 # hot-reload = true
 
 # ----------------------------------------------------------------------------------------------
+# fit-upscale — whether the explicit "fit to window" command (the F key / toolbar button) also
+#               scales images smaller than the window up to fill it.
+#
+#   true   (default) Fit fills the window: a small image is enlarged to fill it, a large one is
+#                    shrunk to fit. Pressing F reflows to the window at any image size.
+#   false  Cap the fit command at native 1:1 (the texture-viewer convention) — F only shrinks
+#                    oversized images and never upscales. Zoom in explicitly to go past 100%.
+#
+# Note: images always *open* fitted without upscaling, regardless of this setting — a picture
+# larger than the window opens scaled to fit, a smaller one opens at 100%. This key only changes
+# what the explicit fit command does afterward.
+#
+# fit-upscale = true
+
+# ----------------------------------------------------------------------------------------------
 # [[open-with]] — external applications offered by the "Open in…" button on the toolbar (the
 #                 rightmost button). Each [[open-with]] block adds one menu entry. With no entries
 #                 configured the button is disabled (greyed out).
