@@ -46,6 +46,8 @@ pub enum Action {
     ToggleOutline,
     /// Choose the viewport backdrop (right-side group).
     Background(Background),
+    /// Enter/leave borderless full-screen (Esc or middle-click over the viewport also toggle it).
+    ToggleFullscreen,
     /// The far-right button: open the actions popup menu — file actions (show in folder, copy
     /// file / path / name) plus any configured "Open in…" external apps. The menu itself is built
     /// and tracked by the win shell (it needs the button's screen rect, and the chosen entry is
@@ -89,6 +91,9 @@ const RIGHT: &[Slot] = &[
     Slot { action: Action::Background(Background::White), group: 1 },
     Slot { action: Action::Background(Background::Grey), group: 1 },
     Slot { action: Action::Background(Background::Checker), group: 1 },
+    // The full-screen toggle sits just left of the "Open in…" button, in its own group (dividers
+    // on both sides).
+    Slot { action: Action::ToggleFullscreen, group: 3 },
     // Laid first (RIGHT is walked in reverse), so the "Open in…" button hugs the far-right corner;
     // its own group gives it a divider from the backdrop controls.
     Slot { action: Action::OpenWithMenu, group: 2 },
@@ -109,6 +114,8 @@ pub struct ViewSnapshot {
     pub outline: bool,
     /// A folder cursor with more than one image exists (enables ←/→).
     pub can_navigate: bool,
+    /// The window is currently in borderless full-screen (drives the toggle's highlight).
+    pub fullscreen: bool,
     pub status_left: String,
     pub status_right: String,
 }
@@ -124,6 +131,8 @@ impl ViewSnapshot {
             // The actions menu (copy / show in folder / open in app) needs an image to act on; the
             // file actions are always available, so a configured app list is no longer required.
             Action::OpenWithMenu => self.has_image,
+            // Full-screen is a window mode, independent of whether an image is loaded.
+            Action::ToggleFullscreen => true,
         }
     }
 
@@ -135,6 +144,7 @@ impl ViewSnapshot {
             Action::ToggleTonemap => self.tonemap == Tonemap::Aces,
             Action::Background(b) => self.background == b,
             Action::ToggleOutline => self.outline,
+            Action::ToggleFullscreen => self.fullscreen,
             _ => false,
         }
     }
@@ -162,6 +172,7 @@ impl ViewSnapshot {
             Action::Background(Background::Grey) => "Grey backdrop",
             Action::Background(Background::Checker) => "Checkerboard backdrop",
             Action::OpenWithMenu => "Copy, show in folder, or open in app\u{2026}",
+            Action::ToggleFullscreen => "Full screen  (F11)",
         }
     }
 
@@ -188,6 +199,7 @@ impl ViewSnapshot {
             Action::Background(Background::Grey) => Icon::G,
             Action::Background(Background::Checker) => Icon::Checker,
             Action::OpenWithMenu => Icon::OpenWith,
+            Action::ToggleFullscreen => Icon::Fullscreen,
         }
     }
 }

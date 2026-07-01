@@ -18,6 +18,24 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Profiling / coverage artifacts
+flamegraph.svg
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS-generated files
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

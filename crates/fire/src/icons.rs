@@ -51,10 +51,11 @@ pub enum Icon {
     Checker,
     Outline,
     OpenWith,
+    Fullscreen,
 }
 
 /// The embedded A8 masters, indexed by `Icon as usize`. Same order as the enum / `build.rs`.
-const MASTERS: [&[u8]; 19] = [
+const MASTERS: [&[u8]; 20] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_left.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_right.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_zoom_out.a8")),
@@ -74,13 +75,14 @@ const MASTERS: [&[u8]; 19] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_C.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_outline.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_open_with.a8")),
+    include_bytes!(concat!(env!("OUT_DIR"), "/icon_fullscreen.a8")),
 ];
 
 /// Compile-time guard that [`Icon`] and [`MASTERS`] stay the same length: [`Icons::draw`] indexes
 /// `masks`/`MASTERS` by `icon as usize`, so a variant added without a corresponding master (or
-/// vice-versa) must fail the build rather than panic in a paint. `OpenWith` must stay the last
+/// vice-versa) must fail the build rather than panic in a paint. `Fullscreen` must stay the last
 /// `Icon` variant for this check to hold.
-const _: () = assert!(Icon::OpenWith as usize + 1 == MASTERS.len());
+const _: () = assert!(Icon::Fullscreen as usize + 1 == MASTERS.len());
 
 /// Per-DPI icon renderer: the downsampled masks for the current physical icon size plus a scratch
 /// 32-bit top-down DIB (with its memory DC) that [`Self::draw`] fills with a tinted, premultiplied

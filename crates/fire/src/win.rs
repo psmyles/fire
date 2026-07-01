@@ -20,7 +20,8 @@ use fire_ipc::OpenRequest;
 
 use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, EndPaint, InvalidateRect, PAINTSTRUCT,
+    BeginPaint, ClientToScreen, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -39,13 +40,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetMessageW, GetWindowLongPtrW, GetWindowPlacement, KillTimer, LoadCursorW, LoadIconW,
     PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
     SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW,
-    MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HMENU,
+    HWND_TOP, IDC_ARROW, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    MSG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPLACEMENT,
     WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
     WNDCLASSW, WPF_RESTORETOMAXIMIZED, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
@@ -146,6 +148,11 @@ struct App {
     /// User-configured entries for the toolbar's "Open in…" menu (from `config.toml`) — external
     /// apps and/or nested submenus. Empty ⇒ the menu button is disabled.
     open_with: Vec<crate::config::MenuEntry>,
+    /// True while the frame is in borderless full-screen (chrome hidden, view covers the monitor).
+    fullscreen: bool,
+    /// The windowed placement captured on entering full-screen, restored on exit (and used when
+    /// saving window state if we quit while still full-screen).
+    windowed_placement: WINDOWPLACEMENT,
 }
 
 impl App {
@@ -338,6 +345,9 @@ impl App {
             Action::ExpDown => self.surface.adjust_exposure(-EXPOSURE_STEP),
             Action::ToggleOutline => self.surface.toggle_outline(),
             Action::Background(bg) => self.surface.set_background(bg),
+            // Toggling full-screen resizes the frame, which fires WM_SIZE (relayout + reposition);
+            // fall through to the shared chrome invalidate below.
+            Action::ToggleFullscreen => self.toggle_fullscreen(),
             // The actions menu is driven directly from the click handler (it needs the button
             // rect); it never reaches the shared dispatch. No-op, and skip the repaint below.
             Action::OpenWithMenu => return,
@@ -440,9 +450,15 @@ impl App {
             // afterwards rather than falling through to the shared invalidate below.
             0x25 => return self.navigate(-1), // Left
             0x27 => return self.navigate(1),  // Right
-            0x1B => unsafe {
-                DestroyWindow(self.frame as HWND); // Esc
-            },
+            0x7A => self.toggle_fullscreen(), // F11
+            // Esc leaves full-screen if in it; otherwise it closes the window.
+            0x1B => {
+                if self.fullscreen {
+                    self.set_fullscreen(false);
+                } else {
+                    unsafe { DestroyWindow(self.frame as HWND) };
+                }
+            }
             _ => return,
         }
         self.invalidate_chrome();
@@ -492,6 +508,7 @@ impl App {
             background: s.background(),
             outline: s.outline(),
             can_navigate: self.folder.as_ref().is_some_and(|f| f.len() > 1),
+            fullscreen: self.fullscreen,
             status_left,
             status_right,
         }
@@ -504,12 +521,77 @@ impl App {
         ((rc.right - rc.left).max(0), (rc.bottom - rc.top).max(0))
     }
 
-    /// The rect reserved for the image view (between toolbar and status bar).
+    /// The rect reserved for the image view. In full-screen the chrome is hidden and the view
+    /// covers the entire client; otherwise it sits between the toolbar and status bar.
     fn view_rect(&self) -> (i32, i32, i32, i32) {
         let (w, h) = self.client();
+        if self.fullscreen {
+            return (0, 0, w.max(0), h.max(0));
+        }
         let top = self.chrome.metrics.toolbar_h;
         let vh = (h - top - self.chrome.metrics.status_h).max(0);
         (0, top, w.max(0), vh)
+    }
+
+    /// Flip in/out of borderless full-screen (toolbar button, F11, Esc, or middle-click).
+    fn toggle_fullscreen(&mut self) {
+        self.set_fullscreen(!self.fullscreen);
+    }
+
+    /// Enter (`on`) or leave borderless full-screen. Entering strips the window's border/caption and
+    /// grows it to cover the monitor it's on (Raymond Chen's documented technique), saving the
+    /// windowed placement so exit restores the exact prior position/size + maximized state. The
+    /// chrome isn't painted while full-screen because [`Self::view_rect`] lets the child view cover
+    /// the whole client — the `SetWindowPos` here fires `WM_SIZE`, which relays out and repositions
+    /// the view for the new mode. No-op if already in the requested state.
+    fn set_fullscreen(&mut self, on: bool) {
+        if on == self.fullscreen {
+            return;
+        }
+        let hwnd = self.frame as HWND;
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            if on {
+                let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+                wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                if GetWindowPlacement(hwnd, &mut wp) == 0 {
+                    return;
+                }
+                let mut mi: MONITORINFO = std::mem::zeroed();
+                mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                if GetMonitorInfoW(mon, &mut mi) == 0 {
+                    return;
+                }
+                self.windowed_placement = wp;
+                // Set the mode before resizing so the synchronous WM_SIZE sees full-screen.
+                self.fullscreen = true;
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW as isize));
+                let r = mi.rcMonitor;
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOP,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+                );
+            } else {
+                self.fullscreen = false;
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW as isize);
+                SetWindowPlacement(hwnd, &self.windowed_placement);
+                SetWindowPos(
+                    hwnd,
+                    ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+                );
+            }
+        }
     }
 
     /// Reposition the child view to the current view rect (its own WM_SIZE resizes/refits the
@@ -709,6 +791,8 @@ pub fn run(
             current_path: None,
             watcher,
             open_with,
+            fullscreen: false,
+            windowed_placement: std::mem::zeroed(),
         });
         app.relayout();
 
@@ -947,7 +1031,7 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         }
         WM_DESTROY => {
             // Remember where/how the window was before it goes away, to restore next launch.
-            save_window_state(hwnd);
+            save_window_state(hwnd, app);
             PostQuitMessage(0);
             0
         }
@@ -1038,6 +1122,13 @@ unsafe fn view_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
                 app.actions_menu_at_view(x, y);
             }
+            0
+        }
+        WM_MBUTTONDOWN => {
+            // A middle-click anywhere over the image toggles full-screen. Take focus so Esc/F11
+            // reach this window afterward.
+            SetFocus(hwnd);
+            app.toggle_fullscreen();
             0
         }
         WM_MOUSEWHEEL => {
@@ -1324,11 +1415,15 @@ unsafe fn apply_placement(frame: HWND, s: &WindowState, show: i32) {
 }
 
 /// Capture the frame's *restored* position/size + maximized flag and persist it (best effort).
-/// Called from `WM_DESTROY`; the HWND is still valid there.
-fn save_window_state(frame: HWND) {
+/// Called from `WM_DESTROY`; the HWND is still valid there. If we quit while full-screen, the live
+/// placement is the borderless monitor rect — persist the saved windowed placement instead so the
+/// next launch reopens at the pre-full-screen size.
+fn save_window_state(frame: HWND, app: &App) {
     let mut wp: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
     wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-    if unsafe { GetWindowPlacement(frame, &mut wp) } == 0 {
+    if app.fullscreen {
+        wp = app.windowed_placement;
+    } else if unsafe { GetWindowPlacement(frame, &mut wp) } == 0 {
         return;
     }
     let r = wp.rcNormalPosition;
