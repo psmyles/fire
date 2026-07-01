@@ -342,6 +342,7 @@ impl App {
             Action::Channel(c) => self.surface.toggle_channel(c),
             Action::ToggleTonemap => self.surface.toggle_tonemap(),
             Action::ExpUp => self.surface.adjust_exposure(EXPOSURE_STEP),
+            Action::ExpReset => self.surface.reset_exposure(),
             Action::ExpDown => self.surface.adjust_exposure(-EXPOSURE_STEP),
             Action::ToggleOutline => self.surface.toggle_outline(),
             Action::Background(bg) => self.surface.set_background(bg),

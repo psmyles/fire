@@ -46,6 +46,7 @@ pub enum Icon {
     A,
     Aces,
     EvUp,
+    EvReset,
     EvDown,
     White,
     Checker,
@@ -55,7 +56,7 @@ pub enum Icon {
 }
 
 /// The embedded A8 masters, indexed by `Icon as usize`. Same order as the enum / `build.rs`.
-const MASTERS: [&[u8]; 20] = [
+const MASTERS: [&[u8]; 21] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_left.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_right.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_zoom_out.a8")),
@@ -70,6 +71,7 @@ const MASTERS: [&[u8]; 20] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_A.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_aces.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_ev+.a8")),
+    include_bytes!(concat!(env!("OUT_DIR"), "/icon_ev0.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_ev-.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_W.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_C.a8")),

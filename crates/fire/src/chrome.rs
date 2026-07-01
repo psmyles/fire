@@ -39,8 +39,9 @@ pub enum Action {
     Channel(Channel),
     /// Reinhard ↔ ACES (HDR only).
     ToggleTonemap,
-    /// Exposure +/- one step (HDR only).
+    /// Exposure +/- one step, or reset to 0 EV (HDR only).
     ExpUp,
+    ExpReset,
     ExpDown,
     /// Toggle the 1px image-boundary outline (right-side group).
     ToggleOutline,
@@ -80,6 +81,7 @@ const LEFT: &[Slot] = &[
     Slot { action: Action::Channel(Channel::A), group: 2 },
     Slot { action: Action::ToggleTonemap, group: HDR_GROUP },
     Slot { action: Action::ExpUp, group: HDR_GROUP },
+    Slot { action: Action::ExpReset, group: HDR_GROUP },
     Slot { action: Action::ExpDown, group: HDR_GROUP },
 ];
 
@@ -127,7 +129,7 @@ impl ViewSnapshot {
             Action::Prev | Action::Next => self.can_navigate,
             Action::ZoomOut | Action::ZoomIn | Action::ZoomToggle => self.has_image,
             Action::Channel(_) | Action::Background(_) | Action::ToggleOutline => self.has_image,
-            Action::ToggleTonemap | Action::ExpUp | Action::ExpDown => self.is_hdr,
+            Action::ToggleTonemap | Action::ExpUp | Action::ExpReset | Action::ExpDown => self.is_hdr,
             // The actions menu (copy / show in folder / open in app) needs an image to act on; the
             // file actions are always available, so a configured app list is no longer required.
             Action::OpenWithMenu => self.has_image,
@@ -165,6 +167,7 @@ impl ViewSnapshot {
             Action::Channel(Channel::A) => "Alpha channel  (A)",
             Action::ToggleTonemap => "Tone map: Reinhard \u{2194} ACES  (T)",
             Action::ExpUp => "Increase exposure  (])",
+            Action::ExpReset => "Reset exposure",
             Action::ExpDown => "Decrease exposure  ([)",
             Action::ToggleOutline => "Image boundary outline",
             Action::Background(Background::Black) => "Black backdrop",
@@ -192,6 +195,7 @@ impl ViewSnapshot {
             Action::Channel(Channel::A) => Icon::A,
             Action::ToggleTonemap => Icon::Aces,
             Action::ExpUp => Icon::EvUp,
+            Action::ExpReset => Icon::EvReset,
             Action::ExpDown => Icon::EvDown,
             Action::ToggleOutline => Icon::Outline,
             Action::Background(Background::Black) => Icon::B,

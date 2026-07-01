@@ -45,7 +45,8 @@ const ICON_MASTER: u32 = 64;
 /// a missing SVG is a build error (the metadata is mandatory, like the shaders).
 const ICON_STEMS: &[&str] = &[
     "icon_left", "icon_right", "icon_zoom_out", "icon_zoom_in", "icon_fit", "icon_1_1", "icon_RGB",
-    "icon_rgba", "icon_R", "icon_G", "icon_B", "icon_A", "icon_aces", "icon_ev+", "icon_ev-",
+    "icon_rgba", "icon_R", "icon_G", "icon_B", "icon_A", "icon_aces", "icon_ev+", "icon_ev0",
+    "icon_ev-",
     "icon_W", "icon_C", "icon_outline", "icon_open_with", "icon_fullscreen",
 ];
 

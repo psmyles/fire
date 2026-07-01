@@ -655,6 +655,11 @@ impl GpuSurface {
         self.refresh();
     }
 
+    pub fn reset_exposure(&mut self) {
+        self.display.exposure = 0.0;
+        self.refresh();
+    }
+
     pub fn toggle_tonemap(&mut self) {
         self.display.tonemap = match self.display.tonemap {
             Tonemap::Reinhard => Tonemap::Aces,
