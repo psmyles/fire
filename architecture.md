@@ -196,7 +196,8 @@ also detected by magic so a no-extension open still routes correctly.
 | Format(s) | Decoder |
 |---|---|
 | PNG, JPEG, `.hdr`, BMP, QOI, PPM, WebP, farbfeld, JXL | **zune** — hot path |
-| TIFF, GIF, TGA, ICO | `image` crate (formats zune doesn't decode) |
+| GIF | `image` crate — **all frames** (animated GIF plays; still GIF is a single frame) |
+| TIFF, TGA, ICO | `image` crate (formats zune doesn't decode) |
 | AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
 | EXR | `exr` crate (pure Rust) → 32-bit float RGBA |
 | PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite |
@@ -223,6 +224,14 @@ Notes:
   upright. All parsing is pure-Rust and bounds-checked (malformed → "no preview", never a
   panic). The displayed pixels are therefore 8-bit (the camera's rendering); full raw
   development is explicitly out of scope (a separate opt-in mode if ever wanted, §14).
+- **Animated GIF:** GIF is routed to the `image` crate (by its `GIF8` magic), which decodes
+  **every** frame — each already composited to a full RGBA8 canvas with GIF disposal handled — plus
+  each frame's display delay. A multi-frame GIF comes back with a `DecodedImage::animation`
+  (`Some(Animation)`); a single-frame GIF is an ordinary still (`None`), so the still path is
+  untouched. Frame 0 is duplicated into `DecodedImage::pixels` so first-paint / downscale / alpha
+  scanning work unchanged. Per-frame delays below 20 ms (including the common 0 = "as fast as
+  possible") are clamped to 100 ms, matching browsers. The viewer plays it back with a UI-thread
+  timer (§10). Animated WebP is *not* animated (WebP stays on the still zune hot path).
 - **Oversized images:** `DecodeOptions::max_dim` is a **CPU/RAM guard**, not a GPU texture
   limit (an RGBA8 bitmap at 16384² is ~1 GiB; float HDR is 4×). It defaults to 16384, is
   configurable, and anything past it is CPU-downscaled to fit, recording the original size
@@ -299,6 +308,13 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
 - Pan / zoom / fit / 1:1; LMB drag-pan (the image can be pushed fully off any edge — Fit/1:1
   recenters it); mouse-wheel and RMB-vertical-drag zoom, both about the cursor.
 - HDR exposure (stops) + tonemap operator (Reinhard / ACES).
+- **Animated GIF playback:** an animated GIF plays automatically at its authored per-frame delays.
+  The decode delivers all frames (§6); the frame window runs a Win32 timer (`ANIM_TIMER_ID`),
+  rescheduled each tick to the next frame's delay, whose handler advances `GpuSurface`'s frame index,
+  uploads that frame as the texture, and invalidates the view. The timer is (re)armed on every adopt
+  and stopped when a still image or a failed load takes over (`App::sync_animation`), so it follows
+  ←/→ navigation and hot-reload and never outlives the animated image. Playback is pan/zoom/channel/
+  exposure-agnostic (those still just change the constant buffer). Only GIF is animated for now.
 - Drag-and-drop open: both the frame and the view child register with `DragAcceptFiles`, and
   each wndproc routes `WM_DROPFILES` through the same `App::open` path as a launch/forward
   (registering both is required because `WS_CLIPCHILDREN` gives the view its own client rect, so

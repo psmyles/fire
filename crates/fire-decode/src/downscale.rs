@@ -6,36 +6,49 @@
 
 use crate::DecodedImage;
 
-/// Shrink `img` in place so neither dimension exceeds `max_dim`. No-op if it already fits.
+/// Shrink `img` in place so neither dimension exceeds `max_dim`. No-op if it already fits. For an
+/// animated image every frame is resampled to the new canvas, so the whole animation stays
+/// consistent (this path is rare for GIFs — they seldom exceed the cap — but must not desync).
 pub fn to_fit(img: &mut DecodedImage, max_dim: u32) {
     if max_dim == 0 || (img.width <= max_dim && img.height <= max_dim) {
         return;
     }
 
-    let longest = img.width.max(img.height) as f64;
+    let (src_w, src_h) = (img.width, img.height);
+    let longest = src_w.max(src_h) as f64;
     let scale = max_dim as f64 / longest;
-    let new_w = ((img.width as f64 * scale).floor() as u32).clamp(1, max_dim);
-    let new_h = ((img.height as f64 * scale).floor() as u32).clamp(1, max_dim);
+    let new_w = ((src_w as f64 * scale).floor() as u32).clamp(1, max_dim);
+    let new_h = ((src_h as f64 * scale).floor() as u32).clamp(1, max_dim);
 
     let bpp = img.format.bytes_per_pixel();
-    let src_w = img.width as usize;
-    let mut out = vec![0u8; new_w as usize * new_h as usize * bpp];
-
-    for y in 0..new_h as usize {
-        // Map destination row to the nearest source row.
-        let sy = (y as u64 * img.height as u64 / new_h as u64) as usize;
-        for x in 0..new_w as usize {
-            let sx = (x as u64 * img.width as u64 / new_w as u64) as usize;
-            let src = (sy * src_w + sx) * bpp;
-            let dst = (y * new_w as usize + x) * bpp;
-            out[dst..dst + bpp].copy_from_slice(&img.pixels[src..src + bpp]);
+    img.pixels = resample(&img.pixels, src_w, src_h, new_w, new_h, bpp);
+    if let Some(anim) = img.animation.as_mut() {
+        for frame in &mut anim.frames {
+            frame.pixels = resample(&frame.pixels, src_w, src_h, new_w, new_h, bpp);
         }
     }
 
-    img.downscaled_from = Some((img.width, img.height));
-    img.pixels = out;
+    img.downscaled_from = Some((src_w, src_h));
     img.width = new_w;
     img.height = new_h;
+}
+
+/// Nearest-neighbor resample of one interleaved `bpp`-byte-per-pixel buffer from `src_w×src_h` to
+/// `new_w×new_h`. Shared by the main image and each animation frame.
+fn resample(src: &[u8], src_w: u32, src_h: u32, new_w: u32, new_h: u32, bpp: usize) -> Vec<u8> {
+    let src_w_us = src_w as usize;
+    let mut out = vec![0u8; new_w as usize * new_h as usize * bpp];
+    for y in 0..new_h as usize {
+        // Map destination row to the nearest source row.
+        let sy = (y as u64 * src_h as u64 / new_h as u64) as usize;
+        for x in 0..new_w as usize {
+            let sx = (x as u64 * src_w as u64 / new_w as u64) as usize;
+            let s = (sy * src_w_us + sx) * bpp;
+            let d = (y * new_w as usize + x) * bpp;
+            out[d..d + bpp].copy_from_slice(&src[s..s + bpp]);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -55,6 +68,7 @@ mod tests {
             source_format: "test",
             alpha_opaque: false,
             downscaled_from: None,
+            animation: None,
         }
     }
 

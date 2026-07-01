@@ -94,7 +94,10 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   hardware mip chain *once* on adopt. Pan/zoom/exposure/channel/tonemap are an 80-byte constant
   buffer; each frame is one fullscreen-triangle draw. Never reintroduce per-pixel CPU work or
   per-frame texture re-uploads. Rendering is event-driven (`InvalidateRect` → `WM_PAINT` → one
-  vsync-paced `Present`); an idle window must cost ~0.
+  vsync-paced `Present`); an idle window must cost ~0. *One deliberate exception:* an animated GIF
+  re-uploads the texture once **per animation frame**, paced by a Win32 timer at the GIF's own frame
+  rate on the UI thread (`GpuSurface::advance_frame` / `App::tick_animation`) — never per render
+  frame; a still image is still upload-once.
 - **Worker/server threads never touch the window or renderer.** The decode pool and pipe server hand
   results to the UI thread *only* via `PostMessage(frame, WM_APP_*)` with a boxed payload in LPARAM;
   the wndproc reclaims the box. Keep this discipline for any new background work.

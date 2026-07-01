@@ -7,8 +7,9 @@
 //!   - EXR            -> `exr` crate       : 32-bit float RGBA (linear/HDR)
 //!   - HEIC/HEIF/AVIF -> libheif (C FFI)   : 8-bit RGBA, or 16-bit RGBA for HDR (+ICC)
 //!   - camera raw     -> [`raw`] preview   : extract the embedded JPEG, decode via zune
+//!   - GIF            -> `image` crate     : every frame (animated GIF plays; see [`Animation`])
 //!   - zune-supported -> **zune** (hot path): PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL
-//!   - else           -> `image` crate     : TIFF/GIF/TGA/ICO (formats zune doesn't decode)
+//!   - else           -> `image` crate     : TIFF/TGA/ICO (formats zune doesn't decode)
 //!
 //! **Decode speed is the project's primary metric** (time-to-first-pixel), so the common
 //! formats run through zune with [`DecoderOptions::new_fast`] (platform intrinsics +
@@ -91,6 +92,31 @@ pub struct DecodedImage {
     /// If the image was downscaled to fit `DecodeOptions::max_dim`, the original
     /// (width, height) before downscaling; the pixel inspector notes this (§6).
     pub downscaled_from: Option<(u32, u32)>,
+    /// Playback timing/pixels for an animated source (animated GIF). `None` for a still image —
+    /// the common case, so the still path is untouched. When `Some`, `pixels` above is frame 0
+    /// (shown immediately) and [`Animation::frames`] holds the full sequence for the viewer to
+    /// cycle through. See [`Animation`].
+    pub animation: Option<Animation>,
+}
+
+/// One frame of an animated image: a full, ready-to-display RGBA canvas plus how long to show it.
+#[derive(Debug, Clone)]
+pub struct AnimationFrame {
+    /// Full-canvas RGBA pixels for this frame, already composited over the prior frames by the
+    /// decoder (GIF disposal handled), in the parent [`DecodedImage`]'s `format`/dimensions — so
+    /// the viewer just swaps the texture with no per-frame compositing.
+    pub pixels: Vec<u8>,
+    /// How long this frame is displayed before advancing, in milliseconds.
+    pub delay_ms: u32,
+}
+
+/// Multi-frame animation for an animated source (currently animated GIF). Present on a
+/// [`DecodedImage`] only when the source has more than one frame.
+#[derive(Debug, Clone)]
+pub struct Animation {
+    /// Every frame in play order (frame 0 included, matching [`DecodedImage::pixels`]). Each is a
+    /// complete canvas at the image's dimensions, so playback is a plain texture swap per frame.
+    pub frames: Vec<AnimationFrame>,
 }
 
 /// Options controlling a decode.
@@ -147,6 +173,9 @@ enum Backend {
     /// A camera-raw file; carries the status-bar label for the detected raw family. The
     /// embedded JPEG preview is extracted ([`raw`]) and decoded through the zune path.
     Raw(&'static str),
+    /// A GIF (still or animated); decoded frame-by-frame via the `image` crate so an animated
+    /// GIF can play. Sniffed separately from [`Backend::Image`] to reach the multi-frame path.
+    Gif,
     Image,
 }
 
@@ -187,6 +216,10 @@ fn sniff(bytes: &[u8], ext: Option<&str>) -> Backend {
         // before the zune/`image` fallback because TIFF-structured raws share TIFF's magic
         // and must not be handed to the `image` crate as ordinary TIFFs.
         Backend::Raw(label)
+    } else if bytes.starts_with(b"GIF8") {
+        // GIF (b"GIF87a"/b"GIF89a"): route to the dedicated multi-frame decoder so an animated
+        // GIF plays. zune has no GIF decoder anyway, so this only pre-empts the `image` fallback.
+        Backend::Gif
     } else if let Some((fmt, _)) = guess_format(ZCursor::new(bytes)) {
         // zune recognizes it (PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL): the fast path.
         if fmt == ImageFormat::Unknown {
@@ -211,6 +244,7 @@ pub fn decode(
         Backend::Exr => decode_exr(bytes)?,
         Backend::Heif(label) => decode_heif(bytes, label)?,
         Backend::Raw(label) => decode_raw(bytes, label)?,
+        Backend::Gif => decode_gif(bytes)?,
         Backend::Zune(fmt) => decode_zune(bytes, fmt)?,
         Backend::Image => decode_image(bytes, ext_hint)?,
     };
@@ -282,6 +316,7 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "PSD",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        animation: None,
     })
 }
 
@@ -331,6 +366,7 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "OpenEXR",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        animation: None,
     })
 }
 
@@ -364,6 +400,7 @@ fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, Decode
         source_format: label,
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        animation: None,
     })
 }
 
@@ -463,6 +500,7 @@ fn decode_zune(
         source_format: zune_format_name(fmt),
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        animation: None,
     })
 }
 
@@ -483,9 +521,68 @@ fn zune_format_name(f: zune_image::codecs::ImageFormat) -> &'static str {
     }
 }
 
-/// Fallback for the formats zune has no decoder for: TIFF/GIF/TGA/ICO via the `image` crate.
-/// Extracts the embedded ICC profile (where the format carries one) and keeps float
-/// sources as 32-bit float RGBA (HDR). Decode speed here is not critical (rare formats).
+/// GIF via the `image` crate. Decodes **every** frame — each already composited to a full RGBA8
+/// canvas by the decoder (GIF disposal handled) — so an animated GIF can play; a single-frame GIF
+/// comes back as an ordinary still image (`animation: None`). GIF is 8-bit and carries no ICC, so
+/// this stays on the simple RGBA8 path. Decode speed is not critical here (GIF is a rare fallback
+/// format), and decoding all frames up front keeps the viewer/renderer trivial (a texture swap per
+/// frame). Frame 0's pixels are duplicated into `DecodedImage::pixels` so the still-image code paths
+/// (first paint, downscale, alpha scan) work unchanged.
+fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    use image::codecs::gif::GifDecoder;
+    use image::AnimationDecoder;
+
+    let decoder =
+        GifDecoder::new(Cursor::new(bytes)).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let frames = decoder
+        .into_frames()
+        .collect_frames()
+        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let first = frames
+        .first()
+        .ok_or_else(|| DecodeError::Malformed("GIF has no frames".into()))?;
+    let (width, height) = first.buffer().dimensions();
+
+    // Frame 0 pixels for the still path (and the first thing painted).
+    let pixels = first.buffer().as_raw().clone();
+
+    // A single-frame GIF is just a still image — skip the animation machinery entirely.
+    let animation = (frames.len() > 1).then(|| Animation {
+        frames: frames
+            .into_iter()
+            .map(|f| {
+                let (num, den) = f.delay().numer_denom_ms();
+                let raw_ms = num.checked_div(den).unwrap_or(0);
+                // Browser-compatible clamp: GIFs commonly encode 0 (and sometimes 10 ms) meaning
+                // "as fast as possible", which renderers treat as 100 ms. Anything ≥ 20 ms is
+                // honored as authored.
+                let delay_ms = if raw_ms < 20 { 100 } else { raw_ms };
+                AnimationFrame { pixels: f.into_buffer().into_raw(), delay_ms }
+            })
+            .collect(),
+    });
+
+    Ok(DecodedImage {
+        pixels,
+        width,
+        height,
+        format: PixelFormat::Rgba8Unorm,
+        bit_depth: 8,
+        // GIF is palette-indexed with an optional transparent index → report RGBA (frames can
+        // carry transparency); the opaque-alpha scan in `decode` flags the fully-opaque case.
+        channels: 4,
+        icc: None,
+        source_format: "GIF",
+        alpha_opaque: false, // set by `decode` after the final buffer is built
+        downscaled_from: None,
+        animation,
+    })
+}
+
+/// Fallback for the formats zune has no decoder for: TIFF/TGA/ICO via the `image` crate (GIF
+/// has its own multi-frame path, see [`decode_gif`]). Extracts the embedded ICC profile (where
+/// the format carries one) and keeps float sources as 32-bit float RGBA (HDR). Decode speed here
+/// is not critical (rare formats).
 ///
 /// TGA carries no start-of-file magic (only an optional end-of-file `TRUEVISION-XFILE.`
 /// footer), so `with_guessed_format` can't detect it from content. Fall back to the file
@@ -544,6 +641,7 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         source_format: format.map(format_name).unwrap_or("image"),
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        animation: None,
     })
 }
 
@@ -662,6 +760,7 @@ mod icc {
                 source_format: "test",
                 alpha_opaque: false,
                 downscaled_from: None,
+                animation: None,
             }
         }
 
@@ -968,6 +1067,69 @@ mod tests {
         let bytes = encode(&image::DynamicImage::ImageRgba8(rgba), image::ImageFormat::Tga);
         let out = decode(&bytes, Some("tga"), &DecodeOptions::default()).unwrap();
         assert_eq!(out.channels, 4, "32-bit RGBA TGA must report an alpha channel");
+    }
+
+    /// Encode a GIF from a list of `(solid RGBA color, delay ms)` frames (test fixture). One frame
+    /// → a still GIF; more → animated.
+    fn encode_gif(w: u32, h: u32, frames: &[([u8; 4], u32)]) -> Vec<u8> {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame, RgbaImage};
+        let mut buf = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut buf);
+            enc.set_repeat(Repeat::Infinite).expect("set repeat");
+            for (color, delay_ms) in frames {
+                let img = RgbaImage::from_pixel(w, h, image::Rgba(*color));
+                let frame = Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(*delay_ms, 1));
+                enc.encode_frame(frame).expect("encode gif frame");
+            }
+        }
+        buf
+    }
+
+    /// An animated GIF decodes every frame, carrying each frame's delay, with frame 0 also in
+    /// `pixels` (the still path). Routed by the `GIF8` magic to the multi-frame decoder.
+    #[test]
+    fn animated_gif_decodes_all_frames_with_delays() {
+        let bytes = encode_gif(4, 4, &[([220, 30, 40, 255], 100), ([20, 60, 220, 255], 60)]);
+        let out = decode(&bytes, Some("gif"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.source_format, "GIF");
+        assert_eq!((out.width, out.height), (4, 4));
+        assert_eq!(out.format, PixelFormat::Rgba8Unorm);
+        assert_eq!(out.channels, 4);
+
+        let anim = out.animation.as_ref().expect("animated GIF carries an Animation");
+        assert_eq!(anim.frames.len(), 2);
+        // Delays round-trip (GIF stores centiseconds; both are multiples of 10 ms, ≥ 20 ms).
+        assert_eq!(anim.frames[0].delay_ms, 100);
+        assert_eq!(anim.frames[1].delay_ms, 60);
+        // Frame 0's pixels are duplicated into `pixels` so the still-image path works unchanged.
+        assert_eq!(out.pixels, anim.frames[0].pixels);
+        // Solid colors survive GIF palette quantization: frame 0 red-ish, frame 1 blue-ish.
+        let f0 = &anim.frames[0].pixels;
+        assert!(f0[0] > 180 && f0[1] < 90 && f0[2] < 100, "frame0 {},{},{}", f0[0], f0[1], f0[2]);
+        let f1 = &anim.frames[1].pixels;
+        assert!(f1[2] > 180 && f1[0] < 90, "frame1 {},{},{}", f1[0], f1[1], f1[2]);
+    }
+
+    /// GIF delays of 0 (and other sub-20 ms values) are clamped to 100 ms, matching how browsers
+    /// treat "as fast as possible" — so a 0-delay GIF plays at a sane speed instead of spinning.
+    #[test]
+    fn gif_zero_delay_clamped_to_100ms() {
+        let bytes = encode_gif(2, 2, &[([1, 2, 3, 255], 0), ([9, 8, 7, 255], 0)]);
+        let out = decode(&bytes, Some("gif"), &DecodeOptions::default()).unwrap();
+        let anim = out.animation.as_ref().expect("animated");
+        assert!(anim.frames.iter().all(|f| f.delay_ms == 100), "0-delay frames clamp to 100 ms");
+    }
+
+    /// A single-frame GIF is an ordinary still image — no `Animation`, so no playback timer.
+    #[test]
+    fn single_frame_gif_is_still() {
+        let bytes = encode_gif(2, 2, &[([10, 200, 60, 255], 100)]);
+        let out = decode(&bytes, Some("gif"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.source_format, "GIF");
+        assert_eq!((out.width, out.height), (2, 2));
+        assert!(out.animation.is_none(), "a single-frame GIF is a still image");
     }
 
     /// Corrupt input must surface an error, never panic (FFI-free path, but the viewer

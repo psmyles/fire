@@ -15,7 +15,7 @@
 
 use std::ffi::c_void;
 
-use fire_decode::{DecodedImage, PixelFormat};
+use fire_decode::{AnimationFrame, DecodedImage, PixelFormat};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HWND;
@@ -134,7 +134,15 @@ pub struct GpuSurface {
     /// Monotonic per-window decode generation; a `DecodeDone` older than this is stale.
     generation: u64,
     /// The displayed image — retained for the pixel inspector (#16) and for re-fit on resize.
+    /// For an animated source this holds frame 0 (dimensions/format/metadata are frame-invariant);
+    /// the frames themselves live in `anim_frames`.
     current_image: Option<DecodedImage>,
+
+    /// Frames of an animated image (animated GIF), each a full RGBA canvas + delay. Empty for a
+    /// still image. `anim_index` is the frame currently uploaded to the texture; the playback
+    /// timer (owned by the win shell) advances it via [`Self::advance_frame`].
+    anim_frames: Vec<AnimationFrame>,
+    anim_index: usize,
 
     viewport: Viewport,
     view: ViewState,
@@ -189,6 +197,8 @@ impl GpuSurface {
             outline: true,
             generation: 0,
             current_image: None,
+            anim_frames: Vec::new(),
+            anim_index: 0,
             viewport: Viewport::new(width, height),
             view: ViewState::default(),
             fit_upscale,
@@ -284,22 +294,30 @@ impl GpuSurface {
         self.current_image.as_ref().map(|i| (i.width, i.height))
     }
 
-    /// Drop the displayed image so the next paint shows the placeholder.
+    /// Drop the displayed image so the next paint shows the placeholder. Also drops any animation
+    /// frames so the win shell's next `frame_delay_ms()` returns `None` and the playback timer stops.
     pub fn clear_image(&mut self) {
         self.current_image = None;
         self._tex = None;
         self.srv = None;
+        self.anim_frames.clear();
+        self.anim_index = 0;
     }
 
     /// Adopt a decoded image: upload it as a GPU texture (hardware mip chain) and reset to fit +
     /// neutral display state for the new file (#17). Returns the GPU error if the upload fails
     /// (e.g. `E_OUTOFMEMORY` on a very large image) so the caller can report it instead of the
     /// process aborting; on failure the prior display state is left untouched.
-    pub fn set_image(&mut self, img: DecodedImage) -> windows::core::Result<()> {
+    pub fn set_image(&mut self, mut img: DecodedImage) -> windows::core::Result<()> {
         let (w, h) = (img.width, img.height);
         // Upload first: if the GPU rejects the texture we bail here, before mutating any state,
         // so a failed adopt can't leave the surface half-updated.
         self.upload_texture(&img)?;
+        // Adopt any animation frames for playback and start from frame 0 (already uploaded above).
+        // Moved out of `img` so the frames aren't cloned; a still image leaves the list empty and
+        // playback stays off. The win shell arms the timer from `frame_delay_ms()` after this.
+        self.anim_frames = img.animation.take().map(|a| a.frames).unwrap_or_default();
+        self.anim_index = 0;
         // Pick the viewport backdrop: once the user has chosen one this session it sticks across
         // every image; otherwise default to the image's nature — a checker only when there is real
         // transparency to read as transparency, solid black otherwise. An RGBA/gray+A source whose
@@ -324,9 +342,13 @@ impl GpuSurface {
     /// the re-decode came back at the same dimensions (the "re-export same canvas" case), so the
     /// user's zoomed-in detail and display state survive the update. The pan is re-clamped
     /// defensively (a no-op while the dims are unchanged).
-    pub fn replace_image_keep_view(&mut self, img: DecodedImage) -> windows::core::Result<()> {
+    pub fn replace_image_keep_view(&mut self, mut img: DecodedImage) -> windows::core::Result<()> {
         let dims = (img.width, img.height);
         self.upload_texture(&img)?;
+        // Refresh the animation frames from the re-decoded file and restart from frame 0 (the view
+        // is preserved, but the animation plays from the top). The win shell re-arms the timer.
+        self.anim_frames = img.animation.take().map(|a| a.frames).unwrap_or_default();
+        self.anim_index = 0;
         self.current_image = Some(img);
         if !self.view.fit {
             self.view.clamp_pan(dims, &self.viewport);
@@ -334,58 +356,47 @@ impl GpuSurface {
         Ok(())
     }
 
-    /// Upload `img` as a `DEFAULT` texture with a full mip chain generated on the GPU. Returns the
-    /// GPU error rather than panicking if texture/SRV creation fails — this runs synchronously
-    /// from the wndproc (via `decode_done`), where a panic would unwind across the Win32 boundary
-    /// and abort the process.
-    fn upload_texture(&mut self, img: &DecodedImage) -> windows::core::Result<()> {
-        let (format, bpp, linear_sample) = match img.format {
-            // 8-bit sources are sRGB-encoded; the `*_SRGB` view decodes to linear on sample.
-            PixelFormat::Rgba8Unorm => (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 4u32, 1i32),
-            // 16-bit unorm is treated as sRGB-encoded (matches the CPU path) → decode in shader.
-            PixelFormat::Rgba16Unorm => (DXGI_FORMAT_R16G16B16A16_UNORM, 8, 0),
-            // Float sources are already linear.
-            PixelFormat::Rgba16Float => (DXGI_FORMAT_R16G16B16A16_FLOAT, 8, 1),
-            PixelFormat::Rgba32Float => (DXGI_FORMAT_R32G32B32A32_FLOAT, 16, 1),
-        };
-        self.linear_sample = linear_sample;
+    /// Delay (ms) the currently displayed animation frame should be shown before advancing, or
+    /// `None` for a still image. The win shell arms the playback timer from this after every adopt.
+    pub fn frame_delay_ms(&self) -> Option<u32> {
+        (self.anim_frames.len() > 1).then(|| self.anim_frames[self.anim_index].delay_ms)
+    }
 
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: img.width,
-            Height: img.height,
-            MipLevels: 0, // 0 → full chain; populated by GenerateMips below
-            ArraySize: 1,
-            Format: format,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
-        };
-
-        unsafe {
-            let mut tex: Option<ID3D11Texture2D> = None;
-            self.device.CreateTexture2D(&desc, None, Some(&mut tex))?;
-            let tex = tex.unwrap();
-
-            // Level 0 only; the rest are generated.
-            self.context.UpdateSubresource(
-                &tex,
-                0,
-                None,
-                img.pixels.as_ptr() as *const c_void,
-                img.width * bpp,
-                0,
-            );
-
-            let mut srv: Option<ID3D11ShaderResourceView> = None;
-            self.device.CreateShaderResourceView(&tex, None, Some(&mut srv))?;
-            let srv = srv.unwrap();
-            self.context.GenerateMips(&srv);
-
-            self._tex = Some(tex);
-            self.srv = Some(srv);
+    /// Advance to the next animation frame (wrapping) and upload it as the texture, returning the
+    /// now-current frame's delay (ms) so the caller can reschedule the timer (GIF frame delays
+    /// vary). Returns `None` and does nothing for a still image. On a GPU upload error the visible
+    /// frame is left unchanged and the current frame's delay is returned, so a transient failure
+    /// paces the retry rather than wedging playback.
+    pub fn advance_frame(&mut self) -> Option<u32> {
+        let n = self.anim_frames.len();
+        if n <= 1 {
+            return None;
         }
+        let (w, h) = self.image_dims()?;
+        let format = self.current_image.as_ref()?.format;
+        let next = (self.anim_index + 1) % n;
+        match create_image_texture(&self.device, &self.context, &self.anim_frames[next].pixels, w, h, format) {
+            Ok((tex, srv, linear)) => {
+                self._tex = Some(tex);
+                self.srv = Some(srv);
+                self.linear_sample = linear;
+                self.anim_index = next;
+            }
+            Err(e) => eprintln!("fire: animation frame upload failed: {e}"),
+        }
+        Some(self.anim_frames[self.anim_index].delay_ms)
+    }
+
+    /// Upload `img`'s (frame-0) pixels as a `DEFAULT` texture with a full mip chain generated on the
+    /// GPU. Returns the GPU error rather than panicking if texture/SRV creation fails — this runs
+    /// synchronously from the wndproc (via `decode_done`), where a panic would unwind across the
+    /// Win32 boundary and abort the process.
+    fn upload_texture(&mut self, img: &DecodedImage) -> windows::core::Result<()> {
+        let (tex, srv, linear_sample) =
+            create_image_texture(&self.device, &self.context, &img.pixels, img.width, img.height, img.format)?;
+        self._tex = Some(tex);
+        self.srv = Some(srv);
+        self.linear_sample = linear_sample;
         Ok(())
     }
 
@@ -808,5 +819,59 @@ fn create_const_buffer(device: &ID3D11Device) -> ID3D11Buffer {
         let mut buf: Option<ID3D11Buffer> = None;
         device.CreateBuffer(&desc, None, Some(&mut buf)).expect("CreateBuffer (constants)");
         buf.unwrap()
+    }
+}
+
+/// Build a `DEFAULT` texture (+ SRV, with a GPU-generated mip chain) from one RGBA frame, returning
+/// the texture, its sampling view, and the `linear_sample` flag for `format` (1 if the sample is
+/// already linear — 8-bit `*_SRGB` / float — 0 if the shader must sRGB-decode 16-bit unorm). A free
+/// function (not a method) so the per-frame animation upload can borrow pixels straight out of
+/// `anim_frames` without aliasing the `&mut self` receiver. Returns the GPU error instead of
+/// panicking (this runs synchronously in the wndproc, where a panic would abort the process).
+fn create_image_texture(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+) -> windows::core::Result<(ID3D11Texture2D, ID3D11ShaderResourceView, i32)> {
+    let (dxgi_format, bpp, linear_sample) = match format {
+        // 8-bit sources are sRGB-encoded; the `*_SRGB` view decodes to linear on sample.
+        PixelFormat::Rgba8Unorm => (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 4u32, 1i32),
+        // 16-bit unorm is treated as sRGB-encoded (matches the CPU path) → decode in shader.
+        PixelFormat::Rgba16Unorm => (DXGI_FORMAT_R16G16B16A16_UNORM, 8, 0),
+        // Float sources are already linear.
+        PixelFormat::Rgba16Float => (DXGI_FORMAT_R16G16B16A16_FLOAT, 8, 1),
+        PixelFormat::Rgba32Float => (DXGI_FORMAT_R32G32B32A32_FLOAT, 16, 1),
+    };
+
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 0, // 0 → full chain; populated by GenerateMips below
+        ArraySize: 1,
+        Format: dxgi_format,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+    };
+
+    unsafe {
+        let mut tex: Option<ID3D11Texture2D> = None;
+        device.CreateTexture2D(&desc, None, Some(&mut tex))?;
+        let tex = tex.unwrap();
+
+        // Level 0 only; the rest are generated.
+        context.UpdateSubresource(&tex, 0, None, pixels.as_ptr() as *const c_void, width * bpp, 0);
+
+        let mut srv: Option<ID3D11ShaderResourceView> = None;
+        device.CreateShaderResourceView(&tex, None, Some(&mut srv))?;
+        let srv = srv.unwrap();
+        context.GenerateMips(&srv);
+
+        Ok((tex, srv, linear_sample))
     }
 }

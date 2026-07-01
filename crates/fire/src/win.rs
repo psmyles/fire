@@ -111,6 +111,10 @@ struct FolderScan {
 const TIP_TIMER_ID: usize = 1;
 const TIP_DELAY_MS: u32 = 500;
 
+/// Timer id for animated-image (GIF) playback on the frame window; distinct from the tooltip
+/// timer. Rescheduled on each tick with the next frame's delay, since GIF frame delays vary.
+const ANIM_TIMER_ID: usize = 2;
+
 /// Multiplicative zoom per wheel notch (and per keyboard zoom step).
 const ZOOM_STEP: f32 = 1.15;
 /// Exposure step per keypress / toolbar press, in stops.
@@ -299,6 +303,8 @@ impl App {
                 // A float source brings in the HDR group; an LDR one drops it — relayout either way.
                 self.relayout();
                 self.invalidate_chrome();
+                // Start playback if this is an animated GIF; stop any prior animation otherwise.
+                self.sync_animation();
                 eprintln!("fire: opened {name} ({w}x{h}, {fmt})");
             }
             Err(e) => {
@@ -320,6 +326,39 @@ impl App {
         self.surface.invalidate();
         self.relayout();
         self.invalidate_chrome();
+        // No image (or a still one) → stop any GIF playback that was running.
+        self.sync_animation();
+    }
+
+    /// (Re)start or stop GIF playback for the freshly adopted image. Arms the frame's animation
+    /// timer to the current frame's delay when the image is animated; kills it otherwise. Called
+    /// after every adopt (fresh open, navigate, hot-reload, failed load) so switching to a still
+    /// image — or a decode failure — stops the previous animation. `SetTimer` with the same id
+    /// replaces any pending timer, so this is safe to call repeatedly.
+    fn sync_animation(&mut self) {
+        match self.surface.frame_delay_ms() {
+            Some(delay) => unsafe {
+                SetTimer(self.frame as HWND, ANIM_TIMER_ID, delay.max(1), None);
+            },
+            None => unsafe {
+                KillTimer(self.frame as HWND, ANIM_TIMER_ID);
+            },
+        }
+    }
+
+    /// Advance the animated image one frame (on the playback timer): upload the next frame, repaint
+    /// the view, and reschedule the timer for that frame's delay. If the image is no longer animated
+    /// (e.g. it was cleared) the timer is stopped.
+    fn tick_animation(&mut self) {
+        match self.surface.advance_frame() {
+            Some(delay) => {
+                unsafe { SetTimer(self.frame as HWND, ANIM_TIMER_ID, delay.max(1), None) };
+                self.surface.invalidate();
+            }
+            None => unsafe {
+                KillTimer(self.frame as HWND, ANIM_TIMER_ID);
+            },
+        }
     }
 
     /// Perform a toolbar action, then repaint the image + chrome.
@@ -929,9 +968,13 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             0
         }
         WM_TIMER => {
-            if wparam == TIP_TIMER_ID {
-                KillTimer(hwnd, TIP_TIMER_ID);
-                app.show_tooltip();
+            match wparam {
+                TIP_TIMER_ID => {
+                    KillTimer(hwnd, TIP_TIMER_ID);
+                    app.show_tooltip();
+                }
+                ANIM_TIMER_ID => app.tick_animation(),
+                _ => {}
             }
             0
         }
