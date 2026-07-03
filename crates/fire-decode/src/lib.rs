@@ -9,7 +9,8 @@
 //!   - camera raw     -> [`raw`] preview   : extract the embedded JPEG, decode via zune
 //!   - GIF            -> `image` crate     : every frame (animated GIF plays; see [`Animation`])
 //!   - Radiance HDR   -> `image` crate     : 32-bit float RGBA (linear/HDR); see [`decode_hdr`]
-//!   - zune-supported -> **zune** (hot path): PNG/JPEG/BMP/QOI/PPM/WebP/farbfeld/JXL
+//!   - PNG            -> `image` crate     : RGBA8/RGBA16 (+ICC); see [`decode_png`]
+//!   - zune-supported -> **zune** (hot path): JPEG/BMP/QOI/PPM/WebP/farbfeld/JXL
 //!   - else           -> `image` crate     : TIFF/TGA/ICO (formats zune doesn't decode)
 //!
 //! **Decode speed is the project's primary metric** (time-to-first-pixel), so the common
@@ -17,8 +18,9 @@
 //! unsafe fast paths enabled). zune output is normalized to interleaved RGBA in the
 //! source bit depth (8/16/float). The `image` crate is kept as a fallback for the
 //! handful of formats zune has no decoder for (TIFF/GIF/TGA), where decode speed is far
-//! less important — and, deliberately, for Radiance HDR, where it is both correct and
-//! faster than zune-hdr (see [`decode_hdr`]).
+//! less important — and, deliberately, for Radiance HDR and PNG, where its decoders
+//! measured faster than zune's (and, for HDR, correct where zune-hdr is not); see
+//! [`decode_hdr`] / [`decode_png`].
 //!
 //! ICC profiles are extracted here; the lcms2 transform into the working space is
 //! applied by [`icc`]. Images larger than the caller's `max_dim` are CPU-downscaled to
@@ -181,6 +183,9 @@ enum Backend {
     /// Radiance HDR (`.hdr`/`.pic`); decoded by the `image` crate, *not* zune — see
     /// [`decode_hdr`] for why zune-hdr is avoided.
     Hdr,
+    /// PNG; decoded by the `image` crate, *not* zune — see [`decode_png`] for why
+    /// zune-png is avoided.
+    Png,
     Image,
 }
 
@@ -226,15 +231,15 @@ fn sniff(bytes: &[u8], ext: Option<&str>) -> Backend {
         // GIF plays. zune has no GIF decoder anyway, so this only pre-empts the `image` fallback.
         Backend::Gif
     } else if let Some((fmt, _)) = guess_format(ZCursor::new(bytes)) {
-        // zune recognizes it (PNG/JPEG/BMP/QOI/PPM/WebP/farbfeld/JXL): the fast path.
-        if fmt == ImageFormat::Unknown {
-            Backend::Image
-        } else if fmt == ImageFormat::HDR {
-            // Radiance HDR is the one zune-sniffed format we do NOT decode with zune;
-            // zune's sniff still covers both the `#?RADIANCE` and `#?RGBE` magics for us.
-            Backend::Hdr
-        } else {
-            Backend::Zune(fmt)
+        // zune recognizes it (JPEG/BMP/QOI/PPM/WebP/farbfeld/JXL): the fast path — except
+        // HDR and PNG, which zune sniffs for us but the `image` crate decodes (its decoders
+        // measured faster than zune's for both; see decode_hdr / decode_png).
+        match fmt {
+            ImageFormat::Unknown => Backend::Image,
+            // zune's sniff covers both the `#?RADIANCE` and `#?RGBE` magics for us.
+            ImageFormat::HDR => Backend::Hdr,
+            ImageFormat::PNG => Backend::Png,
+            _ => Backend::Zune(fmt),
         }
     } else {
         // zune doesn't sniff it (TIFF/GIF/TGA/ICO): fall back to the image crate.
@@ -255,6 +260,7 @@ pub fn decode(
         Backend::Raw(label) => decode_raw(bytes, label)?,
         Backend::Gif => decode_gif(bytes)?,
         Backend::Hdr => decode_hdr(bytes)?,
+        Backend::Png => decode_png(bytes)?,
         Backend::Zune(fmt) => decode_zune(bytes, fmt)?,
         Backend::Image => decode_image(bytes, ext_hint)?,
     };
@@ -475,7 +481,71 @@ fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     })
 }
 
-/// The hot path: zune for PNG/JPEG/BMP/QOI/PPM/WebP/farbfeld/JPEG-XL. Decoded with
+/// PNG via the `image` crate → RGBA8, or RGBA16 for 16-bit sources (precision preserved
+/// for the inspector / HDR pipeline). Extracts the embedded ICC profile.
+///
+/// Deliberately *off* the zune hot path: on large real-world PNGs the `image` crate's
+/// `png`+`fdeflate` stack decodes ~1.8× faster than zune-png end-to-end (measured 2026-07
+/// on 8192×4096 game textures: ~190 ms vs ~340 ms including RGBA normalization), and the
+/// gap is in the core decode, not wrapper overhead. Constructed directly rather than via
+/// `image::ImageReader` so the reader's default memory limits don't reject large-but-real
+/// images (a 216-MP scan trips them); the [`MAX_DECODE_DIM`] header guard here and the
+/// caller's `max_dim` downscale are the actual bomb/RAM guards, matching the zune path.
+fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    use image::{DynamicImage, ImageDecoder};
+
+    let mut decoder = image::codecs::png::PngDecoder::new(Cursor::new(bytes))
+        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let (width, height) = decoder.dimensions();
+    if width as usize > MAX_DECODE_DIM || height as usize > MAX_DECODE_DIM {
+        return Err(DecodeError::Malformed(format!(
+            "PNG dimensions {width}x{height} exceed the {MAX_DECODE_DIM} decode guard"
+        )));
+    }
+    // Source channel count (status bar / alpha-aware UI) and ICC must be read before
+    // `from_decoder` consumes the decoder. Palette sources already report their expanded
+    // RGB/RGBA color type, matching what zune reported.
+    let src_channels = decoder.color_type().channel_count();
+    let icc = decoder.icc_profile().ok().flatten();
+
+    let dynimg = DynamicImage::from_decoder(decoder)
+        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+
+    let is_16bit = matches!(
+        dynimg,
+        DynamicImage::ImageLuma16(_)
+            | DynamicImage::ImageLumaA16(_)
+            | DynamicImage::ImageRgb16(_)
+            | DynamicImage::ImageRgba16(_)
+    );
+    let (pixels, format, bit_depth) = if is_16bit {
+        // The CPU shader reads Rgba16Unorm back as native-endian u16.
+        let rgba = dynimg.into_rgba16();
+        let mut out = Vec::with_capacity(rgba.as_raw().len() * 2);
+        for v in rgba.as_raw() {
+            out.extend_from_slice(&v.to_ne_bytes());
+        }
+        (out, PixelFormat::Rgba16Unorm, 16u8)
+    } else {
+        (dynimg.into_rgba8().into_raw(), PixelFormat::Rgba8Unorm, 8)
+    };
+
+    Ok(DecodedImage {
+        pixels,
+        width,
+        height,
+        format,
+        bit_depth,
+        channels: src_channels,
+        icc,
+        source_format: "PNG",
+        alpha_opaque: false, // set by `decode` after the final buffer is built
+        downscaled_from: None,
+        animation: None,
+    })
+}
+
+/// The hot path: zune for JPEG/BMP/QOI/PPM/WebP/farbfeld/JPEG-XL. Decoded with
 /// the speed-first options, normalized to interleaved RGBA in the source bit depth, and
 /// carrying the embedded ICC profile where the format exposes one.
 ///
@@ -559,7 +629,6 @@ fn zune_format_name(f: zune_image::codecs::ImageFormat) -> &'static str {
     use zune_image::codecs::ImageFormat::*;
     match f {
         JPEG => "JPEG",
-        PNG => "PNG",
         PPM => "PPM",
         PSD => "PSD",
         Farbfeld => "Farbfeld",
@@ -896,9 +965,9 @@ mod tests {
         buf.into_inner()
     }
 
-    /// A lossless RGBA PNG must come back through the zune hot path byte-for-byte.
+    /// A lossless RGBA PNG must come back byte-for-byte (via the `image`-crate PNG path).
     #[test]
-    fn zune_png_rgba_roundtrip() {
+    fn png_rgba_roundtrip() {
         let mut src = image::RgbaImage::new(2, 2);
         src.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
         src.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
@@ -960,7 +1029,7 @@ mod tests {
     /// A grayscale PNG decodes to Luma then expands to RGBA: gray replicated, opaque alpha.
     /// The reported source channel count stays 1 (for the status bar).
     #[test]
-    fn zune_grayscale_png_expands_to_rgba() {
+    fn grayscale_png_expands_to_rgba() {
         let mut src = image::GrayImage::new(2, 1);
         src.put_pixel(0, 0, image::Luma([40]));
         src.put_pixel(1, 0, image::Luma([200]));
@@ -975,7 +1044,7 @@ mod tests {
 
     /// A 16-bit PNG stays 16-bit (precision preserved for the inspector / HDR pipeline).
     #[test]
-    fn zune_png16_stays_16bit() {
+    fn png16_stays_16bit() {
         let mut src = image::ImageBuffer::<image::Rgba<u16>, _>::new(1, 1);
         src.put_pixel(0, 0, image::Rgba([0xFFFF, 0x8000, 0x0001, 0xFFFF]));
         let bytes = encode(&image::DynamicImage::ImageRgba16(src), image::ImageFormat::Png);
@@ -990,6 +1059,26 @@ mod tests {
             .map(|c| u16::from_ne_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(px, vec![0xFFFF, 0x8000, 0x0001, 0xFFFF]);
+    }
+
+    /// A PNG's embedded ICC profile is surfaced by the `image`-crate PNG path (zune-png
+    /// surfaced it via its metadata chunk; the routing change must not lose it).
+    #[test]
+    fn png_icc_profile_is_surfaced() {
+        use image::ImageEncoder;
+
+        let icc = lcms2::Profile::new_srgb().icc().unwrap();
+        let mut buf = Vec::new();
+        let mut enc = image::codecs::png::PngEncoder::new(&mut buf);
+        enc.set_icc_profile(icc.clone()).expect("png encoder supports ICC");
+        enc.write_image(&[200u8, 30, 40, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .expect("encode fixture");
+
+        // honor_icc=false so the raw profile bytes survive for the assertion.
+        let opts = DecodeOptions { honor_icc: false, ..Default::default() };
+        let out = decode(&buf, Some("png"), &opts).unwrap();
+        assert_eq!(out.source_format, "PNG");
+        assert_eq!(out.icc.as_deref(), Some(icc.as_slice()), "embedded ICC must be surfaced");
     }
 
     /// A solid-color JPEG decodes through zune to RGBA8 with the right dims (lossy, so we

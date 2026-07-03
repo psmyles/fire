@@ -195,8 +195,9 @@ also detected by magic so a no-extension open still routes correctly.
 
 | Format(s) | Decoder |
 |---|---|
-| PNG, JPEG, BMP, QOI, PPM, WebP, farbfeld, JXL | **zune** — hot path |
+| JPEG, BMP, QOI, PPM, WebP, farbfeld, JXL | **zune** — hot path |
 | GIF | `image` crate — **all frames** (animated GIF plays; still GIF is a single frame) |
+| PNG | `image` crate → RGBA8/RGBA16 (+ICC). Deliberately **not** zune: the `png`+`fdeflate` stack measured ~1.8× faster than zune-png on large textures (the gap is in the core decode) |
 | Radiance HDR (`.hdr`/`.pic`) | `image` crate → 32-bit float RGBA. Deliberately **not** zune: zune-hdr ≤ 0.5.2 wraps RGBE exponents ≥ 32 stops from unity (dark pixels decode 2³² too bright), and the `image` decoder is ~2× faster besides |
 | TIFF, TGA, ICO | `image` crate (formats zune doesn't decode) |
 | AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
