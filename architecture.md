@@ -195,8 +195,9 @@ also detected by magic so a no-extension open still routes correctly.
 
 | Format(s) | Decoder |
 |---|---|
-| PNG, JPEG, `.hdr`, BMP, QOI, PPM, WebP, farbfeld, JXL | **zune** — hot path |
+| PNG, JPEG, BMP, QOI, PPM, WebP, farbfeld, JXL | **zune** — hot path |
 | GIF | `image` crate — **all frames** (animated GIF plays; still GIF is a single frame) |
+| Radiance HDR (`.hdr`/`.pic`) | `image` crate → 32-bit float RGBA. Deliberately **not** zune: zune-hdr ≤ 0.5.2 wraps RGBE exponents ≥ 32 stops from unity (dark pixels decode 2³² too bright), and the `image` decoder is ~2× faster besides |
 | TIFF, TGA, ICO | `image` crate (formats zune doesn't decode) |
 | AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
 | EXR | `exr` crate (pure Rust) → 32-bit float RGBA |

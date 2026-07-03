@@ -8,15 +8,17 @@
 //!   - HEIC/HEIF/AVIF -> libheif (C FFI)   : 8-bit RGBA, or 16-bit RGBA for HDR (+ICC)
 //!   - camera raw     -> [`raw`] preview   : extract the embedded JPEG, decode via zune
 //!   - GIF            -> `image` crate     : every frame (animated GIF plays; see [`Animation`])
-//!   - zune-supported -> **zune** (hot path): PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL
+//!   - Radiance HDR   -> `image` crate     : 32-bit float RGBA (linear/HDR); see [`decode_hdr`]
+//!   - zune-supported -> **zune** (hot path): PNG/JPEG/BMP/QOI/PPM/WebP/farbfeld/JXL
 //!   - else           -> `image` crate     : TIFF/TGA/ICO (formats zune doesn't decode)
 //!
 //! **Decode speed is the project's primary metric** (time-to-first-pixel), so the common
 //! formats run through zune with [`DecoderOptions::new_fast`] (platform intrinsics +
 //! unsafe fast paths enabled). zune output is normalized to interleaved RGBA in the
-//! source bit depth (8/16/float). The `image` crate is kept only as a fallback for the
+//! source bit depth (8/16/float). The `image` crate is kept as a fallback for the
 //! handful of formats zune has no decoder for (TIFF/GIF/TGA), where decode speed is far
-//! less important.
+//! less important — and, deliberately, for Radiance HDR, where it is both correct and
+//! faster than zune-hdr (see [`decode_hdr`]).
 //!
 //! ICC profiles are extracted here; the lcms2 transform into the working space is
 //! applied by [`icc`]. Images larger than the caller's `max_dim` are CPU-downscaled to
@@ -176,6 +178,9 @@ enum Backend {
     /// A GIF (still or animated); decoded frame-by-frame via the `image` crate so an animated
     /// GIF can play. Sniffed separately from [`Backend::Image`] to reach the multi-frame path.
     Gif,
+    /// Radiance HDR (`.hdr`/`.pic`); decoded by the `image` crate, *not* zune — see
+    /// [`decode_hdr`] for why zune-hdr is avoided.
+    Hdr,
     Image,
 }
 
@@ -221,9 +226,13 @@ fn sniff(bytes: &[u8], ext: Option<&str>) -> Backend {
         // GIF plays. zune has no GIF decoder anyway, so this only pre-empts the `image` fallback.
         Backend::Gif
     } else if let Some((fmt, _)) = guess_format(ZCursor::new(bytes)) {
-        // zune recognizes it (PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JXL): the fast path.
+        // zune recognizes it (PNG/JPEG/BMP/QOI/PPM/WebP/farbfeld/JXL): the fast path.
         if fmt == ImageFormat::Unknown {
             Backend::Image
+        } else if fmt == ImageFormat::HDR {
+            // Radiance HDR is the one zune-sniffed format we do NOT decode with zune;
+            // zune's sniff still covers both the `#?RADIANCE` and `#?RGBE` magics for us.
+            Backend::Hdr
         } else {
             Backend::Zune(fmt)
         }
@@ -245,6 +254,7 @@ pub fn decode(
         Backend::Heif(label) => decode_heif(bytes, label)?,
         Backend::Raw(label) => decode_raw(bytes, label)?,
         Backend::Gif => decode_gif(bytes)?,
+        Backend::Hdr => decode_hdr(bytes)?,
         Backend::Zune(fmt) => decode_zune(bytes, fmt)?,
         Backend::Image => decode_image(bytes, ext_hint)?,
     };
@@ -424,7 +434,48 @@ fn decode_raw(bytes: &[u8], label: &'static str) -> Result<DecodedImage, DecodeE
     Ok(img)
 }
 
-/// The hot path: zune for PNG/JPEG/HDR/BMP/QOI/PPM/WebP/farbfeld/JPEG-XL. Decoded with
+/// Radiance HDR via the `image` crate → 32-bit float RGBA (linear/HDR).
+///
+/// Deliberately *off* the zune hot path, for two reasons measured on real files:
+/// - **Correctness:** zune-hdr (≤ 0.5.2, and upstream `dev` as of 2026-07) computes the RGBE
+///   scale `2^(E-128)` with a shift masked `& 31`, so any pixel with `|E-128| >= 32` wraps —
+///   near-black values (E ≤ 96) come back exactly 2^32 too bright, rendering as bright
+///   blue/green patches in dark regions.
+/// - **Speed:** the `image` crate decodes the same files ~2× faster than zune-hdr, so this
+///   routing also serves the time-to-first-pixel metric.
+///
+/// Non-strict mode accepts the `#?RGBE` signature variant and old signature-less `.pic`
+/// files that the strict `#?RADIANCE` check would reject. Radiance carries no ICC profile;
+/// the data is linear RGB, so the HDR exposure/tonemap path applies downstream.
+fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    let decoder = image::codecs::hdr::HdrDecoder::with_strictness(Cursor::new(bytes), false)
+        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let dynimg = image::DynamicImage::from_decoder(decoder)
+        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let (width, height) = (dynimg.width(), dynimg.height());
+
+    let rgba = dynimg.into_rgba32f();
+    let mut pixels = Vec::with_capacity(rgba.as_raw().len() * 4);
+    for f in rgba.as_raw() {
+        pixels.extend_from_slice(&f.to_ne_bytes());
+    }
+
+    Ok(DecodedImage {
+        pixels,
+        width,
+        height,
+        format: PixelFormat::Rgba32Float,
+        bit_depth: 32,
+        channels: 3, // RGBE is always RGB; the alpha lane is added by normalization
+        icc: None,
+        source_format: "Radiance HDR",
+        alpha_opaque: false, // set by `decode` after the final buffer is built
+        downscaled_from: None,
+        animation: None,
+    })
+}
+
+/// The hot path: zune for PNG/JPEG/BMP/QOI/PPM/WebP/farbfeld/JPEG-XL. Decoded with
 /// the speed-first options, normalized to interleaved RGBA in the source bit depth, and
 /// carrying the embedded ICC profile where the format exposes one.
 ///
@@ -477,7 +528,7 @@ fn decode_zune(
             (out, PixelFormat::Rgba16Unorm, 16)
         }
         BitDepth::Float32 => {
-            // Float sources (Radiance .hdr) are linear/HDR → exposure + tonemap apply.
+            // Float sources are linear/HDR → exposure + tonemap apply.
             let f32s = frame.flatten::<f32>();
             let mut out = Vec::with_capacity(f32s.len() * 4);
             for v in f32s {
@@ -514,7 +565,6 @@ fn zune_format_name(f: zune_image::codecs::ImageFormat) -> &'static str {
         Farbfeld => "Farbfeld",
         QOI => "QOI",
         JPEG_XL => "JPEG XL",
-        HDR => "Radiance HDR",
         BMP => "BMP",
         WEBP => "WebP",
         _ => "image",
