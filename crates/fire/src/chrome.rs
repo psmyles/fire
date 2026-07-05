@@ -16,8 +16,8 @@ use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND, RECT, SIZE};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetTextExtentPoint32W,
-    SelectObject, SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, HDC, HFONT, TRANSPARENT,
+    SelectObject, SetBkMode, SetTextColor, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HDC, HFONT, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
@@ -506,6 +506,35 @@ impl Chrome {
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
 
+        unsafe { SelectObject(hdc, prev) };
+    }
+
+    /// Paint the empty-state placeholder into the viewport `rect` (frame-client coords): the
+    /// no-image backdrop plus a centered, dimmed hint. Shown by the frame while the D3D view is
+    /// hidden (no image loaded); the wording matches the double-click-to-open wiring in the win
+    /// shell. Uses the same no-image backdrop color the surface clears to, so hiding/showing the
+    /// view is seamless.
+    pub fn paint_empty_view(&self, hdc: HDC, rect: &RECT) {
+        let m = &self.metrics;
+        let p = &self.palette;
+        fill(hdc, rect, p.view_clear);
+
+        let text = "Drop an image file here\nDouble-click to open a file browser";
+        let prev = unsafe { SelectObject(hdc, m.font) };
+        unsafe {
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, p.text_dim);
+        }
+        // Center the (possibly wrapped) hint vertically: measure the wrapped block with DT_CALCRECT
+        // against the viewport width, then draw it offset so it sits in the middle.
+        let mut calc = *rect;
+        draw_text(hdc, text, &mut calc, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+        let mut r = *rect;
+        let pad = ((rect.bottom - rect.top) - (calc.bottom - calc.top)) / 2;
+        if pad > 0 {
+            r.top += pad;
+        }
+        draw_text(hdc, text, &mut r, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
         unsafe { SelectObject(hdc, prev) };
     }
 }

@@ -44,6 +44,7 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",                   # Per-Monitor-V2 awareness + GetDpiForWindow
     "Win32_UI_Shell",                   # drag-and-drop file opening (WM_DROPFILES / HDROP)
+    "Win32_UI_Controls_Dialogs",        # GetOpenFileNameW (empty-viewport double-click → Open)
 ] }
 
 # Typed COM bindings for the GPU viewport (D3D11 + DXGI flip-model swapchain). The shader is

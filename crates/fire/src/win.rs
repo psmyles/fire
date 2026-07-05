@@ -5,6 +5,11 @@
 //! the image can repaint without redrawing the chrome (`WS_CLIPCHILDREN`), and the surface's
 //! viewport is exactly the image region (no chrome insets to carry).
 //!
+//! With no image loaded the view is *hidden*, handing its region back to the frame, which paints
+//! an empty-state hint there (drop a file / double-click to open); a double-click over that region
+//! opens the file picker. Once an image loads (or one is decoding) the view is shown again and owns
+//! the region. See [`App::sync_empty_view`].
+//!
 //! Cross-thread wakeups (`WM_APP_OPEN` from the pipe server, `WM_APP_DECODE_DONE` from the
 //! worker pool, `WM_APP_FOLDER_SCANNED` from the folder-scan thread) are posted to the frame,
 //! which owns the title/size/lifecycle. Both windows reach the shared [`App`] through their
@@ -29,6 +34,10 @@ use windows_sys::Win32::System::DataExchange::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OPENFILENAMEW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
+    OFN_PATHMUSTEXIST,
+};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
@@ -40,15 +49,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetMessageW, GetWindowLongPtrW, GetWindowPlacement, KillTimer, LoadCursorW, LoadIconW,
     PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
     SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HMENU,
-    HWND_TOP, IDC_ARROW, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE,
+    HMENU, HWND_TOP, IDC_ARROW, MF_POPUP, MF_SEPARATOR, MF_STRING,
     MSG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-    SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
+    SW_FORCEMINIMIZE, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPLACEMENT,
     WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
     WNDCLASSW, WPF_RESTORETOMAXIMIZED, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
@@ -189,6 +198,8 @@ impl App {
             // Spend the one-shot foreground grant promptly (§4.1).
             foreground::raise(self.frame);
         }
+        // Bring the D3D view up for the load (hiding the empty-state hint) before we ask it to paint.
+        self.sync_empty_view();
         self.surface.invalidate();
         // No image yet → the HDR group (if it was showing) must drop out of the layout now.
         self.relayout();
@@ -326,6 +337,8 @@ impl App {
         self.surface.invalidate();
         self.relayout();
         self.invalidate_chrome();
+        // Back to the empty state: hide the view and paint the drop / double-click hint.
+        self.sync_empty_view();
         // No image (or a still one) → stop any GIF playback that was running.
         self.sync_animation();
     }
@@ -643,6 +656,39 @@ impl App {
         }
     }
 
+    /// The empty state: no image loaded and none loading. Here the frame paints the drop /
+    /// double-click hint (and the D3D view is hidden), and a double-click over the viewport opens
+    /// the file picker. During a load we keep the view up (still showing the previous image, or the
+    /// backdrop for the very first open) so the hint never flashes over a file the user just opened.
+    fn empty_view_active(&self) -> bool {
+        self.surface.current_image().is_none() && !self.loading
+    }
+
+    /// Show the D3D view when there's an image (or one is loading); otherwise hide it so the frame
+    /// can paint the empty-state hint in the same region. Hiding a `WS_CLIPCHILDREN` child hands its
+    /// rect back to the parent, so the frame's `WM_PAINT` gets the viewport area to draw the hint.
+    /// Idempotent — called after every image-state change (load / decode / fail) and once at startup.
+    fn sync_empty_view(&self) {
+        let empty = self.empty_view_active();
+        unsafe { ShowWindow(self.view as HWND, if empty { SW_HIDE } else { SW_SHOW }) };
+        // Repaint the hint when we just went empty; when going non-empty the freshly shown view
+        // repaints itself (via the load/decode `surface.invalidate`), so no frame repaint is needed.
+        if empty {
+            let (x, y, w, h) = self.view_rect();
+            let vr = RECT { left: x, top: y, right: x + w, bottom: y + h };
+            unsafe { InvalidateRect(self.frame as HWND, &vr, 0) };
+        }
+    }
+
+    /// Open the system file picker (empty-viewport double-click / on-screen hint) and load the
+    /// chosen image. The common Open dialog pumps its own modal loop on the UI thread, like the
+    /// actions popup menu; a cancel is a no-op.
+    fn open_via_dialog(&mut self) {
+        if let Some(path) = open_file_dialog(self.frame as HWND) {
+            self.open(OpenRequest::new(path));
+        }
+    }
+
     /// Recompute the toolbar layout for the current DPI/size and visible button set (the HDR group
     /// shows only for float sources, so this also re-runs when an image is adopted/cleared).
     fn relayout(&mut self) {
@@ -711,9 +757,11 @@ pub fn run(
         let app_icon = LoadIconW(hinstance, 1 as *const u16);
 
         // Frame window class (owns chrome + message loop). WS_CLIPCHILDREN is set per-window.
+        // CS_DBLCLKS so the empty viewport (which the frame owns while the D3D view is hidden)
+        // receives WM_LBUTTONDBLCLK for double-click-to-open.
         let frame_class = wide("FireFrameClass");
         RegisterClassW(&WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(frame_wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
@@ -842,6 +890,11 @@ pub fn run(
             app.open(OpenRequest::new(path));
         }
 
+        // Set the initial view visibility: hidden (frame paints the drop / double-click hint) when
+        // launched empty, shown when a launch path is loading. `open` above already synced for the
+        // with-file case; this covers the no-file case before the frame is first shown.
+        app.sync_empty_view();
+
         // Attach the shared App to both windows so either wndproc can reach it.
         let app_raw = Box::into_raw(app);
         SetWindowLongPtrW(frame, GWLP_USERDATA, app_raw as isize);
@@ -915,6 +968,13 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             let snap = app.snapshot();
             app.chrome.paint_toolbar(ps.hdc, w, &snap);
             app.chrome.paint_status(ps.hdc, w, h, &snap);
+            // Empty state: the D3D view is hidden, so the frame owns the viewport region and paints
+            // the drop / double-click hint there (matching the double-click-to-open wiring below).
+            if app.empty_view_active() {
+                let (vx, vy, vw, vh) = app.view_rect();
+                let vr = RECT { left: vx, top: vy, right: vx + vw, bottom: vy + vh };
+                app.chrome.paint_empty_view(ps.hdc, &vr);
+            }
             EndPaint(hwnd, &ps);
             0
         }
@@ -936,6 +996,20 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 match action {
                     Action::OpenWithMenu => app.actions_menu(),
                     _ => app.do_action(action),
+                }
+            }
+            0
+        }
+        WM_LBUTTONDBLCLK => {
+            // Double-clicking the empty viewport opens the file picker (matches the on-screen hint).
+            // Only the empty state reaches here: once an image loads the D3D view is shown and
+            // catches its own clicks. The region check keeps double-clicks on the chrome inert.
+            if app.empty_view_active() {
+                let x = (lparam & 0xffff) as u16 as i16 as i32;
+                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
+                let (vx, vy, vw, vh) = app.view_rect();
+                if x >= vx && x < vx + vw && y >= vy && y < vy + vh {
+                    app.open_via_dialog();
                 }
             }
             0
@@ -1221,6 +1295,57 @@ unsafe fn drop_first_path(hdrop: HDROP) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(OsString::from_wide(&buf[..copied as usize])))
+}
+
+/// File extensions Fire can decode, driving the Open dialog's "Image files" filter. Mirrors the
+/// installer's Explorer associations (`installer/fire.iss`) and `fire-decode`'s routing; the raw
+/// list is `raw.rs`'s `EXTENSIONS`. A file the filter misses is still openable via "All files"
+/// (the decoder routes by magic bytes regardless of extension).
+const SUPPORTED_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "tif", "tiff", "webp", "ico", "tga",
+    "hdr", "exr", "psd", "psb", "heic", "heif", "avif", "cr2", "cr3", "nef", "nrw", "arw", "sr2",
+    "raf", "orf", "rw2", "pef", "srw", "dng", "3fr", "iiq", "erf", "mrw", "dcr", "kdc", "mef",
+    "mos", "raw",
+];
+
+/// Build the double-NUL-terminated `lpstrFilter` for [`open_file_dialog`]: an "Image files" entry
+/// listing every supported extension, then an "All files" catch-all. The filter is `label\0pattern\0`
+/// pairs ended by one extra NUL (the `GetOpenFileNameW` contract).
+fn image_filter_wide() -> Vec<u16> {
+    let patterns: String =
+        SUPPORTED_EXTS.iter().map(|e| format!("*.{e}")).collect::<Vec<_>>().join(";");
+    let mut buf: Vec<u16> = Vec::new();
+    let mut push = |s: &str| {
+        buf.extend(s.encode_utf16());
+        buf.push(0);
+    };
+    push("Image files");
+    push(&patterns);
+    push("All files");
+    push("*.*");
+    buf.push(0); // extra NUL terminating the list
+    buf
+}
+
+/// Run the common Open dialog (owned by the frame) filtered to supported image formats, returning
+/// the chosen path or `None` on cancel. `GetOpenFileNameW` pumps its own modal loop on the UI
+/// thread, like the actions popup menu; no COM init is needed for the classic picker.
+fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
+    let filter = image_filter_wide();
+    let mut file_buf = vec![0u16; 4096];
+    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = file_buf.as_mut_ptr();
+    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if unsafe { GetOpenFileNameW(&mut ofn) } == 0 {
+        return None; // cancelled or dismissed
+    }
+    let end = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+    Some(PathBuf::from(OsString::from_wide(&file_buf[..end])))
 }
 
 fn wide(s: &str) -> Vec<u16> {
