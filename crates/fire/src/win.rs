@@ -15,18 +15,25 @@
 //! which owns the title/size/lifecycle. Both windows reach the shared [`App`] through their
 //! `GWLP_USERDATA`; only the frame owns the box.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::Instant;
 
 use fire_decode::{DecodeOptions, DecodedImage};
 use fire_ipc::OpenRequest;
 
+use crate::flipbook::{self, FlipbookState, Grid, PerPath};
+use crate::hint_chip::{HintChip, CHIP_ACCEPT, CHIP_DISMISS};
+use crate::render::gpu::FlipbookParams;
+use crate::transport::{Transport, TransportEdit, TransportSnapshot};
+
 use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -35,32 +42,32 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
 use windows_sys::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, OPENFILENAMEW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
-    OFN_PATHMUSTEXIST,
+    GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
-use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, DROPFILES, HDROP};
+use windows_sys::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, DROPFILES, HDROP,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetClientRect,
-    GetMessageW, GetWindowLongPtrW, GetWindowPlacement, KillTimer, LoadCursorW, LoadIconW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu,
-    TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE,
-    HMENU, HWND_TOP, IDC_ARROW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MINMAXINFO, MSG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER,
-    SW_FORCEMINIMIZE, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
-    SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
-    TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPLACEMENT,
-    WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_GETMINMAXINFO,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
-    WNDCLASSW, WPF_RESTORETOMAXIMIZED, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowPlacement, IsIconic,
+    KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, CS_DBLCLKS, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HMENU, HWND_TOP, IDC_ARROW, MF_CHECKED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SW_FORCEMINIMIZE,
+    SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
+    SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN,
+    WA_INACTIVE, WINDOWPLACEMENT, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_DPICHANGED, WM_DROPFILES, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW, WPF_RESTORETOMAXIMIZED, WS_CHILD,
+    WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 /// `WM_MOUSELEAVE` (0x02A3) isn't surfaced by windows-sys under the enabled features; it's a
@@ -108,6 +115,9 @@ pub const WM_APP_FOLDER_SCANNED: u32 = WM_APP + 3;
 /// The displayed image's file changed on disk (hot-reload). WPARAM is the watcher's generation
 /// at arm time (stale-drop); no LPARAM payload — the UI re-decodes its own current path.
 pub const WM_APP_FILE_CHANGED: u32 = WM_APP + 4;
+/// The flipbook hint chip was clicked. WPARAM is [`crate::hint_chip::CHIP_ACCEPT`] (enter the mode)
+/// or [`crate::hint_chip::CHIP_DISMISS`] (dismiss for the session); no LPARAM.
+pub const WM_APP_FLIPBOOK_CHIP: u32 = WM_APP + 5;
 
 /// A completed sibling-image scan, delivered to the UI thread (boxed, via the message LPARAM).
 /// The win shell turns it into a [`Folder`] cursor once it confirms it's still current.
@@ -129,6 +139,28 @@ const TIP_DELAY_MS: u32 = 500;
 /// Timer id for animated-image (GIF) playback on the frame window; distinct from the tooltip
 /// timer. Rescheduled on each tick with the next frame's delay, since GIF frame delays vary.
 const ANIM_TIMER_ID: usize = 2;
+
+/// Timer id for flipbook playback on the frame window (distinct from the tooltip / GIF timers).
+/// Paused/disabled kills it, so an idle flipbook costs nothing.
+const FLIPBOOK_TIMER_ID: usize = 3;
+
+/// Timer tick used while crossfading (blend on): a fixed ~60 Hz so the fractional position (and its
+/// crossfade) advances smoothly. Blend off ticks at the frame rate instead (one texture step).
+const FLIPBOOK_BLEND_TICK_MS: u32 = 16;
+
+/// Cap on the playback dt applied per tick, so a stall (modal loop, sleep) doesn't jump the
+/// animation far ahead when ticks resume — it just loses time, like the GIF path.
+const MAX_FLIPBOOK_STEP: f32 = 0.25;
+
+/// Project a per-path [`FlipbookState`] to the surface's render parameters.
+fn surface_flipbook(s: FlipbookState) -> FlipbookParams {
+    FlipbookParams {
+        grid: s.grid,
+        frame_count: s.frame_count,
+        frame_pos: s.frame_pos,
+        blend: s.blend,
+    }
+}
 
 /// Multiplicative zoom per wheel notch (and per keyboard zoom step).
 const ZOOM_STEP: f32 = 1.15;
@@ -172,6 +204,18 @@ struct App {
     /// The windowed placement captured on entering full-screen, restored on exit (and used when
     /// saving window state if we quit while still full-screen).
     windowed_placement: WINDOWPLACEMENT,
+    /// Per-path flipbook state (fire's only per-path map; session-only). Keyed by image path so it
+    /// survives folder navigation and hot-reload. `state` holds the user's settings, `hint`/`hint_
+    /// dismissed` drive the chip. See [`crate::flipbook`].
+    flipbook: HashMap<PathBuf, PerPath>,
+    /// Wall-clock of the previous playback tick, for dt-based advance (robust to timer jitter).
+    flipbook_last_tick: Option<Instant>,
+    /// Set while scrubbing the slider paused a playing flipbook, so release can resume it.
+    resume_after_scrub: bool,
+    /// The flipbook detection hint chip (a floating popup over the view top).
+    chip: HintChip,
+    /// The flipbook transport band (hand-painted; shown only in flipbook mode).
+    transport: Transport,
 }
 
 impl App {
@@ -197,7 +241,10 @@ impl App {
         self.file_label = name.clone();
         self.meta.clear();
         self.loading = true;
-        set_title(self.frame, &format!("{}: {name} (loading…)", crate::product::NAME));
+        set_title(
+            self.frame,
+            &format!("{}: {name} (loading…)", crate::product::NAME),
+        );
         // SAFETY: frame is live for the App's lifetime.
         unsafe { ShowWindow(self.frame as HWND, SW_SHOW) };
         if activate {
@@ -224,8 +271,16 @@ impl App {
         if let Some(w) = &self.watcher {
             w.watch(generation, path);
         }
-        let opts = DecodeOptions { max_dim: MAX_CPU_DIM, honor_icc: true };
-        self.pool.submit(DecodeJob { generation, path: path.to_path_buf(), opts, reload });
+        let opts = DecodeOptions {
+            max_dim: MAX_CPU_DIM,
+            honor_icc: true,
+        };
+        self.pool.submit(DecodeJob {
+            generation,
+            path: path.to_path_buf(),
+            opts,
+            reload,
+        });
         generation
     }
 
@@ -237,7 +292,9 @@ impl App {
         if generation != self.surface.generation() {
             return; // superseded by a newer open/navigate/reload
         }
-        let Some(path) = self.current_path.clone() else { return };
+        let Some(path) = self.current_path.clone() else {
+            return;
+        };
         self.begin_decode(&path, true);
     }
 
@@ -261,11 +318,16 @@ impl App {
             .name("fire-folder-scan".into())
             .spawn(move || {
                 let entries = folder::scan(&path);
-                let payload = Box::new(FolderScan { generation, path, entries });
+                let payload = Box::new(FolderScan {
+                    generation,
+                    path,
+                    entries,
+                });
                 let lparam = Box::into_raw(payload) as isize;
                 // SAFETY: the box outlives the post; the UI thread reclaims it in the wndproc.
                 // If the window is gone the post fails — reclaim here so we don't leak.
-                let posted = unsafe { PostMessageW(frame as HWND, WM_APP_FOLDER_SCANNED, 0, lparam) };
+                let posted =
+                    unsafe { PostMessageW(frame as HWND, WM_APP_FOLDER_SCANNED, 0, lparam) };
                 if posted == 0 {
                     drop(unsafe { Box::from_raw(lparam as *mut FolderScan) });
                 }
@@ -301,7 +363,8 @@ impl App {
                 // hot-reload at the *same* dimensions instead keeps the current view (zoom/pan/
                 // channel/exposure) so a re-export of the same canvas doesn't yank the user out
                 // of their zoomed-in detail; a reload that changed dimensions re-fits.
-                let same_dims = self.surface.current_image().map(|i| (i.width, i.height)) == Some((w, h));
+                let same_dims =
+                    self.surface.current_image().map(|i| (i.width, i.height)) == Some((w, h));
                 let upload = if outcome.reload && same_dims {
                     self.surface.replace_image_keep_view(img)
                 } else {
@@ -322,6 +385,12 @@ impl App {
                 self.invalidate_chrome();
                 // Start playback if this is an animated GIF; stop any prior animation otherwise.
                 self.sync_animation();
+                // Record this decode's flipbook hint (a reload re-detects) and re-apply any per-path
+                // flipbook state for the adopted image (restores it on navigate-back; the chip
+                // appears if a fresh hint landed).
+                self.flipbook.entry(outcome.path.clone()).or_default().hint =
+                    outcome.flipbook_guess;
+                self.apply_flipbook();
                 eprintln!("fire: opened {name} ({w}x{h}, {fmt})");
             }
             Err(e) => {
@@ -338,7 +407,10 @@ impl App {
     fn fail_load(&mut self, name: &str, meta: String) {
         self.file_label = name.to_string();
         self.meta = meta;
-        set_title(self.frame, &format!("{}: {name} (failed)", crate::product::NAME));
+        set_title(
+            self.frame,
+            &format!("{}: {name} (failed)", crate::product::NAME),
+        );
         self.surface.clear_image();
         self.surface.invalidate();
         self.relayout();
@@ -347,6 +419,8 @@ impl App {
         self.sync_empty_view();
         // No image (or a still one) → stop any GIF playback that was running.
         self.sync_animation();
+        // No image → clear any flipbook surface state, stop its timer, and hide the chip.
+        self.apply_flipbook();
     }
 
     /// (Re)start or stop GIF playback for the freshly adopted image. Arms the frame's animation
@@ -380,6 +454,243 @@ impl App {
         }
     }
 
+    // --- flipbook (sprite-sheet) mode ------------------------------------------
+
+    /// The current image's per-path flipbook entry (created on demand).
+    fn flipbook_entry(&mut self) -> Option<&mut PerPath> {
+        let path = self.current_path.clone()?;
+        Some(self.flipbook.entry(path).or_default())
+    }
+
+    /// A clone of the active flipbook state when the mode is enabled for the current image.
+    fn flipbook_state(&self) -> Option<FlipbookState> {
+        let e = self.flipbook.get(self.current_path.as_ref()?)?;
+        e.enabled.then(|| e.state.clone()).flatten()
+    }
+
+    /// Whether the transport band is shown (flipbook active, windowed).
+    fn transport_visible(&self) -> bool {
+        !self.fullscreen && self.flipbook_state().is_some()
+    }
+
+    /// Mirror the active per-path state onto the surface (or clear it), re-arm the timer, update
+    /// the hint chip, and re-lay-out if the band's visibility changed.
+    fn apply_flipbook(&mut self) {
+        let was_visible = self.transport_visible();
+        let params = self.flipbook_state().map(surface_flipbook);
+        self.surface.set_flipbook(params);
+        self.sync_flipbook_timer();
+        self.sync_chip();
+        if self.transport_visible() != was_visible {
+            // The band appeared/disappeared → the view rect changed.
+            self.relayout();
+            self.reposition_view();
+            self.invalidate_chrome();
+        }
+        self.invalidate_transport();
+    }
+
+    /// Toggle flipbook mode for the current image (K / toolbar). Enabling seeds state from the
+    /// detected grid (or an 8×8 default) and dismisses the hint chip; disabling stops playback but
+    /// retains the settings for re-entry.
+    fn toggle_flipbook(&mut self) {
+        // Needs a still image (a GIF is already an animation, not a sprite sheet).
+        if self.surface.current_image().is_none() || self.surface.frame_delay_ms().is_some() {
+            return;
+        }
+        let Some(entry) = self.flipbook_entry() else {
+            return;
+        };
+        if entry.enabled {
+            entry.enabled = false;
+            if let Some(s) = &mut entry.state {
+                s.playing = false;
+            }
+        } else {
+            entry.enabled = true;
+            entry.hint_dismissed = true;
+            if entry.state.is_none() {
+                let grid = entry.hint.unwrap_or(Grid::new(8, 8));
+                entry.state = Some(FlipbookState::new(grid));
+            }
+        }
+        self.apply_flipbook();
+        self.invalidate_chrome();
+    }
+
+    /// Arm/kill the flipbook playback timer to match the active state. Paused/off = no timer.
+    fn sync_flipbook_timer(&mut self) {
+        let tick = self.flipbook_state().and_then(|s| {
+            (s.playing && s.frame_count > 1).then(|| {
+                if s.blend {
+                    FLIPBOOK_BLEND_TICK_MS
+                } else {
+                    (1000.0 / s.fps).clamp(8.0, 60_000.0) as u32
+                }
+            })
+        });
+        match tick {
+            Some(t) => {
+                self.flipbook_last_tick = Some(Instant::now());
+                unsafe { SetTimer(self.frame as HWND, FLIPBOOK_TIMER_ID, t.max(1), None) };
+            }
+            None => {
+                self.flipbook_last_tick = None;
+                unsafe { KillTimer(self.frame as HWND, FLIPBOOK_TIMER_ID) };
+            }
+        }
+    }
+
+    /// Advance flipbook playback (on the timer): dt-based so jitter/stalls don't accumulate.
+    fn tick_flipbook(&mut self) {
+        let Some(path) = self.current_path.clone() else {
+            return;
+        };
+        let now = Instant::now();
+        let dt = self
+            .flipbook_last_tick
+            .map(|t| (now - t).as_secs_f32().min(MAX_FLIPBOOK_STEP))
+            .unwrap_or(0.0);
+        self.flipbook_last_tick = Some(now);
+        let Some(entry) = self.flipbook.get_mut(&path) else {
+            return;
+        };
+        if !entry.enabled {
+            return;
+        }
+        let Some(s) = &mut entry.state else {
+            return;
+        };
+        if !s.playing || s.frame_count <= 1 {
+            return;
+        }
+        s.frame_pos = (s.frame_pos + dt * s.fps).rem_euclid(s.frame_count as f32);
+        let pos = s.frame_pos;
+        self.surface.set_flipbook_pos(pos);
+        self.invalidate_transport();
+    }
+
+    /// Show or hide the detection hint chip: shown when the current image has an undismissed hint,
+    /// the mode is off, and we're windowed and not minimized.
+    fn sync_chip(&mut self) {
+        let minimized = unsafe { IsIconic(self.frame as HWND) != 0 };
+        let entry = self
+            .current_path
+            .as_ref()
+            .and_then(|p| self.flipbook.get(p));
+        let show = !self.fullscreen
+            && !minimized
+            && entry.is_some_and(|e| e.hint.is_some() && !e.enabled && !e.hint_dismissed);
+        if !show {
+            self.chip.hide();
+            return;
+        }
+        let grid = entry.and_then(|e| e.hint).unwrap();
+        // Anchor at the top-center of the view rect, a small gap down.
+        let (vx, vy, vw, _) = self.view_rect();
+        let gap = self.chrome.metrics.dpi as i32 * 8 / 96;
+        let mut pt = POINT {
+            x: vx + vw / 2,
+            y: vy + gap,
+        };
+        unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
+        self.chip.show(grid, pt.x, pt.y);
+    }
+
+    /// Build the read model the transport band paints from.
+    fn transport_snapshot(&self) -> Option<TransportSnapshot> {
+        let s = self.flipbook_state()?;
+        Some(TransportSnapshot {
+            cols: s.grid.cols,
+            rows: s.grid.rows,
+            frame_count: s.frame_count,
+            fps: s.fps,
+            blend: s.blend,
+            playing: s.playing,
+            frame_pos: s.frame_pos,
+            grid_max: flipbook::GRID_MAX,
+        })
+    }
+
+    /// The transport band rect (frame-client coords) when visible.
+    fn transport_band_rect(&self) -> Option<RECT> {
+        if !self.transport_visible() {
+            return None;
+        }
+        let (w, h) = self.client();
+        let th = self.chrome.metrics.transport_h;
+        let top = h - self.chrome.metrics.status_h - th;
+        Some(RECT {
+            left: 0,
+            top,
+            right: w,
+            bottom: top + th,
+        })
+    }
+
+    /// Invalidate just the transport band strip (playback tick / scrub / hover).
+    fn invalidate_transport(&self) {
+        if let Some(r) = self.transport_band_rect() {
+            unsafe { InvalidateRect(self.frame as HWND, &r, 0) };
+        }
+    }
+
+    /// Apply a transport edit to the active flipbook state, then sync the surface/timer/repaint.
+    fn apply_transport_edit(&mut self, edit: TransportEdit) {
+        let Some(path) = self.current_path.clone() else {
+            return;
+        };
+        let mut grid_changed = false;
+        {
+            let Some(entry) = self.flipbook.get_mut(&path) else {
+                return;
+            };
+            let Some(s) = &mut entry.state else {
+                return;
+            };
+            match edit {
+                TransportEdit::SetCols(c) => {
+                    let follow = s.frame_count == s.grid.cols * s.grid.rows;
+                    s.grid.cols = c;
+                    if follow {
+                        s.frame_count = s.grid.cols * s.grid.rows;
+                    }
+                    grid_changed = true;
+                }
+                TransportEdit::SetRows(r) => {
+                    let follow = s.frame_count == s.grid.cols * s.grid.rows;
+                    s.grid.rows = r;
+                    if follow {
+                        s.frame_count = s.grid.cols * s.grid.rows;
+                    }
+                    grid_changed = true;
+                }
+                TransportEdit::SetCount(n) => s.frame_count = n,
+                TransportEdit::SetFps(f) => s.fps = f,
+                TransportEdit::ToggleBlend => s.blend = !s.blend,
+                TransportEdit::TogglePlay => s.playing = !s.playing,
+                TransportEdit::Scrub(pos) => s.frame_pos = pos,
+            }
+            s.clamp();
+        }
+        if grid_changed {
+            // A grid change refits to the new frame rect via set_flipbook.
+            self.apply_flipbook();
+        } else if matches!(
+            edit,
+            TransportEdit::TogglePlay | TransportEdit::SetFps(_) | TransportEdit::ToggleBlend
+        ) {
+            // Play/fps/blend keep the grid but change playback (or the shader blend) and the timer.
+            let params = self.flipbook_state().map(surface_flipbook);
+            self.surface.set_flipbook(params);
+            self.sync_flipbook_timer();
+        } else if let Some(s) = self.flipbook_state() {
+            // Count/scrub: just move the position on the surface.
+            self.surface.set_flipbook_pos(s.frame_pos);
+        }
+        self.invalidate_transport();
+    }
+
     /// Perform a toolbar action, then repaint the image + chrome.
     fn do_action(&mut self, action: Action) {
         match action {
@@ -407,6 +718,9 @@ impl App {
             // Toggling full-screen resizes the frame, which fires WM_SIZE (relayout + reposition);
             // fall through to the shared chrome invalidate below.
             Action::ToggleFullscreen => self.toggle_fullscreen(),
+            // Flipbook mode runs its own relayout/reposition/invalidate; return without the shared
+            // chrome invalidate below.
+            Action::ToggleFlipbook => return self.toggle_flipbook(),
             // The actions and overflow menus are driven directly from the click handler (they need
             // the button rect); they never reach the shared dispatch. No-op, skip the repaint below.
             Action::OpenWithMenu | Action::Overflow => return,
@@ -420,9 +734,14 @@ impl App {
     /// then anyway). All on the UI thread — `TrackPopupMenu` runs its own modal pump but touches no
     /// worker/renderer.
     fn actions_menu(&mut self) {
-        let Some(rect) = self.chrome.button_rect_for(Action::OpenWithMenu) else { return };
+        let Some(rect) = self.chrome.button_rect_for(Action::OpenWithMenu) else {
+            return;
+        };
         // Anchor the menu at the button's bottom-left, in screen coords.
-        let mut pt = POINT { x: rect.left, y: rect.bottom };
+        let mut pt = POINT {
+            x: rect.left,
+            y: rect.bottom,
+        };
         unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
         self.show_actions_menu(pt);
     }
@@ -432,14 +751,19 @@ impl App {
     /// items mirror the toolbar buttons' enabled/checked state. A no-op if nothing overflowed. On
     /// the UI thread, like the actions popup.
     fn overflow_menu(&mut self) {
-        let Some(rect) = self.chrome.button_rect_for(Action::Overflow) else { return };
+        let Some(rect) = self.chrome.button_rect_for(Action::Overflow) else {
+            return;
+        };
         let snap = self.snapshot();
         let items = self.chrome.overflow_menu(&snap);
         if items.is_empty() {
             return;
         }
         // Anchor the menu at the button's bottom-left, in screen coords.
-        let mut pt = POINT { x: rect.left, y: rect.bottom };
+        let mut pt = POINT {
+            x: rect.left,
+            y: rect.bottom,
+        };
         unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
         let chosen = unsafe {
             // Same foreground idiom as the actions popup so an outside click dismisses cleanly.
@@ -492,7 +816,9 @@ impl App {
     /// current image. Shared by [`Self::actions_menu`] (toolbar button) and [`Self::actions_menu_at_view`]
     /// (right-click). A no-op if there's no image.
     fn show_actions_menu(&mut self, pt: POINT) {
-        let Some(image) = self.current_path.clone() else { return };
+        let Some(image) = self.current_path.clone() else {
+            return;
+        };
         unsafe {
             // The documented idiom so the menu dismisses correctly on an outside click.
             SetForegroundWindow(self.frame as HWND);
@@ -531,7 +857,9 @@ impl App {
             match cmd as usize {
                 ID_SHOW_IN_EXPLORER => show_in_explorer(&image),
                 ID_COPY_FILE => copy_file_to_clipboard(self.frame as HWND, &image),
-                ID_COPY_PATH => copy_text_to_clipboard(self.frame as HWND, &image.to_string_lossy()),
+                ID_COPY_PATH => {
+                    copy_text_to_clipboard(self.frame as HWND, &image.to_string_lossy())
+                }
                 ID_COPY_NAME => copy_text_to_clipboard(self.frame as HWND, &file_name(&image)),
                 id if id >= OPEN_WITH_ID_BASE => {
                     if let Some(app) = leaves.get(id - OPEN_WITH_ID_BASE) {
@@ -545,18 +873,51 @@ impl App {
 
     /// Map a virtual-key press to a view command (layout-independent VK codes).
     fn handle_key(&mut self, vk: u32) {
+        // While a transport field is being typed into, route Enter/Tab/Esc to the editor first so
+        // keystrokes don't leak to view commands.
+        if self.transport.is_editing() {
+            match vk {
+                0x0D | 0x09 => {
+                    // Enter / Tab commit.
+                    if let Some(snap) = self.transport_snapshot() {
+                        if let Some(edit) = self.transport.commit(&snap) {
+                            self.apply_transport_edit(edit);
+                        }
+                    }
+                    self.invalidate_transport();
+                    return;
+                }
+                0x1B => {
+                    // Esc cancels the edit (does not leave the mode / close the window).
+                    self.transport.cancel_edit();
+                    self.invalidate_transport();
+                    return;
+                }
+                _ => return, // other keys handled via WM_CHAR
+            }
+        }
+        // Space / , / . drive playback when flipbook mode is active.
+        if self.flipbook_state().is_some() {
+            match vk {
+                0x20 => return self.flipbook_key(TransportEdit::TogglePlay), // Space
+                0xBC => return self.flipbook_step(-1),                       // ,
+                0xBE => return self.flipbook_step(1),                        // .
+                _ => {}
+            }
+        }
         match vk {
-            0x46 => self.surface.fit(),                          // F
-            0x31 => self.surface.one_to_one(),                   // 1
-            0x52 => self.surface.toggle_channel(Channel::R),     // R
-            0x47 => self.surface.toggle_channel(Channel::G),     // G
-            0x42 => self.surface.toggle_channel(Channel::B),     // B
-            0x41 => self.surface.toggle_channel(Channel::A),     // A
-            0x43 => self.surface.set_channel(Channel::Rgb),      // C
-            0x54 => self.surface.toggle_tonemap(),               // T
-            0xDD => self.surface.adjust_exposure(EXPOSURE_STEP), // ]
-            0xDB => self.surface.adjust_exposure(-EXPOSURE_STEP), // [
-            0xBB | 0x6B => self.surface.zoom_centered(ZOOM_STEP), // = / numpad +
+            0x46 => self.surface.fit(),                                 // F
+            0x31 => self.surface.one_to_one(),                          // 1
+            0x52 => self.surface.toggle_channel(Channel::R),            // R
+            0x47 => self.surface.toggle_channel(Channel::G),            // G
+            0x42 => self.surface.toggle_channel(Channel::B),            // B
+            0x41 => self.surface.toggle_channel(Channel::A),            // A
+            0x43 => self.surface.set_channel(Channel::Rgb),             // C
+            0x54 => self.surface.toggle_tonemap(),                      // T
+            0x4B => return self.toggle_flipbook(),                      // K
+            0xDD => self.surface.adjust_exposure(EXPOSURE_STEP),        // ]
+            0xDB => self.surface.adjust_exposure(-EXPOSURE_STEP),       // [
+            0xBB | 0x6B => self.surface.zoom_centered(ZOOM_STEP),       // = / numpad +
             0xBD | 0x6D => self.surface.zoom_centered(1.0 / ZOOM_STEP), // - / numpad -
             // ← / → walk the folder. navigate() runs its own load + repaint, so return
             // afterwards rather than falling through to the shared invalidate below.
@@ -574,6 +935,25 @@ impl App {
             _ => return,
         }
         self.invalidate_chrome();
+    }
+
+    /// Apply a playback edit from a keybind (Space) and repaint the band.
+    fn flipbook_key(&mut self, edit: TransportEdit) {
+        self.apply_transport_edit(edit);
+    }
+
+    /// Step the flipbook one frame (`, / .`), pausing playback and moving to the exact frame.
+    fn flipbook_step(&mut self, delta: i32) {
+        let Some(s) = self.flipbook_state() else {
+            return;
+        };
+        let count = s.frame_count.max(1) as f32;
+        let pos = (s.frame_pos.floor() + delta as f32).rem_euclid(count);
+        // Pause, then move; two edits (TogglePlay only if currently playing).
+        if s.playing {
+            self.apply_transport_edit(TransportEdit::TogglePlay);
+        }
+        self.apply_transport_edit(TransportEdit::Scrub(pos));
     }
 
     /// Build the snapshot the chrome renders from.
@@ -621,6 +1001,8 @@ impl App {
             outline: s.outline(),
             can_navigate: self.folder.as_ref().is_some_and(|f| f.len() > 1),
             fullscreen: self.fullscreen,
+            flipbook: self.flipbook_state().is_some(),
+            has_animation: self.surface.frame_delay_ms().is_some(),
             status_left,
             status_right,
         }
@@ -641,7 +1023,13 @@ impl App {
             return (0, 0, w.max(0), h.max(0));
         }
         let top = self.chrome.metrics.toolbar_h;
-        let vh = (h - top - self.chrome.metrics.status_h).max(0);
+        // The flipbook transport band, when shown, sits between the view and the status bar.
+        let band = if self.transport_visible() {
+            self.chrome.metrics.transport_h
+        } else {
+            0
+        };
+        let vh = (h - top - self.chrome.metrics.status_h - band).max(0);
         (0, top, w.max(0), vh)
     }
 
@@ -711,7 +1099,15 @@ impl App {
     fn reposition_view(&self) {
         let (x, y, w, h) = self.view_rect();
         unsafe {
-            SetWindowPos(self.view as HWND, ptr::null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowPos(
+                self.view as HWND,
+                ptr::null_mut(),
+                x,
+                y,
+                w,
+                h,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
     }
 
@@ -734,7 +1130,12 @@ impl App {
         // repaints itself (via the load/decode `surface.invalidate`), so no frame repaint is needed.
         if empty {
             let (x, y, w, h) = self.view_rect();
-            let vr = RECT { left: x, top: y, right: x + w, bottom: y + h };
+            let vr = RECT {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            };
             unsafe { InvalidateRect(self.frame as HWND, &vr, 0) };
         }
     }
@@ -754,23 +1155,44 @@ impl App {
         let (w, _) = self.client();
         let snap = self.snapshot();
         self.chrome.relayout(w, &snap);
+        // Lay out the transport band's widgets when it's shown (its rect depends on the client size).
+        if let Some(band) = self.transport_band_rect() {
+            self.transport.layout(band, &self.chrome);
+        }
     }
 
     /// Invalidate the toolbar + status strips (the chrome) without disturbing the view child.
     fn invalidate_chrome(&self) {
         let (w, h) = self.client();
-        let tb = RECT { left: 0, top: 0, right: w, bottom: self.chrome.metrics.toolbar_h };
-        let sb = RECT { left: 0, top: h - self.chrome.metrics.status_h, right: w, bottom: h };
+        let tb = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: self.chrome.metrics.toolbar_h,
+        };
+        let sb = RECT {
+            left: 0,
+            top: h - self.chrome.metrics.status_h,
+            right: w,
+            bottom: h,
+        };
         unsafe {
             InvalidateRect(self.frame as HWND, &tb, 0);
             InvalidateRect(self.frame as HWND, &sb, 0);
         }
+        // The transport band sits above the status bar; refresh it too when present.
+        self.invalidate_transport();
     }
 
     /// Invalidate only the status strip (e.g. on a zoom change).
     fn invalidate_status(&self) {
         let (w, h) = self.client();
-        let sb = RECT { left: 0, top: h - self.chrome.metrics.status_h, right: w, bottom: h };
+        let sb = RECT {
+            left: 0,
+            top: h - self.chrome.metrics.status_h,
+            right: w,
+            bottom: h,
+        };
         unsafe { InvalidateRect(self.frame as HWND, &sb, 0) };
     }
 
@@ -779,11 +1201,16 @@ impl App {
     fn show_tooltip(&mut self) {
         let Some(idx) = self.chrome.hover else { return };
         let snap = self.snapshot();
-        let Some((rect, text)) = self.chrome.button_tooltip(idx, &snap) else { return };
+        let Some((rect, text)) = self.chrome.button_tooltip(idx, &snap) else {
+            return;
+        };
         // Drop the bubble below the whole toolbar (a small DPI-scaled gap), left-aligned to the
         // button; convert from frame-client coords to the screen coords the popup wants.
         let gap = self.chrome.metrics.dpi as i32 * 2 / 96;
-        let mut pt = POINT { x: rect.left, y: self.chrome.metrics.toolbar_h + gap };
+        let mut pt = POINT {
+            x: rect.left,
+            y: self.chrome.metrics.toolbar_h + gap,
+        };
         unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
         self.tooltip.show(text, pt.x, pt.y);
     }
@@ -883,6 +1310,7 @@ pub fn run(
         let dpi = GetDpiForWindow(frame).max(96);
         let ch = Chrome::new(dpi, dark);
         let tooltip = Tooltip::new(frame as isize, dpi, dark);
+        let chip = HintChip::new(frame as isize, dpi, dark);
 
         // Initial view rect from the frame client size and chrome metrics.
         let (fw, fh) = client_size(frame);
@@ -915,8 +1343,13 @@ pub fn run(
         DragAcceptFiles(frame, 1);
         DragAcceptFiles(view, 1);
 
-        let mut surface =
-            GpuSurface::new(view as isize, hinstance as isize, vw as u32, vh as u32, fit_upscale);
+        let mut surface = GpuSurface::new(
+            view as isize,
+            hinstance as isize,
+            vw as u32,
+            vh as u32,
+            fit_upscale,
+        );
         surface.set_clear(ch.view_clear_packed());
         // Workers and the pipe server post to the frame (it owns title/size/lifecycle).
         let pool = DecodePool::new(frame as isize);
@@ -940,6 +1373,11 @@ pub fn run(
             open_with,
             fullscreen: false,
             windowed_placement: std::mem::zeroed(),
+            flipbook: HashMap::new(),
+            flipbook_last_tick: None,
+            resume_after_scrub: false,
+            chip,
+            transport: Transport::default(),
         });
         app.relayout();
 
@@ -994,7 +1432,12 @@ pub fn run(
 /// [`frame_wndproc_impl`] behind a `catch_unwind` firewall — the same panic-boundary posture the
 /// decode FFI uses (see [`crate::decode_pool`]). On a caught panic we log and defer to
 /// `DefWindowProc`, leaving the window alive.
-unsafe extern "system" fn frame_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn frame_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         frame_wndproc_impl(hwnd, msg, wparam, lparam)
     })) {
@@ -1027,11 +1470,21 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             let snap = app.snapshot();
             app.chrome.paint_toolbar(ps.hdc, w, &snap);
             app.chrome.paint_status(ps.hdc, w, h, &snap);
+            // Flipbook transport band (above the status bar) when in flipbook mode.
+            if let (Some(band), Some(tsnap)) = (app.transport_band_rect(), app.transport_snapshot())
+            {
+                app.transport.paint(ps.hdc, band, &app.chrome, &tsnap);
+            }
             // Empty state: the D3D view is hidden, so the frame owns the viewport region and paints
             // the drop / double-click hint there (matching the double-click-to-open wiring below).
             if app.empty_view_active() {
                 let (vx, vy, vw, vh) = app.view_rect();
-                let vr = RECT { left: vx, top: vy, right: vx + vw, bottom: vy + vh };
+                let vr = RECT {
+                    left: vx,
+                    top: vy,
+                    right: vx + vw,
+                    bottom: vy + vh,
+                };
                 app.chrome.paint_empty_view(ps.hdc, &vr);
             }
             EndPaint(hwnd, &ps);
@@ -1042,7 +1495,14 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.relayout();
             app.reposition_view();
             app.invalidate_chrome();
+            // Reposition/hide the hint chip for the new size (also handles minimize/restore).
+            app.sync_chip();
             0
+        }
+        WM_MOVE => {
+            // The hint chip is a separate top-level popup, so it must follow the frame.
+            app.sync_chip();
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_GETMINMAXINFO => {
             // Clamp the minimum track size so the toolbar can't be squeezed until its buttons
@@ -1053,7 +1513,12 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             let (cw, ch) = app.chrome.min_client_size();
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
             let dpi = GetDpiForWindow(hwnd).max(96);
-            let mut r = RECT { left: 0, top: 0, right: cw, bottom: ch };
+            let mut r = RECT {
+                left: 0,
+                top: 0,
+                right: cw,
+                bottom: ch,
+            };
             AdjustWindowRectExForDpi(&mut r, style, 0, 0, dpi);
             mmi.ptMinTrackSize.x = r.right - r.left;
             mmi.ptMinTrackSize.y = r.bottom - r.top;
@@ -1063,6 +1528,37 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             let x = (lparam & 0xffff) as u16 as i16 as i32;
             let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
             app.cancel_tooltip();
+            // A press anywhere commits any in-progress typed field edit first.
+            if app.transport.is_editing() {
+                if let Some(snap) = app.transport_snapshot() {
+                    if let Some(edit) = app.transport.commit(&snap) {
+                        app.apply_transport_edit(edit);
+                    }
+                }
+            }
+            // Transport band press (grid/count/play/slider/fps/blend).
+            if let Some(band) = app.transport_band_rect() {
+                if y >= band.top && y < band.bottom {
+                    if let Some(snap) = app.transport_snapshot() {
+                        let press = app.transport.press(x, y, &snap);
+                        if press.capture {
+                            SetCapture(hwnd);
+                        }
+                        if press.slider {
+                            // Pause during a scrub; resume on release if it was playing.
+                            app.resume_after_scrub = snap.playing;
+                            if snap.playing {
+                                app.apply_transport_edit(TransportEdit::TogglePlay);
+                            }
+                        }
+                        if let Some(edit) = press.edit {
+                            app.apply_transport_edit(edit);
+                        }
+                        app.invalidate_transport();
+                    }
+                    return 0;
+                }
+            }
             let snap = app.snapshot();
             if let Some(action) = app.chrome.hit_test(x, y, &snap) {
                 // The actions button opens a popup menu, which needs the button's screen rect, so
@@ -1073,6 +1569,23 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     Action::Overflow => app.overflow_menu(),
                     _ => app.do_action(action),
                 }
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            if app.transport.is_dragging() {
+                ReleaseCapture();
+                let was_slider = app.transport.release();
+                if was_slider && app.resume_after_scrub {
+                    app.resume_after_scrub = false;
+                    app.apply_transport_edit(TransportEdit::TogglePlay);
+                }
+                // A field click (no drag) entered type-edit mode → take focus so the following
+                // WM_CHAR / Enter / Esc reach the frame (the view child may have held focus).
+                if app.transport.is_editing() {
+                    SetFocus(hwnd);
+                }
+                app.invalidate_transport();
             }
             0
         }
@@ -1093,6 +1606,30 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         WM_MOUSEMOVE => {
             let x = (lparam & 0xffff) as u16 as i16 as i32;
             let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
+            // An active transport drag (mouse captured) takes moves anywhere, even outside the band.
+            if app.transport.is_dragging() {
+                if let Some(snap) = app.transport_snapshot() {
+                    if let Some(edit) = app.transport.drag_to(x, &snap) {
+                        app.apply_transport_edit(edit);
+                    }
+                }
+                return 0;
+            }
+            // Transport band hover (below the toolbar): repaint on change.
+            if let Some(band) = app.transport_band_rect() {
+                if y >= band.top && y < band.bottom {
+                    if app.transport.set_hover(x, y) {
+                        app.invalidate_transport();
+                    }
+                    if app.chrome.hover.is_some() {
+                        app.chrome.hover = None;
+                        app.invalidate_chrome();
+                    }
+                    return 0;
+                } else if app.transport.clear_hover() {
+                    app.invalidate_transport();
+                }
+            }
             let hov = if y < app.chrome.metrics.toolbar_h {
                 app.chrome.hover_index(x, y)
             } else {
@@ -1124,6 +1661,7 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     app.show_tooltip();
                 }
                 ANIM_TIMER_ID => app.tick_animation(),
+                FLIPBOOK_TIMER_ID => app.tick_flipbook(),
                 _ => {}
             }
             0
@@ -1133,6 +1671,9 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             if app.chrome.hover.is_some() {
                 app.chrome.hover = None;
                 app.invalidate_chrome();
+            }
+            if app.transport.clear_hover() {
+                app.invalidate_transport();
             }
             0
         }
@@ -1145,14 +1686,42 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_MOUSEWHEEL => {
-            // Delivered to the focused window; the surface zooms about its own tracked cursor,
-            // so we ignore the (screen-space) position here.
-            let delta = ((wparam >> 16) & 0xffff) as u16 as i16 as f32 / 120.0;
-            if delta != 0.0 {
-                app.surface.zoom_at_cursor(ZOOM_STEP.powf(delta));
+            // WM_MOUSEWHEEL carries *screen* coords; convert to client to test the transport band.
+            let notches = ((wparam >> 16) & 0xffff) as u16 as i16 as i32 / 120;
+            let mut pt = POINT {
+                x: (lparam & 0xffff) as u16 as i16 as i32,
+                y: ((lparam >> 16) & 0xffff) as u16 as i16 as i32,
+            };
+            ScreenToClient(hwnd, &mut pt);
+            let over_band = app
+                .transport_band_rect()
+                .is_some_and(|b| pt.y >= b.top && pt.y < b.bottom);
+            if over_band {
+                let ctrl = (GetKeyState(0x11) as u16 & 0x8000) != 0; // VK_CONTROL
+                if let Some(snap) = app.transport_snapshot() {
+                    if let Some(edit) = app.transport.wheel(pt.x, pt.y, notches, ctrl, &snap) {
+                        app.apply_transport_edit(edit);
+                    }
+                }
+            } else if notches != 0 {
+                // Over the image: zoom about the surface's tracked cursor (position ignored here).
+                app.surface.zoom_at_cursor(ZOOM_STEP.powf(notches as f32));
                 app.invalidate_status();
             }
             0
+        }
+        WM_CHAR => {
+            // Typed input for a transport numeric field (the codebase's only typed field). Digits
+            // (and `.` for fps) and Backspace go to the active edit; nothing else consumes them.
+            if app.transport.is_editing() {
+                if let Some(ch) = char::from_u32(wparam as u32) {
+                    if app.transport.type_char(ch) {
+                        app.invalidate_transport();
+                    }
+                }
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_KEYDOWN => {
             app.handle_key(wparam as u32);
@@ -1181,6 +1750,20 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.reload(wparam as u64);
             0
         }
+        WM_APP_FLIPBOOK_CHIP => {
+            // The hint chip was clicked: accept enters flipbook mode, dismiss hides it for good.
+            match wparam {
+                CHIP_ACCEPT => app.toggle_flipbook(),
+                CHIP_DISMISS => {
+                    if let Some(e) = app.flipbook_entry() {
+                        e.hint_dismissed = true;
+                    }
+                    app.sync_chip();
+                }
+                _ => {}
+            }
+            0
+        }
         WM_DPICHANGED => {
             // Adopt the OS-suggested rect, then rescale chrome + view for the new DPI.
             let new_dpi = (wparam & 0xffff) as u32;
@@ -1198,10 +1781,15 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 );
             }
             app.cancel_tooltip();
+            // Cancel any in-progress transport drag/edit (their pixel anchors are DPI-stale).
+            app.transport.cancel_drag();
+            app.transport.cancel_edit();
             app.chrome.set_dpi(new_dpi);
             app.tooltip.set_dpi(new_dpi);
+            app.chip.set_dpi(new_dpi);
             app.relayout();
             app.reposition_view();
+            app.sync_chip();
             InvalidateRect(hwnd, ptr::null(), 0);
             0
         }
@@ -1211,6 +1799,7 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             if dark != app.chrome.dark {
                 app.chrome.set_dark(dark);
                 app.tooltip.set_dark(dark);
+                app.chip.set_dark(dark);
                 app.surface.set_clear(app.chrome.view_clear_packed());
                 chrome::apply_dark_titlebar(hwnd, dark);
                 chrome::apply_dark_menus(hwnd, dark);
@@ -1236,7 +1825,12 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
 /// Child view proc. Same panic firewall as [`frame_wndproc`]: the real handling is in
 /// [`view_wndproc_impl`], behind `catch_unwind`, so a panic in (e.g.) a paint can't unwind into
 /// the Win32 dispatcher and abort.
-unsafe extern "system" fn view_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn view_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         view_wndproc_impl(hwnd, msg, wparam, lparam)
     })) {
@@ -1285,10 +1879,10 @@ unsafe fn view_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
             SetCapture(hwnd);
             SetFocus(hwnd); // take keyboard focus so nav keys reach this window
-            // Sync the pan origin to the press point so the first move's delta is measured from
-            // here, not a stale position. Matters after the context menu (or any gap where the
-            // view saw no WM_MOUSEMOVE): without this, the cursor is still at the right-click
-            // point and the first drag lurches the image toward the click. (RMB does the same.)
+                            // Sync the pan origin to the press point so the first move's delta is measured from
+                            // here, not a stale position. Matters after the context menu (or any gap where the
+                            // view saw no WM_MOUSEMOVE): without this, the cursor is still at the right-click
+                            // point and the first drag lurches the image toward the click. (RMB does the same.)
             app.surface.on_cursor_moved((x, y));
             app.surface.begin_drag();
             0
@@ -1388,8 +1982,11 @@ const SUPPORTED_EXTS: &[&str] = &[
 /// listing every supported extension, then an "All files" catch-all. The filter is `label\0pattern\0`
 /// pairs ended by one extra NUL (the `GetOpenFileNameW` contract).
 fn image_filter_wide() -> Vec<u16> {
-    let patterns: String =
-        SUPPORTED_EXTS.iter().map(|e| format!("*.{e}")).collect::<Vec<_>>().join(";");
+    let patterns: String = SUPPORTED_EXTS
+        .iter()
+        .map(|e| format!("*.{e}"))
+        .collect::<Vec<_>>()
+        .join(";");
     let mut buf: Vec<u16> = Vec::new();
     let mut push = |s: &str| {
         buf.extend(s.encode_utf16());
@@ -1420,7 +2017,10 @@ fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
     if unsafe { GetOpenFileNameW(&mut ofn) } == 0 {
         return None; // cancelled or dismissed
     }
-    let end = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+    let end = file_buf
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(file_buf.len());
     Some(PathBuf::from(OsString::from_wide(&file_buf[..end])))
 }
 
@@ -1470,8 +2070,13 @@ unsafe fn build_open_with_menu<'a>(
 /// take down the viewer. Each arg is one argv element (no shell), so there's no quoting/injection. A
 /// no-op for a submenu entry (no `path`), which never reaches here.
 fn launch_external(app: &crate::config::MenuEntry, image: &Path) {
-    let Some(path) = app.path.as_deref() else { return };
-    match std::process::Command::new(path).args(app.resolved_args(image)).spawn() {
+    let Some(path) = app.path.as_deref() else {
+        return;
+    };
+    match std::process::Command::new(path)
+        .args(app.resolved_args(image))
+        .spawn()
+    {
         Ok(_child) => {}
         Err(e) => eprintln!("fire: failed to launch {} ({}): {e}", app.name, path),
     }
@@ -1483,7 +2088,10 @@ fn launch_external(app: &crate::config::MenuEntry, image: &Path) {
 fn show_in_explorer(image: &Path) {
     use std::os::windows::process::CommandExt;
     let arg = format!("/select,\"{}\"", image.display());
-    if let Err(e) = std::process::Command::new("explorer.exe").raw_arg(arg).spawn() {
+    if let Err(e) = std::process::Command::new("explorer.exe")
+        .raw_arg(arg)
+        .spawn()
+    {
         eprintln!("fire: failed to show {} in Explorer: {e}", image.display());
     }
 }
@@ -1522,7 +2130,11 @@ fn copy_text_to_clipboard(owner: HWND, text: &str) {
 /// then the wide path (with its NUL), then one extra NUL ending the (single-entry) list. Same
 /// best-effort ownership rule as [`copy_text_to_clipboard`].
 fn copy_file_to_clipboard(owner: HWND, image: &Path) {
-    let path: Vec<u16> = image.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let path: Vec<u16> = image
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let header = std::mem::size_of::<DROPFILES>();
     // header + the path (incl. its NUL) + one extra NUL ending the double-NUL-terminated list.
     let bytes = header + (path.len() + 1) * std::mem::size_of::<u16>();
@@ -1554,7 +2166,10 @@ fn copy_file_to_clipboard(owner: HWND, image: &Path) {
 }
 
 fn file_name(path: &std::path::Path) -> String {
-    path.file_name().and_then(|s| s.to_str()).unwrap_or("image").to_string()
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image")
+        .to_string()
 }
 
 /// Status-bar metadata tail: "PNG   2048×1024   8-bit RGBA   1.4 MB   ICC".
@@ -1566,7 +2181,10 @@ fn format_meta(img: &DecodedImage, file_size: Option<u64>) -> String {
         4 => "RGBA",
         _ => "·",
     };
-    let mut s = format!("{}   {}×{}   {}-bit {}", img.source_format, img.width, img.height, img.bit_depth, ch);
+    let mut s = format!(
+        "{}   {}×{}   {}-bit {}",
+        img.source_format, img.width, img.height, img.bit_depth, ch
+    );
     if let Some(bytes) = file_size {
         s.push_str(&format!("   {}", human_size(bytes)));
     }
@@ -1601,7 +2219,10 @@ fn set_title(hwnd: isize, title: &str) {
 fn client_size(hwnd: HWND) -> (u32, u32) {
     let mut rc: RECT = unsafe { std::mem::zeroed() };
     unsafe { GetClientRect(hwnd, &mut rc) };
-    ((rc.right - rc.left).max(1) as u32, (rc.bottom - rc.top).max(1) as u32)
+    (
+        (rc.right - rc.left).max(1) as u32,
+        (rc.bottom - rc.top).max(1) as u32,
+    )
 }
 
 // --- window placement: launcher Run setting + remembered position/size --------
@@ -1637,7 +2258,10 @@ fn is_maximize(cmd: i32) -> bool {
 }
 
 fn is_minimize(cmd: i32) -> bool {
-    cmd == SW_SHOWMINIMIZED || cmd == SW_SHOWMINNOACTIVE || cmd == SW_MINIMIZE || cmd == SW_FORCEMINIMIZE
+    cmd == SW_SHOWMINIMIZED
+        || cmd == SW_SHOWMINNOACTIVE
+        || cmd == SW_MINIMIZE
+        || cmd == SW_FORCEMINIMIZE
 }
 
 /// Restore the saved restored-rect and apply `show` atomically via `SetWindowPlacement`. Using

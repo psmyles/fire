@@ -17,8 +17,8 @@ use std::ptr;
 
 use windows_sys::Win32::Graphics::Gdi::{
     AlphaBlend, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
+    HBITMAP, HDC, HGDIOBJ,
 };
 
 /// Master rasterization size of each embedded icon (px). Must match `build.rs`'s `ICON_MASTER`;
@@ -53,11 +53,14 @@ pub enum Icon {
     Outline,
     OpenWith,
     Fullscreen,
+    Flipbook,
+    Play,
+    Pause,
     More,
 }
 
 /// The embedded A8 masters, indexed by `Icon as usize`. Same order as the enum / `build.rs`.
-const MASTERS: [&[u8]; 22] = [
+const MASTERS: [&[u8]; 25] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_left.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_right.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_zoom_out.a8")),
@@ -79,6 +82,9 @@ const MASTERS: [&[u8]; 22] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_outline.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_open_with.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_fullscreen.a8")),
+    include_bytes!(concat!(env!("OUT_DIR"), "/icon_flipbook.a8")),
+    include_bytes!(concat!(env!("OUT_DIR"), "/icon_play.a8")),
+    include_bytes!(concat!(env!("OUT_DIR"), "/icon_pause.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_more.a8")),
 ];
 
@@ -121,13 +127,27 @@ impl Icons {
 
         let mut bits: *mut c_void = ptr::null_mut();
         let (dc, bmp, old) = unsafe {
-            let bmp = CreateDIBSection(ptr::null_mut(), &bmi, DIB_RGB_COLORS, &mut bits, ptr::null_mut(), 0);
+            let bmp = CreateDIBSection(
+                ptr::null_mut(),
+                &bmi,
+                DIB_RGB_COLORS,
+                &mut bits,
+                ptr::null_mut(),
+                0,
+            );
             let dc = CreateCompatibleDC(ptr::null_mut());
             let old = SelectObject(dc, bmp as HGDIOBJ);
             (dc, bmp, old)
         };
 
-        Icons { icon_px: n, masks, dc, bmp, bits: bits as *mut u8, old }
+        Icons {
+            icon_px: n,
+            masks,
+            dc,
+            bmp,
+            bits: bits as *mut u8,
+            old,
+        }
     }
 
     /// Rebuild for a new physical icon size (after a DPI change). No-op if unchanged; otherwise
@@ -163,7 +183,19 @@ impl Icons {
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
         unsafe {
-            AlphaBlend(hdc, cx - n / 2, cy - n / 2, n, n, self.dc, 0, 0, n, n, blend);
+            AlphaBlend(
+                hdc,
+                cx - n / 2,
+                cy - n / 2,
+                n,
+                n,
+                self.dc,
+                0,
+                0,
+                n,
+                n,
+                blend,
+            );
         }
     }
 }

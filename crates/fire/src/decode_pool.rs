@@ -46,6 +46,9 @@ pub struct DecodeOutcome {
     pub result: Result<DecodedImage, DecodeError>,
     /// Echoed from the job; see [`DecodeJob::reload`].
     pub reload: bool,
+    /// Auto-detected flipbook grid, computed on the worker from the decoded pixels (`None` for a
+    /// non-sheet image or an animated source). Surfaced by the UI only as a dismissible hint.
+    pub flipbook_guess: Option<crate::flipbook::Grid>,
 }
 
 /// Sender handle to the worker pool; held by the `App` for the window's lifetime.
@@ -68,19 +71,32 @@ impl DecodePool {
                     // Exits when the pool (and thus `tx`) is dropped at shutdown.
                     while let Ok(job) = rx.recv() {
                         let result = decode(&job);
+                        // Auto-detect a flipbook grid off the UI thread while we're already here.
+                        // Skipped for animated sources (a GIF is not a sprite sheet) and never
+                        // allowed to kill the worker — detection is a best-effort hint.
+                        let flipbook_guess = result
+                            .as_ref()
+                            .ok()
+                            .filter(|img| img.animation.is_none())
+                            .and_then(|img| {
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    crate::flipbook::detect(&job.path, img)
+                                }))
+                                .unwrap_or(None)
+                            });
                         let outcome = Box::new(DecodeOutcome {
                             generation: job.generation,
                             path: job.path,
                             result,
                             reload: job.reload,
+                            flipbook_guess,
                         });
                         let lparam = Box::into_raw(outcome) as isize;
                         // SAFETY: the box outlives the post; the UI thread reclaims it in
                         // the wndproc. If the post fails (window gone), reclaim here so we
                         // don't leak.
-                        let posted = unsafe {
-                            PostMessageW(hwnd as HWND, WM_APP_DECODE_DONE, 0, lparam)
-                        };
+                        let posted =
+                            unsafe { PostMessageW(hwnd as HWND, WM_APP_DECODE_DONE, 0, lparam) };
                         if posted == 0 {
                             drop(unsafe { Box::from_raw(lparam as *mut DecodeOutcome) });
                             break; // window is gone; stop working
@@ -103,8 +119,10 @@ impl DecodePool {
 /// never lost. The decode crate already wraps its C/C++ FFI in `catch_unwind`; this is
 /// a belt-and-suspenders boundary around the whole pure-Rust + FFI path.
 fn decode(job: &DecodeJob) -> Result<DecodedImage, DecodeError> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_path(&job.path, &job.opts)))
-        .unwrap_or_else(|_| Err(DecodeError::Other("decoder panicked".into())))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        decode_path(&job.path, &job.opts)
+    }))
+    .unwrap_or_else(|_| Err(DecodeError::Other("decoder panicked".into())))
 }
 
 fn worker_count() -> usize {

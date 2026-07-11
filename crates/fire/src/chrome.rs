@@ -49,6 +49,8 @@ pub enum Action {
     Background(Background),
     /// Enter/leave borderless full-screen (Esc or middle-click over the viewport also toggle it).
     ToggleFullscreen,
+    /// Enter/leave flipbook (sprite-sheet) viewer mode (K); disabled for animated sources.
+    ToggleFlipbook,
     /// The far-right button: open the actions popup menu — file actions (show in folder, copy
     /// file / path / name) plus any configured "Open in…" external apps. The menu itself is built
     /// and tracked by the win shell (it needs the button's screen rect, and the chosen entry is
@@ -80,37 +82,128 @@ const HDR_GROUP: u8 = 3;
 /// drives overflow drop order (see [`Slot`]): navigation is kept longest, then zoom, then the
 /// all-channels reset, then the channel solos, and the HDR group is shed first.
 const LEFT: &[Slot] = &[
-    Slot { action: Action::Prev, group: 0, prio: 90 },
-    Slot { action: Action::Next, group: 0, prio: 90 },
-    Slot { action: Action::ZoomOut, group: 1, prio: 70 },
-    Slot { action: Action::ZoomToggle, group: 1, prio: 75 },
-    Slot { action: Action::ZoomIn, group: 1, prio: 70 },
-    Slot { action: Action::Channel(Channel::Rgb), group: 2, prio: 50 },
-    Slot { action: Action::Channel(Channel::R), group: 2, prio: 40 },
-    Slot { action: Action::Channel(Channel::G), group: 2, prio: 40 },
-    Slot { action: Action::Channel(Channel::B), group: 2, prio: 40 },
-    Slot { action: Action::Channel(Channel::A), group: 2, prio: 40 },
-    Slot { action: Action::ToggleTonemap, group: HDR_GROUP, prio: 20 },
-    Slot { action: Action::ExpUp, group: HDR_GROUP, prio: 20 },
-    Slot { action: Action::ExpReset, group: HDR_GROUP, prio: 15 },
-    Slot { action: Action::ExpDown, group: HDR_GROUP, prio: 20 },
+    Slot {
+        action: Action::Prev,
+        group: 0,
+        prio: 90,
+    },
+    Slot {
+        action: Action::Next,
+        group: 0,
+        prio: 90,
+    },
+    Slot {
+        action: Action::ZoomOut,
+        group: 1,
+        prio: 70,
+    },
+    Slot {
+        action: Action::ZoomToggle,
+        group: 1,
+        prio: 75,
+    },
+    Slot {
+        action: Action::ZoomIn,
+        group: 1,
+        prio: 70,
+    },
+    Slot {
+        action: Action::Channel(Channel::Rgb),
+        group: 2,
+        prio: 50,
+    },
+    Slot {
+        action: Action::Channel(Channel::R),
+        group: 2,
+        prio: 40,
+    },
+    Slot {
+        action: Action::Channel(Channel::G),
+        group: 2,
+        prio: 40,
+    },
+    Slot {
+        action: Action::Channel(Channel::B),
+        group: 2,
+        prio: 40,
+    },
+    Slot {
+        action: Action::Channel(Channel::A),
+        group: 2,
+        prio: 40,
+    },
+    // Flipbook toggle: its own group (divider on each side), kept on the bar ahead of the channel
+    // solos but shed before navigation/zoom when the window is narrow.
+    Slot {
+        action: Action::ToggleFlipbook,
+        group: 4,
+        prio: 55,
+    },
+    Slot {
+        action: Action::ToggleTonemap,
+        group: HDR_GROUP,
+        prio: 20,
+    },
+    Slot {
+        action: Action::ExpUp,
+        group: HDR_GROUP,
+        prio: 20,
+    },
+    Slot {
+        action: Action::ExpReset,
+        group: HDR_GROUP,
+        prio: 15,
+    },
+    Slot {
+        action: Action::ExpDown,
+        group: HDR_GROUP,
+        prio: 20,
+    },
 ];
 
 /// Right-docked controls: the outline toggle, then the viewport backdrop group. Drawn far-right,
 /// in this visual (left→right) order; a divider separates the groups like the left side.
 /// `prio` is unused here — the right group is anchored to the far edge and never overflows.
 const RIGHT: &[Slot] = &[
-    Slot { action: Action::ToggleOutline, group: 0, prio: 0 },
-    Slot { action: Action::Background(Background::Black), group: 1, prio: 0 },
-    Slot { action: Action::Background(Background::White), group: 1, prio: 0 },
-    Slot { action: Action::Background(Background::Grey), group: 1, prio: 0 },
-    Slot { action: Action::Background(Background::Checker), group: 1, prio: 0 },
+    Slot {
+        action: Action::ToggleOutline,
+        group: 0,
+        prio: 0,
+    },
+    Slot {
+        action: Action::Background(Background::Black),
+        group: 1,
+        prio: 0,
+    },
+    Slot {
+        action: Action::Background(Background::White),
+        group: 1,
+        prio: 0,
+    },
+    Slot {
+        action: Action::Background(Background::Grey),
+        group: 1,
+        prio: 0,
+    },
+    Slot {
+        action: Action::Background(Background::Checker),
+        group: 1,
+        prio: 0,
+    },
     // The full-screen toggle sits just left of the "Open in…" button, in its own group (dividers
     // on both sides).
-    Slot { action: Action::ToggleFullscreen, group: 3, prio: 0 },
+    Slot {
+        action: Action::ToggleFullscreen,
+        group: 3,
+        prio: 0,
+    },
     // Laid first (RIGHT is walked in reverse), so the "Open in…" button hugs the far-right corner;
     // its own group gives it a divider from the backdrop controls.
-    Slot { action: Action::OpenWithMenu, group: 2, prio: 0 },
+    Slot {
+        action: Action::OpenWithMenu,
+        group: 2,
+        prio: 0,
+    },
 ];
 
 /// A live read-only view of display state, built by the win shell each paint so the chrome
@@ -130,6 +223,10 @@ pub struct ViewSnapshot {
     pub can_navigate: bool,
     /// The window is currently in borderless full-screen (drives the toggle's highlight).
     pub fullscreen: bool,
+    /// Flipbook viewer mode is active for the current image (drives the toggle's highlight).
+    pub flipbook: bool,
+    /// The current image is an animated source (GIF) — flipbook mode is disabled for it.
+    pub has_animation: bool,
     pub status_left: String,
     pub status_right: String,
 }
@@ -141,12 +238,16 @@ impl ViewSnapshot {
             Action::Prev | Action::Next => self.can_navigate,
             Action::ZoomOut | Action::ZoomIn | Action::ZoomToggle => self.has_image,
             Action::Channel(_) | Action::Background(_) | Action::ToggleOutline => self.has_image,
-            Action::ToggleTonemap | Action::ExpUp | Action::ExpReset | Action::ExpDown => self.is_hdr,
+            Action::ToggleTonemap | Action::ExpUp | Action::ExpReset | Action::ExpDown => {
+                self.is_hdr
+            }
             // The actions menu (copy / show in folder / open in app) needs an image to act on; the
             // file actions are always available, so a configured app list is no longer required.
             Action::OpenWithMenu => self.has_image,
             // Full-screen is a window mode, independent of whether an image is loaded.
             Action::ToggleFullscreen => true,
+            // Flipbook needs a still image (a GIF is already an animation, not a sprite sheet).
+            Action::ToggleFlipbook => self.has_image && !self.has_animation,
             // The overflow button is only ever laid out when it holds dropped controls; opening its
             // menu is always allowed (the individual entries carry their own enabled state).
             Action::Overflow => true,
@@ -162,6 +263,7 @@ impl ViewSnapshot {
             Action::Background(b) => self.background == b,
             Action::ToggleOutline => self.outline,
             Action::ToggleFullscreen => self.fullscreen,
+            Action::ToggleFlipbook => self.flipbook,
             // The overflow button itself never latches (its menu entries carry the real state).
             Action::Overflow => false,
             _ => false,
@@ -176,7 +278,13 @@ impl ViewSnapshot {
             Action::Next => "Next image  (\u{2192})",
             Action::ZoomOut => "Zoom out  (\u{2212})",
             Action::ZoomIn => "Zoom in  (+)",
-            Action::ZoomToggle => if self.fit { "Actual size 1:1  (1)" } else { "Fit to window  (F)" },
+            Action::ZoomToggle => {
+                if self.fit {
+                    "Actual size 1:1  (1)"
+                } else {
+                    "Fit to window  (F)"
+                }
+            }
             Action::Channel(Channel::Rgb) => "All channels  (C)",
             Action::Channel(Channel::R) => "Red channel  (R)",
             Action::Channel(Channel::G) => "Green channel  (G)",
@@ -193,6 +301,7 @@ impl ViewSnapshot {
             Action::Background(Background::Checker) => "Checkerboard backdrop",
             Action::OpenWithMenu => "Copy, show in folder, or open in app\u{2026}",
             Action::ToggleFullscreen => "Full screen  (F11)",
+            Action::ToggleFlipbook => "Flipbook mode  (K)",
             Action::Overflow => "More controls\u{2026}",
         }
     }
@@ -205,8 +314,20 @@ impl ViewSnapshot {
             Action::Next => Icon::Right,
             Action::ZoomOut => Icon::ZoomOut,
             Action::ZoomIn => Icon::ZoomIn,
-            Action::ZoomToggle => if self.fit { Icon::OneToOne } else { Icon::Fit },
-            Action::Channel(Channel::Rgb) => if self.has_alpha { Icon::Rgba } else { Icon::Rgb },
+            Action::ZoomToggle => {
+                if self.fit {
+                    Icon::OneToOne
+                } else {
+                    Icon::Fit
+                }
+            }
+            Action::Channel(Channel::Rgb) => {
+                if self.has_alpha {
+                    Icon::Rgba
+                } else {
+                    Icon::Rgb
+                }
+            }
             Action::Channel(Channel::R) => Icon::R,
             Action::Channel(Channel::G) => Icon::G,
             Action::Channel(Channel::B) => Icon::B,
@@ -222,23 +343,25 @@ impl ViewSnapshot {
             Action::Background(Background::Checker) => Icon::Checker,
             Action::OpenWithMenu => Icon::OpenWith,
             Action::ToggleFullscreen => Icon::Fullscreen,
+            Action::ToggleFlipbook => Icon::Flipbook,
             Action::Overflow => Icon::More,
         }
     }
 }
 
-/// Light/dark color set. All values are GDI `COLORREF` (`0x00BBGGRR`).
+/// Light/dark color set. All values are GDI `COLORREF` (`0x00BBGGRR`). `pub(crate)` so the
+/// transport band ([`crate::transport`]) can paint with the same tokens.
 #[derive(Clone, Copy)]
-struct Palette {
-    toolbar_bg: u32,
-    status_bg: u32,
-    text: u32,
-    text_dim: u32,
-    btn_hover: u32,
-    btn_active: u32,
-    btn_active_text: u32,
-    separator: u32,
-    border: u32,
+pub(crate) struct Palette {
+    pub(crate) toolbar_bg: u32,
+    pub(crate) status_bg: u32,
+    pub(crate) text: u32,
+    pub(crate) text_dim: u32,
+    pub(crate) btn_hover: u32,
+    pub(crate) btn_active: u32,
+    pub(crate) btn_active_text: u32,
+    pub(crate) separator: u32,
+    pub(crate) border: u32,
     /// Letterbox / no-image backdrop, also a COLORREF; converted to `0x00RRGGBB` packing on use.
     view_clear: u32,
 }
@@ -290,6 +413,8 @@ pub struct Metrics {
     pub dpi: u32,
     pub toolbar_h: i32,
     pub status_h: i32,
+    /// Flipbook transport band height (shown only in flipbook mode; see [`crate::transport`]).
+    pub transport_h: i32,
     /// Square button edge.
     btn: i32,
     /// Icon edge (centered in the button); also the icon-mask render size.
@@ -297,7 +422,8 @@ pub struct Metrics {
     gap: i32,
     sep: i32,
     margin: i32,
-    font: HFONT,
+    /// The 9pt UI font; `pub(crate)` so the transport band can select it for its labels/fields.
+    pub(crate) font: HFONT,
 }
 
 impl Metrics {
@@ -307,6 +433,7 @@ impl Metrics {
             dpi,
             toolbar_h: s(36),
             status_h: s(24),
+            transport_h: s(30),
             btn: s(28),
             icon: s(20),
             gap: s(4),
@@ -314,6 +441,11 @@ impl Metrics {
             margin: s(8),
             font: create_ui_font(dpi),
         }
+    }
+
+    /// Scale a 96-dpi logical value to physical px at this DPI (for the transport band's widths).
+    pub(crate) fn scale(&self, v: i32) -> i32 {
+        v * self.dpi as i32 / 96
     }
 }
 
@@ -434,6 +566,15 @@ impl Chrome {
         self.palette.view_clear_packed()
     }
 
+    /// The active palette / icon renderer — for the transport band, which paints with the same
+    /// tokens and glyphs as the toolbar.
+    pub(crate) fn palette(&self) -> &Palette {
+        &self.palette
+    }
+    pub(crate) fn icons(&self) -> &Icons {
+        &self.icons
+    }
+
     /// The smallest client (w, h) the frame should allow, so the toolbar never overlaps: the width
     /// that fits the always-present right group plus the fully-collapsed left group (just the "»"
     /// overflow button) with a divider's gap between them, and a height for both chrome strips plus
@@ -444,8 +585,9 @@ impl Chrome {
         // The overflow button sits at the left margin; its right edge must clear the right group's
         // inner edge by a separator's gap: margin + btn + sep + (right group footprint).
         let width = m.margin + m.btn + m.sep + right_group_span(m);
-        // Both chrome strips plus ~120 logical px of image area (enough for the empty-state hint).
-        let height = m.toolbar_h + m.status_h + 120 * m.dpi as i32 / 96;
+        // Both chrome strips (plus the flipbook transport band, which can appear) and ~120 logical
+        // px of image area (enough for the empty-state hint).
+        let height = m.toolbar_h + m.status_h + m.transport_h + 120 * m.dpi as i32 / 96;
         (width, height)
     }
 
@@ -475,7 +617,12 @@ impl Chrome {
             prev_group = Some(slot.group);
             let left = rx - m.btn;
             self.buttons.push(LaidButton {
-                rect: RECT { left, top: btn_y, right: rx, bottom: btn_y + m.btn },
+                rect: RECT {
+                    left,
+                    top: btn_y,
+                    right: rx,
+                    bottom: btn_y + m.btn,
+                },
                 action: slot.action,
             });
             rx = left - m.gap;
@@ -520,7 +667,12 @@ impl Chrome {
             }
             prev_group = Some(slot.group);
             self.buttons.push(LaidButton {
-                rect: RECT { left: x, top: btn_y, right: x + m.btn, bottom: btn_y + m.btn },
+                rect: RECT {
+                    left: x,
+                    top: btn_y,
+                    right: x + m.btn,
+                    bottom: btn_y + m.btn,
+                },
                 action: slot.action,
             });
             x += m.btn + m.gap;
@@ -529,14 +681,18 @@ impl Chrome {
         // dropped actions are exposed in toolbar order for the popup.
         if !overflow.is_empty() {
             self.buttons.push(LaidButton {
-                rect: RECT { left: x, top: btn_y, right: x + m.btn, bottom: btn_y + m.btn },
+                rect: RECT {
+                    left: x,
+                    top: btn_y,
+                    right: x + m.btn,
+                    bottom: btn_y + m.btn,
+                },
                 action: Action::Overflow,
             });
             overflow.sort_by_key(|(i, _)| *i);
             self.overflow = overflow.into_iter().map(|(_, slot)| slot.action).collect();
         }
     }
-
 
     /// Map a point (frame-client coords) to the button action under it, if any and enabled.
     pub fn hit_test(&self, x: i32, y: i32, snap: &ViewSnapshot) -> Option<Action> {
@@ -548,7 +704,10 @@ impl Chrome {
     /// The rect (frame-client coords) of the laid button for `action`, if it's currently visible —
     /// used to anchor the "Open in…" popup menu under its button.
     pub fn button_rect_for(&self, action: Action) -> Option<RECT> {
-        self.buttons.iter().find(|b| b.action == action).map(|b| b.rect)
+        self.buttons
+            .iter()
+            .find(|b| b.action == action)
+            .map(|b| b.rect)
     }
 
     /// The entries for the "»" overflow popup: the left-group buttons dropped at the current width,
@@ -570,9 +729,9 @@ impl Chrome {
     /// The index (into `buttons`) of the button under a point, regardless of enabled state — for
     /// hover.
     pub fn hover_index(&self, x: i32, y: i32) -> Option<usize> {
-        self.buttons
-            .iter()
-            .position(|lb| x >= lb.rect.left && x < lb.rect.right && y >= lb.rect.top && y < lb.rect.bottom)
+        self.buttons.iter().position(|lb| {
+            x >= lb.rect.left && x < lb.rect.right && y >= lb.rect.top && y < lb.rect.bottom
+        })
     }
 
     /// The button rect (frame-client coords) and tooltip text for the button at `idx` — used to
@@ -587,7 +746,16 @@ impl Chrome {
     pub fn paint_toolbar(&self, hdc: HDC, width: i32, snap: &ViewSnapshot) {
         let m = &self.metrics;
         let p = &self.palette;
-        fill(hdc, &RECT { left: 0, top: 0, right: width, bottom: m.toolbar_h }, p.toolbar_bg);
+        fill(
+            hdc,
+            &RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: m.toolbar_h,
+            },
+            p.toolbar_bg,
+        );
 
         for &sx in &self.seps {
             let r = RECT {
@@ -622,7 +790,16 @@ impl Chrome {
             self.icons.draw(hdc, snap.icon(action), cx, cy, color);
         }
 
-        fill(hdc, &RECT { left: 0, top: m.toolbar_h - 1, right: width, bottom: m.toolbar_h }, p.border);
+        fill(
+            hdc,
+            &RECT {
+                left: 0,
+                top: m.toolbar_h - 1,
+                right: width,
+                bottom: m.toolbar_h,
+            },
+            p.border,
+        );
     }
 
     /// Paint the status bar across the bottom of the frame client area.
@@ -630,8 +807,26 @@ impl Chrome {
         let m = &self.metrics;
         let p = &self.palette;
         let top = height - m.status_h;
-        fill(hdc, &RECT { left: 0, top, right: width, bottom: height }, p.status_bg);
-        fill(hdc, &RECT { left: 0, top, right: width, bottom: top + 1 }, p.border);
+        fill(
+            hdc,
+            &RECT {
+                left: 0,
+                top,
+                right: width,
+                bottom: height,
+            },
+            p.status_bg,
+        );
+        fill(
+            hdc,
+            &RECT {
+                left: 0,
+                top,
+                right: width,
+                bottom: top + 1,
+            },
+            p.border,
+        );
 
         let prev = unsafe { SelectObject(hdc, m.font) };
         unsafe { SetBkMode(hdc, TRANSPARENT as i32) };
@@ -639,11 +834,26 @@ impl Chrome {
         // Right side first so we know how much room the (ellipsized) left side gets.
         let rw = text_width(hdc, &snap.status_right);
         unsafe { SetTextColor(hdc, p.text_dim) };
-        let mut rr = RECT { left: width - m.margin - rw, top, right: width - m.margin, bottom: height };
-        draw_text(hdc, &snap.status_right, &mut rr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        let mut rr = RECT {
+            left: width - m.margin - rw,
+            top,
+            right: width - m.margin,
+            bottom: height,
+        };
+        draw_text(
+            hdc,
+            &snap.status_right,
+            &mut rr,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
 
         unsafe { SetTextColor(hdc, p.text) };
-        let mut lr = RECT { left: m.margin, top, right: width - m.margin - rw - m.margin, bottom: height };
+        let mut lr = RECT {
+            left: m.margin,
+            top,
+            right: width - m.margin - rw - m.margin,
+            bottom: height,
+        };
         draw_text(
             hdc,
             &snap.status_left,
@@ -673,7 +883,12 @@ impl Chrome {
         // Center the (possibly wrapped) hint vertically: measure the wrapped block with DT_CALCRECT
         // against the viewport width, then draw it offset so it sits in the middle.
         let mut calc = *rect;
-        draw_text(hdc, text, &mut calc, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+        draw_text(
+            hdc,
+            text,
+            &mut calc,
+            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT,
+        );
         let mut r = *rect;
         let pad = ((rect.bottom - rect.top) - (calc.bottom - calc.top)) / 2;
         if pad > 0 {
@@ -762,7 +977,11 @@ pub fn apply_dark_menus(hwnd: HWND, dark: bool) {
         }
         if let Some(p) = GetProcAddress(lib, SET_PREFERRED_APP_MODE as *const u8) {
             let f: SetPreferredAppModeFn = std::mem::transmute(p);
-            f(if dark { APP_MODE_FORCE_DARK } else { APP_MODE_DEFAULT });
+            f(if dark {
+                APP_MODE_FORCE_DARK
+            } else {
+                APP_MODE_DEFAULT
+            });
         }
         if let Some(p) = GetProcAddress(lib, FLUSH_MENU_THEMES as *const u8) {
             let f: FlushMenuThemesFn = std::mem::transmute(p);
@@ -780,8 +999,14 @@ pub(crate) fn create_ui_font(dpi: u32) -> HFONT {
     let face = wide("Segoe UI");
     unsafe {
         CreateFontW(
-            height, 0, 0, 0, 400, // FW_NORMAL
-            0, 0, 0, // italic / underline / strikeout
+            height,
+            0,
+            0,
+            0,
+            400, // FW_NORMAL
+            0,
+            0,
+            0, // italic / underline / strikeout
             1, // DEFAULT_CHARSET
             0, // OUT_DEFAULT_PRECIS
             0, // CLIP_DEFAULT_PRECIS
@@ -793,7 +1018,7 @@ pub(crate) fn create_ui_font(dpi: u32) -> HFONT {
 }
 
 /// Fill a rect with a solid color (creates and frees a one-shot brush).
-fn fill(hdc: HDC, rect: &RECT, color: u32) {
+pub(crate) fn fill(hdc: HDC, rect: &RECT, color: u32) {
     unsafe {
         let brush = CreateSolidBrush(color);
         FillRect(hdc, rect, brush);
@@ -802,13 +1027,13 @@ fn fill(hdc: HDC, rect: &RECT, color: u32) {
 }
 
 /// Draw a (null-terminated) string into `rect` with the given DrawText flags.
-fn draw_text(hdc: HDC, s: &str, rect: &mut RECT, fmt: u32) {
+pub(crate) fn draw_text(hdc: HDC, s: &str, rect: &mut RECT, fmt: u32) {
     let w = wide(s);
     unsafe { DrawTextW(hdc, w.as_ptr(), -1, rect, fmt) };
 }
 
 /// Width in px of `s` using the currently-selected font.
-fn text_width(hdc: HDC, s: &str) -> i32 {
+pub(crate) fn text_width(hdc: HDC, s: &str) -> i32 {
     let w: Vec<u16> = s.encode_utf16().collect();
     let mut sz = SIZE { cx: 0, cy: 0 };
     unsafe { GetTextExtentPoint32W(hdc, w.as_ptr(), w.len() as i32, &mut sz) };
@@ -835,6 +1060,8 @@ mod tests {
             outline: false,
             can_navigate: true,
             fullscreen: false,
+            flipbook: false,
+            has_animation: false,
             status_left: String::new(),
             status_right: String::new(),
         }
@@ -931,7 +1158,10 @@ mod tests {
         // The overflow button and the right group don't overlap: "»" right edge ≤ outline left edge.
         let more_right = c.button_rect_for(Action::Overflow).unwrap().right;
         let outline_left = c.button_rect_for(Action::ToggleOutline).unwrap().left;
-        assert!(more_right <= outline_left, "overflow button overlaps the right group at min width");
+        assert!(
+            more_right <= outline_left,
+            "overflow button overlaps the right group at min width"
+        );
     }
 
     #[test]

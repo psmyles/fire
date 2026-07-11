@@ -44,10 +44,31 @@ const ICON_MASTER: u32 = 64;
 /// module embeds via `include_bytes!`. The list is the source of truth for the `icons::Icon` enum;
 /// a missing SVG is a build error (the metadata is mandatory, like the shaders).
 const ICON_STEMS: &[&str] = &[
-    "icon_left", "icon_right", "icon_zoom_out", "icon_zoom_in", "icon_fit", "icon_1_1", "icon_RGB",
-    "icon_rgba", "icon_R", "icon_G", "icon_B", "icon_A", "icon_aces", "icon_ev+", "icon_ev0",
+    "icon_left",
+    "icon_right",
+    "icon_zoom_out",
+    "icon_zoom_in",
+    "icon_fit",
+    "icon_1_1",
+    "icon_RGB",
+    "icon_rgba",
+    "icon_R",
+    "icon_G",
+    "icon_B",
+    "icon_A",
+    "icon_aces",
+    "icon_ev+",
+    "icon_ev0",
     "icon_ev-",
-    "icon_W", "icon_C", "icon_outline", "icon_open_with", "icon_fullscreen", "icon_more",
+    "icon_W",
+    "icon_C",
+    "icon_outline",
+    "icon_open_with",
+    "icon_fullscreen",
+    "icon_flipbook",
+    "icon_play",
+    "icon_pause",
+    "icon_more",
 ];
 
 /// Rasterize each toolbar SVG to a square A8 coverage mask in `OUT_DIR`. The SVGs are single-color
@@ -69,8 +90,8 @@ fn rasterize_icons() {
         let tree = resvg::usvg::Tree::from_data(&data, &opt)
             .unwrap_or_else(|e| panic!("{} is not valid SVG: {e}", svg.display()));
 
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(ICON_MASTER, ICON_MASTER)
-            .expect("allocate icon pixmap");
+        let mut pixmap =
+            resvg::tiny_skia::Pixmap::new(ICON_MASTER, ICON_MASTER).expect("allocate icon pixmap");
         let size = tree.size();
         let transform = resvg::tiny_skia::Transform::from_scale(
             ICON_MASTER as f32 / size.width(),
@@ -160,8 +181,13 @@ fn find_fxc() -> PathBuf {
     let mut candidates: Vec<(std::ffi::OsString, PathBuf)> = Vec::new();
     for var in ["ProgramFiles(x86)", "ProgramFiles"] {
         let Ok(pf) = std::env::var(var) else { continue };
-        let bin = PathBuf::from(pf).join("Windows Kits").join("10").join("bin");
-        let Ok(entries) = std::fs::read_dir(&bin) else { continue };
+        let bin = PathBuf::from(pf)
+            .join("Windows Kits")
+            .join("10")
+            .join("bin");
+        let Ok(entries) = std::fs::read_dir(&bin) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path().join("x64").join("fxc.exe");
             if p.exists() {

@@ -15,14 +15,17 @@
 mod chrome;
 mod config;
 mod decode_pool;
+mod flipbook;
 mod folder;
-mod icons;
-mod forward;
 mod foreground;
+mod forward;
+mod hint_chip;
+mod icons;
 mod ipc_server;
 mod product;
 mod render;
 mod tooltip;
+mod transport;
 mod watcher;
 mod win;
 mod window_state;
@@ -83,9 +86,14 @@ struct SingleInstance(HANDLE);
 impl SingleInstance {
     /// Returns `Some` if we are the first instance, `None` if another already holds it.
     fn acquire() -> Option<Self> {
-        let name: Vec<u16> = MUTEX_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let name: Vec<u16> = MUTEX_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         // SAFETY: name is a valid null-terminated wide string; null attributes are fine.
-        let handle = unsafe { CreateMutexW(ptr::null(), 1 /* initial owner */, name.as_ptr()) };
+        let handle = unsafe {
+            CreateMutexW(ptr::null(), 1 /* initial owner */, name.as_ptr())
+        };
         if handle.is_null() {
             // Couldn't create the mutex; proceed without the guarantee rather than refuse, but
             // surface why single-instance coordination silently degraded to multi-instance.

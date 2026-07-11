@@ -91,13 +91,17 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 ## Cross-cutting invariants (the things that span files)
 
 - **GPU = upload once, redraw is one draw.** The decoded image becomes a D3D11 texture with a
-  hardware mip chain *once* on adopt. Pan/zoom/exposure/channel/tonemap are an 80-byte constant
-  buffer; each frame is one fullscreen-triangle draw. Never reintroduce per-pixel CPU work or
-  per-frame texture re-uploads. Rendering is event-driven (`InvalidateRect` → `WM_PAINT` → one
-  vsync-paced `Present`); an idle window must cost ~0. *One deliberate exception:* an animated GIF
-  re-uploads the texture once **per animation frame**, paced by a Win32 timer at the GIF's own frame
-  rate on the UI thread (`GpuSurface::advance_frame` / `App::tick_animation`) — never per render
-  frame; a still image is still upload-once.
+  hardware mip chain *once* on adopt. Pan/zoom/exposure/channel/tonemap (and the flipbook cell
+  selection) are a **112-byte** constant buffer (`Params` in `render/gpu.rs` ↔ `cbuffer` in
+  `render/shader.hlsl`, kept in lockstep by hand and guarded by a `size_of` assert); each frame is
+  one fullscreen-triangle draw. Never reintroduce per-pixel CPU work or per-frame texture
+  re-uploads. Rendering is event-driven (`InvalidateRect` → `WM_PAINT` → one vsync-paced
+  `Present`); an idle window must cost ~0. *One deliberate exception:* an animated GIF re-uploads
+  the texture once **per animation frame**, paced by a Win32 timer at the GIF's own frame rate on
+  the UI thread (`GpuSurface::advance_frame` / `App::tick_animation`) — never per render frame; a
+  still image is still upload-once. **Flipbook mode** (sprite-sheet playback, `crate::flipbook`) is
+  *not* an exception: the whole sheet stays one texture and playback only changes constant-buffer
+  values (cell offsets + blend, `App::tick_flipbook` on `FLIPBOOK_TIMER_ID`), never re-uploading.
 - **Worker/server threads never touch the window or renderer.** The decode pool and pipe server hand
   results to the UI thread *only* via `PostMessage(frame, WM_APP_*)` with a boxed payload in LPARAM;
   the wndproc reclaims the box. Keep this discipline for any new background work.

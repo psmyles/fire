@@ -15,7 +15,7 @@ SamplerState samp_aniso : register(s0);
 SamplerState samp_point : register(s1);
 
 cbuffer Params : register(b0) {
-    float2 img_size;
+    float2 img_size;       // frame rect in flipbook mode (fb_on), else whole image
     float2 surf_size;
     float2 pan;
     float  inv_zoom;
@@ -27,8 +27,13 @@ cbuffer Params : register(b0) {
     int    linear_sample;  // 1=sample already linear, 0=sRGB-decode rgb in shader
     int    background;     // 0=black 1=white 2=grey 3=checker (letterbox + transparency)
     int    outline;        // 1=draw a 1px image-boundary outline
-    int    _pad;
+    int    fb_on;          // 1=flipbook: img_size is a cell rect, sample cell_a/cell_b of the sheet
     float4 clear_lin;
+    float2 sheet_size;     // whole texture (texels); flipbook cell offsets are in this space
+    float2 cell_a;         // frame-A cell origin (texels)
+    float2 cell_b;         // frame-B cell origin (== cell_a when not blending)
+    float  fb_blend;       // 0..1 crossfade toward frame B (0 = hard cut)
+    float  fb_max_lod;     // mip clamp so minified samples can't bleed across cells
 };
 
 struct VSOut { float4 pos : SV_Position; };
@@ -63,6 +68,24 @@ float3 aces(float3 x) {
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
+// Sample the flipbook frame texel `f` (frame-local, 0..img_size) from the sheet cell at origin
+// `cell`. Explicit-LOD: the sheet's mip chain averages across cell boundaries, so implicit mips
+// would ghost neighbouring frames into a minified frame — clamp to `fb_max_lod`. A half-texel
+// inset keeps bilinear/aniso taps inside the cell; magnify (inv_zoom<=1) stays crisp at mip 0.
+float4 sample_cell(float2 f, float2 cell) {
+    float2 t  = cell + clamp(f, 0.5, img_size - 0.5);
+    float2 uv = t / sheet_size;
+    float4 s;
+    if (inv_zoom <= 1.0) {
+        s = tex.SampleLevel(samp_point, uv, 0.0);
+    } else {
+        float lod = min(tex.CalculateLevelOfDetail(samp_aniso, uv), fb_max_lod);
+        s = tex.SampleLevel(samp_aniso, uv, lod);
+    }
+    if (linear_sample == 0) s.rgb = srgb_to_linear(s.rgb);
+    return s;
+}
+
 float4 ps_main(float4 pos : SV_Position) : SV_Target {
     if (has_image == 0) return clear_lin;
     float2 sp = pos.xy;                       // surface pixel center (origin top-left)
@@ -80,13 +103,23 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
         return float4(v, v, v, 1.0);
     }
     if (f.x < 0.0 || f.y < 0.0 || f.x >= img_size.x || f.y >= img_size.y)
-        return float4(backdrop(sp), 1.0);                // letterbox = chosen backdrop
-    float2 uv = f / img_size;
-    float4 s = (inv_zoom <= 1.0) ? tex.Sample(samp_point, uv)   // magnify/1:1 -> crisp texels
-                                 : tex.Sample(samp_aniso, uv);  // minify -> mips + anisotropic
-    float3 rgb = s.rgb;
-    float a = s.a;
-    if (linear_sample == 0) rgb = srgb_to_linear(rgb);
+        return float4(backdrop(sp), 1.0);                // letterbox = chosen backdrop (frame rect)
+    float3 rgb;
+    float a;
+    if (fb_on != 0) {
+        // Flipbook: sample frame A of the sheet, crossfading toward frame B (sample_cell decodes).
+        float4 s = sample_cell(f, cell_a);
+        if (fb_blend > 0.0) s = lerp(s, sample_cell(f, cell_b), fb_blend);
+        rgb = s.rgb;
+        a = s.a;
+    } else {
+        float2 uv = f / img_size;
+        float4 s = (inv_zoom <= 1.0) ? tex.Sample(samp_point, uv)   // magnify/1:1 -> crisp texels
+                                     : tex.Sample(samp_aniso, uv);  // minify -> mips + anisotropic
+        rgb = s.rgb;
+        a = s.a;
+        if (linear_sample == 0) rgb = srgb_to_linear(rgb);
+    }
     if (is_hdr != 0) {
         rgb *= exposure;
         rgb = (tonemap == 1) ? aces(rgb) : reinhard(rgb);

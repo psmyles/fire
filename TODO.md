@@ -1,2 +1,1 @@
-- flipbook viewer
 - shortcut editor

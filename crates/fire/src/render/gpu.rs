@@ -30,9 +30,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE,
     D3D11_CREATE_DEVICE_FLAG, D3D11_FILTER_ANISOTROPIC, D3D11_FILTER_MIN_MAG_MIP_POINT,
     D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD, D3D11_RENDER_TARGET_VIEW_DESC,
-    D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RESOURCE_MISC_GENERATE_MIPS, D3D11_RTV_DIMENSION_TEXTURE2D,
-    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEX2D_RTV, D3D11_TEXTURE2D_DESC,
-    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
+    D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RESOURCE_MISC_GENERATE_MIPS,
+    D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEX2D_RTV,
+    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC,
+    D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UNORM,
@@ -62,6 +63,7 @@ const ZOOM_DRAG_CLICK_SLOP: f32 = 5.0;
 
 /// Per-frame shader constants. Layout matches the HLSL `cbuffer` (16-byte float4 registers);
 /// keep the field order/padding in lockstep with the `Params` cbuffer in `render/shader.hlsl`.
+/// 112 bytes = 7 float4 registers.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Params {
@@ -82,11 +84,40 @@ struct Params {
     background: i32,
     /// 1 → draw a 1px outline around the image boundary.
     outline: i32,
-    _pad2: i32,
+    /// 1 → flipbook mode: `img_w/img_h` are the (fractional) frame rect, and the fields below
+    /// select the cell(s) to sample from the sheet. 0 → whole-image sampling (fields ignored).
+    fb_on: i32,
     clear_r: f32,
     clear_g: f32,
     clear_b: f32,
     clear_a: f32,
+    // Flipbook cell selection (all in sheet texels). Identity when `fb_on == 0`.
+    sheet_w: f32,
+    sheet_h: f32,
+    cell_a_x: f32,
+    cell_a_y: f32,
+    cell_b_x: f32,
+    cell_b_y: f32,
+    /// Crossfade factor toward cell B (0 = hard cut).
+    fb_blend: f32,
+    /// Mip-LOD clamp so minified samples can't bleed across cell boundaries (`f32::MAX` = none).
+    fb_max_lod: f32,
+}
+
+// The cbuffer layout is kept in lockstep with the HLSL `cbuffer Params` in `render/shader.hlsl`
+// by hand (there is no reflection); these guard the size so a field added on only one side is a
+// build error rather than silent visual corruption. 112 bytes = 7 × 16-byte float4 registers.
+const _: () = assert!(std::mem::size_of::<Params>() == 112);
+const _: () = assert!(std::mem::size_of::<Params>().is_multiple_of(16));
+
+/// Flipbook render parameters mirrored onto the surface from the active per-path state (the
+/// surface never owns durable flipbook state — the win shell does). `None` = not in flipbook mode.
+#[derive(Debug, Clone, Copy)]
+pub struct FlipbookParams {
+    pub grid: crate::flipbook::Grid,
+    pub frame_count: u32,
+    pub frame_pos: f32,
+    pub blend: bool,
 }
 
 /// GPU render state for the view window: the D3D11 device/swapchain plus the same pan/zoom/fit
@@ -146,6 +177,10 @@ pub struct GpuSurface {
 
     viewport: Viewport,
     view: ViewState,
+    /// Active flipbook render parameters, mirrored from the win shell's per-path state. `Some`
+    /// makes pan/zoom/fit operate on the frame rect and the shader sample a single cell. The
+    /// surface never persists this — it is (re)applied on every adopt via [`Self::set_flipbook`].
+    flipbook: Option<FlipbookParams>,
     /// Whether the explicit "fit to window" command (`F` / toolbar) scales *small* images up to
     /// fill the surface (the `fit-upscale` config key). False keeps the texture-viewer cap at 1:1.
     /// This governs only the explicit command — images always *open* (and re-open on folder
@@ -201,6 +236,7 @@ impl GpuSurface {
             anim_index: 0,
             viewport: Viewport::new(width, height),
             view: ViewState::default(),
+            flipbook: None,
             fit_upscale,
             display: DisplayState::default(),
             cursor: (0.0, 0.0),
@@ -256,7 +292,9 @@ impl GpuSurface {
     }
 
     pub fn is_hdr(&self) -> bool {
-        self.current_image.as_ref().is_some_and(|i| i.format.is_hdr())
+        self.current_image
+            .as_ref()
+            .is_some_and(|i| i.format.is_hdr())
     }
 
     /// Whether the current image carries an alpha channel (gray+A or RGBA source) — drives the
@@ -265,7 +303,9 @@ impl GpuSurface {
     /// alpha actually holds transparency (and thus defaults to the checker backdrop) is a separate
     /// signal handled in [`Self::set_image`] via `DecodedImage::alpha_opaque`.
     pub fn has_alpha(&self) -> bool {
-        self.current_image.as_ref().is_some_and(|i| matches!(i.channels, 2 | 4))
+        self.current_image
+            .as_ref()
+            .is_some_and(|i| matches!(i.channels, 2 | 4))
     }
 
     pub fn background(&self) -> Background {
@@ -294,6 +334,43 @@ impl GpuSurface {
         self.current_image.as_ref().map(|i| (i.width, i.height))
     }
 
+    /// Dimensions the pan/zoom/fit math operates on: the frame rect in flipbook mode, else the
+    /// whole image. All view-control call sites use this so entering the mode or changing the
+    /// grid re-fits and clamps against the frame.
+    fn view_dims(&self) -> Option<(u32, u32)> {
+        let (w, h) = self.image_dims()?;
+        Some(match self.flipbook {
+            Some(fb) => crate::flipbook::frame_dims(fb.grid, (w, h)),
+            None => (w, h),
+        })
+    }
+
+    /// Adopt (or clear) flipbook render parameters. Re-fits the view to the frame rect only when
+    /// entering/leaving the mode or when the grid changes (so playback/scrub position changes,
+    /// which call [`Self::set_flipbook_pos`], don't disturb the user's pan/zoom). Repaints.
+    pub fn set_flipbook(&mut self, fb: Option<FlipbookParams>) {
+        let old_grid = self.flipbook.map(|f| f.grid);
+        let new_grid = fb.map(|f| f.grid);
+        self.flipbook = fb;
+        if old_grid != new_grid {
+            // Entering/leaving the mode or a grid edit changes the fitted content size → re-fit
+            // without upscaling (same rule as opening an image), against the new view dims.
+            if let Some(dims) = self.view_dims() {
+                self.view.fit_to_window(dims, &self.viewport, false);
+            }
+        }
+        self.refresh();
+    }
+
+    /// Update only the fractional playback position (the hot path: playback tick / slider scrub).
+    /// No re-fit; just repaint.
+    pub fn set_flipbook_pos(&mut self, frame_pos: f32) {
+        if let Some(fb) = &mut self.flipbook {
+            fb.frame_pos = frame_pos;
+            self.refresh();
+        }
+    }
+
     /// Drop the displayed image so the next paint shows the placeholder. Also drops any animation
     /// frames so the win shell's next `frame_delay_ms()` returns `None` and the playback timer stops.
     pub fn clear_image(&mut self) {
@@ -302,6 +379,7 @@ impl GpuSurface {
         self.srv = None;
         self.anim_frames.clear();
         self.anim_index = 0;
+        self.flipbook = None;
     }
 
     /// Adopt a decoded image: upload it as a GPU texture (hardware mip chain) and reset to fit +
@@ -325,11 +403,16 @@ impl GpuSurface {
         // black like an opaque image — but it keeps its true format and an inspectable alpha
         // channel (`alpha_opaque`); the user can still isolate the all-white alpha.
         let has_transparency = matches!(img.channels, 2 | 4) && !img.alpha_opaque;
-        self.background = self
-            .background_override
-            .unwrap_or(if has_transparency { Background::Checker } else { Background::Black });
+        self.background = self.background_override.unwrap_or(if has_transparency {
+            Background::Checker
+        } else {
+            Background::Black
+        });
         self.current_image = Some(img);
         self.display = DisplayState::default();
+        // A fresh image starts as a whole-image view; the win shell re-applies any per-path
+        // flipbook state (via `set_flipbook`) right after this adopt, which re-fits to the frame.
+        self.flipbook = None;
         // Every newly opened image (including folder ←/→ navigation) fits *without* upscaling: a
         // large image shrinks to fit, a small one shows at native 1:1. The explicit fit command
         // (`F` / toolbar) can still fill the surface — see `fit_upscale` / `fit`.
@@ -343,15 +426,18 @@ impl GpuSurface {
     /// user's zoomed-in detail and display state survive the update. The pan is re-clamped
     /// defensively (a no-op while the dims are unchanged).
     pub fn replace_image_keep_view(&mut self, mut img: DecodedImage) -> windows::core::Result<()> {
-        let dims = (img.width, img.height);
         self.upload_texture(&img)?;
         // Refresh the animation frames from the re-decoded file and restart from frame 0 (the view
         // is preserved, but the animation plays from the top). The win shell re-arms the timer.
         self.anim_frames = img.animation.take().map(|a| a.frames).unwrap_or_default();
         self.anim_index = 0;
         self.current_image = Some(img);
+        // Hot reload keeps flipbook mode active (same path); clamp against the frame rect when in
+        // flipbook mode, else the whole image (a no-op while the dims are unchanged).
         if !self.view.fit {
-            self.view.clamp_pan(dims, &self.viewport);
+            if let Some(vd) = self.view_dims() {
+                self.view.clamp_pan(vd, &self.viewport);
+            }
         }
         Ok(())
     }
@@ -375,7 +461,14 @@ impl GpuSurface {
         let (w, h) = self.image_dims()?;
         let format = self.current_image.as_ref()?.format;
         let next = (self.anim_index + 1) % n;
-        match create_image_texture(&self.device, &self.context, &self.anim_frames[next].pixels, w, h, format) {
+        match create_image_texture(
+            &self.device,
+            &self.context,
+            &self.anim_frames[next].pixels,
+            w,
+            h,
+            format,
+        ) {
             Ok((tex, srv, linear)) => {
                 self._tex = Some(tex);
                 self.srv = Some(srv);
@@ -392,8 +485,14 @@ impl GpuSurface {
     /// synchronously from the wndproc (via `decode_done`), where a panic would unwind across the
     /// Win32 boundary and abort the process.
     fn upload_texture(&mut self, img: &DecodedImage) -> windows::core::Result<()> {
-        let (tex, srv, linear_sample) =
-            create_image_texture(&self.device, &self.context, &img.pixels, img.width, img.height, img.format)?;
+        let (tex, srv, linear_sample) = create_image_texture(
+            &self.device,
+            &self.context,
+            &img.pixels,
+            img.width,
+            img.height,
+            img.format,
+        )?;
         self._tex = Some(tex);
         self.srv = Some(srv);
         self.linear_sample = linear_sample;
@@ -421,11 +520,12 @@ impl GpuSurface {
                 eprintln!("fire: swapchain ResizeBuffers failed: {e}");
             }
         }
-        if let Some(dims) = self.image_dims() {
+        if let Some(dims) = self.view_dims() {
             if self.view.fit {
                 // Re-fit with the rule the active fit used (load = no upscale, explicit fit =
                 // `fit_upscale`), so a resize doesn't silently switch a small image's scaling.
-                self.view.fit_to_window(dims, &self.viewport, self.view.fit_upscale);
+                self.view
+                    .fit_to_window(dims, &self.viewport, self.view.fit_upscale);
             } else {
                 self.view.clamp_pan(dims, &self.viewport);
             }
@@ -471,7 +571,10 @@ impl GpuSurface {
                 },
             };
             let mut rtv: Option<ID3D11RenderTargetView> = None;
-            if let Err(e) = self.device.CreateRenderTargetView(&back, Some(&desc), Some(&mut rtv)) {
+            if let Err(e) = self
+                .device
+                .CreateRenderTargetView(&back, Some(&desc), Some(&mut rtv))
+            {
                 eprintln!("fire: CreateRenderTargetView failed: {e}");
                 return;
             }
@@ -494,9 +597,35 @@ impl GpuSurface {
         };
 
         let is_hdr = self.is_hdr();
-        let (img_w, img_h, has_image) = match &self.current_image {
-            Some(img) => (img.width as f32, img.height as f32, 1),
-            None => (1.0, 1.0, 0),
+        // Flipbook mode maps the surface into a single frame rect: `img_w/img_h` become the
+        // (fractional) cell size and the fb_* fields pick which cell(s) of the sheet to sample.
+        // Off (still image / whole sheet), the fb fields are identity so the shader path below is
+        // untouched. Every field is set explicitly (no `..default()`), matching the checker note.
+        let (img_w, img_h, has_image, fbf) = match self.current_image.as_ref().zip(self.flipbook) {
+            Some((img, fbp)) => {
+                let sheet = (img.width, img.height);
+                let (fw, fh) = (
+                    img.width as f32 / fbp.grid.cols.max(1) as f32,
+                    img.height as f32 / fbp.grid.rows.max(1) as f32,
+                );
+                let (a, b, blend) =
+                    crate::flipbook::resolve_frames(fbp.frame_pos, fbp.frame_count, fbp.blend);
+                let (ax, ay) = crate::flipbook::frame_cell_offset(a, fbp.grid, sheet);
+                let (bx, by) = crate::flipbook::frame_cell_offset(b, fbp.grid, sheet);
+                let lod = crate::flipbook::max_lod(fbp.grid, sheet);
+                (fw, fh, 1, Some((sheet, (ax, ay), (bx, by), blend, lod)))
+            }
+            None => match &self.current_image {
+                Some(img) => (img.width as f32, img.height as f32, 1, None),
+                None => (1.0, 1.0, 0, None),
+            },
+        };
+        // Identity flipbook fields when off (fb_on == 0 → shader ignores them, but keep them sane).
+        let (sheet_w, sheet_h, ca, cb, fb_blend, fb_max_lod, fb_on) = match fbf {
+            Some((sheet, ca, cb, blend, lod)) => {
+                (sheet.0 as f32, sheet.1 as f32, ca, cb, blend, lod, 1)
+            }
+            None => (img_w, img_h, (0.0, 0.0), (0.0, 0.0), 0.0, f32::MAX, 0),
         };
         let params = Params {
             img_w,
@@ -506,7 +635,11 @@ impl GpuSurface {
             pan_x: self.view.pan.0,
             pan_y: self.view.pan.1,
             inv_zoom: 1.0 / self.view.zoom,
-            exposure: if is_hdr { self.display.exposure.exp2() } else { 1.0 },
+            exposure: if is_hdr {
+                self.display.exposure.exp2()
+            } else {
+                1.0
+            },
             channel: channel_code(self.display.channel),
             tonemap: match self.display.tonemap {
                 Tonemap::Reinhard => 0,
@@ -517,18 +650,32 @@ impl GpuSurface {
             linear_sample: self.linear_sample,
             background: background_code(self.background),
             outline: self.outline as i32,
-            _pad2: 0,
+            fb_on,
             clear_r: self.clear_lin[0],
             clear_g: self.clear_lin[1],
             clear_b: self.clear_lin[2],
             clear_a: 1.0,
+            sheet_w,
+            sheet_h,
+            cell_a_x: ca.0,
+            cell_a_y: ca.1,
+            cell_b_x: cb.0,
+            cell_b_y: cb.1,
+            fb_blend,
+            fb_max_lod,
         };
 
         unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             if self
                 .context
-                .Map(&self.cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .Map(
+                    &self.cbuffer,
+                    0,
+                    D3D11_MAP_WRITE_DISCARD,
+                    0,
+                    Some(&mut mapped),
+                )
                 .is_ok()
             {
                 std::ptr::copy_nonoverlapping(
@@ -548,14 +695,20 @@ impl GpuSurface {
                 MaxDepth: 1.0,
             };
             self.context.RSSetViewports(Some(&[vp]));
-            self.context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-            self.context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.context
+                .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+            self.context
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             self.context.VSSetShader(&self.vs, None);
             self.context.PSSetShader(&self.ps, None);
-            self.context.PSSetConstantBuffers(0, Some(&[Some(self.cbuffer.clone())]));
-            self.context.PSSetShaderResources(0, Some(std::slice::from_ref(&self.srv)));
             self.context
-                .PSSetSamplers(0, Some(&[Some(self.samp_aniso.clone()), Some(self.samp_point.clone())]));
+                .PSSetConstantBuffers(0, Some(&[Some(self.cbuffer.clone())]));
+            self.context
+                .PSSetShaderResources(0, Some(std::slice::from_ref(&self.srv)));
+            self.context.PSSetSamplers(
+                0,
+                Some(&[Some(self.samp_aniso.clone()), Some(self.samp_point.clone())]),
+            );
             self.context.Draw(3, 0);
             // Sync interval 1 → vsync-paced (tear-free); event-driven, so no idle frames.
             let _ = self.swapchain.Present(1, DXGI_PRESENT(0));
@@ -568,7 +721,7 @@ impl GpuSurface {
         let delta = (pos.0 - self.cursor.0, pos.1 - self.cursor.1);
         self.cursor = pos;
         if self.dragging {
-            if let Some(dims) = self.image_dims() {
+            if let Some(dims) = self.view_dims() {
                 self.view.pan_by(delta, dims, &self.viewport);
                 self.refresh();
             }
@@ -584,9 +737,10 @@ impl GpuSurface {
             let dy = pos.1 - self.zoom_last_y;
             self.zoom_last_y = pos.1;
             if dy != 0.0 {
-                if let Some(dims) = self.image_dims() {
+                if let Some(dims) = self.view_dims() {
                     let factor = (dy * ZOOM_DRAG_SENSITIVITY).exp();
-                    self.view.zoom_to_cursor(factor, self.zoom_anchor, dims, &self.viewport);
+                    self.view
+                        .zoom_to_cursor(factor, self.zoom_anchor, dims, &self.viewport);
                     self.refresh();
                 }
             }
@@ -623,36 +777,42 @@ impl GpuSurface {
     }
 
     pub fn zoom_at_cursor(&mut self, factor: f32) {
-        if let Some(dims) = self.image_dims() {
-            self.view.zoom_to_cursor(factor, self.cursor, dims, &self.viewport);
+        if let Some(dims) = self.view_dims() {
+            self.view
+                .zoom_to_cursor(factor, self.cursor, dims, &self.viewport);
             self.refresh();
         }
     }
 
     pub fn zoom_centered(&mut self, factor: f32) {
-        if let Some(dims) = self.image_dims() {
+        if let Some(dims) = self.view_dims() {
             self.view.zoom_centered(factor, dims, &self.viewport);
             self.refresh();
         }
     }
 
     pub fn fit(&mut self) {
-        if let Some(dims) = self.image_dims() {
-            self.view.fit_to_window(dims, &self.viewport, self.fit_upscale);
+        if let Some(dims) = self.view_dims() {
+            self.view
+                .fit_to_window(dims, &self.viewport, self.fit_upscale);
             self.refresh();
         }
     }
 
     pub fn one_to_one(&mut self) {
         self.view.one_to_one();
-        if let Some(dims) = self.image_dims() {
+        if let Some(dims) = self.view_dims() {
             self.view.clamp_pan(dims, &self.viewport);
         }
         self.refresh();
     }
 
     pub fn toggle_channel(&mut self, ch: Channel) {
-        self.display.channel = if self.display.channel == ch { Channel::Rgb } else { ch };
+        self.display.channel = if self.display.channel == ch {
+            Channel::Rgb
+        } else {
+            ch
+        };
         self.refresh();
     }
 
@@ -712,7 +872,10 @@ fn srgb_to_linear(c: f32) -> f32 {
 /// Create a hardware D3D11 device, falling back to the WARP software rasterizer (RDP/headless).
 fn create_device() -> (ID3D11Device, ID3D11DeviceContext) {
     let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
-    for (driver, is_warp) in [(D3D_DRIVER_TYPE_HARDWARE, false), (D3D_DRIVER_TYPE_WARP, true)] {
+    for (driver, is_warp) in [
+        (D3D_DRIVER_TYPE_HARDWARE, false),
+        (D3D_DRIVER_TYPE_WARP, true),
+    ] {
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
         let r = unsafe {
@@ -745,7 +908,10 @@ fn create_swapchain(device: &ID3D11Device, hwnd: HWND, w: u32, h: u32) -> IDXGIS
         Width: w,
         Height: h,
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: 2,
         Scaling: DXGI_SCALING_STRETCH,
@@ -771,8 +937,12 @@ fn create_shaders(device: &ID3D11Device) -> (ID3D11VertexShader, ID3D11PixelShad
     unsafe {
         let mut vs: Option<ID3D11VertexShader> = None;
         let mut ps: Option<ID3D11PixelShader> = None;
-        device.CreateVertexShader(VS_DXBC, None, Some(&mut vs)).expect("CreateVertexShader");
-        device.CreatePixelShader(PS_DXBC, None, Some(&mut ps)).expect("CreatePixelShader");
+        device
+            .CreateVertexShader(VS_DXBC, None, Some(&mut vs))
+            .expect("CreateVertexShader");
+        device
+            .CreatePixelShader(PS_DXBC, None, Some(&mut ps))
+            .expect("CreatePixelShader");
         (vs.unwrap(), ps.unwrap())
     }
 }
@@ -799,8 +969,12 @@ fn create_samplers(device: &ID3D11Device) -> (ID3D11SamplerState, ID3D11SamplerS
     unsafe {
         let mut aniso: Option<ID3D11SamplerState> = None;
         let mut pt: Option<ID3D11SamplerState> = None;
-        device.CreateSamplerState(&base, Some(&mut aniso)).expect("CreateSamplerState aniso");
-        device.CreateSamplerState(&point, Some(&mut pt)).expect("CreateSamplerState point");
+        device
+            .CreateSamplerState(&base, Some(&mut aniso))
+            .expect("CreateSamplerState aniso");
+        device
+            .CreateSamplerState(&point, Some(&mut pt))
+            .expect("CreateSamplerState point");
         (aniso.unwrap(), pt.unwrap())
     }
 }
@@ -817,7 +991,9 @@ fn create_const_buffer(device: &ID3D11Device) -> ID3D11Buffer {
     };
     unsafe {
         let mut buf: Option<ID3D11Buffer> = None;
-        device.CreateBuffer(&desc, None, Some(&mut buf)).expect("CreateBuffer (constants)");
+        device
+            .CreateBuffer(&desc, None, Some(&mut buf))
+            .expect("CreateBuffer (constants)");
         buf.unwrap()
     }
 }
@@ -852,7 +1028,10 @@ fn create_image_texture(
         MipLevels: 0, // 0 → full chain; populated by GenerateMips below
         ArraySize: 1,
         Format: dxgi_format,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
         CPUAccessFlags: 0,
@@ -865,7 +1044,14 @@ fn create_image_texture(
         let tex = tex.unwrap();
 
         // Level 0 only; the rest are generated.
-        context.UpdateSubresource(&tex, 0, None, pixels.as_ptr() as *const c_void, width * bpp, 0);
+        context.UpdateSubresource(
+            &tex,
+            0,
+            None,
+            pixels.as_ptr() as *const c_void,
+            width * bpp,
+            0,
+        );
 
         let mut srv: Option<ID3D11ShaderResourceView> = None;
         device.CreateShaderResourceView(&tex, None, Some(&mut srv))?;

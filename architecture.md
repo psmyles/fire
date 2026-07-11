@@ -29,7 +29,8 @@ Two consequences shape the whole design:
   whole per-pixel pipeline on *every* pan/zoom event; on a large window at a high refresh rate
   (a 240 Hz monitor) that pegs a CPU core during fast interaction. Instead the image is
   uploaded **once** as a D3D11 texture with a hardware-generated mip chain, and pan / zoom /
-  exposure / channel / tonemap become an **80-byte constant buffer** — each frame is one
+  exposure / channel / tonemap (and flipbook cell selection) become a **112-byte constant
+  buffer** — each frame is one
   fullscreen-triangle draw that re-samples the texture (**~0 CPU per frame**). A **DXGI
   flip-model swapchain** paces presentation to vsync, so interaction is tear-free and smooth at
   the monitor's true refresh. The device is created **when the window opens**, not warmed ahead
@@ -139,8 +140,9 @@ This path only runs in SingleInstance mode; NewWindow has nothing to forward.
   uploaded to a `USAGE_DEFAULT` texture created with a full mip chain
   (`D3D11_RESOURCE_MISC_GENERATE_MIPS`); `GenerateMips` builds the pyramid on the GPU. Each of the
   four `PixelFormat`s maps to a native DXGI format (see §5.1). After that, pan / zoom / exposure /
-  channel / tonemap are just values in an **80-byte constant buffer**; the source texture never
-  changes until a new image is opened.
+  channel / tonemap (and the flipbook cell offsets + blend) are just values in a **112-byte
+  constant buffer**; the source texture never changes until a new image is opened (flipbook
+  playback only moves the cell offsets — never re-uploads).
 - **Per-frame work is one draw.** A frame maps the constant buffer (`MAP_WRITE_DISCARD`), writes
   the view transform + display state, and issues a single **fullscreen-triangle** draw; the pixel
   shader inverse-maps each output pixel into image space and samples the texture. There is no
