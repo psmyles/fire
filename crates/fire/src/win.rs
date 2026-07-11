@@ -212,6 +212,10 @@ struct App {
     flipbook_last_tick: Option<Instant>,
     /// Set while scrubbing the slider paused a playing flipbook, so release can resume it.
     resume_after_scrub: bool,
+    /// The band visibility last applied by [`App::apply_flipbook`], so it can detect an
+    /// appear/disappear transition (callers mutate the map before calling it, so it can't recompute
+    /// the "before" state).
+    transport_shown: bool,
     /// The flipbook detection hint chip (a floating popup over the view top).
     chip: HintChip,
     /// The flipbook transport band (hand-painted; shown only in flipbook mode).
@@ -474,15 +478,20 @@ impl App {
     }
 
     /// Mirror the active per-path state onto the surface (or clear it), re-arm the timer, update
-    /// the hint chip, and re-lay-out if the band's visibility changed.
+    /// the hint chip, and re-lay-out if the band's visibility changed since it was last applied.
+    /// Callers mutate the flipbook map *before* calling this, so the "before" state is tracked in
+    /// `transport_shown` rather than recomputed (which would compare `transport_visible()` to
+    /// itself and never fire).
     fn apply_flipbook(&mut self) {
-        let was_visible = self.transport_visible();
         let params = self.flipbook_state().map(surface_flipbook);
         self.surface.set_flipbook(params);
         self.sync_flipbook_timer();
         self.sync_chip();
-        if self.transport_visible() != was_visible {
-            // The band appeared/disappeared → the view rect changed.
+        let visible = self.transport_visible();
+        if visible != self.transport_shown {
+            // The band appeared/disappeared → the view rect changed: re-lay-out the band widgets
+            // and shrink/grow the D3D view to make room (its WM_SIZE re-fits to the new region).
+            self.transport_shown = visible;
             self.relayout();
             self.reposition_view();
             self.invalidate_chrome();
@@ -1376,6 +1385,7 @@ pub fn run(
             flipbook: HashMap::new(),
             flipbook_last_tick: None,
             resume_after_scrub: false,
+            transport_shown: false,
             chip,
             transport: Transport::default(),
         });
@@ -1678,10 +1688,14 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             0
         }
         WM_ACTIVATE => {
-            // Losing activation (alt-tab / click away): drop the topmost tip so it can't linger
-            // over other windows. Still defer to DefWindowProc for the default focus handling.
+            // Losing activation (alt-tab / click away): drop the topmost tip and the hint chip so
+            // they can't linger over other windows; on regaining activation, re-show the chip if it
+            // still applies. Still defer to DefWindowProc for the default focus handling.
             if (wparam & 0xffff) == WA_INACTIVE as usize {
                 app.cancel_tooltip();
+                app.chip.hide();
+            } else {
+                app.sync_chip();
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }

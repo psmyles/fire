@@ -8,8 +8,10 @@
 //!     keys by path,
 //!   * the frame math the renderer needs ([`resolve_frames`], [`frame_cell_offset`],
 //!     [`frame_dims`], [`max_lod`]), and
-//!   * grid auto-detection ([`detect`]) run off-thread on the decode worker — a filename token
-//!     like `_8x8` is only a *prior* that content analysis must validate, surfaced solely as a
+//!   * grid auto-detection ([`detect`]) run off-thread on the decode worker — **the pixels decide
+//!     the grid** (YIN period detection over the luma, then alpha, channel; §Detection), because
+//!     filenames can be wrong or missing. A `_8x8` filename token is only a last-resort fallback
+//!     for a sheet content can't resolve, never an override. The result is surfaced solely as a
 //!     dismissible hint (it never enters the mode on its own).
 //!
 //! [`crate::render::gpu`] turns the active state into constant-buffer values; [`crate::win`]
@@ -176,47 +178,45 @@ pub fn max_lod(grid: Grid, sheet: (u32, u32)) -> f32 {
 
 /// Longest-axis cap for the grayscale analysis copy (integer box-binned down to this).
 const DETECT_MAX_DIM: u32 = 512;
-/// Minimum cell size (source px) for a divisor to be a candidate.
-const CELL_MIN_PX: u32 = 8;
-/// Minimum cell size (thumbnail px) required to score a candidate at all.
-const THUMB_CELL_MIN: u32 = 4;
-/// Divisor sweep per axis (plus the filename prior, admitted even above this).
-const DIV_MIN: u32 = 2;
-const DIV_MAX: u32 = 16;
-
-/// Weight of the (per-axis) boundary-anomaly term relative to the shift-correlation term in an
-/// axis's evidence. Shift-correlation carries full-bleed sheets; boundary anomaly carries padded
-/// or hard-seamed sheets of dissimilar frames.
-const BA_WEIGHT: f32 = 0.4;
-/// Absolute combined-score bar a non-prior candidate must clear to be a confident detection.
-const SCORE_ABS_MIN: f32 = 1.0;
-/// Lower bar the explicit filename prior must clear to be considered validated.
-const PRIOR_SCORE_MIN: f32 = 0.5;
-/// A confident non-prior winner must beat the best non-harmonic competitor by this factor.
-const NONPRIOR_MARGIN: f32 = 1.5;
-/// Small denominator guard for the relative boundary-anomaly ratio.
-const BOUNDARY_EPS: f32 = 1e-3;
+/// Smallest cell size, in thumbnail pixels, a period candidate may have (a smaller "cell" is
+/// noise, not a frame). Also the minimum autocorrelation lag searched.
+const MIN_CELL_THUMB: usize = 6;
+/// Profile variance (mean-subtracted, luma-gradient units) below which an axis is "flat" — a
+/// uniform texture with no gutters. Below this there is no grid to find.
+const PROFILE_VAR_EPS: f32 = 1e-6;
+/// YIN absolute threshold: the cumulative-mean-normalized difference must dip below this at the
+/// fundamental period. Real grids sit in a tight cluster of deep dips (`d' < 0.15`) well
+/// separated from textures and full-bleed non-grids (`d' > 0.55`); this sits in the empty gap
+/// between them for a wide margin on both sides. Full-bleed animations whose gutters dissolve
+/// (fire/smoke) fall in the upper cluster and rely on the filename token instead.
+const YIN_THRESHOLD: f32 = 0.35;
 /// Variance (on 0..1 luma) below which a cell is "flat" and excluded from similarity scoring.
 const FLAT_VAR_EPS: f32 = 1e-4;
-/// Minimum fraction of non-flat cells for a candidate to be scored — a finer grid that splits a
-/// localized sprite into mostly-empty cells fails this and is rejected (over-split guard).
+/// Minimum fraction of non-flat cells for the detected grid to stand — a period that splits a
+/// localized sprite into mostly-empty cells is spurious (over-split guard).
 const MIN_NONFLAT_FRAC: f32 = 0.5;
-/// Consecutive-cell median NCC at/above which cells are treated as identical (a tiled or
-/// gradient texture, not distinct animation frames) and rejected.
-const IDENTICAL_CAP: f32 = 0.97;
-/// Within a harmonic family, keep the coarser grid over a finer one unless the finer scores
-/// clearly higher: drop the finer if the coarser scores at least this fraction of it (resists
-/// over-splitting a true grid into a finer harmonic).
-const COARSE_PREFER: f32 = 0.9;
+/// Minimum frame count along a strip's one animated axis (`N×1` / `1×N`). A 2-frame strip is too
+/// weak to claim from content; a 2-D grid is allowed at 2×2 (4 cells) by the general cell floor.
+const STRIP_MIN_FRAMES: u32 = 3;
+/// Minimum adjacent-cell median NCC for a strip. A strip has only one axis of evidence, so it also
+/// must look like an *animation* — consecutive frames resembling each other. A segmented object
+/// whose bands read as a strip (bat wing → `1×3`, adjacent ≈ 0.25) fails this; a real strip
+/// (drifting plant/flame frames, adjacent ≈ 0.6) clears it.
+const STRIP_ADJ_MIN: f32 = 0.45;
+/// Median NCC between cells a half-loop apart at/above which the sheet is a near-perfect *tiling*
+/// (identical cells, not evolving animation frames) and rejected. Real animations — even smooth
+/// smoke — evolve enough to stay below this; a pixel-repeating texture sits at 1.0.
+const FAR_IDENTICAL_CAP: f32 = 0.999;
 
-/// Detect the flipbook grid of a decoded sheet, or `None`. The filename token is a *prior* that
-/// content analysis validates or overrides; content can also detect a grid with no token at all.
-/// Runs on the decode worker; a few ms of pure Rust over a ≤512px grayscale copy.
+/// Detect the flipbook grid of a decoded sheet, or `None`. **Content is the determining factor:**
+/// the pixels decide the grid, because filenames can be wrong or missing. A `NxM` filename token
+/// is used *only* as a fallback when content analysis cannot resolve a grid at all — it never
+/// overrides what the pixels show. The content detector finds the grid of a regular sprite sheet
+/// (including non-power-of-two grids on a power-of-two atlas, and 1×N / N×1 strips) and returns
+/// `None` for a lone sprite or a texture. Runs on the decode worker; a few ms of pure Rust over a
+/// ≤512px grayscale copy.
 pub fn detect(path: &Path, image: &DecodedImage) -> Option<Grid> {
-    let prior = filename_prior(path);
-    // Content detection wins; if it finds nothing, fall back to an explicit filename token (a
-    // harmless hint reflecting the author's stated intent).
-    content_grid(image, prior).or(prior)
+    content_grid(image).or_else(|| filename_prior(path))
 }
 
 /// Parse a `NxM` grid token from the filename (case-insensitive `x`, digits only, no regex).
@@ -255,172 +255,133 @@ fn parse_grid_token(tok: &str) -> Option<Grid> {
     Some(Grid::new(cols, rows))
 }
 
-/// Content analysis: validate/override the prior, or detect from scratch. See the module-level
-/// resolution rules; returns `None` when nothing clears its bar (the prior fallback lives in
-/// [`detect`]).
-fn content_grid(image: &DecodedImage, prior: Option<Grid>) -> Option<Grid> {
-    let (thumb, tw, th) = luminance_thumbnail(image)?;
-    let (w, h) = (image.width, image.height);
+/// Content analysis: detect the grid from the pixels alone. `None` when the image shows no
+/// sprite-sheet structure. Tries the luminance channel first (colour/brightness structure — the
+/// usual case), then falls back to the alpha channel (structure carried in transparency — a mask
+/// over flat RGB, or a crisper alpha edge than the RGB). Each channel independently rejects
+/// non-grids, so the fallback widens what we can find without adding false positives. The alpha
+/// pass is skipped when the image is fully opaque (its alpha carries nothing).
+fn content_grid(image: &DecodedImage) -> Option<Grid> {
+    grid_from_signal(image, Signal::Luma).or_else(|| {
+        (!image.alpha_opaque)
+            .then(|| grid_from_signal(image, Signal::Alpha))
+            .flatten()
+    })
+}
 
-    let col_divs = axis_divisors(w, tw, prior.map(|g| g.cols));
-    let row_divs = axis_divisors(h, th, prior.map(|g| g.rows));
-    if col_divs.is_empty() || row_divs.is_empty() {
-        return None;
-    }
+/// Detect a grid from one channel of the image (see [`content_grid`] for the cascade). `None` if
+/// that channel shows no regular sprite-sheet periodicity.
+fn grid_from_signal(image: &DecodedImage, signal: Signal) -> Option<Grid> {
+    let (thumb, tw, th) = analysis_thumbnail(image, signal)?;
 
-    // Per-axis evidence: gradient-activity profiles (for boundary anomaly) and shift-correlation
-    // (for content periodicity) as a function of the number of divisions.
+    // Per-axis "content activity" profiles: `col_act[x]` is the mean vertical detail in column x,
+    // `row_act[y]` the mean horizontal detail in row y. A sprite sheet lays content in a regular
+    // grid of cells separated by empty gutters, so each profile is *periodic* — high over cells,
+    // low over gutters — with period = one cell. A single object (one broad bump) or a uniform
+    // texture (flat profile) has no such periodicity.
     let col_act = axis_activity(&thumb, tw, th, Axis::Col);
     let row_act = axis_activity(&thumb, tw, th, Axis::Row);
-    let col_median = median(&col_act);
-    let row_median = median(&row_act);
-    let col_ev = |n: u32| {
-        axis_evidence(
-            &col_act,
-            col_median,
-            shift_corr(&thumb, tw, th, Axis::Col, n),
-            n,
-        )
-    };
-    let row_ev = |n: u32| {
-        axis_evidence(
-            &row_act,
-            row_median,
-            shift_corr(&thumb, tw, th, Axis::Row, n),
-            n,
-        )
-    };
 
-    // Score every (cols × rows) candidate.
-    let mut scored: Vec<(Grid, f32)> = Vec::new();
-    for &cols in &col_divs {
-        let cx = col_ev(cols);
-        for &rows in &row_divs {
-            let grid = Grid::new(cols, rows);
-            if grid.cells() < 4 {
-                continue;
-            }
-            if cols < 2 && rows < 2 {
-                continue;
-            }
-            let (sim, nonflat_frac) = cell_similarity(&thumb, tw, th, grid);
-            // A flipbook needs animation-like cells: enough non-flat cells that are NOT identical.
-            // Identical cells (median NCC ≥ cap) are a tiling/gradient, not distinct frames; a
-            // mostly-flat split is an over-split of a localized sprite. Both are rejected here so
-            // periodicity alone (shift-correlation) can't promote a tiled texture.
-            let animationlike = nonflat_frac >= MIN_NONFLAT_FRAC && sim < IDENTICAL_CAP;
-            let score = if animationlike {
-                cx + row_ev(rows)
-            } else {
-                0.0
-            };
-            scored.push((grid, score));
-        }
-    }
-    if scored.is_empty() {
+    // A full grid has a period on both axes; a strip (`N×1` / `1×N`) has one on the animation axis
+    // and none on the other (each frame spans the sheet's short dimension). Take rows/cols = 1
+    // when that axis carries no period.
+    let grid = match (axis_period(&col_act, tw), axis_period(&row_act, th)) {
+        (Some((c, _)), Some((r, _))) => Grid::new(c, r),
+        (Some((c, _)), None) => Grid::new(c, 1), // horizontal strip
+        (None, Some((r, _))) => Grid::new(1, r), // vertical strip
+        (None, None) => return None,
+    };
+    let (min_axis, max_axis) = (grid.cols.min(grid.rows), grid.cols.max(grid.rows));
+    let is_strip = min_axis == 1;
+    // Enough frames to be an animation: a 2-D grid needs ≥ 4 cells (2×2); a strip needs ≥ 3 frames
+    // along its one axis (a 2-frame "animation" is too weak to claim from content alone).
+    if grid.cells() < 4 && !(is_strip && max_axis >= STRIP_MIN_FRAMES) {
         return None;
     }
 
-    let winner = confident_winner(&scored);
-
-    match prior {
-        Some(p) => {
-            // A confident detection that differs from the prior overrides it (filename wrong or
-            // coarser than the real grid). Otherwise a validated prior wins.
-            if let Some(w) = winner {
-                if w != p {
-                    return Some(w);
-                }
-                return Some(p);
-            }
-            let prior_score = scored
-                .iter()
-                .find(|(g, _)| *g == p)
-                .map(|(_, s)| *s)
-                .unwrap_or(0.0);
-            if prior_score >= PRIOR_SCORE_MIN {
-                Some(p)
-            } else {
-                None // detect() falls back to the prior anyway
-            }
-        }
-        None => winner,
-    }
-}
-
-/// Pick the confident non-prior winner: the highest-scoring qualifier (biased toward the coarser
-/// grid within a harmonic family) that clears the absolute bar and beats the best non-harmonic
-/// competitor by [`NONPRIOR_MARGIN`]. `None` if nothing qualifies.
-fn confident_winner(scored: &[(Grid, f32)]) -> Option<Grid> {
-    let qualifiers: Vec<(Grid, f32)> = scored
-        .iter()
-        .copied()
-        .filter(|(_, s)| *s >= SCORE_ABS_MIN)
-        .collect();
-    if qualifiers.is_empty() {
+    // Content guards on the frame sequence. YIN already required regular gutters (an irregular
+    // texture yields no period), so these reject the residual shapes:
+    //   * a mostly-*empty* split (a localized sprite over-split into blank cells), and
+    //   * a near-*perfect tiling* — cells identical even a half-loop apart (`far ≈ 1`). A real
+    //     animation always evolves, so even smooth smoke/fire sheets stay below the cap (measured
+    //     `far ≤ 0.9955`) while a pixel-repeating texture sits at exactly 1.0.
+    //   * for a **strip** only (one axis of evidence, so easier to fool): the frames must resemble
+    //     each other (`adjacent ≥ STRIP_ADJ_MIN`) — a segmented object whose bands read as a strip
+    //     (a bat wing → `1×3`, adjacent ≈ 0.25) has dissimilar "frames" and is rejected.
+    let (adj, far, nonflat_frac) = cell_sequence_stats(&thumb, tw, th, grid);
+    if nonflat_frac < MIN_NONFLAT_FRAC || far >= FAR_IDENTICAL_CAP {
         return None;
     }
-    // Collapse harmonic families toward the coarser grid: drop a finer qualifier when a coarser
-    // harmonic scores nearly as well (a finer harmonic re-splits the true grid's cells and tends
-    // to inflate similarity). A finer grid survives only if it scores clearly higher.
-    let kept: Vec<(Grid, f32)> = qualifiers
-        .iter()
-        .copied()
-        .filter(|&(g, gs)| {
-            !qualifiers.iter().any(|&(o, os)| {
-                o != g && harmonic(g, o) && o.cells() < g.cells() && os >= COARSE_PREFER * gs
-            })
-        })
-        .collect();
-
-    let (winner, wscore) = kept
-        .iter()
-        .copied()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
-
-    // Margin over the best competitor not harmonically related to the winner.
-    let competitor = scored
-        .iter()
-        .filter(|&&(g, _)| g != winner && !harmonic(g, winner))
-        .map(|&(_, s)| s)
-        .fold(0.0_f32, f32::max);
-    if wscore >= NONPRIOR_MARGIN * competitor {
-        Some(winner)
-    } else {
-        None
+    if is_strip && adj < STRIP_ADJ_MIN {
+        return None;
     }
+    Some(grid)
 }
 
-/// Two grids are harmonically related when one is an integer multiple of the other on *both*
-/// axes (so their seams nest); such candidates naturally co-score and are excluded from the
-/// competitor margin.
-fn harmonic(a: Grid, b: Grid) -> bool {
-    let multiple =
-        |x: Grid, y: Grid| x.cols.is_multiple_of(y.cols) && x.rows.is_multiple_of(y.rows);
-    multiple(a, b) || multiple(b, a)
-}
+/// Detect the fundamental grid period along one axis from its activity `profile` (the thumbnail is
+/// `thumb_dim` samples along this axis). Returns `(cells, confidence)` where `cells =
+/// round(thumb_dim / period)` in `2..=GRID_MAX`, or `None` when the profile shows no clear
+/// repeating period (a single object or a flat texture).
+///
+/// Method: the YIN cumulative-mean-normalized difference function. `d(τ) = mean_i (a[i] −
+/// a[i+τ])²` dips toward 0 at the true period (the profile lines up with itself one cell over);
+/// normalizing by the running mean of `d` removes the "small lag ⇒ small difference" bias and,
+/// crucially, the amplitude *envelope* bias — a flipbook whose frames grow/fade across the sheet
+/// still has aligned gutters, so the dip survives even though a raw autocorrelation would lock
+/// onto the low-frequency envelope instead (that bug detected FireFar's 8×8 as 5×5). The
+/// fundamental is the smallest-lag dip below [`YIN_THRESHOLD`]; confidence is the dip depth.
+fn axis_period(profile: &[f32], thumb_dim: u32) -> Option<(u32, f32)> {
+    let l = profile.len();
+    if l < 16 {
+        return None;
+    }
+    let mean = profile.iter().sum::<f32>() / l as f32;
+    let var: f32 = profile.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / l as f32;
+    if var <= PROFILE_VAR_EPS {
+        return None; // flat profile: uniform texture, no gutters
+    }
 
-/// Candidate divisors for one axis: `2..=16` that divide `dim` with cell ≥ [`CELL_MIN_PX`],
-/// plus the `prior` value (admitted even above 16 when it divides and its thumbnail cell is
-/// large enough), plus `1` (strip sheets — a 1 on one axis is only usable when the other is ≥ 2,
-/// enforced during candidate scoring).
-fn axis_divisors(dim: u32, thumb_dim: u32, prior: Option<u32>) -> Vec<u32> {
-    let mut out = vec![1u32];
-    for n in DIV_MIN..=DIV_MAX {
-        if dim.is_multiple_of(n) && dim / n >= CELL_MIN_PX && thumb_dim / n >= THUMB_CELL_MIN {
-            out.push(n);
+    // Search lags for 2..=GRID_MAX cells; need ≥2 periods of support, so τ ≤ l/2.
+    let tau_min = (l / GRID_MAX as usize).max(MIN_CELL_THUMB);
+    let tau_max = l / 2;
+    if tau_min >= tau_max {
+        return None;
+    }
+
+    // YIN difference function d(τ) = mean squared difference of the profile against itself at lag
+    // τ, then the cumulative-mean normalization d'(τ) = d(τ)·τ / Σ_{j≤τ} d(j).
+    let mut d = vec![0.0f64; tau_max + 1];
+    for (tau, dv) in d.iter_mut().enumerate().skip(1) {
+        let n = l - tau;
+        let mut s = 0.0f64;
+        for i in 0..n {
+            let diff = (profile[i] - profile[i + tau]) as f64;
+            s += diff * diff;
+        }
+        *dv = s / n as f64;
+    }
+    let mut dp = vec![1.0f64; tau_max + 1];
+    let mut running = 0.0f64;
+    for tau in 1..=tau_max {
+        running += d[tau];
+        dp[tau] = if running > 0.0 {
+            d[tau] * tau as f64 / running
+        } else {
+            1.0
+        };
+    }
+
+    // Smallest-lag local minimum of d' that drops below the threshold (YIN "absolute threshold").
+    let mut best: Option<(u32, f32)> = None;
+    for tau in tau_min..tau_max {
+        if dp[tau] < YIN_THRESHOLD as f64 && dp[tau] <= dp[tau - 1] && dp[tau] <= dp[tau + 1] {
+            let cells = ((thumb_dim as f32 / tau as f32).round() as u32).clamp(2, GRID_MAX);
+            let conf = (1.0 - dp[tau]).clamp(0.0, 1.0) as f32;
+            best = Some((cells, conf));
+            break;
         }
     }
-    if let Some(p) = prior {
-        if (GRID_MIN..=GRID_MAX).contains(&p)
-            && dim.is_multiple_of(p)
-            && thumb_dim / p.max(1) >= THUMB_CELL_MIN
-            && !out.contains(&p)
-        {
-            out.push(p);
-        }
-    }
-    out
+    best
 }
 
 enum Axis {
@@ -458,128 +419,22 @@ fn axis_activity(thumb: &[f32], tw: u32, th: u32, axis: Axis) -> Vec<f32> {
     }
 }
 
-/// Boundary-anomaly score for `n` divisions of an axis whose gradient-activity profile is `act`
-/// (with precomputed `median`). Interior boundaries sit at `round(k·len/n)`; each contributes
-/// the largest `|act − median| / (median + eps)` within ±1 gap (rounding tolerance). Padding
-/// reads as a deep dip, a butted seam as a spike — both anomalous. `0` when `n < 2`.
-fn boundary_score(act: &[f32], median: f32, n: u32) -> f32 {
-    if n < 2 || act.is_empty() {
-        return 0.0;
-    }
-    let len = act.len() + 1; // number of pixels along the axis
-    let denom = median + BOUNDARY_EPS;
-    let mut sum = 0.0;
-    let mut count = 0u32;
-    for k in 1..n {
-        let pos = ((k as f32) * (len as f32) / (n as f32)).round() as i64; // boundary pixel
-        let center = pos - 1; // gap between pixel pos-1 and pos
-        let mut best = 0.0f32;
-        for d in -1..=1 {
-            let gi = center + d;
-            if gi >= 0 && (gi as usize) < act.len() {
-                let dev = (act[gi as usize] - median).abs() / denom;
-                best = best.max(dev);
-            }
-        }
-        sum += best;
-        count += 1;
-    }
-    if count == 0 {
-        0.0
-    } else {
-        sum / count as f32
-    }
-}
-
-/// Combined evidence that an axis is divided into `n` cells: content periodicity (shift
-/// correlation, clamped to ≥0) plus a weighted boundary-anomaly term. `0` for `n < 2` (no
-/// division carries no evidence — a strip sheet leans on the other axis).
-fn axis_evidence(act: &[f32], median: f32, shift_corr: f32, n: u32) -> f32 {
-    if n < 2 {
-        return 0.0;
-    }
-    shift_corr.max(0.0) + BA_WEIGHT * boundary_score(act, median, n)
-}
-
-/// Normalized cross-correlation (Pearson) between the thumbnail and itself shifted by one cell
-/// (`dim/n`) along `axis`. Peaks at the true cell size (adjacent frames align) and its multiples;
-/// a sub-cell shift misaligns content and scores low — so the maximum over an axis's divisors
-/// lands on the true division. `0` for a degenerate shift.
-fn shift_corr(thumb: &[f32], tw: u32, th: u32, axis: Axis, n: u32) -> f32 {
-    if n < 2 {
-        return 0.0;
-    }
-    let (tw, th) = (tw as usize, th as usize);
-    let (dim, is_col) = match axis {
-        Axis::Col => (tw, true),
-        Axis::Row => (th, false),
-    };
-    let s = ((dim as f32) / (n as f32)).round() as usize;
-    if s < 1 || s >= dim {
-        return 0.0;
-    }
-    // Gather (a, b) pairs where b is a's neighbour one cell along the axis.
-    let mut sa = 0.0f64;
-    let mut sb = 0.0f64;
-    let mut saa = 0.0f64;
-    let mut sbb = 0.0f64;
-    let mut sab = 0.0f64;
-    let mut cnt = 0.0f64;
-    if is_col {
-        for y in 0..th {
-            let row = y * tw;
-            for x in 0..tw - s {
-                let a = thumb[row + x] as f64;
-                let b = thumb[row + x + s] as f64;
-                sa += a;
-                sb += b;
-                saa += a * a;
-                sbb += b * b;
-                sab += a * b;
-                cnt += 1.0;
-            }
-        }
-    } else {
-        for y in 0..th - s {
-            let row = y * tw;
-            let row2 = (y + s) * tw;
-            for x in 0..tw {
-                let a = thumb[row + x] as f64;
-                let b = thumb[row2 + x] as f64;
-                sa += a;
-                sb += b;
-                saa += a * a;
-                sbb += b * b;
-                sab += a * b;
-                cnt += 1.0;
-            }
-        }
-    }
-    if cnt < 2.0 {
-        return 0.0;
-    }
-    let cov = sab - sa * sb / cnt;
-    let va = saa - sa * sa / cnt;
-    let vb = sbb - sb * sb / cnt;
-    if va <= 0.0 || vb <= 0.0 {
-        return 0.0;
-    }
-    (cov / (va.sqrt() * vb.sqrt())) as f32
-}
-
-/// Cell-similarity score for a candidate grid: split the thumbnail into cells, box-downsample
-/// each to an 8×8 thumbnail, mean-subtract and L2-normalize (skipping near-flat cells), then
-/// take the median normalized cross-correlation between consecutive cells (row-major). Returns
-/// `(median_ncc, non_flat_fraction)`. Animation frames are similar-but-not-identical (high
-/// median NCC); an arbitrary image chopped into a grid scores low.
-fn cell_similarity(thumb: &[f32], tw: u32, th: u32, grid: Grid) -> (f32, f32) {
+/// Summarize the detected grid's cells for the content guards. Returns `(adjacent, far,
+/// nonflat_frac)` — median NCC (on 8×8 mean-subtracted unit cell descriptors) between consecutive
+/// cells and between cells a half-loop apart, and the fraction of non-flat cells:
+///   * `adjacent` low means neighbouring cells don't resemble each other — a *segmented object*
+///     (e.g. a bat wing whose bands read as a strip), not an animation. Used to guard strips,
+///     which have only one axis of evidence.
+///   * `far ≈ 1` means every cell is identical even half a loop away — a repeating *texture*, not
+///     evolving frames (a real animation, even smooth smoke, drifts below 1).
+///   * low `nonflat_frac` means the grid over-split a localized sprite into blank cells.
+fn cell_sequence_stats(thumb: &[f32], tw: u32, th: u32, grid: Grid) -> (f32, f32, f32) {
     let cols = grid.cols.max(1);
     let rows = grid.rows.max(1);
     let n = (cols * rows) as usize;
     if n < 2 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, 0.0);
     }
-    // Normalized 8×8 descriptor per cell (None if flat).
     let mut descs: Vec<Option<[f32; 64]>> = Vec::with_capacity(n);
     for r in 0..rows {
         let y0 = (r as f32 * th as f32 / rows as f32).round() as u32;
@@ -592,18 +447,16 @@ fn cell_similarity(thumb: &[f32], tw: u32, th: u32, grid: Grid) -> (f32, f32) {
     }
     let nonflat = descs.iter().filter(|d| d.is_some()).count();
     let nonflat_frac = nonflat as f32 / n as f32;
-
-    let mut nccs: Vec<f32> = Vec::with_capacity(n - 1);
-    for i in 0..n - 1 {
-        if let (Some(a), Some(b)) = (&descs[i], &descs[i + 1]) {
-            let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-            nccs.push(dot); // descriptors are unit-norm → dot == NCC
+    let ncc = |i: usize, j: usize| -> Option<f32> {
+        match (&descs[i], &descs[j]) {
+            (Some(a), Some(b)) => Some(a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()),
+            _ => None,
         }
-    }
-    if nccs.is_empty() {
-        return (0.0, nonflat_frac);
-    }
-    (median(&nccs), nonflat_frac)
+    };
+    let adj: Vec<f32> = (0..n - 1).filter_map(|i| ncc(i, i + 1)).collect();
+    let half = (n / 2).max(1);
+    let far: Vec<f32> = (0..n - half).filter_map(|i| ncc(i, i + half)).collect();
+    (median(&adj), median(&far), nonflat_frac)
 }
 
 /// Box-downsample a cell rect to an 8×8, mean-subtracted, L2-normalized descriptor. `None` if
@@ -654,9 +507,9 @@ fn cell_descriptor(
     Some(d)
 }
 
-/// Build the ≤512px grayscale (luminance, 0..1) analysis copy via integer box binning. Returns
-/// `(pixels, thumb_w, thumb_h)`; `None` if the image is too small to analyze.
-fn luminance_thumbnail(image: &DecodedImage) -> Option<(Vec<f32>, u32, u32)> {
+/// Build the ≤512px grayscale analysis copy of `signal` (luma or alpha, 0..1-ish) via integer box
+/// binning. Returns `(pixels, thumb_w, thumb_h)`; `None` if the image is too small to analyze.
+fn analysis_thumbnail(image: &DecodedImage, signal: Signal) -> Option<(Vec<f32>, u32, u32)> {
     let (w, h) = (image.width, image.height);
     if w < 2 || h < 2 {
         return None;
@@ -684,7 +537,7 @@ fn luminance_thumbnail(image: &DecodedImage) -> Option<(Vec<f32>, u32, u32)> {
                         break;
                     }
                     let off = sy as usize * stride + sx as usize * bpp;
-                    s += luma_at(px, off, image.format);
+                    s += sample_at(px, off, image.format, signal);
                     cnt += 1;
                 }
             }
@@ -694,33 +547,51 @@ fn luminance_thumbnail(image: &DecodedImage) -> Option<(Vec<f32>, u32, u32)> {
     Some((out, tw, th))
 }
 
-/// Rec.709 luminance (0..1-ish; HDR values may exceed 1, which is fine — scores are relative) of
-/// the RGBA pixel at byte offset `off`, per format. Mirrors the per-format lane handling in
-/// `fire_decode`'s `alpha_is_opaque`.
-fn luma_at(px: &[u8], off: usize, format: PixelFormat) -> f32 {
-    let (r, g, b) = match format {
+/// Which channel the analysis thumbnail samples. A sprite sheet's cell/gutter structure can live
+/// in either: colour/brightness ([`Signal::Luma`], the usual case) or transparency
+/// ([`Signal::Alpha`] — VFX exports whose frames are an opacity mask over flat RGB, e.g. steam on
+/// solid white, or fire whose alpha edge is crisper than its smoky RGB). Detection tries luma
+/// first and falls back to alpha.
+#[derive(Clone, Copy)]
+enum Signal {
+    Luma,
+    Alpha,
+}
+
+/// The analysis scalar (0..1-ish; HDR luma may exceed 1, which is fine — scores are relative) of
+/// the RGBA pixel at byte offset `off`, per format and [`Signal`]. Mirrors the per-format lane
+/// handling in `fire_decode`'s `alpha_is_opaque`.
+fn sample_at(px: &[u8], off: usize, format: PixelFormat, signal: Signal) -> f32 {
+    let (r, g, b, a) = match format {
         PixelFormat::Rgba8Unorm => (
             px[off] as f32 / 255.0,
             px[off + 1] as f32 / 255.0,
             px[off + 2] as f32 / 255.0,
+            px[off + 3] as f32 / 255.0,
         ),
         PixelFormat::Rgba16Unorm => (
             u16::from_ne_bytes([px[off], px[off + 1]]) as f32 / 65535.0,
             u16::from_ne_bytes([px[off + 2], px[off + 3]]) as f32 / 65535.0,
             u16::from_ne_bytes([px[off + 4], px[off + 5]]) as f32 / 65535.0,
+            u16::from_ne_bytes([px[off + 6], px[off + 7]]) as f32 / 65535.0,
         ),
         PixelFormat::Rgba16Float => (
             half_to_f32(u16::from_ne_bytes([px[off], px[off + 1]])),
             half_to_f32(u16::from_ne_bytes([px[off + 2], px[off + 3]])),
             half_to_f32(u16::from_ne_bytes([px[off + 4], px[off + 5]])),
+            half_to_f32(u16::from_ne_bytes([px[off + 6], px[off + 7]])),
         ),
         PixelFormat::Rgba32Float => (
             f32::from_ne_bytes([px[off], px[off + 1], px[off + 2], px[off + 3]]),
             f32::from_ne_bytes([px[off + 4], px[off + 5], px[off + 6], px[off + 7]]),
             f32::from_ne_bytes([px[off + 8], px[off + 9], px[off + 10], px[off + 11]]),
+            f32::from_ne_bytes([px[off + 12], px[off + 13], px[off + 14], px[off + 15]]),
         ),
     };
-    0.2126 * r + 0.7152 * g + 0.0722 * b
+    match signal {
+        Signal::Luma => 0.2126 * r + 0.7152 * g + 0.0722 * b,
+        Signal::Alpha => a,
+    }
 }
 
 /// Minimal IEEE half → f32 (no dependency). Handles normals, subnormals, zero, inf/NaN.
@@ -893,6 +764,27 @@ mod tests {
         })
     }
 
+    /// A `cols×rows` grid of drifting blobs over an arbitrary `w×h` canvas — cell size `w/cols`,
+    /// `h/rows` may be fractional (a 5×5 on 512² has 102.4px cells). Exercises the period detector
+    /// on non-power-of-two grids, the common real-world layout the old divisor scan couldn't see.
+    fn moving_dot_sheet_frac(cols: u32, rows: u32, w: u32, h: u32) -> DecodedImage {
+        let cw = w as f32 / cols as f32;
+        let ch = h as f32 / rows as f32;
+        img_from(w, h, |x, y| {
+            let c = ((x as f32 / cw).floor() as u32).min(cols - 1);
+            let r = ((y as f32 / ch).floor() as u32).min(rows - 1);
+            let frame = (r * cols + c) as f32;
+            let lx = x as f32 - c as f32 * cw;
+            let ly = y as f32 - r as f32 * ch;
+            let bx = cw * (0.5 + 0.2 * (frame * 0.9).sin());
+            let by = ch * (0.5 + 0.2 * (frame * 1.3).cos());
+            let d2 = (lx - bx).powi(2) + (ly - by).powi(2);
+            let sig = cw.min(ch) * 0.15;
+            let v = (-d2 / (2.0 * sig * sig)).exp();
+            (v * 255.0) as u8
+        })
+    }
+
     #[test]
     fn detect_moving_dot_no_prior() {
         let img = moving_dot_sheet(8, 8, 16); // 128×128, full-bleed
@@ -903,13 +795,76 @@ mod tests {
     }
 
     #[test]
-    fn detect_overrides_wrong_prior() {
-        // Same 8×8 content, filename lies about 4×4 → content overrides to 8×8.
+    fn detect_non_divisible_grid_no_prior() {
+        // 5×5 on a 512² canvas → 102.4px cells (512 not divisible by 5). The period detector must
+        // find it from content with no filename token — the real-world VFX case (a 5×5 sheet on a
+        // power-of-two atlas) that a divisor-only scan structurally cannot detect.
+        let img = moving_dot_sheet_frac(5, 5, 512, 512);
+        assert_eq!(
+            detect(&PathBuf::from("untitled.png"), &img),
+            Some(Grid::new(5, 5))
+        );
+    }
+
+    #[test]
+    fn detect_single_object_no_prior_none() {
+        // One centred blob filling the frame (a lone sprite, no grid) → no repeating period → None.
+        let img = img_from(256, 256, |x, y| {
+            let dx = x as f32 - 128.0;
+            let dy = y as f32 - 128.0;
+            let v = (-(dx * dx + dy * dy) / (2.0 * 70.0 * 70.0)).exp();
+            (v * 255.0) as u8
+        });
+        assert_eq!(detect(&PathBuf::from("spark.png"), &img), None);
+    }
+
+    #[test]
+    fn detect_content_beats_wrong_token() {
+        // Content is the determining factor: an 8×8 sheet with a filename lying about 4×4 detects
+        // as 8×8 from the pixels — the token never overrides content.
         let img = moving_dot_sheet(8, 8, 16);
         assert_eq!(
             detect(&PathBuf::from("boom_4x4.png"), &img),
             Some(Grid::new(8, 8))
         );
+    }
+
+    #[test]
+    fn detect_horizontal_strip_no_prior() {
+        // A 4×1 strip: four full-height bars, one per cell, centred (clean column period) and
+        // widening frame to frame (similar neighbours, distinct ends). No vertical structure, so
+        // the row axis has no period → a strip. Content must detect 4×1 with no filename token.
+        let (cols, cw, h) = (4u32, 56u32, 168u32);
+        let img = img_from(cols * cw, h, |x, _y| {
+            let c = (x / cw) as f32;
+            let lx = (x % cw) as f32 - cw as f32 * 0.5;
+            let sig = cw as f32 * (0.12 + 0.04 * c); // width grows per frame
+            ((-(lx * lx) / (2.0 * sig * sig)).exp() * 255.0) as u8
+        });
+        assert_eq!(
+            detect(&PathBuf::from("untitled.png"), &img),
+            Some(Grid::new(4, 1))
+        );
+    }
+
+    #[test]
+    fn detect_dissimilar_bands_not_strip() {
+        // Three horizontally-uniform bands (up-ramp, down-ramp, flat-ish) split by dark gutters:
+        // the row axis reads a period-3, but the bands don't resemble each other (a segmented
+        // object, like a bat wing), so the strip adjacency guard rejects it.
+        let (w, h) = (128u32, 96u32); // 3 bands of 32
+        let img = img_from(w, h, |_x, y| {
+            let ly = y % 32;
+            if ly < 3 {
+                return 0; // dark gutter → row period 3, columns stay uniform (no col period)
+            }
+            match y / 32 {
+                0 => (ly * 7) as u8,            // ramp up
+                1 => ((32 - ly) * 7) as u8,     // ramp down — anti-correlated with band 0
+                _ => (60 + (ly % 5) * 8) as u8, // different again
+            }
+        });
+        assert_eq!(detect(&PathBuf::from("wing.png"), &img), None);
     }
 
     #[test]
@@ -968,5 +923,47 @@ mod tests {
     fn detect_weak_content_no_token_none() {
         let img = img_from(128, 64, |x, _| (x * 255 / 128) as u8);
         assert_eq!(detect(&PathBuf::from("grad.png"), &img), None);
+    }
+
+    #[test]
+    fn detect_alpha_only_sheet() {
+        // A sheet whose structure lives ONLY in alpha — RGB is solid white, the moving blob is the
+        // alpha mask (a common VFX export, e.g. steam). The luma pass sees a flat field; the alpha
+        // fallback must recover the 8×8 grid. No filename token.
+        let (cols, rows, cell) = (8u32, 8u32, 16u32);
+        let (w, h) = (cols * cell, rows * cell);
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let c = x / cell;
+                let r = y / cell;
+                let frame = (r * cols + c) as f32;
+                let lx = (x % cell) as f32;
+                let ly = (y % cell) as f32;
+                let bx = cell as f32 * (0.5 + 0.2 * (frame * 0.9).sin());
+                let by = cell as f32 * (0.5 + 0.2 * (frame * 1.3).cos());
+                let d2 = (lx - bx).powi(2) + (ly - by).powi(2);
+                let sig = cell as f32 * 0.15;
+                let a = ((-d2 / (2.0 * sig * sig)).exp() * 255.0) as u8;
+                px.extend_from_slice(&[255, 255, 255, a]); // flat white RGB, structure in alpha
+            }
+        }
+        let img = DecodedImage {
+            pixels: px,
+            width: w,
+            height: h,
+            format: PixelFormat::Rgba8Unorm,
+            bit_depth: 8,
+            channels: 4,
+            alpha_opaque: false, // gate the alpha pass on
+            icc: None,
+            source_format: "TEST",
+            downscaled_from: None,
+            animation: None,
+        };
+        assert_eq!(
+            detect(&PathBuf::from("steam.png"), &img),
+            Some(Grid::new(8, 8))
+        );
     }
 }
