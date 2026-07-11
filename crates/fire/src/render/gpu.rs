@@ -14,6 +14,7 @@
 //! write. The whole pipeline is linear.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use fire_decode::{AnimationFrame, DecodedImage, PixelFormat};
 
@@ -166,8 +167,10 @@ pub struct GpuSurface {
     generation: u64,
     /// The displayed image — retained for the pixel inspector (#16) and for re-fit on resize.
     /// For an animated source this holds frame 0 (dimensions/format/metadata are frame-invariant);
-    /// the frames themselves live in `anim_frames`.
-    current_image: Option<DecodedImage>,
+    /// the frames themselves live in `anim_frames`. Held behind an `Arc` because the decode worker
+    /// keeps a clone alive to run flipbook detection *after* the image has been posted for display
+    /// (so detection never delays time-to-first-pixel); both sides only ever read it.
+    current_image: Option<Arc<DecodedImage>>,
 
     /// Frames of an animated image (animated GIF), each a full RGBA canvas + delay. Empty for a
     /// still image. `anim_index` is the frame currently uploaded to the texture; the playback
@@ -266,7 +269,7 @@ impl GpuSurface {
     }
 
     pub fn current_image(&self) -> Option<&DecodedImage> {
-        self.current_image.as_ref()
+        self.current_image.as_deref()
     }
 
     // --- read-only view of display state, for the chrome ---
@@ -386,15 +389,20 @@ impl GpuSurface {
     /// neutral display state for the new file (#17). Returns the GPU error if the upload fails
     /// (e.g. `E_OUTOFMEMORY` on a very large image) so the caller can report it instead of the
     /// process aborting; on failure the prior display state is left untouched.
-    pub fn set_image(&mut self, mut img: DecodedImage) -> windows::core::Result<()> {
+    pub fn set_image(&mut self, img: Arc<DecodedImage>) -> windows::core::Result<()> {
         let (w, h) = (img.width, img.height);
         // Upload first: if the GPU rejects the texture we bail here, before mutating any state,
         // so a failed adopt can't leave the surface half-updated.
         self.upload_texture(&img)?;
         // Adopt any animation frames for playback and start from frame 0 (already uploaded above).
-        // Moved out of `img` so the frames aren't cloned; a still image leaves the list empty and
-        // playback stays off. The win shell arms the timer from `frame_delay_ms()` after this.
-        self.anim_frames = img.animation.take().map(|a| a.frames).unwrap_or_default();
+        // The image is shared with the decode worker (for flipbook detection), so frames are cloned
+        // rather than moved out; a still image (the shared case) leaves the list empty and clones
+        // nothing. The win shell arms the timer from `frame_delay_ms()` after this.
+        self.anim_frames = img
+            .animation
+            .as_ref()
+            .map(|a| a.frames.clone())
+            .unwrap_or_default();
         self.anim_index = 0;
         // Pick the viewport backdrop: once the user has chosen one this session it sticks across
         // every image; otherwise default to the image's nature — a checker only when there is real
@@ -425,11 +433,15 @@ impl GpuSurface {
     /// the re-decode came back at the same dimensions (the "re-export same canvas" case), so the
     /// user's zoomed-in detail and display state survive the update. The pan is re-clamped
     /// defensively (a no-op while the dims are unchanged).
-    pub fn replace_image_keep_view(&mut self, mut img: DecodedImage) -> windows::core::Result<()> {
+    pub fn replace_image_keep_view(&mut self, img: Arc<DecodedImage>) -> windows::core::Result<()> {
         self.upload_texture(&img)?;
         // Refresh the animation frames from the re-decoded file and restart from frame 0 (the view
         // is preserved, but the animation plays from the top). The win shell re-arms the timer.
-        self.anim_frames = img.animation.take().map(|a| a.frames).unwrap_or_default();
+        self.anim_frames = img
+            .animation
+            .as_ref()
+            .map(|a| a.frames.clone())
+            .unwrap_or_default();
         self.anim_index = 0;
         self.current_image = Some(img);
         // Hot reload keeps flipbook mode active (same path); clamp against the frame rect when in

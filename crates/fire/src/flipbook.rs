@@ -925,6 +925,7 @@ mod tests {
         assert_eq!(detect(&PathBuf::from("grad.png"), &img), None);
     }
 
+
     #[test]
     fn detect_alpha_only_sheet() {
         // A sheet whose structure lives ONLY in alpha — RGB is solid white, the moving blob is the

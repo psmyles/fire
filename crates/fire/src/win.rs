@@ -96,7 +96,7 @@ const OPEN_WITH_ID_BASE: usize = 100;
 const OVERFLOW_ID_BASE: usize = 1000;
 
 use crate::chrome::{self, Action, Chrome, ViewSnapshot};
-use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool};
+use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool, FlipbookGuess};
 use crate::folder::{self, Folder};
 use crate::foreground;
 use crate::ipc_server;
@@ -118,6 +118,9 @@ pub const WM_APP_FILE_CHANGED: u32 = WM_APP + 4;
 /// The flipbook hint chip was clicked. WPARAM is [`crate::hint_chip::CHIP_ACCEPT`] (enter the mode)
 /// or [`crate::hint_chip::CHIP_DISMISS`] (dismiss for the session); no LPARAM.
 pub const WM_APP_FLIPBOOK_CHIP: u32 = WM_APP + 5;
+/// A finished flipbook auto-detection from a worker, posted *after* its `WM_APP_DECODE_DONE` so the
+/// per-pixel scan never delays the image. LPARAM is `Box<FlipbookGuess>`.
+pub const WM_APP_FLIPBOOK_GUESS: u32 = WM_APP + 6;
 
 /// A completed sibling-image scan, delivered to the UI thread (boxed, via the message LPARAM).
 /// The win shell turns it into a [`Folder`] cursor once it confirms it's still current.
@@ -389,11 +392,10 @@ impl App {
                 self.invalidate_chrome();
                 // Start playback if this is an animated GIF; stop any prior animation otherwise.
                 self.sync_animation();
-                // Record this decode's flipbook hint (a reload re-detects) and re-apply any per-path
-                // flipbook state for the adopted image (restores it on navigate-back; the chip
-                // appears if a fresh hint landed).
-                self.flipbook.entry(outcome.path.clone()).or_default().hint =
-                    outcome.flipbook_guess;
+                // Re-apply any per-path flipbook state for the adopted image (restores it on
+                // navigate-back). The auto-detection hint for a fresh open arrives *later*, via
+                // `WM_APP_FLIPBOOK_GUESS` (kept off the time-to-first-pixel path), and re-applies
+                // then — so a new sheet shows instantly and the chip pops a beat afterward.
                 self.apply_flipbook();
                 eprintln!("fire: opened {name} ({w}x{h}, {fmt})");
             }
@@ -402,6 +404,18 @@ impl App {
                 self.fail_load(&name, format!("failed: {e}"));
             }
         }
+    }
+
+    /// Apply a flipbook auto-detection result that arrived after its image (see
+    /// [`WM_APP_FLIPBOOK_GUESS`]). Stale-dropped by generation like a decode, so a guess for an
+    /// image the user has already navigated away from is ignored. On a match, `current_path` is the
+    /// guess's path, so recording the hint and re-applying pops the chip for the visible image.
+    fn flipbook_guess_done(&mut self, guess: FlipbookGuess) {
+        if guess.generation != self.surface.generation() {
+            return; // superseded by a newer open
+        }
+        self.flipbook.entry(guess.path).or_default().hint = guess.guess;
+        self.apply_flipbook();
     }
 
     /// Shared failure path for a load (failed decode *or* failed GPU upload): show `meta` in the
@@ -1753,6 +1767,11 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         WM_APP_DECODE_DONE => {
             let outcome = Box::from_raw(lparam as *mut DecodeOutcome);
             app.decode_done(*outcome);
+            0
+        }
+        WM_APP_FLIPBOOK_GUESS => {
+            let guess = Box::from_raw(lparam as *mut FlipbookGuess);
+            app.flipbook_guess_done(*guess);
             0
         }
         WM_APP_FOLDER_SCANNED => {
