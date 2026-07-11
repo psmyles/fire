@@ -54,51 +54,63 @@ pub enum Action {
     /// and tracked by the win shell (it needs the button's screen rect, and the chosen entry is
     /// performed there directly — no per-entry `Action`).
     OpenWithMenu,
+    /// A synthetic "»" button that only appears when the left group can't fit the window width: it
+    /// opens a popup listing the left-group buttons that were dropped (see [`Chrome::relayout`] and
+    /// [`Chrome::overflow_menu`]). Chosen entries dispatch to the same `Action`s the toolbar drives.
+    Overflow,
 }
 
-/// A toolbar slot: the action it performs and a visual group (groups are separated by a thin
-/// divider). Slots are laid out into [`LaidButton`]s by [`Chrome::relayout`].
+/// A toolbar slot: the action it performs, a visual group (groups are separated by a thin
+/// divider), and a `prio` used only for the left group's overflow. When the window is too narrow to
+/// hold the whole left group, [`Chrome::relayout`] drops the *lowest*-`prio` slots into the overflow
+/// popup first (ties broken by position — the rightmost of equal priority goes first, so a group
+/// collapses from its tail inward). Higher = kept on the bar longer. The right group is anchored to
+/// the far edge and never overflows, so its slots' `prio` is unused.
 struct Slot {
     action: Action,
     group: u8,
+    prio: u8,
 }
 
 /// The HDR group (tonemap + exposure). Laid out only for float sources; hidden otherwise so the
 /// toolbar doesn't carry inert controls for LDR images.
 const HDR_GROUP: u8 = 3;
 
-/// Left-docked controls, in order: navigate · zoom · channel isolation · HDR (float only).
+/// Left-docked controls, in order: navigate · zoom · channel isolation · HDR (float only). `prio`
+/// drives overflow drop order (see [`Slot`]): navigation is kept longest, then zoom, then the
+/// all-channels reset, then the channel solos, and the HDR group is shed first.
 const LEFT: &[Slot] = &[
-    Slot { action: Action::Prev, group: 0 },
-    Slot { action: Action::Next, group: 0 },
-    Slot { action: Action::ZoomOut, group: 1 },
-    Slot { action: Action::ZoomToggle, group: 1 },
-    Slot { action: Action::ZoomIn, group: 1 },
-    Slot { action: Action::Channel(Channel::Rgb), group: 2 },
-    Slot { action: Action::Channel(Channel::R), group: 2 },
-    Slot { action: Action::Channel(Channel::G), group: 2 },
-    Slot { action: Action::Channel(Channel::B), group: 2 },
-    Slot { action: Action::Channel(Channel::A), group: 2 },
-    Slot { action: Action::ToggleTonemap, group: HDR_GROUP },
-    Slot { action: Action::ExpUp, group: HDR_GROUP },
-    Slot { action: Action::ExpReset, group: HDR_GROUP },
-    Slot { action: Action::ExpDown, group: HDR_GROUP },
+    Slot { action: Action::Prev, group: 0, prio: 90 },
+    Slot { action: Action::Next, group: 0, prio: 90 },
+    Slot { action: Action::ZoomOut, group: 1, prio: 70 },
+    Slot { action: Action::ZoomToggle, group: 1, prio: 75 },
+    Slot { action: Action::ZoomIn, group: 1, prio: 70 },
+    Slot { action: Action::Channel(Channel::Rgb), group: 2, prio: 50 },
+    Slot { action: Action::Channel(Channel::R), group: 2, prio: 40 },
+    Slot { action: Action::Channel(Channel::G), group: 2, prio: 40 },
+    Slot { action: Action::Channel(Channel::B), group: 2, prio: 40 },
+    Slot { action: Action::Channel(Channel::A), group: 2, prio: 40 },
+    Slot { action: Action::ToggleTonemap, group: HDR_GROUP, prio: 20 },
+    Slot { action: Action::ExpUp, group: HDR_GROUP, prio: 20 },
+    Slot { action: Action::ExpReset, group: HDR_GROUP, prio: 15 },
+    Slot { action: Action::ExpDown, group: HDR_GROUP, prio: 20 },
 ];
 
 /// Right-docked controls: the outline toggle, then the viewport backdrop group. Drawn far-right,
 /// in this visual (left→right) order; a divider separates the groups like the left side.
+/// `prio` is unused here — the right group is anchored to the far edge and never overflows.
 const RIGHT: &[Slot] = &[
-    Slot { action: Action::ToggleOutline, group: 0 },
-    Slot { action: Action::Background(Background::Black), group: 1 },
-    Slot { action: Action::Background(Background::White), group: 1 },
-    Slot { action: Action::Background(Background::Grey), group: 1 },
-    Slot { action: Action::Background(Background::Checker), group: 1 },
+    Slot { action: Action::ToggleOutline, group: 0, prio: 0 },
+    Slot { action: Action::Background(Background::Black), group: 1, prio: 0 },
+    Slot { action: Action::Background(Background::White), group: 1, prio: 0 },
+    Slot { action: Action::Background(Background::Grey), group: 1, prio: 0 },
+    Slot { action: Action::Background(Background::Checker), group: 1, prio: 0 },
     // The full-screen toggle sits just left of the "Open in…" button, in its own group (dividers
     // on both sides).
-    Slot { action: Action::ToggleFullscreen, group: 3 },
+    Slot { action: Action::ToggleFullscreen, group: 3, prio: 0 },
     // Laid first (RIGHT is walked in reverse), so the "Open in…" button hugs the far-right corner;
     // its own group gives it a divider from the backdrop controls.
-    Slot { action: Action::OpenWithMenu, group: 2 },
+    Slot { action: Action::OpenWithMenu, group: 2, prio: 0 },
 ];
 
 /// A live read-only view of display state, built by the win shell each paint so the chrome
@@ -135,6 +147,9 @@ impl ViewSnapshot {
             Action::OpenWithMenu => self.has_image,
             // Full-screen is a window mode, independent of whether an image is loaded.
             Action::ToggleFullscreen => true,
+            // The overflow button is only ever laid out when it holds dropped controls; opening its
+            // menu is always allowed (the individual entries carry their own enabled state).
+            Action::Overflow => true,
         }
     }
 
@@ -147,6 +162,8 @@ impl ViewSnapshot {
             Action::Background(b) => self.background == b,
             Action::ToggleOutline => self.outline,
             Action::ToggleFullscreen => self.fullscreen,
+            // The overflow button itself never latches (its menu entries carry the real state).
+            Action::Overflow => false,
             _ => false,
         }
     }
@@ -176,6 +193,7 @@ impl ViewSnapshot {
             Action::Background(Background::Checker) => "Checkerboard backdrop",
             Action::OpenWithMenu => "Copy, show in folder, or open in app\u{2026}",
             Action::ToggleFullscreen => "Full screen  (F11)",
+            Action::Overflow => "More controls\u{2026}",
         }
     }
 
@@ -204,6 +222,7 @@ impl ViewSnapshot {
             Action::Background(Background::Checker) => Icon::Checker,
             Action::OpenWithMenu => Icon::OpenWith,
             Action::ToggleFullscreen => Icon::Fullscreen,
+            Action::Overflow => Icon::More,
         }
     }
 }
@@ -304,6 +323,62 @@ struct LaidButton {
     action: Action,
 }
 
+/// One entry of the "»" overflow popup, built by [`Chrome::overflow_menu`] for the win shell to
+/// turn into a menu item. `label` is the button's tooltip text (name + shortcut); `enabled` greys
+/// the item; `checked` shows a check for a toggle that's currently on.
+pub struct OverflowItem {
+    pub action: Action,
+    pub label: &'static str,
+    pub enabled: bool,
+    pub checked: bool,
+}
+
+/// The x of the right edge of the left group if `kept` were laid out from the left margin — the last
+/// button's right edge, or the trailing "»" button's if `with_overflow`. Mirrors the layout math in
+/// [`Chrome::relayout`] (buttons, per-group dividers, gaps) without allocating, so the overflow loop
+/// can test candidate sets. An empty `kept` reduces to just the margin (plus the overflow button,
+/// when present).
+/// The right-docked group's footprint: the distance from the window's right edge to the group's
+/// leftmost button's left edge, for the current metrics (width-independent — the group is anchored
+/// to the far edge). Mirrors [`Chrome::relayout`]'s right→left walk with x tracked as an offset from
+/// the right edge (starting at `-margin`); the `right_group_span_matches_relayout` test guards that
+/// the two stay in step. Used to size the window's minimum width.
+fn right_group_span(m: &Metrics) -> i32 {
+    let mut x = -m.margin;
+    let mut left = x;
+    let mut prev_group: Option<u8> = None;
+    for slot in RIGHT.iter().rev() {
+        if prev_group.is_some_and(|g| g != slot.group) {
+            x -= m.sep;
+        }
+        prev_group = Some(slot.group);
+        left = x - m.btn;
+        x = left - m.gap;
+    }
+    -left // footprint = right edge (offset 0) − the leftmost button's (negative) left offset
+}
+
+fn left_group_end(m: &Metrics, kept: &[(usize, &Slot)], with_overflow: bool) -> i32 {
+    let mut x = m.margin;
+    let mut prev_group: Option<u8> = None;
+    for (_, slot) in kept {
+        if prev_group.is_some_and(|g| g != slot.group) {
+            x += m.sep;
+        }
+        prev_group = Some(slot.group);
+        x += m.btn + m.gap;
+    }
+    // `x` is now the left edge of the next button; the last placed button's right edge is `x - m.gap`.
+    // The overflow button, if any, sits at `x` and extends `m.btn`.
+    if with_overflow {
+        x + m.btn
+    } else if kept.is_empty() {
+        m.margin
+    } else {
+        x - m.gap
+    }
+}
+
 /// The frame's chrome: metrics, palette, the per-DPI icon renderer, the laid-out toolbar, and
 /// the hovered button.
 pub struct Chrome {
@@ -313,6 +388,10 @@ pub struct Chrome {
     icons: Icons,
     buttons: Vec<LaidButton>,
     seps: Vec<i32>,
+    /// Left-group actions dropped into the overflow popup at the current width, in toolbar order.
+    /// Populated by [`Self::relayout`]; non-empty exactly when an [`Action::Overflow`] button was
+    /// laid out. The win shell reads this to build the "»" menu.
+    overflow: Vec<Action>,
     /// Index into `buttons` of the hovered button.
     pub hover: Option<usize>,
 }
@@ -328,6 +407,7 @@ impl Chrome {
             icons,
             buttons: Vec::new(),
             seps: Vec::new(),
+            overflow: Vec::new(),
             hover: None,
         }
     }
@@ -354,6 +434,21 @@ impl Chrome {
         self.palette.view_clear_packed()
     }
 
+    /// The smallest client (w, h) the frame should allow, so the toolbar never overlaps: the width
+    /// that fits the always-present right group plus the fully-collapsed left group (just the "»"
+    /// overflow button) with a divider's gap between them, and a height for both chrome strips plus
+    /// a modest viewport. The win shell feeds this to `WM_GETMINMAXINFO` (converted to a window
+    /// rect). Scales with DPI, since every term is a DPI-scaled metric.
+    pub fn min_client_size(&self) -> (i32, i32) {
+        let m = &self.metrics;
+        // The overflow button sits at the left margin; its right edge must clear the right group's
+        // inner edge by a separator's gap: margin + btn + sep + (right group footprint).
+        let width = m.margin + m.btn + m.sep + right_group_span(m);
+        // Both chrome strips plus ~120 logical px of image area (enough for the empty-state hint).
+        let height = m.toolbar_h + m.status_h + 120 * m.dpi as i32 / 96;
+        (width, height)
+    }
+
     /// Recompute button rects for the current metrics + visible button set (call on size/DPI
     /// change, and whenever HDR-ness changes so the float-only group appears/disappears). `width`
     /// is the frame client width, used to right-dock the background group. Clears the hover, which
@@ -361,37 +456,15 @@ impl Chrome {
     pub fn relayout(&mut self, width: i32, snap: &ViewSnapshot) {
         self.buttons.clear();
         self.seps.clear();
+        self.overflow.clear();
         self.hover = None;
         let m = &self.metrics;
         let btn_y = (m.toolbar_h - m.btn) / 2;
 
-        // Left group: pack left→right, a divider between visual groups. The HDR group is laid out
-        // only for float sources.
-        let mut x = m.margin;
-        let mut prev_group: Option<u8> = None;
-        for slot in LEFT {
-            if slot.group == HDR_GROUP && !snap.is_hdr {
-                continue;
-            }
-            // The alpha-isolation button only makes sense for a source that has an alpha channel.
-            if slot.action == Action::Channel(Channel::A) && !snap.has_alpha {
-                continue;
-            }
-            if prev_group.is_some_and(|g| g != slot.group) {
-                self.seps.push(x + m.sep / 2);
-                x += m.sep;
-            }
-            prev_group = Some(slot.group);
-            self.buttons.push(LaidButton {
-                rect: RECT { left: x, top: btn_y, right: x + m.btn, bottom: btn_y + m.btn },
-                action: slot.action,
-            });
-            x += m.btn + m.gap;
-        }
-
-        // Right group: pack right→left from the far edge so the backdrop controls hug the corner.
-        // Dividers go between visual groups, mirroring the left side (here the gap is opened to
-        // the *left* of each new group as we walk leftward).
+        // Right group first: pack right→left from the far edge so the backdrop controls hug the
+        // corner. Dividers go between visual groups, mirroring the left side (here the gap is opened
+        // to the *left* of each new group as we walk leftward). Laying it out first tells us how far
+        // left it reaches, which bounds the left group and drives overflow.
         let mut rx = width - m.margin;
         let mut prev_group: Option<u8> = None;
         for slot in RIGHT.iter().rev() {
@@ -407,7 +480,63 @@ impl Chrome {
             });
             rx = left - m.gap;
         }
+        // Leftmost edge the right group reaches; the left group must end a separator's gap before it.
+        let right_edge = rx + m.gap;
+        let left_limit = right_edge - m.sep;
+
+        // The left group's currently-visible slots (HDR only for float sources; alpha only when the
+        // source carries alpha), keeping each slot's index in LEFT for stable ordering + tie-breaks.
+        let mut kept: Vec<(usize, &Slot)> = LEFT
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                if slot.group == HDR_GROUP && !snap.is_hdr {
+                    return false;
+                }
+                slot.action != Action::Channel(Channel::A) || snap.has_alpha
+            })
+            .collect();
+
+        // Shed the lowest-priority slots into the overflow popup until the group (plus the "»"
+        // button, once overflow is non-empty) fits within `left_limit`. Ties drop the rightmost
+        // (later LEFT index) first, so a group collapses from its tail inward.
+        let mut overflow: Vec<(usize, &Slot)> = Vec::new();
+        while !kept.is_empty() && left_group_end(m, &kept, !overflow.is_empty()) > left_limit {
+            let (drop_pos, _) = kept
+                .iter()
+                .enumerate()
+                .min_by(|(_, (ia, a)), (_, (ib, b))| a.prio.cmp(&b.prio).then(ib.cmp(ia)))
+                .unwrap();
+            overflow.push(kept.remove(drop_pos));
+        }
+
+        // Lay out the survivors left→right, a divider between visual groups.
+        let mut x = m.margin;
+        let mut prev_group: Option<u8> = None;
+        for (_, slot) in &kept {
+            if prev_group.is_some_and(|g| g != slot.group) {
+                self.seps.push(x + m.sep / 2);
+                x += m.sep;
+            }
+            prev_group = Some(slot.group);
+            self.buttons.push(LaidButton {
+                rect: RECT { left: x, top: btn_y, right: x + m.btn, bottom: btn_y + m.btn },
+                action: slot.action,
+            });
+            x += m.btn + m.gap;
+        }
+        // The "»" button follows the last survivor (no divider — it's not a visual group), and the
+        // dropped actions are exposed in toolbar order for the popup.
+        if !overflow.is_empty() {
+            self.buttons.push(LaidButton {
+                rect: RECT { left: x, top: btn_y, right: x + m.btn, bottom: btn_y + m.btn },
+                action: Action::Overflow,
+            });
+            overflow.sort_by_key(|(i, _)| *i);
+            self.overflow = overflow.into_iter().map(|(_, slot)| slot.action).collect();
+        }
     }
+
 
     /// Map a point (frame-client coords) to the button action under it, if any and enabled.
     pub fn hit_test(&self, x: i32, y: i32, snap: &ViewSnapshot) -> Option<Action> {
@@ -420,6 +549,22 @@ impl Chrome {
     /// used to anchor the "Open in…" popup menu under its button.
     pub fn button_rect_for(&self, action: Action) -> Option<RECT> {
         self.buttons.iter().find(|b| b.action == action).map(|b| b.rect)
+    }
+
+    /// The entries for the "»" overflow popup: the left-group buttons dropped at the current width,
+    /// in toolbar order, each with its label plus the same enabled/checked state the toolbar would
+    /// draw. Empty when nothing overflowed (no "»" button laid out). The win shell turns these into
+    /// a `TrackPopupMenu` and dispatches the chosen `action` through the normal path.
+    pub fn overflow_menu(&self, snap: &ViewSnapshot) -> Vec<OverflowItem> {
+        self.overflow
+            .iter()
+            .map(|&action| OverflowItem {
+                action,
+                label: snap.tooltip(action),
+                enabled: snap.enabled(action),
+                checked: snap.active(action),
+            })
+            .collect()
     }
 
     /// The index (into `buttons`) of the button under a point, regardless of enabled state — for
@@ -672,4 +817,132 @@ fn text_width(hdc: HDC, s: &str) -> i32 {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot() -> ViewSnapshot {
+        ViewSnapshot {
+            channel: Channel::Rgb,
+            fit: true,
+            tonemap: Tonemap::Reinhard,
+            is_hdr: false,
+            has_image: true,
+            has_alpha: false,
+            background: Background::Black,
+            outline: false,
+            can_navigate: true,
+            fullscreen: false,
+            status_left: String::new(),
+            status_right: String::new(),
+        }
+    }
+
+    /// The left-group actions currently on the bar (i.e. not the right group and not overflowed).
+    fn on_bar(c: &Chrome) -> Vec<Action> {
+        let is_right = |a: Action| RIGHT.iter().any(|s| s.action == a);
+        c.buttons
+            .iter()
+            .map(|b| b.action)
+            .filter(|a| *a != Action::Overflow && !is_right(*a))
+            .collect()
+    }
+
+    #[test]
+    fn wide_window_shows_every_left_button_and_no_overflow() {
+        let mut c = Chrome::new(96, true);
+        let snap = snapshot();
+        c.relayout(2000, &snap);
+        assert!(c.button_rect_for(Action::Overflow).is_none());
+        assert!(c.overflow_menu(&snap).is_empty());
+        // All non-alpha, non-HDR left buttons are present (alpha/HDR are filtered by the snapshot).
+        assert!(c.button_rect_for(Action::Prev).is_some());
+        assert!(c.button_rect_for(Action::Channel(Channel::B)).is_some());
+    }
+
+    #[test]
+    fn narrow_window_overflows_lowest_priority_first_and_keeps_nav() {
+        let mut c = Chrome::new(96, true);
+        let snap = snapshot();
+        // Wide enough for the right group + nav/zoom, but not the channel group (which overflows).
+        c.relayout(500, &snap);
+
+        // The "»" button is laid out and its menu is non-empty.
+        assert!(c.button_rect_for(Action::Overflow).is_some());
+        let menu = c.overflow_menu(&snap);
+        assert!(!menu.is_empty());
+
+        // Navigation (highest priority) stays on the bar; a channel solo (low priority) overflowed.
+        assert!(c.button_rect_for(Action::Prev).is_some());
+        assert!(c.button_rect_for(Action::Next).is_some());
+        assert!(menu.iter().any(|i| i.action == Action::Channel(Channel::B)));
+        assert!(c.button_rect_for(Action::Channel(Channel::B)).is_none());
+
+        // Nothing is both on the bar and in the menu, and together they cover every visible slot.
+        let bar = on_bar(&c);
+        for item in &menu {
+            assert!(!bar.contains(&item.action));
+        }
+    }
+
+    #[test]
+    fn overflow_menu_is_in_toolbar_order() {
+        let mut c = Chrome::new(96, true);
+        let snap = snapshot();
+        // Very narrow: force most of the left group into overflow.
+        c.relayout(180, &snap);
+        let menu = c.overflow_menu(&snap);
+
+        // Menu entries follow LEFT declaration order (stable), regardless of drop order.
+        let left_order: Vec<Action> = LEFT.iter().map(|s| s.action).collect();
+        let mut last = None;
+        for item in &menu {
+            let pos = left_order.iter().position(|a| *a == item.action).unwrap();
+            if let Some(prev) = last {
+                assert!(pos > prev, "overflow menu not in toolbar order");
+            }
+            last = Some(pos);
+        }
+    }
+
+    #[test]
+    fn right_group_span_matches_relayout() {
+        let c = Chrome::new(96, true);
+        // Outline is laid last in the right group, so it hugs the group's inner (leftmost) edge.
+        let mut c2 = Chrome::new(96, true);
+        let w = 1000;
+        c2.relayout(w, &snapshot());
+        let outline_left = c2.button_rect_for(Action::ToggleOutline).unwrap().left;
+        assert_eq!(right_group_span(&c.metrics), w - outline_left);
+    }
+
+    #[test]
+    fn min_client_size_is_the_overflow_floor() {
+        let mut c = Chrome::new(96, true);
+        let snap = snapshot();
+        let (min_w, _) = c.min_client_size();
+
+        // At exactly the minimum width, the left group is fully collapsed to just the "»" button.
+        c.relayout(min_w, &snap);
+        assert!(c.button_rect_for(Action::Overflow).is_some());
+        assert!(c.button_rect_for(Action::Prev).is_none());
+        // The overflow button and the right group don't overlap: "»" right edge ≤ outline left edge.
+        let more_right = c.button_rect_for(Action::Overflow).unwrap().right;
+        let outline_left = c.button_rect_for(Action::ToggleOutline).unwrap().left;
+        assert!(more_right <= outline_left, "overflow button overlaps the right group at min width");
+    }
+
+    #[test]
+    fn shrinking_then_widening_restores_the_full_bar() {
+        let mut c = Chrome::new(96, true);
+        let snap = snapshot();
+        c.relayout(300, &snap);
+        assert!(c.button_rect_for(Action::Overflow).is_some());
+        // Widening again must clear the overflow (relayout starts from a clean slate each call).
+        c.relayout(2000, &snap);
+        assert!(c.button_rect_for(Action::Overflow).is_none());
+        assert!(c.overflow_menu(&snap).is_empty());
+    }
 }

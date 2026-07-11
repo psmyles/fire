@@ -38,7 +38,7 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OPENFILENAMEW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
     OFN_PATHMUSTEXIST,
 };
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -50,12 +50,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
     SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu,
     TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE,
-    HMENU, HWND_TOP, IDC_ARROW, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MSG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    HMENU, HWND_TOP, IDC_ARROW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    MINMAXINFO, MSG, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER,
     SW_FORCEMINIMIZE, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW,
     SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
     TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN, WINDOWPLACEMENT,
     WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
+    WM_GETMINMAXINFO,
     WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
     WNDCLASSW, WPF_RESTORETOMAXIMIZED, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
@@ -81,6 +83,10 @@ const ID_COPY_FILE: usize = 2;
 const ID_COPY_PATH: usize = 3;
 const ID_COPY_NAME: usize = 4;
 const OPEN_WITH_ID_BASE: usize = 100;
+/// Command ids for the "»" overflow popup: `OVERFLOW_ID_BASE + index` into the items returned by
+/// [`Chrome::overflow_menu`]. Kept clear of the actions-popup ranges above (this menu is separate,
+/// but a distinct base keeps the two unambiguous).
+const OVERFLOW_ID_BASE: usize = 1000;
 
 use crate::chrome::{self, Action, Chrome, ViewSnapshot};
 use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool};
@@ -401,9 +407,9 @@ impl App {
             // Toggling full-screen resizes the frame, which fires WM_SIZE (relayout + reposition);
             // fall through to the shared chrome invalidate below.
             Action::ToggleFullscreen => self.toggle_fullscreen(),
-            // The actions menu is driven directly from the click handler (it needs the button
-            // rect); it never reaches the shared dispatch. No-op, and skip the repaint below.
-            Action::OpenWithMenu => return,
+            // The actions and overflow menus are driven directly from the click handler (they need
+            // the button rect); they never reach the shared dispatch. No-op, skip the repaint below.
+            Action::OpenWithMenu | Action::Overflow => return,
         }
         self.invalidate_chrome();
     }
@@ -419,6 +425,59 @@ impl App {
         let mut pt = POINT { x: rect.left, y: rect.bottom };
         unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
         self.show_actions_menu(pt);
+    }
+
+    /// Open the "»" overflow popup under its button: the left-group controls that didn't fit the
+    /// current window width, each dispatching through the normal action path when chosen. The menu
+    /// items mirror the toolbar buttons' enabled/checked state. A no-op if nothing overflowed. On
+    /// the UI thread, like the actions popup.
+    fn overflow_menu(&mut self) {
+        let Some(rect) = self.chrome.button_rect_for(Action::Overflow) else { return };
+        let snap = self.snapshot();
+        let items = self.chrome.overflow_menu(&snap);
+        if items.is_empty() {
+            return;
+        }
+        // Anchor the menu at the button's bottom-left, in screen coords.
+        let mut pt = POINT { x: rect.left, y: rect.bottom };
+        unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
+        let chosen = unsafe {
+            // Same foreground idiom as the actions popup so an outside click dismisses cleanly.
+            SetForegroundWindow(self.frame as HWND);
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return;
+            }
+            for (i, item) in items.iter().enumerate() {
+                let mut flags = MF_STRING;
+                if !item.enabled {
+                    flags |= MF_GRAYED;
+                }
+                if item.checked {
+                    flags |= MF_CHECKED;
+                }
+                let label = wide(item.label);
+                AppendMenuW(menu, flags, OVERFLOW_ID_BASE + i, label.as_ptr());
+            }
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON,
+                pt.x,
+                pt.y,
+                0,
+                self.frame as HWND,
+                ptr::null(),
+            );
+            DestroyMenu(menu);
+            // 0 = dismissed; otherwise map the id back to the item's action.
+            (cmd as usize)
+                .checked_sub(OVERFLOW_ID_BASE)
+                .and_then(|idx| items.get(idx))
+                .map(|item| item.action)
+        };
+        if let Some(action) = chosen {
+            self.do_action(action);
+        }
     }
 
     /// Open the same actions popup at a point in the *view* window's client area — the right-click
@@ -985,6 +1044,21 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.invalidate_chrome();
             0
         }
+        WM_GETMINMAXINFO => {
+            // Clamp the minimum track size so the toolbar can't be squeezed until its buttons
+            // overlap: the chrome reports the smallest *client* size that still lays out (right group
+            // + collapsed "»"), which we widen to an outer window rect for the frame's current style
+            // and DPI. Windows pre-fills the other MINMAXINFO fields, so we override only the min.
+            let mmi = &mut *(lparam as *mut MINMAXINFO);
+            let (cw, ch) = app.chrome.min_client_size();
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+            let dpi = GetDpiForWindow(hwnd).max(96);
+            let mut r = RECT { left: 0, top: 0, right: cw, bottom: ch };
+            AdjustWindowRectExForDpi(&mut r, style, 0, 0, dpi);
+            mmi.ptMinTrackSize.x = r.right - r.left;
+            mmi.ptMinTrackSize.y = r.bottom - r.top;
+            0
+        }
         WM_LBUTTONDOWN => {
             let x = (lparam & 0xffff) as u16 as i16 as i32;
             let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
@@ -995,6 +1069,8 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 // it's handled here rather than in the rect-less `do_action`.
                 match action {
                     Action::OpenWithMenu => app.actions_menu(),
+                    // The "»" popup, like the actions menu, needs the button's screen rect.
+                    Action::Overflow => app.overflow_menu(),
                     _ => app.do_action(action),
                 }
             }
