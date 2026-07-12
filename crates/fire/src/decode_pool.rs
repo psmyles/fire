@@ -38,6 +38,10 @@ pub struct DecodeJob {
     /// True if this is a hot-reload of the displayed file (vs. a fresh open/navigate). The UI
     /// uses it to keep the current view when the re-decoded image has the same dimensions.
     pub reload: bool,
+    /// Whether to run sprite-sheet auto-detection after posting the image (the
+    /// `flipbook.auto-detect` config key). False skips the per-pixel scan entirely — no
+    /// [`WM_APP_FLIPBOOK_GUESS`] is posted, so no hint chip can appear.
+    pub detect_flipbook: bool,
 }
 
 /// A finished decode, delivered back to the UI thread (boxed, via the message LPARAM). The image
@@ -83,11 +87,12 @@ impl DecodePool {
                         let result = decode(&job).map(Arc::new);
                         // Keep a clone to run flipbook detection *after* the image is posted, so a
                         // large sheet reaches the screen without waiting on the per-pixel scan.
-                        // Skipped for animated sources (a GIF is not a sprite sheet).
+                        // Skipped for animated sources (a GIF is not a sprite sheet), and when the
+                        // user has turned auto-detection off.
                         let detect_input = result
                             .as_ref()
                             .ok()
-                            .filter(|img| img.animation.is_none())
+                            .filter(|img| job.detect_flipbook && img.animation.is_none())
                             .map(Arc::clone);
                         let generation = job.generation;
                         let path = job.path.clone();

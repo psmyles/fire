@@ -58,11 +58,13 @@ pub enum Icon {
     Pause,
     /// The transport band's blend checkbox tick (drawn inside the box, not on a button).
     Check,
+    /// The gear that opens the settings dialog.
+    Settings,
     More,
 }
 
 /// The embedded A8 masters, indexed by `Icon as usize`. Same order as the enum / `build.rs`.
-const MASTERS: [&[u8]; 26] = [
+const MASTERS: [&[u8]; 27] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_left.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_right.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_zoom_out.a8")),
@@ -88,6 +90,7 @@ const MASTERS: [&[u8]; 26] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_play.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_pause.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_check.a8")),
+    include_bytes!(concat!(env!("OUT_DIR"), "/icon_settings.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_more.a8")),
 ];
 

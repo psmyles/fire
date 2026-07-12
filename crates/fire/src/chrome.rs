@@ -23,6 +23,7 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
 use crate::icons::{Icon, Icons};
+use crate::keybinds::{KeyAction, ShortcutLabels};
 use crate::render::view::{Background, Channel, Tonemap};
 
 /// A toolbar command, produced by hit-testing a click and consumed by the win shell.
@@ -56,6 +57,10 @@ pub enum Action {
     /// and tracked by the win shell (it needs the button's screen rect, and the chosen entry is
     /// performed there directly — no per-entry `Action`).
     OpenWithMenu,
+    /// Open the settings dialog ([`crate::settings`]). Like the two menu buttons, this is handled
+    /// in the win shell's click path rather than the rect-less `do_action`, because the dialog runs
+    /// a nested modal loop and must not be entered while an `&mut App` borrow is live.
+    OpenSettings,
     /// A synthetic "»" button that only appears when the left group can't fit the window width: it
     /// opens a popup listing the left-group buttons that were dropped (see [`Chrome::relayout`] and
     /// [`Chrome::overflow_menu`]). Chosen entries dispatch to the same `Action`s the toolbar drives.
@@ -190,17 +195,23 @@ const RIGHT: &[Slot] = &[
         group: 1,
         prio: 0,
     },
-    // The full-screen toggle sits just left of the "Open in…" button, in its own group (dividers
-    // on both sides).
+    // The full-screen toggle sits just left of the actions/settings pair, in its own group
+    // (dividers on both sides).
     Slot {
         action: Action::ToggleFullscreen,
         group: 3,
         prio: 0,
     },
-    // Laid first (RIGHT is walked in reverse), so the "Open in…" button hugs the far-right corner;
-    // its own group gives it a divider from the backdrop controls.
+    // These two share the far-right group (RIGHT is walked in reverse, so the settings gear is laid
+    // first and hugs the corner, with the "Open in…" button to its left). Their group gives the pair
+    // a divider from the backdrop controls.
     Slot {
         action: Action::OpenWithMenu,
+        group: 2,
+        prio: 0,
+    },
+    Slot {
+        action: Action::OpenSettings,
         group: 2,
         prio: 0,
     },
@@ -227,6 +238,9 @@ pub struct ViewSnapshot {
     pub flipbook: bool,
     /// The current image is an animated source (GIF) — flipbook mode is disabled for it.
     pub has_animation: bool,
+    /// The live keyboard shortcuts, so a button's tooltip shows the key that *currently* drives it
+    /// rather than a literal baked into the string (the settings dialog can rebind any of them).
+    pub shortcuts: ShortcutLabels,
     pub status_left: String,
     pub status_right: String,
 }
@@ -244,8 +258,9 @@ impl ViewSnapshot {
             // The actions menu (copy / show in folder / open in app) needs an image to act on; the
             // file actions are always available, so a configured app list is no longer required.
             Action::OpenWithMenu => self.has_image,
-            // Full-screen is a window mode, independent of whether an image is loaded.
-            Action::ToggleFullscreen => true,
+            // Full-screen is a window mode, independent of whether an image is loaded. So are the
+            // settings — you can configure Fire from an empty window.
+            Action::ToggleFullscreen | Action::OpenSettings => true,
             // Flipbook needs a still image (a GIF is already an animation, not a sprite sheet).
             Action::ToggleFlipbook => self.has_image && !self.has_animation,
             // The overflow button is only ever laid out when it holds dropped controls; opening its
@@ -271,38 +286,52 @@ impl ViewSnapshot {
     }
 
     /// Hover-tooltip text for a button. State-aware where the button is (the zoom toggle
-    /// describes the mode a click switches *to*); the parenthetical is the keyboard shortcut.
-    fn tooltip(&self, a: Action) -> &'static str {
+    /// describes the mode a click switches *to*); the parenthetical is the button's *current*
+    /// keyboard shortcut, read from [`Self::shortcuts`] — a rebound key relabels its button, and an
+    /// unbound action shows no parenthetical at all.
+    fn tooltip(&self, a: Action) -> String {
+        // The shortcut suffix for the key action a button shares its command with.
+        let k = |ka: KeyAction| self.shortcuts.suffix(ka);
         match a {
-            Action::Prev => "Previous image  (\u{2190})",
-            Action::Next => "Next image  (\u{2192})",
-            Action::ZoomOut => "Zoom out  (\u{2212})",
-            Action::ZoomIn => "Zoom in  (+)",
+            Action::Prev => format!("Previous image{}", k(KeyAction::PrevImage)),
+            Action::Next => format!("Next image{}", k(KeyAction::NextImage)),
+            Action::ZoomOut => format!("Zoom out{}", k(KeyAction::ZoomOut)),
+            Action::ZoomIn => format!("Zoom in{}", k(KeyAction::ZoomIn)),
+            // The one button whose command depends on state: it switches to whichever mode we're
+            // not in, so it borrows that mode's shortcut.
             Action::ZoomToggle => {
                 if self.fit {
-                    "Actual size 1:1  (1)"
+                    format!("Actual size 1:1{}", k(KeyAction::ActualSize))
                 } else {
-                    "Fit to window  (F)"
+                    format!("Fit to window{}", k(KeyAction::Fit))
                 }
             }
-            Action::Channel(Channel::Rgb) => "All channels  (C)",
-            Action::Channel(Channel::R) => "Red channel  (R)",
-            Action::Channel(Channel::G) => "Green channel  (G)",
-            Action::Channel(Channel::B) => "Blue channel  (B)",
-            Action::Channel(Channel::A) => "Alpha channel  (A)",
-            Action::ToggleTonemap => "Tone map: Reinhard \u{2194} ACES  (T)",
-            Action::ExpUp => "Increase exposure  (])",
-            Action::ExpReset => "Reset exposure",
-            Action::ExpDown => "Decrease exposure  ([)",
-            Action::ToggleOutline => "Image boundary outline",
-            Action::Background(Background::Black) => "Black backdrop",
-            Action::Background(Background::White) => "White backdrop",
-            Action::Background(Background::Grey) => "Grey backdrop",
-            Action::Background(Background::Checker) => "Checkerboard backdrop",
-            Action::OpenWithMenu => "Copy, show in folder, or open in app\u{2026}",
-            Action::ToggleFullscreen => "Full screen  (F11)",
-            Action::ToggleFlipbook => "Flipbook mode  (K)",
-            Action::Overflow => "More controls\u{2026}",
+            Action::Channel(Channel::Rgb) => format!("All channels{}", k(KeyAction::ChannelRgb)),
+            Action::Channel(Channel::R) => format!("Red channel{}", k(KeyAction::ChannelR)),
+            Action::Channel(Channel::G) => format!("Green channel{}", k(KeyAction::ChannelG)),
+            Action::Channel(Channel::B) => format!("Blue channel{}", k(KeyAction::ChannelB)),
+            Action::Channel(Channel::A) => format!("Alpha channel{}", k(KeyAction::ChannelA)),
+            Action::ToggleTonemap => format!(
+                "Tone map: Reinhard \u{2194} ACES{}",
+                k(KeyAction::ToggleTonemap)
+            ),
+            Action::ExpUp => format!("Increase exposure{}", k(KeyAction::ExposureUp)),
+            Action::ExpReset => format!("Reset exposure{}", k(KeyAction::ExposureReset)),
+            Action::ExpDown => format!("Decrease exposure{}", k(KeyAction::ExposureDown)),
+            Action::ToggleOutline => {
+                format!("Image boundary outline{}", k(KeyAction::ToggleOutline))
+            }
+            Action::Background(Background::Black) => "Black backdrop".into(),
+            Action::Background(Background::White) => "White backdrop".into(),
+            Action::Background(Background::Grey) => "Grey backdrop".into(),
+            Action::Background(Background::Checker) => "Checkerboard backdrop".into(),
+            Action::OpenWithMenu => "Copy, show in folder, or open in app\u{2026}".into(),
+            Action::ToggleFullscreen => {
+                format!("Full screen{}", k(KeyAction::ToggleFullscreen))
+            }
+            Action::ToggleFlipbook => format!("Flipbook mode{}", k(KeyAction::ToggleFlipbook)),
+            Action::Overflow => "More controls\u{2026}".into(),
+            Action::OpenSettings => "Settings\u{2026}".into(),
         }
     }
 
@@ -345,6 +374,7 @@ impl ViewSnapshot {
             Action::ToggleFullscreen => Icon::Fullscreen,
             Action::ToggleFlipbook => Icon::Flipbook,
             Action::Overflow => Icon::More,
+            Action::OpenSettings => Icon::Settings,
         }
     }
 }
@@ -371,7 +401,9 @@ const fn rgb(r: u8, g: u8, b: u8) -> u32 {
 }
 
 impl Palette {
-    fn for_mode(dark: bool) -> Self {
+    /// `pub(crate)` so the settings dialog ([`crate::settings`]) themes itself from the same tokens
+    /// as the toolbar — it is a separate top-level window, not part of the chrome.
+    pub(crate) fn for_mode(dark: bool) -> Self {
         if dark {
             Palette {
                 toolbar_bg: rgb(43, 43, 43),
@@ -460,7 +492,7 @@ struct LaidButton {
 /// the item; `checked` shows a check for a toggle that's currently on.
 pub struct OverflowItem {
     pub action: Action,
-    pub label: &'static str,
+    pub label: String,
     pub enabled: bool,
     pub checked: bool,
 }
@@ -737,7 +769,7 @@ impl Chrome {
     /// The button rect (frame-client coords) and tooltip text for the button at `idx` — used to
     /// position and fill the hover tooltip. `None` if the index is stale (e.g. a relayout shrank
     /// the button set). Shown for disabled buttons too: a greyed control's label is still useful.
-    pub fn button_tooltip(&self, idx: usize, snap: &ViewSnapshot) -> Option<(RECT, &'static str)> {
+    pub fn button_tooltip(&self, idx: usize, snap: &ViewSnapshot) -> Option<(RECT, String)> {
         let lb = self.buttons.get(idx)?;
         Some((lb.rect, snap.tooltip(lb.action)))
     }
@@ -1062,6 +1094,7 @@ mod tests {
             fullscreen: false,
             flipbook: false,
             has_animation: false,
+            shortcuts: crate::keybinds::Keybinds::defaults().labels(),
             status_left: String::new(),
             status_right: String::new(),
         }

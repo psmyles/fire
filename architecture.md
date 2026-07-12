@@ -299,8 +299,17 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
   mode (`set_image` fits to the current viewport). The launcher's "Run" setting (the shortcut's
   Normal/Minimized/Maximized, read from `STARTUPINFO.wShowWindow`) overrides the show state:
   an explicit Maximized/Minimized wins, otherwise the remembered maximized state is restored.
-- **Settings:** stored as **TOML** in `%APPDATA%`, editable directly; external edits
-  hot-reload via the `notify` crate. The in-app settings dialog is native Win32.
+- **Settings:** stored as **TOML** in `%APPDATA%\fire\config.toml`, editable directly *and* from
+  the in-app settings dialog (`crate::settings`) — a modal, tabbed, hand-painted native Win32
+  window (General / Flipbook / Keybinds / Context menu) with OK/Cancel/Apply. It is custom-drawn
+  for the same reason the toolbar is (no dark mode in the common controls), so it has no child
+  controls at all: one HWND, a list of widget rects, and the chrome's `Palette` + GDI helpers.
+  Committing hands the edited `Config` to the frame via `WM_APP_SETTINGS_APPLY` — the dialog runs
+  a nested message pump, so it must never hold the `&mut App` that pump re-enters. Changes apply
+  live where that isn't hostile (watcher, backdrop, zoom/exposure steps, keybinds, menu contents),
+  on the next image where re-fitting under the user would be (open-fit, tonemap, flipbook playback
+  defaults), and on the next launch for `instance-mode`. *Not yet:* hot-reloading `config.toml`
+  when it changes on disk (only the displayed image is watched — §10).
 - **Future:** a third mode — compare two images side-by-side in one window, or tabs — is
   anticipated; it reuses the frame/child-view split (one view child per slot).
 
@@ -415,10 +424,11 @@ tonemap-to-SDR HDR with exposure; downscale-to-fit RAM guard; **DPI-aware, dark-
 GDI toolbar + status bar**; open-in-editor + clipboard; association-only Explorer
 integration; unsigned installer.
 
-**In progress / deferred:** pixel inspector, native settings dialog + background-color
-picker, exposure trackbar, toolbar tooltips; compare/tabs mode; Explorer
-`IThumbnailProvider`; **full raw development** (demosaic the sensor mosaic instead of showing
-the embedded preview — a separate opt-in mode, kept off the fast path); code signing.
+**In progress / deferred:** pixel inspector, background-color *picker* (the settings dialog ships
+the four preset backdrops; a custom color needs a `Params`/shader change), exposure trackbar;
+compare/tabs mode; Explorer `IThumbnailProvider`; **full raw development** (demosaic the sensor
+mosaic instead of showing the embedded preview — a separate opt-in mode, kept off the fast path);
+code signing.
 
 ---
 

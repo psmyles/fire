@@ -1,18 +1,39 @@
-//! Minimal startup config, read once before the window is created. Only the
-//! instance-lifecycle mode lives here for now; the full settings surface (Phase 4) extends
-//! this struct. Read from `%APPDATA%\fire\config.toml`; a missing/invalid file → defaults.
+//! User settings: the whole of Fire's persisted configuration. Read once at startup (before the
+//! window is created) from `%APPDATA%\fire\config.toml`; a missing/invalid file → defaults, so a
+//! typo can never stop the app launching.
+//!
+//! The settings dialog ([`crate::settings`]) edits a *clone* of this struct and hands the edited
+//! copy back to the window, which live-applies what it can and calls [`Config::save`]. That makes
+//! this the one round-tripping type: every field must both deserialize (hand-edited file) and
+//! serialize (dialog write-back). Field *order* matters for `save` — TOML requires plain values
+//! before tables, so all scalars are declared ahead of `[flipbook]` / `[context-menu]` /
+//! `[keybinds]` / `[[open-with]]`.
+//!
+//! [`sanitize`](Config::sanitize) is the single clamp chokepoint: it runs after a load and before
+//! an apply, so no out-of-range value from a hand edit or a widget ever reaches the renderer.
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+use crate::flipbook::{FPS_DEFAULT, FPS_MAX, FPS_MIN};
+use crate::render::view::{Background, Tonemap};
 
 /// The commented template written verbatim to `config.toml` on first run (see
 /// [`Config::ensure_default_config`]). Kept as a repo file so the docs live in version control and a
 /// missing file is a build error — the same posture as the shaders/icons.
 const DEFAULT_CONFIG: &str = include_str!("default_config.toml");
 
+/// Bounds on the multiplicative zoom step (per wheel notch / key press). Below ~1.01 zooming is
+/// imperceptible; above 4× a single notch is a jump.
+const ZOOM_STEP_MIN: f32 = 1.01;
+const ZOOM_STEP_MAX: f32 = 4.0;
+/// Bounds on the exposure step, in stops.
+const EXPOSURE_STEP_MIN: f32 = 0.01;
+const EXPOSURE_STEP_MAX: f32 = 4.0;
+
 /// How a launch relates to any already-running Fire window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum InstanceMode {
     /// Default: each opened image gets its own independent window/process. No mutex, no
@@ -31,21 +52,21 @@ pub enum InstanceMode {
 /// `[[open-with.items.items]]`, and so on. If an entry has both `items` and `path`, the submenu
 /// wins: it is shown as a submenu and `path`/`args` are ignored. An entry with neither is malformed
 /// and skipped.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct MenuEntry {
     /// Label shown in the menu.
     pub name: String,
     /// Leaf only: full path to the program's executable. Mutually exclusive with `items`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// Leaf only: launch arguments; the token `{path}` is replaced with the current image's path.
     /// When empty, the image path is passed as the sole argument.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Submenu only: nested entries. When non-empty this entry is a submenu (and `path`/`args` are
     /// ignored).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<MenuEntry>,
 }
 
@@ -66,7 +87,143 @@ impl MenuEntry {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// The viewport backdrop a freshly opened image gets. `Auto` keeps the built-in per-image rule
+/// (real transparency → checkerboard, otherwise black); any other value pins the backdrop for every
+/// image, the same override the toolbar's background buttons set at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackgroundCfg {
+    #[default]
+    Auto,
+    Black,
+    White,
+    Grey,
+    Checker,
+}
+
+impl BackgroundCfg {
+    /// The renderer's backdrop override this choice implies — `None` for `Auto` (per-image default).
+    pub fn override_for_render(self) -> Option<Background> {
+        match self {
+            BackgroundCfg::Auto => None,
+            BackgroundCfg::Black => Some(Background::Black),
+            BackgroundCfg::White => Some(Background::White),
+            BackgroundCfg::Grey => Some(Background::Grey),
+            BackgroundCfg::Checker => Some(Background::Checker),
+        }
+    }
+}
+
+/// The tonemap operator a freshly adopted HDR image starts on (the `T` key still toggles it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TonemapCfg {
+    #[default]
+    Reinhard,
+    Aces,
+}
+
+impl TonemapCfg {
+    pub fn to_render(self) -> Tonemap {
+        match self {
+            TonemapCfg::Reinhard => Tonemap::Reinhard,
+            TonemapCfg::Aces => Tonemap::Aces,
+        }
+    }
+}
+
+/// How an image is scaled when it *opens* (a fresh open, folder navigation, or a re-decode that
+/// changed dimensions). The explicit fit command is governed separately by `fit-upscale`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FitCfg {
+    /// Default: shrink an oversized image to fit the window; show a small one at native 1:1.
+    #[default]
+    Fit,
+    /// Always open at native 1:1 (100%), however large the image — pan to explore it.
+    ActualSize,
+}
+
+/// `[flipbook]` — the defaults a *newly enabled* flipbook adopts, plus the auto-detection gate.
+/// Changing these never disturbs a flipbook already set up this session (its per-path state wins);
+/// they seed the next one. See [`crate::flipbook`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct FlipbookCfg {
+    /// Playback rate a new flipbook starts at, in frames per second.
+    pub fps: f32,
+    /// Whether a new flipbook crossfades between frames.
+    pub blend: bool,
+    /// Whether a new flipbook starts playing immediately (vs. parked on frame 0).
+    pub autoplay: bool,
+    /// Run sprite-sheet detection on every decoded still image and offer the hint chip when a grid
+    /// is found. Off means Fire never scans for sheets — flipbook mode stays available by hand
+    /// (`K` / toolbar), it just isn't suggested.
+    pub auto_detect: bool,
+}
+
+impl Default for FlipbookCfg {
+    fn default() -> Self {
+        Self {
+            fps: FPS_DEFAULT,
+            blend: false,
+            autoplay: true,
+            auto_detect: true,
+        }
+    }
+}
+
+/// `[context-menu]` — visibility of the fixed items in the right-click / actions menu. The
+/// configurable "Open in…" entries below them are `[[open-with]]`. Hiding every item here (with no
+/// open-with entries) leaves only "Settings…".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ContextMenuCfg {
+    pub show_in_explorer: bool,
+    pub copy_file: bool,
+    pub copy_path: bool,
+    pub copy_file_name: bool,
+}
+
+impl Default for ContextMenuCfg {
+    fn default() -> Self {
+        Self {
+            show_in_explorer: true,
+            copy_file: true,
+            copy_path: true,
+            copy_file_name: true,
+        }
+    }
+}
+
+/// One `[keybinds]` value: a single chord (`fit = "F"`) or several aliases for one action
+/// (`zoom-in = ["=", "Num+"]`). Untagged, so TOML's own shape decides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum KeyValue {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl KeyValue {
+    /// The chord strings, however they were written. An empty string is an explicit *unbind* and is
+    /// preserved as such — [`crate::keybinds`] drops it when parsing, leaving the action with no
+    /// chords.
+    pub fn as_strings(&self) -> Vec<&str> {
+        match self {
+            KeyValue::One(s) => vec![s.as_str()],
+            KeyValue::Many(v) => v.iter().map(|s| s.as_str()).collect(),
+        }
+    }
+}
+
+/// `[keybinds]` — action name → chord(s). Only bindings the user *changed* are stored; anything
+/// absent keeps its shipped default (so future default changes still reach users who never rebound
+/// that action). Parsed into the real table by [`crate::keybinds::Keybinds::from_config`], which
+/// skips unknown names and unparseable chords rather than failing the load.
+pub type KeybindsCfg = std::collections::BTreeMap<String, KeyValue>;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Config {
     pub instance_mode: InstanceMode,
@@ -76,9 +233,23 @@ pub struct Config {
     /// Whether the explicit "fit to window" command (`F` / toolbar) also scales images *smaller*
     /// than the window up to fill it. On by default, so the fit command always fills regardless of
     /// image size; set `fit-upscale = false` to cap it at native 1:1 (the texture-viewer
-    /// convention). Note this governs only the explicit command — images always *open* fitted
-    /// without upscaling, so a small image is shown at 100% on load and folder navigation.
+    /// convention). Note this governs only the explicit command — images always *open* per
+    /// `default-fit`, so a small image is shown at 100% on load and folder navigation.
     pub fit_upscale: bool,
+    /// Multiplicative zoom per wheel notch / zoom keypress. Clamped to `1.01..=4.0`.
+    pub zoom_step: f32,
+    /// Exposure step per `[` / `]` press (HDR sources), in stops. Clamped to `0.01..=4.0`.
+    pub exposure_step: f32,
+    /// The tonemap operator a freshly adopted HDR image starts on.
+    pub default_tonemap: TonemapCfg,
+    /// How an image is scaled when it opens.
+    pub default_fit: FitCfg,
+    /// The viewport backdrop. `Auto` keeps the per-image default (checker for transparency).
+    pub background: BackgroundCfg,
+    pub flipbook: FlipbookCfg,
+    pub context_menu: ContextMenuCfg,
+    /// Keyboard bindings the user has changed from the defaults. See [`KeybindsCfg`].
+    pub keybinds: KeybindsCfg,
     /// User-defined entries for the toolbar's "Open in…" menu — external apps and/or nested
     /// submenus. Empty (button disabled) unless the user adds `[[open-with]]` blocks.
     pub open_with: Vec<MenuEntry>,
@@ -93,18 +264,88 @@ impl Default for Config {
             instance_mode: InstanceMode::default(),
             hot_reload: true,
             fit_upscale: true,
+            zoom_step: 1.15,
+            exposure_step: 0.25,
+            default_tonemap: TonemapCfg::default(),
+            default_fit: FitCfg::default(),
+            background: BackgroundCfg::default(),
+            flipbook: FlipbookCfg::default(),
+            context_menu: ContextMenuCfg::default(),
+            keybinds: KeybindsCfg::new(),
             open_with: Vec::new(),
         }
     }
 }
 
 impl Config {
-    /// Best-effort load; any error (no file, bad TOML) falls back to defaults.
+    /// Best-effort load; any error (no file, bad TOML) falls back to defaults. Always sanitized, so
+    /// a hand-edited out-of-range value can't reach the renderer.
     pub fn load() -> Self {
-        config_path()
+        let mut cfg: Config = config_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        cfg.sanitize();
+        cfg
+    }
+
+    /// Clamp every numeric field into range (and replace any NaN with its default). The single
+    /// chokepoint for range enforcement: called after a load and before the settings dialog's edits
+    /// are applied, so nothing downstream has to re-check.
+    pub fn sanitize(&mut self) {
+        self.zoom_step = clamp_finite(self.zoom_step, 1.15, ZOOM_STEP_MIN, ZOOM_STEP_MAX);
+        self.exposure_step = clamp_finite(
+            self.exposure_step,
+            0.25,
+            EXPOSURE_STEP_MIN,
+            EXPOSURE_STEP_MAX,
+        );
+        self.flipbook.fps = clamp_finite(self.flipbook.fps, FPS_DEFAULT, FPS_MIN, FPS_MAX);
+    }
+
+    /// Best-effort save to `config.toml`. Written to a sibling temp file and renamed over the
+    /// target, so a reader (or a crash mid-write) never sees a truncated config. Failures are
+    /// ignored: the settings dialog applies its changes to the live window *before* calling this,
+    /// so an unwritable config costs the user persistence, not the edit.
+    ///
+    /// Note this rewrites the file from the struct — hand-written comments (including the shipped
+    /// template's) do not survive the first save. The header below says so in the file itself.
+    pub fn save(&self) {
+        let Some(path) = config_path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let Ok(body) = toml::to_string(self) else {
+            return;
+        };
+        let text = format!("{SAVED_HEADER}{body}");
+        // Rename is atomic on the same volume; write the temp file beside the target.
+        let tmp = path.with_extension("toml.tmp");
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            // A failed rename leaves the temp file behind; clear it rather than litter %APPDATA%.
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// Prepended to every [`Config::save`], so a user who opens the file after using the settings
+/// dialog knows why their comments are gone and that hand-editing still works.
+const SAVED_HEADER: &str = "\
+# Fire configuration — %APPDATA%\\fire\\config.toml
+#
+# Written by Fire's Settings dialog. You can still hand-edit this file (it is read at startup, and
+# unknown or invalid keys fall back to the built-in defaults), but note that saving from the
+# Settings dialog rewrites the file from Fire's own state — comments added here are not preserved.
+# Delete the file to regenerate the fully documented template.
+
+";
+
+/// Clamp `v` into `lo..=hi`, substituting `fallback` for a NaN/infinite value.
+fn clamp_finite(v: f32, fallback: f32, lo: f32, hi: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(lo, hi)
+    } else {
+        fallback
     }
 }
 
@@ -198,5 +439,115 @@ mod tests {
     fn default_template_parses() {
         let cfg: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
         assert!(cfg.open_with.is_empty());
+        assert_eq!(cfg, Config::default());
+    }
+
+    /// A config written by the settings dialog reads back identical — the round-trip the dialog's
+    /// save/load cycle depends on. Also pins the TOML value-before-table field order: `to_string`
+    /// errors out if a scalar is declared after `[flipbook]` / `[[open-with]]`.
+    #[test]
+    fn save_round_trip() {
+        let cfg = Config {
+            instance_mode: InstanceMode::SingleInstance,
+            hot_reload: false,
+            fit_upscale: false,
+            zoom_step: 1.25,
+            exposure_step: 0.5,
+            default_tonemap: TonemapCfg::Aces,
+            default_fit: FitCfg::ActualSize,
+            background: BackgroundCfg::Grey,
+            flipbook: FlipbookCfg {
+                fps: 12.0,
+                blend: true,
+                autoplay: false,
+                auto_detect: false,
+            },
+            context_menu: ContextMenuCfg {
+                show_in_explorer: false,
+                copy_file: true,
+                copy_path: false,
+                copy_file_name: true,
+            },
+            keybinds: [
+                ("fit".to_string(), KeyValue::One("Ctrl+F".into())),
+                (
+                    "zoom-in".to_string(),
+                    KeyValue::Many(vec!["=".into(), "Num+".into()]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            open_with: vec![MenuEntry {
+                name: "Tools".into(),
+                path: None,
+                args: vec![],
+                items: vec![MenuEntry {
+                    name: "Photoshop".into(),
+                    path: Some(r"C:\ps.exe".into()),
+                    args: vec!["{path}".into()],
+                    items: vec![],
+                }],
+            }],
+        };
+        let text = toml::to_string(&cfg).expect("serializes");
+        let back: Config = toml::from_str(&text).expect("deserializes");
+        assert_eq!(back, cfg);
+    }
+
+    /// The header `save` prepends is a comment block, so a saved file still parses.
+    #[test]
+    fn saved_header_is_valid_toml() {
+        let body = toml::to_string(&Config::default()).unwrap();
+        let cfg: Config = toml::from_str(&format!("{SAVED_HEADER}{body}")).unwrap();
+        assert_eq!(cfg, Config::default());
+    }
+
+    /// A pre-settings-dialog config (only the original four keys) still parses, with every new key
+    /// taking its default — the backward-compat guarantee for existing installs.
+    #[test]
+    fn legacy_config_parses_with_new_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+            instance-mode = "single-instance"
+            hot-reload = false
+            fit-upscale = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.instance_mode, InstanceMode::SingleInstance);
+        assert!(!cfg.hot_reload);
+        assert!(!cfg.fit_upscale);
+        // Everything the settings dialog added is defaulted.
+        assert_eq!(cfg.zoom_step, 1.15);
+        assert_eq!(cfg.background, BackgroundCfg::Auto);
+        assert_eq!(cfg.flipbook, FlipbookCfg::default());
+        assert_eq!(cfg.context_menu, ContextMenuCfg::default());
+    }
+
+    /// Out-of-range and non-finite numbers from a hand edit are clamped, never propagated.
+    #[test]
+    fn sanitize_clamps_numbers() {
+        let mut cfg = Config {
+            zoom_step: 100.0,
+            exposure_step: 0.0,
+            flipbook: FlipbookCfg {
+                fps: 1e9,
+                ..FlipbookCfg::default()
+            },
+            ..Config::default()
+        };
+        cfg.sanitize();
+        assert_eq!(cfg.zoom_step, ZOOM_STEP_MAX);
+        assert_eq!(cfg.exposure_step, EXPOSURE_STEP_MIN);
+        assert_eq!(cfg.flipbook.fps, FPS_MAX);
+
+        let mut nan = Config {
+            zoom_step: f32::NAN,
+            exposure_step: f32::INFINITY,
+            ..Config::default()
+        };
+        nan.sanitize();
+        assert_eq!(nan.zoom_step, 1.15);
+        assert_eq!(nan.exposure_step, 0.25);
     }
 }

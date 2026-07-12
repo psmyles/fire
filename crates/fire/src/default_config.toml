@@ -1,9 +1,14 @@
 # Fire configuration
 #
 # Read once at startup. Fire writes this commented template the first time it runs (only if the
-# file is missing) and never modifies it afterward — your edits are safe. Delete the file to
-# regenerate this template. Invalid TOML or unknown keys fall back to the built-in defaults, so a
-# typo can never stop Fire from launching.
+# file is missing) and never modifies it on its own. Invalid TOML or unknown keys fall back to the
+# built-in defaults, so a typo can never stop Fire from launching. Delete the file to regenerate
+# this template.
+#
+# Every key below is also editable in the app: Settings… (the gear on the toolbar, or the
+# right-click menu). NOTE that saving from the Settings dialog rewrites this file from Fire's own
+# state, which does not preserve comments — so if you hand-edit and want to keep your notes, avoid
+# saving from the dialog afterward (or keep a copy).
 #
 # Location: %APPDATA%\fire\config.toml
 # Format:   TOML (https://toml.io)
@@ -40,6 +45,77 @@
 # what the explicit fit command does afterward.
 #
 # fit-upscale = true
+
+# ----------------------------------------------------------------------------------------------
+# default-fit — how an image is scaled when it OPENS (a fresh open, ←/→ folder navigation, or a
+#               hot-reload that changed the image's dimensions).
+#
+#   "fit"          (default) Shrink an oversized image to fit the window; show a smaller one at
+#                  native 1:1. Nothing is ever enlarged on open.
+#   "actual-size"  Always open at 100%, however large the image — pan to explore it.
+#
+# default-fit = "fit"
+
+# ----------------------------------------------------------------------------------------------
+# background — the viewport backdrop: it fills the letterbox around the image and shows through
+#              transparent pixels. (The toolbar's background buttons override this for the session.)
+#
+#   "auto"     (default) Per image: a checkerboard when the image really has transparency,
+#              solid black otherwise.
+#   "black"    Always solid black.
+#   "white"    Always solid white.
+#   "grey"     Always neutral 40% grey.
+#   "checker"  Always the light/dark transparency checkerboard.
+#
+# background = "auto"
+
+# ----------------------------------------------------------------------------------------------
+# default-tonemap — the tonemap operator a freshly opened HDR image (EXR / HDR / float) starts on.
+#                   The T key still toggles between the two at any time.
+#
+#   "reinhard"  (default) Gentle, filmic-neutral roll-off.
+#   "aces"      Punchier, contrastier ACES-style curve.
+#
+# default-tonemap = "reinhard"
+
+# ----------------------------------------------------------------------------------------------
+# zoom-step / exposure-step — how far one input step moves the view.
+#
+#   zoom-step      Multiplicative zoom per wheel notch (and per = / - press). 1.15 = +15% per
+#                  notch. Range 1.01 – 4.0; larger is coarser/faster.
+#   exposure-step  Exposure change per [ or ] press on an HDR image, in stops. Range 0.01 – 4.0.
+#
+# zoom-step = 1.15
+# exposure-step = 0.25
+
+# ----------------------------------------------------------------------------------------------
+# [flipbook] — sprite-sheet playback mode (the K key / toolbar button). These are the DEFAULTS a
+#              newly enabled flipbook adopts; the transport band under the image edits the live
+#              one, and each image keeps its own settings for the session.
+#
+#   fps          Playback rate a new flipbook starts at. Range 0.1 – 120. Default 24.
+#   blend        Crossfade consecutive frames. Default false.
+#   autoplay     Start playing on enter (false parks it on frame 0). Default true.
+#   auto-detect  Scan each decoded image for a sprite-sheet grid and offer the hint chip when one
+#                is found. Default true. Setting this to false stops the scan entirely — flipbook
+#                mode still works by hand (K), it just isn't suggested.
+#
+# [flipbook]
+# fps = 24.0
+# blend = false
+# autoplay = true
+# auto-detect = true
+
+# ----------------------------------------------------------------------------------------------
+# [context-menu] — which of the fixed items appear in the right-click menu over the image (and in
+#                  the toolbar's actions menu). Set one to false to hide it. The configurable
+#                  "Open in…" entries below are separate ([[open-with]]).
+#
+# [context-menu]
+# show-in-explorer = true
+# copy-file = true
+# copy-path = true
+# copy-file-name = true
 
 # ----------------------------------------------------------------------------------------------
 # [[open-with]] — entries for the "Open in…" button on the toolbar (the rightmost button) and the

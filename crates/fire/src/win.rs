@@ -68,8 +68,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WA_INACTIVE, WINDOWPLACEMENT, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
     WM_DPICHANGED, WM_DROPFILES, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSW, WPF_RESTORETOMAXIMIZED, WS_CHILD,
-    WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW,
+    WPF_RESTORETOMAXIMIZED, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 /// `WM_MOUSELEAVE` (0x02A3) isn't surfaced by windows-sys under the enabled features; it's a
@@ -91,6 +91,7 @@ const ID_SHOW_IN_EXPLORER: usize = 1;
 const ID_COPY_FILE: usize = 2;
 const ID_COPY_PATH: usize = 3;
 const ID_COPY_NAME: usize = 4;
+const ID_SETTINGS: usize = 5;
 const OPEN_WITH_ID_BASE: usize = 100;
 /// Command ids for the "»" overflow popup: `OVERFLOW_ID_BASE + index` into the items returned by
 /// [`Chrome::overflow_menu`]. Kept clear of the actions-popup ranges above (this menu is separate,
@@ -98,10 +99,12 @@ const OPEN_WITH_ID_BASE: usize = 100;
 const OVERFLOW_ID_BASE: usize = 1000;
 
 use crate::chrome::{self, Action, Chrome, ViewSnapshot};
+use crate::config::Config;
 use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool, FlipbookGuess};
 use crate::folder::{self, Folder};
 use crate::foreground;
 use crate::ipc_server;
+use crate::keybinds::{KeyAction, KeyChord, Keybinds};
 use crate::render::gpu::GpuSurface;
 use crate::render::view::Channel;
 use crate::tooltip::Tooltip;
@@ -123,6 +126,13 @@ pub const WM_APP_FLIPBOOK_CHIP: u32 = WM_APP + 5;
 /// A finished flipbook auto-detection from a worker, posted *after* its `WM_APP_DECODE_DONE` so the
 /// per-pixel scan never delays the image. LPARAM is `Box<FlipbookGuess>`.
 pub const WM_APP_FLIPBOOK_GUESS: u32 = WM_APP + 6;
+/// OK / Apply in the settings dialog: LPARAM is `Box<Config>`, the edited settings. Posted (never
+/// sent) so the frame adopts them under its own `&mut App` rather than the dialog holding one across
+/// its modal loop — see [`crate::settings`].
+pub const WM_APP_SETTINGS_APPLY: u32 = WM_APP + 7;
+/// "Settings…" was chosen from the right-click menu. Posted rather than opened inline because that
+/// menu is tracked from inside an `&mut App` borrow, which the dialog's nested loop must not overlap.
+pub const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 8;
 
 /// A completed sibling-image scan, delivered to the UI thread (boxed, via the message LPARAM).
 /// The win shell turns it into a [`Folder`] cursor once it confirms it's still current.
@@ -167,13 +177,19 @@ fn surface_flipbook(s: FlipbookState) -> FlipbookParams {
     }
 }
 
-/// Multiplicative zoom per wheel notch (and per keyboard zoom step).
-const ZOOM_STEP: f32 = 1.15;
-/// Exposure step per keypress / toolbar press, in stops.
-const EXPOSURE_STEP: f32 = 0.25;
 /// Max decoded dimension on either axis — a CPU/RAM guard (no GPU texture limit now). An
 /// RGBA8 bitmap at 16384² is ~1 GiB; float HDR is 4×. Larger images are CPU-downscaled.
 const MAX_CPU_DIM: u32 = 16384;
+
+/// Modifier virtual-keys, read live per keypress to build the pressed [`KeyChord`].
+const VK_SHIFT: i32 = 0x10;
+const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12; // Alt
+
+/// Whether a modifier key is currently held (`GetKeyState`'s high bit).
+fn key_down(vk: i32) -> bool {
+    (unsafe { GetKeyState(vk) } as u16 & 0x8000) != 0
+}
 
 /// UI-thread state, stashed in both windows' `GWLP_USERDATA` (the frame owns the box).
 struct App {
@@ -201,9 +217,13 @@ struct App {
     /// File-change watcher for hot-reload; `None` when disabled in config. Dropped with the
     /// `App`, which stops the watch thread.
     watcher: Option<FileWatcher>,
-    /// User-configured entries for the toolbar's "Open in…" menu (from `config.toml`) — external
-    /// apps and/or nested submenus. Empty ⇒ the menu button is disabled.
-    open_with: Vec<crate::config::MenuEntry>,
+    /// The live user settings (`config.toml`). The authority for everything the settings dialog can
+    /// change: the dialog edits a clone and hands it back via [`WM_APP_SETTINGS_APPLY`], which
+    /// [`App::apply_settings`] adopts here and pushes into the renderer/watcher/pool.
+    cfg: Config,
+    /// The keyboard table, resolved from `cfg.keybinds` over the defaults. Drives both key dispatch
+    /// ([`App::handle_key`]) and the toolbar tooltips' shortcut suffixes.
+    keybinds: Keybinds,
     /// True while the frame is in borderless full-screen (chrome hidden, view covers the monitor).
     fullscreen: bool,
     /// The windowed placement captured on entering full-screen, restored on exit (and used when
@@ -287,6 +307,7 @@ impl App {
             path: path.to_path_buf(),
             opts,
             reload,
+            detect_flipbook: self.cfg.flipbook.auto_detect,
         });
         generation
     }
@@ -521,6 +542,8 @@ impl App {
         if self.surface.current_image().is_none() || self.surface.frame_delay_ms().is_some() {
             return;
         }
+        // Copy the defaults out before borrowing the per-path entry (both live on `self`).
+        let defaults = self.cfg.flipbook;
         let Some(entry) = self.flipbook_entry() else {
             return;
         };
@@ -534,7 +557,7 @@ impl App {
             entry.hint_dismissed = true;
             if entry.state.is_none() {
                 let grid = entry.hint.unwrap_or(Grid::new(8, 8));
-                entry.state = Some(FlipbookState::new(grid));
+                entry.state = Some(FlipbookState::new(grid, &defaults));
             }
         }
         self.apply_flipbook();
@@ -721,8 +744,8 @@ impl App {
             // invalidate below — like the ←/→ keys.
             Action::Prev => return self.navigate(-1),
             Action::Next => return self.navigate(1),
-            Action::ZoomOut => self.surface.zoom_centered(1.0 / ZOOM_STEP),
-            Action::ZoomIn => self.surface.zoom_centered(ZOOM_STEP),
+            Action::ZoomOut => self.surface.zoom_centered(1.0 / self.cfg.zoom_step),
+            Action::ZoomIn => self.surface.zoom_centered(self.cfg.zoom_step),
             Action::ZoomToggle => {
                 if self.surface.is_fit() {
                     self.surface.one_to_one();
@@ -733,9 +756,9 @@ impl App {
             Action::Channel(Channel::Rgb) => self.surface.set_channel(Channel::Rgb),
             Action::Channel(c) => self.surface.toggle_channel(c),
             Action::ToggleTonemap => self.surface.toggle_tonemap(),
-            Action::ExpUp => self.surface.adjust_exposure(EXPOSURE_STEP),
+            Action::ExpUp => self.surface.adjust_exposure(self.cfg.exposure_step),
             Action::ExpReset => self.surface.reset_exposure(),
-            Action::ExpDown => self.surface.adjust_exposure(-EXPOSURE_STEP),
+            Action::ExpDown => self.surface.adjust_exposure(-self.cfg.exposure_step),
             Action::ToggleOutline => self.surface.toggle_outline(),
             Action::Background(bg) => self.surface.set_background(bg),
             // Toggling full-screen resizes the frame, which fires WM_SIZE (relayout + reposition);
@@ -744,9 +767,10 @@ impl App {
             // Flipbook mode runs its own relayout/reposition/invalidate; return without the shared
             // chrome invalidate below.
             Action::ToggleFlipbook => return self.toggle_flipbook(),
-            // The actions and overflow menus are driven directly from the click handler (they need
-            // the button rect); they never reach the shared dispatch. No-op, skip the repaint below.
-            Action::OpenWithMenu | Action::Overflow => return,
+            // The two popup menus need their button's screen rect, and the settings dialog runs a
+            // nested modal loop that must not be entered under a live `&mut App` borrow — all three
+            // are driven directly from the click handler and never reach this shared dispatch.
+            Action::OpenWithMenu | Action::Overflow | Action::OpenSettings => return,
         }
         self.invalidate_chrome();
     }
@@ -803,7 +827,7 @@ impl App {
                 if item.checked {
                     flags |= MF_CHECKED;
                 }
-                let label = wide(item.label);
+                let label = wide(&item.label);
                 AppendMenuW(menu, flags, OVERFLOW_ID_BASE + i, label.as_ptr());
             }
             let cmd = TrackPopupMenu(
@@ -849,24 +873,42 @@ impl App {
             if menu.is_null() {
                 return;
             }
-            // Fixed file actions first (always available once an image is open).
-            let show = wide("Show in Explorer");
-            AppendMenuW(menu, MF_STRING, ID_SHOW_IN_EXPLORER, show.as_ptr());
-            let copy_file = wide("Copy File");
-            AppendMenuW(menu, MF_STRING, ID_COPY_FILE, copy_file.as_ptr());
-            let copy_path = wide("Copy Path");
-            AppendMenuW(menu, MF_STRING, ID_COPY_PATH, copy_path.as_ptr());
-            let copy_name = wide("Copy File Name");
-            AppendMenuW(menu, MF_STRING, ID_COPY_NAME, copy_name.as_ptr());
+            // Fixed file actions first, each shown unless hidden in `[context-menu]`. All four can
+            // be off, leaving just the open-with tree.
+            let cm = self.cfg.context_menu;
+            let fixed = [
+                (cm.show_in_explorer, ID_SHOW_IN_EXPLORER, "Show in Explorer"),
+                (cm.copy_file, ID_COPY_FILE, "Copy File"),
+                (cm.copy_path, ID_COPY_PATH, "Copy Path"),
+                (cm.copy_file_name, ID_COPY_NAME, "Copy File Name"),
+            ];
+            let mut shown = 0usize;
+            for (on, id, text) in fixed {
+                if on {
+                    let label = wide(text);
+                    AppendMenuW(menu, MF_STRING, id, label.as_ptr());
+                    shown += 1;
+                }
+            }
             // Then the configured "Open in…" tree, after a divider. Submenus become nested popups;
             // each leaf app gets an id of OPEN_WITH_ID_BASE + its pre-order index, collected into
             // `leaves` so the returned command id maps straight back to the app to launch. Ids start
             // at OPEN_WITH_ID_BASE so they never collide with the fixed actions above.
             let mut leaves: Vec<&crate::config::MenuEntry> = Vec::new();
-            if !self.open_with.is_empty() {
-                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-                build_open_with_menu(menu, &self.open_with, &mut leaves);
+            if !self.cfg.open_with.is_empty() {
+                if shown > 0 {
+                    AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                }
+                build_open_with_menu(menu, &self.cfg.open_with, &mut leaves);
+                shown += 1;
             }
+            // "Settings…" always comes last, after a divider — it's the one entry that isn't about
+            // the image.
+            if shown > 0 {
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            }
+            let settings = wide("Settings\u{2026}");
+            AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
             let cmd = TrackPopupMenu(
                 menu,
                 TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON,
@@ -884,6 +926,12 @@ impl App {
                     copy_text_to_clipboard(self.frame as HWND, &image.to_string_lossy())
                 }
                 ID_COPY_NAME => copy_text_to_clipboard(self.frame as HWND, &file_name(&image)),
+                // Not opened inline: we're inside an `&mut self` borrow, and the dialog's nested
+                // message loop re-enters the wndproc, which takes its own. Post and let the loop
+                // deliver it once this borrow is gone.
+                ID_SETTINGS => {
+                    PostMessageW(self.frame as HWND, WM_APP_OPEN_SETTINGS, 0, 0);
+                }
                 id if id >= OPEN_WITH_ID_BASE => {
                     if let Some(app) = leaves.get(id - OPEN_WITH_ID_BASE) {
                         launch_external(app, &image);
@@ -894,10 +942,13 @@ impl App {
         }
     }
 
-    /// Map a virtual-key press to a view command (layout-independent VK codes).
-    fn handle_key(&mut self, vk: u32) {
-        // While a transport field is being typed into, route Enter/Tab/Esc to the editor first so
-        // keystrokes don't leak to view commands.
+    /// Route a virtual-key press through the keybind table. Returns whether the press was consumed
+    /// — the `WM_SYSKEYDOWN` path uses that to let unbound Alt chords (Alt+F4, the system menu)
+    /// fall through to `DefWindowProc`.
+    fn handle_key(&mut self, vk: u32) -> bool {
+        // While a transport field is being typed into, Enter/Tab/Esc belong to the editor. These
+        // are *editor* keys, not bindings — they stay hardcoded so rebinding (say) Esc can't strand
+        // a half-typed field.
         if self.transport.is_editing() {
             match vk {
                 0x0D | 0x09 => {
@@ -908,54 +959,67 @@ impl App {
                         }
                     }
                     self.invalidate_transport();
-                    return;
                 }
                 0x1B => {
                     // Esc cancels the edit (does not leave the mode / close the window).
                     self.transport.cancel_edit();
                     self.invalidate_transport();
-                    return;
                 }
-                _ => return, // other keys handled via WM_CHAR
+                _ => {} // other keys handled via WM_CHAR
             }
+            return true;
         }
-        // Space / , / . drive playback when flipbook mode is active.
-        if self.flipbook_state().is_some() {
-            match vk {
-                0x20 => return self.flipbook_key(TransportEdit::TogglePlay), // Space
-                0xBC => return self.flipbook_step(-1),                       // ,
-                0xBE => return self.flipbook_step(1),                        // .
-                _ => {}
-            }
-        }
-        match vk {
-            0x46 => self.surface.fit(),                                 // F
-            0x31 => self.surface.one_to_one(),                          // 1
-            0x52 => self.surface.toggle_channel(Channel::R),            // R
-            0x47 => self.surface.toggle_channel(Channel::G),            // G
-            0x42 => self.surface.toggle_channel(Channel::B),            // B
-            0x41 => self.surface.toggle_channel(Channel::A),            // A
-            0x43 => self.surface.set_channel(Channel::Rgb),             // C
-            0x54 => self.surface.toggle_tonemap(),                      // T
-            0x4B => return self.toggle_flipbook(),                      // K
-            0xDD => self.surface.adjust_exposure(EXPOSURE_STEP),        // ]
-            0xDB => self.surface.adjust_exposure(-EXPOSURE_STEP),       // [
-            0xBB | 0x6B => self.surface.zoom_centered(ZOOM_STEP),       // = / numpad +
-            0xBD | 0x6D => self.surface.zoom_centered(1.0 / ZOOM_STEP), // - / numpad -
-            // ← / → walk the folder. navigate() runs its own load + repaint, so return
-            // afterwards rather than falling through to the shared invalidate below.
-            0x25 => return self.navigate(-1), // Left
-            0x27 => return self.navigate(1),  // Right
-            0x7A => self.toggle_fullscreen(), // F11
+        let chord = KeyChord {
+            vk,
+            ctrl: key_down(VK_CONTROL),
+            alt: key_down(VK_MENU),
+            shift: key_down(VK_SHIFT),
+        };
+        // Flipbook-context bindings (play/pause, step) win while the mode is active, and are inert
+        // outside it — the precedence the table encodes.
+        let in_flipbook = self.flipbook_state().is_some();
+        let Some(action) = self.keybinds.lookup(chord, in_flipbook) else {
+            return false;
+        };
+        self.perform_key_action(action);
+        true
+    }
+
+    /// Perform a bound keyboard command.
+    fn perform_key_action(&mut self, action: KeyAction) {
+        match action {
+            KeyAction::Fit => self.surface.fit(),
+            KeyAction::ActualSize => self.surface.one_to_one(),
+            KeyAction::ZoomIn => self.surface.zoom_centered(self.cfg.zoom_step),
+            KeyAction::ZoomOut => self.surface.zoom_centered(1.0 / self.cfg.zoom_step),
+            KeyAction::ChannelRgb => self.surface.set_channel(Channel::Rgb),
+            KeyAction::ChannelR => self.surface.toggle_channel(Channel::R),
+            KeyAction::ChannelG => self.surface.toggle_channel(Channel::G),
+            KeyAction::ChannelB => self.surface.toggle_channel(Channel::B),
+            KeyAction::ChannelA => self.surface.toggle_channel(Channel::A),
+            KeyAction::ToggleTonemap => self.surface.toggle_tonemap(),
+            KeyAction::ExposureUp => self.surface.adjust_exposure(self.cfg.exposure_step),
+            KeyAction::ExposureDown => self.surface.adjust_exposure(-self.cfg.exposure_step),
+            KeyAction::ExposureReset => self.surface.reset_exposure(),
+            KeyAction::ToggleOutline => self.surface.toggle_outline(),
+            // Navigation runs its own load + repaint (and relayout), so return without the shared
+            // invalidate below.
+            KeyAction::PrevImage => return self.navigate(-1),
+            KeyAction::NextImage => return self.navigate(1),
+            KeyAction::ToggleFullscreen => self.toggle_fullscreen(),
             // Esc leaves full-screen if in it; otherwise it closes the window.
-            0x1B => {
+            KeyAction::CloseOrExitFullscreen => {
                 if self.fullscreen {
                     self.set_fullscreen(false);
                 } else {
                     unsafe { DestroyWindow(self.frame as HWND) };
                 }
             }
-            _ => return,
+            // Flipbook mode runs its own relayout/reposition/invalidate.
+            KeyAction::ToggleFlipbook => return self.toggle_flipbook(),
+            KeyAction::FlipbookPlayPause => return self.flipbook_key(TransportEdit::TogglePlay),
+            KeyAction::FlipbookPrevFrame => return self.flipbook_step(-1),
+            KeyAction::FlipbookNextFrame => return self.flipbook_step(1),
         }
         self.invalidate_chrome();
     }
@@ -985,6 +1049,55 @@ impl App {
         if self.flipbook_state().is_some_and(|s| s.playing) {
             self.apply_transport_edit(TransportEdit::TogglePlay);
         }
+    }
+
+    /// Open the settings dialog. Takes the config *by clone* and re-enters through
+    /// [`WM_APP_SETTINGS_APPLY`], because the dialog runs a nested message pump that re-enters this
+    /// wndproc — so it must not be called while an `&mut App` borrow is alive. Every caller
+    /// therefore reaches it via a `PostMessage`, never inline from a click handler.
+    fn open_settings(&mut self) {
+        let cfg = self.cfg.clone();
+        let (frame, dark) = (self.frame, self.chrome.dark);
+        // Any hover/tooltip state is stale the moment the modal window takes over.
+        self.cancel_tooltip();
+        self.chrome.hover = None;
+        self.invalidate_chrome();
+        crate::settings::run_modal(frame, cfg, dark);
+    }
+
+    /// Adopt the settings the dialog committed (OK / Apply): push each field wherever it lives, then
+    /// persist. Applied *before* saving, so an unwritable `config.toml` still costs the user
+    /// persistence rather than the edit.
+    ///
+    /// Three tiers, by how far a change can reach without being obnoxious:
+    ///   * **Live** — watcher, zoom/exposure steps, backdrop, keybinds, menu contents.
+    ///   * **Next image** — the fit/tonemap an image *opens* with, and the flipbook playback
+    ///     defaults: re-fitting or re-tonemapping the picture under the user's cursor would undo
+    ///     whatever they'd just set up by hand.
+    ///   * **Next launch** — `instance-mode` (the pipe server and mutex are decided at startup).
+    fn apply_settings(&mut self, new: Config) {
+        // Hot-reload: start or stop the watch thread, re-arming it on the open image.
+        if new.hot_reload != self.cfg.hot_reload {
+            if new.hot_reload {
+                let w = FileWatcher::spawn(self.frame);
+                if let Some(p) = &self.current_path {
+                    w.watch(self.surface.generation(), p);
+                }
+                self.watcher = Some(w);
+            } else {
+                self.watcher = None; // dropping it stops the thread
+            }
+        }
+        self.keybinds = Keybinds::from_config(&new.keybinds);
+        apply_view_config(&mut self.surface, &new);
+        self.cfg = new;
+        self.cfg.save();
+
+        // The toolbar's tooltips carry the (possibly rebound) shortcuts, and the backdrop buttons
+        // reflect the new default; the open-with menu is rebuilt per-show, so it needs nothing.
+        self.relayout();
+        self.invalidate_chrome();
+        self.surface.invalidate();
     }
 
     /// Build the snapshot the chrome renders from.
@@ -1034,6 +1147,7 @@ impl App {
             fullscreen: self.fullscreen,
             flipbook: self.flipbook_state().is_some(),
             has_animation: self.surface.frame_delay_ms().is_some(),
+            shortcuts: self.keybinds.labels(),
             status_left,
             status_right,
         }
@@ -1243,7 +1357,7 @@ impl App {
             y: self.chrome.metrics.toolbar_h + gap,
         };
         unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
-        self.tooltip.show(text, pt.x, pt.y);
+        self.tooltip.show(&text, pt.x, pt.y);
     }
 
     /// Hide the tooltip and cancel any pending hover-delay timer.
@@ -1253,16 +1367,21 @@ impl App {
     }
 }
 
+/// Push the view-related settings into the renderer. The one place that maps `Config` onto
+/// [`GpuSurface`], shared by startup and the settings dialog's Apply, so the two can't drift.
+/// Backdrop applies to the image already on screen; the fit/tonemap defaults seed the *next* adopt
+/// (yanking the current image's zoom or tonemap out from under the user would be hostile).
+fn apply_view_config(surface: &mut GpuSurface, cfg: &Config) {
+    surface.set_fit_upscale(cfg.fit_upscale);
+    surface.set_open_actual_size(cfg.default_fit == crate::config::FitCfg::ActualSize);
+    surface.set_default_tonemap(cfg.default_tonemap.to_render());
+    surface.set_background_pref(cfg.background.override_for_render());
+}
+
 /// Create the frame + child view, wire up the decode pool, optionally serve the pipe
 /// (single-instance mode), open `initial` if given, and run the message loop until the window
 /// is closed (the process then exits — non-resident).
-pub fn run(
-    initial: Option<PathBuf>,
-    serve_pipe: bool,
-    hot_reload: bool,
-    fit_upscale: bool,
-    open_with: Vec<crate::config::MenuEntry>,
-) {
+pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
     unsafe {
         let hinstance = GetModuleHandleW(ptr::null());
 
@@ -1379,14 +1498,18 @@ pub fn run(
             hinstance as isize,
             vw as u32,
             vh as u32,
-            fit_upscale,
+            cfg.fit_upscale,
         );
         surface.set_clear(ch.view_clear_packed());
+        // The view-related config the surface owns (backdrop / open-fit / tonemap defaults). Same
+        // path the settings dialog re-runs on Apply — see `App::apply_view_config`.
+        apply_view_config(&mut surface, &cfg);
         // Workers and the pipe server post to the frame (it owns title/size/lifecycle).
         let pool = DecodePool::new(frame as isize);
         // Hot-reload watcher (config-gated); posts WM_APP_FILE_CHANGED to the frame, same as the
         // pool. None when disabled, so no watch thread is spawned.
-        let watcher = hot_reload.then(|| FileWatcher::spawn(frame as isize));
+        let watcher = cfg.hot_reload.then(|| FileWatcher::spawn(frame as isize));
+        let keybinds = Keybinds::from_config(&cfg.keybinds);
 
         let mut app = Box::new(App {
             frame: frame as isize,
@@ -1401,7 +1524,8 @@ pub fn run(
             folder: None,
             current_path: None,
             watcher,
-            open_with,
+            cfg,
+            keybinds,
             fullscreen: false,
             windowed_placement: std::mem::zeroed(),
             flipbook: HashMap::new(),
@@ -1617,6 +1741,12 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     Action::OpenWithMenu => app.actions_menu(),
                     // The "»" popup, like the actions menu, needs the button's screen rect.
                     Action::Overflow => app.overflow_menu(),
+                    // Post rather than open inline: `app` is borrowed from GWLP_USERDATA for this
+                    // message, and the dialog's nested loop re-enters this wndproc, which takes its
+                    // own borrow. Handing it to the message loop drops ours first.
+                    Action::OpenSettings => {
+                        PostMessageW(hwnd, WM_APP_OPEN_SETTINGS, 0, 0);
+                    }
                     _ => app.do_action(action),
                 }
             }
@@ -1760,7 +1890,8 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 }
             } else if notches != 0 {
                 // Over the image: zoom about the surface's tracked cursor (position ignored here).
-                app.surface.zoom_at_cursor(ZOOM_STEP.powf(notches as f32));
+                let step = app.cfg.zoom_step;
+                app.surface.zoom_at_cursor(step.powf(notches as f32));
                 app.invalidate_status();
             }
             0
@@ -1781,6 +1912,15 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         WM_KEYDOWN => {
             app.handle_key(wparam as u32);
             0
+        }
+        // Alt chords arrive here, not as WM_KEYDOWN. Consume only the ones actually bound, so
+        // Alt+F4 and the Alt-menu still reach DefWindowProc.
+        WM_SYSKEYDOWN => {
+            if app.handle_key(wparam as u32) {
+                0
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         WM_DROPFILES => {
             handle_drop(app, wparam as HDROP);
@@ -1808,6 +1948,15 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         }
         WM_APP_FILE_CHANGED => {
             app.reload(wparam as u64);
+            0
+        }
+        WM_APP_OPEN_SETTINGS => {
+            app.open_settings();
+            0
+        }
+        WM_APP_SETTINGS_APPLY => {
+            let cfg = Box::from_raw(lparam as *mut Config);
+            app.apply_settings(*cfg);
             0
         }
         WM_APP_FLIPBOOK_CHIP => {
@@ -1982,7 +2131,8 @@ unsafe fn view_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_MOUSEWHEEL => {
             let delta = ((wparam >> 16) & 0xffff) as u16 as i16 as f32 / 120.0;
             if delta != 0.0 {
-                app.surface.zoom_at_cursor(ZOOM_STEP.powf(delta));
+                let step = app.cfg.zoom_step;
+                app.surface.zoom_at_cursor(step.powf(delta));
                 app.invalidate_status();
             }
             0
@@ -1990,6 +2140,14 @@ unsafe fn view_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_KEYDOWN => {
             app.handle_key(wparam as u32);
             0
+        }
+        // See the frame's WM_SYSKEYDOWN: Alt chords come through here.
+        WM_SYSKEYDOWN => {
+            if app.handle_key(wparam as u32) {
+                0
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         WM_DROPFILES => {
             handle_drop(app, wparam as HDROP);
@@ -2116,12 +2274,14 @@ unsafe fn build_open_with_menu<'a>(
                 // to `menu`, so `sub` needs no separate DestroyMenu.
                 AppendMenuW(menu, MF_POPUP, sub as usize, label.as_ptr());
             }
-        } else if entry.path.is_some() {
+        } else if entry.path.as_deref().is_some_and(|p| !p.trim().is_empty()) {
             let id = OPEN_WITH_ID_BASE + leaves.len();
             leaves.push(entry);
             unsafe { AppendMenuW(menu, MF_STRING, id, label.as_ptr()) };
         }
-        // else: malformed entry (no `path`, no `items`) — silently skipped.
+        // else: malformed entry (no usable `path`, no `items`) — silently skipped. The settings
+        // dialog creates entries before they have a program, so a half-filled one just doesn't show
+        // up in the menu yet.
     }
 }
 

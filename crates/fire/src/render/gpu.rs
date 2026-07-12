@@ -186,9 +186,15 @@ pub struct GpuSurface {
     flipbook: Option<FlipbookParams>,
     /// Whether the explicit "fit to window" command (`F` / toolbar) scales *small* images up to
     /// fill the surface (the `fit-upscale` config key). False keeps the texture-viewer cap at 1:1.
-    /// This governs only the explicit command — images always *open* (and re-open on folder
-    /// navigation) fitted without upscaling, so a small image is shown at 100% on load.
+    /// This governs only the explicit command — how an image *opens* is `open_actual_size`.
     fit_upscale: bool,
+    /// Whether a freshly adopted image opens at native 1:1 instead of fitted (the `default-fit`
+    /// config key). Fitted-on-open (the default) never upscales, so a small image shows at 100%
+    /// either way; this only changes what an *oversized* image does on open.
+    open_actual_size: bool,
+    /// The tonemap operator a freshly adopted image starts on (the `default-tonemap` config key).
+    /// Seeds [`DisplayState`] on each adopt; the `T` toggle still moves the live one.
+    default_tonemap: Tonemap,
     display: DisplayState,
     cursor: (f32, f32),
     dragging: bool,
@@ -241,6 +247,8 @@ impl GpuSurface {
             view: ViewState::default(),
             flipbook: None,
             fit_upscale,
+            open_actual_size: false,
+            default_tonemap: Tonemap::Reinhard,
             display: DisplayState::default(),
             cursor: (0.0, 0.0),
             dragging: false,
@@ -321,6 +329,36 @@ impl GpuSurface {
         self.background = bg;
         self.background_override = Some(bg);
         self.refresh();
+    }
+
+    /// Apply the configured backdrop preference (settings dialog / startup): `Some` pins that
+    /// backdrop for every image, `None` restores the per-image default (checker for real
+    /// transparency, black otherwise) — including for the image already on screen.
+    pub fn set_background_pref(&mut self, bg: Option<Background>) {
+        self.background_override = bg;
+        self.background = bg.unwrap_or_else(|| {
+            self.current_image
+                .as_ref()
+                .map_or(Background::Black, |img| default_background(img))
+        });
+        self.refresh();
+    }
+
+    /// Whether the explicit fit command upscales small images (the `fit-upscale` config key).
+    pub fn set_fit_upscale(&mut self, on: bool) {
+        self.fit_upscale = on;
+    }
+
+    /// Whether a newly opened image lands at native 1:1 rather than fitted (`default-fit`). Takes
+    /// effect on the next adopt — it never yanks the view of the image already on screen.
+    pub fn set_open_actual_size(&mut self, on: bool) {
+        self.open_actual_size = on;
+    }
+
+    /// The tonemap a newly adopted image starts on (`default-tonemap`). Like `set_open_actual_size`,
+    /// this seeds the *next* image: the current one keeps whatever the user toggled it to.
+    pub fn set_default_tonemap(&mut self, t: Tonemap) {
+        self.default_tonemap = t;
     }
 
     pub fn outline(&self) -> bool {
@@ -404,27 +442,30 @@ impl GpuSurface {
             .map(|a| a.frames.clone())
             .unwrap_or_default();
         self.anim_index = 0;
-        // Pick the viewport backdrop: once the user has chosen one this session it sticks across
-        // every image; otherwise default to the image's nature — a checker only when there is real
-        // transparency to read as transparency, solid black otherwise. An RGBA/gray+A source whose
-        // alpha is entirely opaque (e.g. a 32-bit screenshot) carries no transparency, so it gets
-        // black like an opaque image — but it keeps its true format and an inspectable alpha
-        // channel (`alpha_opaque`); the user can still isolate the all-white alpha.
-        let has_transparency = matches!(img.channels, 2 | 4) && !img.alpha_opaque;
-        self.background = self.background_override.unwrap_or(if has_transparency {
-            Background::Checker
-        } else {
-            Background::Black
-        });
+        // Pick the viewport backdrop: an explicit pick (the toolbar's background buttons, or the
+        // `background` config key) sticks across every image; otherwise default to the image's
+        // nature — see `default_background`.
+        self.background = self
+            .background_override
+            .unwrap_or_else(|| default_background(&img));
         self.current_image = Some(img);
-        self.display = DisplayState::default();
+        // Neutral display state for the new file (#17), seeded with the configured tonemap.
+        self.display = DisplayState {
+            tonemap: self.default_tonemap,
+            ..DisplayState::default()
+        };
         // A fresh image starts as a whole-image view; the win shell re-applies any per-path
         // flipbook state (via `set_flipbook`) right after this adopt, which re-fits to the frame.
         self.flipbook = None;
         // Every newly opened image (including folder ←/→ navigation) fits *without* upscaling: a
         // large image shrinks to fit, a small one shows at native 1:1. The explicit fit command
-        // (`F` / toolbar) can still fill the surface — see `fit_upscale` / `fit`.
-        self.view.fit_to_window((w, h), &self.viewport, false);
+        // (`F` / toolbar) can still fill the surface — see `fit_upscale` / `fit`. With
+        // `default-fit = "actual-size"` an image instead opens at 100% however large it is.
+        if self.open_actual_size {
+            self.view.one_to_one();
+        } else {
+            self.view.fit_to_window((w, h), &self.viewport, false);
+        }
         Ok(())
     }
 
@@ -859,6 +900,21 @@ fn channel_code(ch: Channel) -> i32 {
         Channel::G => 2,
         Channel::B => 3,
         Channel::A => 4,
+    }
+}
+
+/// The backdrop an image gets when the user hasn't pinned one (no toolbar pick, `background =
+/// "auto"`): a checkerboard only when there is real transparency to read *as* transparency, solid
+/// black otherwise. An RGBA/gray+A source whose alpha is entirely opaque (e.g. a 32-bit screenshot)
+/// carries no transparency, so it gets black like an opaque image — but it keeps its true format
+/// and an inspectable alpha channel (`alpha_opaque`); the user can still isolate the all-white
+/// alpha.
+fn default_background(img: &DecodedImage) -> Background {
+    let has_transparency = matches!(img.channels, 2 | 4) && !img.alpha_opaque;
+    if has_transparency {
+        Background::Checker
+    } else {
+        Background::Black
     }
 }
 

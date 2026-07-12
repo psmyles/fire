@@ -83,7 +83,17 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 - `watcher.rs` — hot-reload: a per-window thread watches the open image's directory (`notify`) and
   posts `WM_APP_FILE_CHANGED` when the file's contents change, so the UI re-decodes it. Same
   off-thread/`PostMessage`/generation-tagged discipline as the decode pool and folder scan.
-- `config.rs` — TOML config from `%APPDATA%\fire\config.toml`; missing/invalid → defaults.
+- `config.rs` — the whole persisted settings surface, as TOML in `%APPDATA%\fire\config.toml`;
+  missing/invalid → defaults, always `sanitize()`d. Round-trips (`Serialize` + `save()`), because
+  the settings dialog writes it back.
+- `keybinds.rs` — the key→`KeyAction` table (pure, unit-tested). *The* source of what a key does:
+  `App::handle_key` looks up a `KeyChord`, and the toolbar's tooltips take their "(F)" suffixes from
+  the same table, so a rebind relabels its button. Only non-default bindings are persisted.
+- `settings/` — the modal, tabbed, hand-painted settings dialog (`mod.rs` = window + widgets;
+  `model.rs` = pure field accessors + open-with tree edits). **It never holds an `&mut App`**: its
+  nested message pump re-enters the frame's wndproc, so it edits a cloned `Config` and posts it back
+  via `WM_APP_SETTINGS_APPLY` (see `App::apply_settings` for what applies live vs. next-image vs.
+  next-launch).
 - `forward.rs` / `ipc_server.rs` / `foreground.rs` — SingleInstance pipe client / server / foreground raise.
 - `build.rs` — precompiles `render/shader.hlsl` to DXBC via `fxc` (embedded with `include_bytes!`) and
   embeds the `.ico` + product metadata via `winresource`.
@@ -126,5 +136,6 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 Under active construction; see `TODO.md` and architecture.md §14 for the v1-vs-deferred split. The
 core viewer (window, threaded decode, GPU viewport, pan/zoom/fit, channel isolation, HDR
 exposure/tonemap, DPI/dark chrome, folder ←/→ navigation) is in place, as is the Inno Setup
-installer with per-format Explorer associations (`installer/`, `scripts/build-installer.ps1`).
-In progress: pixel inspector, settings dialog, clipboard.
+installer with per-format Explorer associations (`installer/`, `scripts/build-installer.ps1`), and
+the settings dialog (General / Flipbook / Keybinds / Context menu).
+In progress: pixel inspector, clipboard.

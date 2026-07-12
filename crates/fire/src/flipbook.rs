@@ -69,20 +69,23 @@ pub struct FlipbookState {
 }
 
 impl FlipbookState {
-    /// A fresh state adopting `grid`: full frame count, 24 fps, no blend, playing from frame 0.
-    pub fn new(grid: Grid) -> Self {
+    /// A fresh state adopting `grid`: the full frame count, starting at frame 0, with the playback
+    /// rate / blend / autoplay taken from the user's `[flipbook]` config defaults.
+    pub fn new(grid: Grid, cfg: &crate::config::FlipbookCfg) -> Self {
         let grid = Grid::new(
             grid.cols.clamp(GRID_MIN, GRID_MAX),
             grid.rows.clamp(GRID_MIN, GRID_MAX),
         );
-        Self {
+        let mut s = Self {
             grid,
             frame_count: grid.cells().max(1),
-            fps: FPS_DEFAULT,
-            blend: false,
-            playing: true,
+            fps: cfg.fps,
+            blend: cfg.blend,
+            playing: cfg.autoplay,
             frame_pos: 0.0,
-        }
+        };
+        s.clamp();
+        s
     }
 
     /// Re-establish every invariant after an edit: grid axes in range, `frame_count` in
@@ -720,7 +723,7 @@ mod tests {
 
     #[test]
     fn state_clamp_invariants() {
-        let mut s = FlipbookState::new(Grid::new(8, 8));
+        let mut s = FlipbookState::new(Grid::new(8, 8), &crate::config::FlipbookCfg::default());
         s.grid = Grid::new(100, 0);
         s.frame_count = 9999;
         s.fps = 1000.0;
@@ -730,6 +733,23 @@ mod tests {
         assert_eq!(s.frame_count, 64);
         assert_eq!(s.fps, FPS_MAX);
         assert!(s.frame_pos >= 0.0 && s.frame_pos < 64.0);
+    }
+
+    /// A new flipbook seeds its playback settings from `[flipbook]` (and clamps them), rather than
+    /// the old hardcoded 24 fps / no blend / autoplay.
+    #[test]
+    fn state_seeds_from_config_defaults() {
+        let cfg = crate::config::FlipbookCfg {
+            fps: 1000.0, // out of range: clamped, not rejected
+            blend: true,
+            autoplay: false,
+            auto_detect: true,
+        };
+        let s = FlipbookState::new(Grid::new(4, 2), &cfg);
+        assert_eq!(s.fps, FPS_MAX);
+        assert!(s.blend);
+        assert!(!s.playing);
+        assert_eq!(s.frame_count, 8);
     }
 
     // ---- detection: synthetic sheets -------------------------------------------------------

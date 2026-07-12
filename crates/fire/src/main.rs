@@ -22,8 +22,10 @@ mod forward;
 mod hint_chip;
 mod icons;
 mod ipc_server;
+mod keybinds;
 mod product;
 mod render;
+mod settings;
 mod tooltip;
 mod transport;
 mod watcher;
@@ -57,19 +59,15 @@ fn main() {
     // discoverable, then read it.
     config::ensure_default_config();
     let cfg = Config::load();
-    let hot_reload = cfg.hot_reload;
-    let fit_upscale = cfg.fit_upscale;
-    let instance_mode = cfg.instance_mode;
-    let open_with = cfg.open_with;
 
-    match instance_mode {
+    match cfg.instance_mode {
         InstanceMode::NewWindow => {
             // Plain app: our own window, no coordination of any kind.
-            win::run(path, false, hot_reload, fit_upscale, open_with);
+            win::run(path, false, cfg);
         }
         InstanceMode::SingleInstance => match SingleInstance::acquire() {
             // We're the owner: open the window and serve the pipe for later launches.
-            Some(_guard) => win::run(path, true, hot_reload, fit_upscale, open_with),
+            Some(_guard) => win::run(path, true, cfg),
             // Another window owns the pipe: hand it the path and exit.
             None => {
                 if let Err(e) = forward::forward(path) {
