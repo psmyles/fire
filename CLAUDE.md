@@ -79,14 +79,19 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   the only places that use the typed `windows` crate (typed COM); everything else uses `windows-sys`.
 - `render/view.rs` — pure pan/zoom/fit math + `Channel` (no Win32, unit-tested).
 - `ui/` — the whole UI, rebuilt every frame in immediate mode (`mod.rs` = toolbar / status bar /
-  transport band / hint chip / empty-state hint; `theme.rs` = style, colors, metrics). **Pure UI: no
-  Win32, no COM, no GDI.** It reads a `ViewSnapshot` and returns a `ui::Frame` of what the user asked
-  for; the win shell applies it.
+  transport band / hint chip / empty-state hint; `theme.rs` = style, colors, metrics; `settings/` =
+  the settings window). **Pure UI: no Win32, no COM, no GDI.** It reads a `ViewSnapshot` and returns a
+  `ui::Frame` of what the user asked for; the win shell applies it.
+- `ui/settings/` — the settings window, an ImGui `BeginPopupModal` (`mod.rs` = the modal + its four
+  tabs; `model.rs` = pure field accessors + open-with tree edits, unit-tested). It wears **ImGui's
+  stock style, not fire's chrome theme** (`render::imgui::StockStyle`): the chrome is a toolbar, a
+  settings window is a form. Two things it can't do itself are reported to the shell instead —
+  "Browse…" (the file dialog pumps a modal loop) and keybind *capture* (chords are virtual keys, which
+  only the wndproc sees).
 - `chrome.rs` — despite the name, no longer paints anything. What survives is the shared *model* and
   *theme*: `Action` + `ViewSnapshot` (the command vocabulary and the state the UI renders from), the
   light/dark `Palette` — whose highlight is the user's **system accent** (`GetSysColor(COLOR_HIGHLIGHT)`
-  tracks it: documented, no registry poking) — and the dark title-bar / dark-menu plumbing. The four
-  GDI text helpers at the bottom exist *only* for the settings dialog, and go away with it.
+  tracks it: documented, no registry poking) — and the dark title-bar / dark-menu plumbing.
 - `decode_pool.rs` — off-thread worker pool (no async runtime).
 - `folder.rs` — sibling-image cursor behind ←/→ navigation + the status-bar count; pure scan/
   sort/cursor logic (no Win32, unit-tested), scanned off-thread and posted back to the frame.
@@ -95,17 +100,11 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   off-thread/`PostMessage`/generation-tagged discipline as the decode pool and folder scan.
 - `config.rs` — the whole persisted settings surface, as TOML in `%APPDATA%\fire\config.toml`;
   missing/invalid → defaults, always `sanitize()`d. Round-trips (`Serialize` + `save()`), because
-  the settings dialog writes it back.
+  the settings window writes it back (`App::apply_settings` decides what applies live vs. next-image
+  vs. next-launch).
 - `keybinds.rs` — the key→`KeyAction` table (pure, unit-tested). *The* source of what a key does:
   `App::handle_key` looks up a `KeyChord`, and the toolbar's tooltips take their "(F)" suffixes from
   the same table, so a rebind relabels its button. Only non-default bindings are persisted.
-- `settings/` — the modal, tabbed settings dialog (`mod.rs` = window + widgets; `model.rs` = pure
-  field accessors + open-with tree edits). **Still a hand-painted Win32 window** — the last of the
-  old UI, and the reason `chrome.rs`'s GDI text helpers still exist. It is being replaced by an ImGui
-  modal; don't invest in it. **It never holds an `&mut App`**: its nested message pump re-enters the
-  main wndproc, so it edits a cloned `Config` and posts it back via `WM_APP_SETTINGS_APPLY` (see
-  `App::apply_settings` for what applies live vs. next-image vs. next-launch). `model.rs` is pure and
-  survives the port unchanged.
 - `forward.rs` / `ipc_server.rs` / `foreground.rs` — SingleInstance pipe client / server / foreground raise.
 - `build.rs` — precompiles `render/shader.hlsl` to DXBC via `fxc` (embedded with `include_bytes!`) and
   embeds the `.ico` + product metadata via `winresource`.
@@ -128,8 +127,11 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   migration was most at risk of breaking, because ImGui's natural mode is to redraw forever. A frame
   is drawn only when something happened. `App::request_frames(n)` asks for the *one or two* extra
   frames ImGui needs to settle a hover or a click, and the count **terminates** — at zero, `WM_PAINT`
-  stops requesting itself. Never add an unconditional repaint or a free-running timer; the current
-  cost is 0.16% of a core idle (the file watcher, not ImGui) and it must stay there.
+  stops requesting itself. Never add an unconditional repaint or a free-running timer; the measured
+  cost is 0.00% of a core idle and it must stay there. The one timer that repaints with no input
+  behind it is the **caret blink** (`App::sync_caret_timer`), and it is armed *only* while
+  `io.want_text_input` — i.e. while a settings text field is actually being edited — and killed the
+  instant focus leaves.
 - **Two render-target views of one backbuffer, and they are not interchangeable.** The image shader
   emits *linear* light and writes through the `*_SRGB` view; ImGui's colors are *already* sRGB and
   must write through the plain `UNORM` view. Drawing ImGui through the sRGB view encodes twice and
@@ -140,12 +142,13 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   results to the UI thread *only* via `PostMessage(frame, WM_APP_*)` with a boxed payload in LPARAM;
   the wndproc reclaims the box. Keep this discipline for any new background work.
 - **Nothing that pumps messages may be entered from `WM_PAINT`, or under a live `&mut App`.** The UI
-  is built during the paint, so a click on "Open in…" or "»" is *discovered* mid-paint — but
-  `TrackPopupMenu` runs a nested modal loop that re-enters the wndproc, which would both recurse into
-  an unvalidated paint and take a second `&mut App`. So the menu is recorded and posted
-  (`WM_APP_OPEN_MENU`), and opens once the paint has finished. Same reason the settings dialog is
-  reached via `WM_APP_OPEN_SETTINGS` and never called inline. Any future modal (a file picker, a
-  message box) obeys the same rule.
+  is built during the paint, so a click on "Open in…", "»", or the settings window's "Browse…" is
+  *discovered* mid-paint — but `TrackPopupMenu` and `GetOpenFileNameW` run nested modal loops that
+  re-enter the wndproc, which would both recurse into an unvalidated paint and take a second
+  `&mut App`. So each is recorded and posted (`WM_APP_OPEN_MENU`, `WM_APP_SETTINGS_BROWSE`) and runs
+  once the paint has finished. Any future *Win32* modal obeys the same rule. **ImGui modals do not**,
+  and that is the point of them: the settings window is drawn inside the frame we were already
+  painting, so it pumps nothing and borrows nothing — its state just lives in `App`.
 - **Stale-drop by generation.** Each decode job carries the window's monotonic `generation`; a result
   is uploaded only if it's still current, so a slow decode can't clobber a newer open.
 - **`panic = "unwind"` must stay** (see the comment in root `Cargo.toml`). Every C/C++ FFI call
@@ -168,13 +171,17 @@ Under active construction; see `TODO.md` and architecture.md §14 for the v1-vs-
 core viewer (window, threaded decode, GPU viewport, pan/zoom/fit, channel isolation, HDR
 exposure/tonemap, DPI/dark chrome, folder ←/→ navigation) is in place, as is the Inno Setup
 installer with per-format Explorer associations (`installer/`, `scripts/build-installer.ps1`), and
-the settings dialog (General / Flipbook / Keybinds / Context menu).
+the settings window (General / Flipbook / Keybinds / Context menu).
 
-**The UI is mid-migration from hand-painted GDI to Dear ImGui.** Done: the single-window collapse,
-the toolbar, status bar, flipbook transport, hint chip, tooltips and the empty-state hint — all ImGui
-now, with the GDI paint/hit-test/hover/focus layer deleted. **Not yet:** the *settings dialog* is
-still a hand-painted Win32 window, and the *two popup menus* (open-with, overflow) are still
-`TrackPopupMenu` — which is why `chrome::apply_dark_menus`, the one undocumented API left in the
-codebase (uxtheme ordinals 133/135/136), is still here. Both are on the way out; don't build on them.
+**The UI is almost entirely Dear ImGui.** Done: the single-window collapse, the toolbar, status bar,
+flipbook transport, hint chip, tooltips, the empty-state hint, and the **settings window** — with the
+GDI paint/hit-test/hover/focus layer and the hand-painted Win32 dialog both deleted. **Not yet:** the
+*two popup menus* (open-with, overflow) are still `TrackPopupMenu`, which is why
+`chrome::apply_dark_menus` — the one undocumented API left in the codebase (uxtheme ordinals
+133/135/136) — is still here. It is on the way out; don't build on it.
+
+The settings window is deliberately **unstyled**: it runs on ImGui's stock look while the chrome runs
+on fire's theme. That is a decision, not an oversight (see `ui/settings`), and the style pass is still
+to come.
 
 In progress: pixel inspector, clipboard.

@@ -10,13 +10,16 @@
 //! `TrackPopupMenu` for now, so this module only reports where to anchor them. They become ImGui
 //! popups in a later phase, which is what finally retires the undocumented uxtheme ordinals.
 
+pub mod settings;
 pub mod theme;
 
 use dear_imgui_rs::{Condition, StyleColor, TextureId, Ui, WindowFlags};
 
 use crate::chrome::{Action, ViewSnapshot};
+use crate::config::Config;
 use crate::icons::Icon;
 use crate::flipbook::Grid;
+use crate::render::imgui::StockStyle;
 use crate::transport::{TransportEdit, TransportSnapshot};
 use theme::Metrics;
 
@@ -57,6 +60,13 @@ pub struct Frame {
     /// The flipbook hint chip: enter flipbook mode / never ask again for this image.
     pub chip_accept: bool,
     pub chip_dismiss: bool,
+    /// The settings window committed (OK or Apply): the edited config, for `App::apply_settings`.
+    pub settings_apply: Option<Config>,
+    /// The settings window closed (OK, Cancel, Esc, or the title bar's ×).
+    pub settings_close: bool,
+    /// The settings window's "Browse…": the shell runs the common file dialog, which pumps its own
+    /// modal loop and so must not be entered from inside `WM_PAINT`.
+    pub settings_browse: bool,
 }
 
 /// Left-docked slots, in order, each with the overflow priority the GDI chrome used: navigation is
@@ -109,6 +119,8 @@ pub fn build(
     snap: &ViewSnapshot,
     transport: Option<&TransportSnapshot>,
     chip: Option<Grid>,
+    settings: Option<&mut settings::State>,
+    stock: StockStyle,
     m: &Metrics,
     icon_px: f32,
     dark: bool,
@@ -135,6 +147,12 @@ pub fn build(
     // the shell still sees the double-click that opens the file picker.
     if !snap.has_image && !snap.loading {
         empty_hint(ui, image);
+    }
+
+    // Last, so it lands on top of the chrome — and outside any window, which is where popups live.
+    // It brings its own style (stock ImGui, not fire's chrome theme).
+    if let Some(st) = settings {
+        settings::build(ui, st, stock, client, m.scale, &mut out);
     }
 
     out
@@ -408,8 +426,8 @@ fn button(
         && enabled
 }
 
-/// Black or white, whichever stays readable on the accent. Mirrors `chrome::on_accent`, but in
-/// linear-ish float space (ImGui colors), not COLORREF.
+/// Black or white, whichever stays readable on the accent — a user with a pale yellow accent must not
+/// get white-on-yellow.
 fn on_accent(c: [f32; 4]) -> [f32; 4] {
     let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
     if l > 0.59 {

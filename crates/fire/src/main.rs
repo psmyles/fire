@@ -24,7 +24,6 @@ mod ipc_server;
 mod keybinds;
 mod product;
 mod render;
-mod settings;
 mod transport;
 mod ui;
 mod watcher;

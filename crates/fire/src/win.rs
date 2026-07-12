@@ -68,11 +68,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SW_FORCEMINIMIZE,
     SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN,
-    WINDOWPLACEMENT, WM_APP, WM_CLOSE, WM_DESTROY,
+    WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
     WM_DWMCOLORIZATIONCOLORCHANGED, WM_DPICHANGED, WM_DROPFILES, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
     WPF_RESTORETOMAXIMIZED, WS_OVERLAPPEDWINDOW,
 };
 
@@ -120,13 +120,12 @@ pub const WM_APP_FILE_CHANGED: u32 = WM_APP + 4;
 /// A finished flipbook auto-detection from a worker, posted *after* its `WM_APP_DECODE_DONE` so the
 /// per-pixel scan never delays the image. LPARAM is `Box<FlipbookGuess>`.
 pub const WM_APP_FLIPBOOK_GUESS: u32 = WM_APP + 6;
-/// OK / Apply in the settings dialog: LPARAM is `Box<Config>`, the edited settings. Posted (never
-/// sent) so the frame adopts them under its own `&mut App` rather than the dialog holding one across
-/// its modal loop — see [`crate::settings`].
-pub const WM_APP_SETTINGS_APPLY: u32 = WM_APP + 7;
 /// "Settings…" was chosen from the right-click menu. Posted rather than opened inline because that
-/// menu is tracked from inside an `&mut App` borrow, which the dialog's nested loop must not overlap.
+/// menu is tracked inside `TrackPopupMenu`'s nested pump, which re-enters this wndproc.
 pub const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 8;
+/// The settings window's "Browse…" button. Posted, not called: `GetOpenFileNameW` pumps its own
+/// modal loop, and the click that asked for it was discovered *during* `WM_PAINT`.
+pub const WM_APP_SETTINGS_BROWSE: u32 = WM_APP + 10;
 
 /// Open the popup menu the UI asked for this frame. Posted (not called) so `TrackPopupMenu`'s
 /// nested modal pump runs *after* `WM_PAINT` has completed — see [`App::apply_ui`].
@@ -151,6 +150,13 @@ const ANIM_TIMER_ID: usize = 2;
 /// Timer id for flipbook playback on the frame window (distinct from the tooltip / GIF timers).
 /// Paused/disabled kills it, so an idle flipbook costs nothing.
 const FLIPBOOK_TIMER_ID: usize = 3;
+
+/// Timer id for the text caret's blink, armed only while a text field is being edited (in practice,
+/// only in the settings window) — see [`App::sync_caret_timer`].
+const CARET_TIMER_ID: usize = 4;
+/// Caret blink tick. ImGui blinks on a wall-clock schedule; this only has to be frequent enough that
+/// the phase changes look continuous.
+const CARET_BLINK_MS: u32 = 33;
 
 /// Timer tick used while crossfading (blend on): a fixed ~60 Hz so the fractional position (and its
 /// crossfade) advances smoothly. Blend off ticks at the frame rate instead (one texture step).
@@ -237,6 +243,12 @@ struct App {
     flipbook_last_tick: Option<Instant>,
     /// A popup menu the UI asked for, deferred out of `WM_PAINT` (see [`App::apply_ui`]).
     pending_menu: Option<PendingMenu>,
+    /// The settings window, while it is open. It is an ImGui modal drawn inside our own frame, so —
+    /// unlike the Win32 dialog it replaced — it runs no nested message pump and holds no borrow: its
+    /// state simply lives here and is edited during the paint. `None` = closed.
+    settings: Option<crate::ui::settings::State>,
+    /// Whether the caret-blink timer is currently armed (see [`App::sync_caret_timer`]).
+    caret_timer: bool,
 }
 
 /// A Win32 popup menu requested by the UI, waiting for the paint to finish.
@@ -719,13 +731,9 @@ impl App {
             Action::ToggleFullscreen => self.toggle_fullscreen(),
             // Flipbook mode runs its own surface/timer sync + redraw.
             Action::ToggleFlipbook => return self.toggle_flipbook(),
-            // The settings dialog runs a nested modal loop, which re-enters this wndproc and would
-            // take a second `&mut App` while ours is live. Hand it to the message loop, which drops
-            // our borrow first. (Same reason the popup menus are deferred — see `apply_ui`.)
-            Action::OpenSettings => {
-                unsafe { PostMessageW(self.frame as HWND, WM_APP_OPEN_SETTINGS, 0, 0) };
-                return;
-            }
+            // The settings window is an ImGui modal drawn in our own frame — no nested pump, no
+            // second `&mut App` — so switching it on is just setting state.
+            Action::OpenSettings => return self.open_settings(),
             // These are reported as menu anchors, not actions; they never reach here.
             Action::OpenWithMenu | Action::Overflow => return,
         }
@@ -966,15 +974,91 @@ impl App {
         }
     }
 
-    /// Open the settings dialog. Takes the config *by clone* and re-enters through
-    /// [`WM_APP_SETTINGS_APPLY`], because the dialog runs a nested message pump that re-enters this
-    /// wndproc — so it must not be called while an `&mut App` borrow is alive. Every caller
-    /// therefore reaches it via a `PostMessage`, never inline from a click handler.
+    /// Open the settings window: seed it from the live config and let the next paint draw it.
+    ///
+    /// This used to be a nested `GetMessageW` pump over a second HWND, which is why it had to be
+    /// reached by `PostMessage` and could never be handed an `&mut App`. As an ImGui modal it is just
+    /// state, so it can be switched on from anywhere — including from inside a click handler.
+    /// Re-opening while already open keeps the window that's up (and its unsaved edits).
     fn open_settings(&mut self) {
-        let cfg = self.cfg.clone();
-        let (frame, dark) = (self.frame, self.dark);
-        crate::settings::run_modal(frame, cfg, dark);
+        if self.settings.is_none() {
+            self.settings = Some(crate::ui::settings::State::new(&self.cfg));
+        }
         self.redraw();
+    }
+
+    /// Whether a keybind row is armed and waiting for a key press.
+    fn settings_capturing(&self) -> bool {
+        self.settings.as_ref().is_some_and(|s| s.capturing())
+    }
+
+    /// Feed a raw virtual key to the armed keybind row. The modifier state is read live here, since
+    /// the settings module is pure UI and never touches Win32.
+    fn settings_capture(&mut self, vk: u32) {
+        if let Some(s) = &mut self.settings {
+            s.capture_key(
+                vk,
+                key_down(VK_CONTROL),
+                key_down(VK_MENU),
+                key_down(VK_SHIFT),
+            );
+        }
+    }
+
+    /// The settings window's two shell-level keys: **Esc** cancels (discarding the draft), **Enter**
+    /// commits and closes, exactly as the Win32 dialog did. Everything else the window needs, ImGui
+    /// already routed.
+    fn settings_key(&mut self, vk: u32) {
+        const VK_RETURN: u32 = 0x0D;
+        const VK_ESCAPE: u32 = 0x1B;
+        match vk {
+            VK_ESCAPE => {
+                self.settings = None;
+                self.redraw();
+            }
+            VK_RETURN => {
+                if let Some(cfg) = self.settings.as_mut().map(|s| s.commit()) {
+                    self.apply_settings(cfg);
+                }
+                self.settings = None;
+                self.redraw();
+            }
+            _ => {}
+        }
+    }
+
+    /// The settings window's "Browse…" — the common file dialog, filtered to executables. Deferred
+    /// out of `WM_PAINT` (it pumps its own modal loop) via [`WM_APP_SETTINGS_BROWSE`], exactly like
+    /// the popup menus.
+    fn settings_browse(&mut self) {
+        let Some(path) = browse_for_program(self.frame as HWND) else {
+            return;
+        };
+        if let Some(s) = &mut self.settings {
+            s.set_program(&path.to_string_lossy());
+        }
+        self.redraw();
+    }
+
+    /// Arm or disarm the caret-blink timer.
+    ///
+    /// The one thing in fire that needs a repaint with no input behind it: a text caret has to blink
+    /// on its own. It is armed *only* while a field is being edited (i.e. essentially only in the
+    /// settings window) and killed the moment focus leaves — otherwise it would be exactly the
+    /// free-running timer the event-driven-render invariant forbids.
+    fn sync_caret_timer(&mut self) {
+        let want = self.imgui.wants_text_input();
+        if want == self.caret_timer {
+            return;
+        }
+        self.caret_timer = want;
+        unsafe {
+            if want {
+                SetTimer(self.frame as HWND, CARET_TIMER_ID, CARET_BLINK_MS, None);
+            } else {
+                KillTimer(self.frame as HWND, CARET_TIMER_ID);
+            }
+        }
     }
 
     /// Adopt the settings the dialog committed (OK / Apply): push each field wherever it lives, then
@@ -1227,7 +1311,11 @@ impl App {
         let dark = self.dark;
         let fullscreen = self.fullscreen;
         let icon_px = self.imgui.icon_px();
+        let stock = self.imgui.stock_style(dark);
 
+        // The settings state is *edited* by the UI, so it has to go in by `&mut`. Move it out for the
+        // duration rather than borrow a field of `self` across `self.imgui.frame(…)`.
+        let mut settings = self.settings.take();
         let frame = self.imgui.frame(|ui, tex| {
             crate::ui::build(
                 ui,
@@ -1235,6 +1323,8 @@ impl App {
                 &snap,
                 transport.as_ref(),
                 chip,
+                settings.as_mut(),
+                stock,
                 &metrics,
                 icon_px,
                 dark,
@@ -1243,8 +1333,10 @@ impl App {
                 fullscreen,
             )
         });
+        self.settings = settings;
 
         self.surface.present();
+        self.sync_caret_timer();
         self.apply_ui(frame);
     }
 
@@ -1282,6 +1374,20 @@ impl App {
                 items: frame.overflow,
             });
             unsafe { PostMessageW(self.frame as HWND, WM_APP_OPEN_MENU, 0, 0) };
+        }
+
+        // The settings window. Apply *before* close, so OK (which does both) commits.
+        if let Some(cfg) = frame.settings_apply {
+            self.apply_settings(cfg);
+        }
+        if frame.settings_close {
+            self.settings = None;
+            self.redraw();
+        }
+        // "Browse…" opens the common file dialog, which — like the popup menus — pumps its own modal
+        // loop and so must not be entered from inside this paint.
+        if frame.settings_browse {
+            unsafe { PostMessageW(self.frame as HWND, WM_APP_SETTINGS_BROWSE, 0, 0) };
         }
     }
 
@@ -1421,6 +1527,8 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             flipbook: HashMap::new(),
             flipbook_last_tick: None,
             pending_menu: None,
+            settings: None,
+            caret_timer: false,
         });
 
         // Open the launch path immediately (decode is async; the image swaps in via
@@ -1509,6 +1617,17 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
     // mine". Gating on the return value instead would let a click on a toolbar button *also* pan the
     // image underneath it.
     if msg != WM_PAINT {
+        let key_msg = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+
+        // A keybind row on the settings tab is armed: this press *is* the binding. Take it before
+        // ImGui sees it — Esc has to reach the capture (where it cancels), and ImGui would read it
+        // as "close the modal" instead.
+        if key_msg && app.settings_capturing() {
+            app.settings_capture(wparam as u32);
+            app.request_frames(2);
+            return 0;
+        }
+
         if app.imgui.wnd_proc(hwnd as isize, msg, wparam, lparam) {
             return 0;
         }
@@ -1524,10 +1643,12 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 | WM_MBUTTONDOWN
                 | WM_MOUSEWHEEL
         );
-        let key_msg = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+        // WM_CHAR and the key-ups matter for the settle frames even though nothing below dispatches
+        // them: without WM_CHAR, typing into a text field wouldn't repaint it.
+        let input_msg = key_msg || matches!(msg, WM_CHAR | WM_KEYUP | WM_SYSKEYUP);
 
         // Any input can change a hover or an active state, so give ImGui its settle frames.
-        if mouse_msg || key_msg {
+        if mouse_msg || input_msg {
             app.request_frames(2);
         }
 
@@ -1535,6 +1656,20 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         // cursor strays over the chrome — otherwise the drag would stick the moment it crossed the
         // toolbar.
         if mouse_msg && !app.surface.is_mouse_captured() && app.imgui.wants_mouse() {
+            return 0;
+        }
+        // The settings window is modal: while it is up, keys belong to it, not to the viewer — a
+        // stray `F` must not re-fit the image behind it.
+        //
+        // Esc and Enter we handle ourselves. ImGui's nav deliberately does *not* close a modal on
+        // Escape, and a dialog you can't escape is a trap. But while a **text field** is being
+        // edited those two keys are the field's (Esc reverts it, Enter commits it) — ImGui has
+        // already seen them via `wnd_proc` above — so we stay out of the way, and a second press,
+        // once the field has let go, reaches us.
+        if key_msg && app.settings.is_some() {
+            if !app.imgui.wants_text_input() {
+                app.settings_key(wparam as u32);
+            }
             return 0;
         }
         if key_msg && app.imgui.wants_keyboard() {
@@ -1679,6 +1814,8 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             match wparam {
                 ANIM_TIMER_ID => app.tick_animation(),
                 FLIPBOOK_TIMER_ID => app.tick_flipbook(),
+                // The caret is drawn by ImGui, so blinking it is just another frame.
+                CARET_TIMER_ID => app.request_frames(1),
                 _ => {}
             }
             0
@@ -1722,9 +1859,8 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.open_pending_menu();
             0
         }
-        WM_APP_SETTINGS_APPLY => {
-            let cfg = Box::from_raw(lparam as *mut Config);
-            app.apply_settings(*cfg);
+        WM_APP_SETTINGS_BROWSE => {
+            app.settings_browse();
             0
         }
 
@@ -1873,6 +2009,32 @@ fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// The common Open dialog, filtered to executables — the settings window's "Browse…", behind an
+/// open-with entry's program path.
+fn browse_for_program(owner: HWND) -> Option<PathBuf> {
+    let mut filter: Vec<u16> = Vec::new();
+    for s in ["Programs", "*.exe;*.com;*.bat;*.cmd", "All files", "*.*"] {
+        filter.extend(s.encode_utf16());
+        filter.push(0);
+    }
+    filter.push(0);
+
+    let mut buf = vec![0u16; 4096];
+    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = owner;
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = buf.as_mut_ptr();
+    ofn.nMaxFile = buf.len() as u32;
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if unsafe { GetOpenFileNameW(&mut ofn) } == 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(PathBuf::from(String::from_utf16_lossy(&buf[..end])))
 }
 
 /// Recursively append the "Open in…" `entries` to `menu`: a submenu (an entry with children) becomes

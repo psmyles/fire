@@ -366,25 +366,39 @@ for, which the win shell applies.
   mode (`set_image` fits to the current viewport). The launcher's "Run" setting (the shortcut's
   Normal/Minimized/Maximized, read from `STARTUPINFO.wShowWindow`) overrides the show state:
   an explicit Maximized/Minimized wins, otherwise the remembered maximized state is restored.
-- **Settings:** stored as **TOML** in `%APPDATA%\fire\config.toml`, editable directly *and* from
-  the in-app settings dialog (`crate::settings`) — a modal, tabbed, native Win32 window (General /
-  Flipbook / Keybinds / Context menu) with OK/Cancel/Apply. It is custom-drawn for the same reason
-  the toolbar is (no dark mode in the common controls): one HWND, a list of widget rects, and the
-  chrome's `Palette` + GDI helpers, on a 4px grid with the label column measured per tab. The **one
-  exception** is the open-with detail form's three text boxes, which are real `EDIT` controls —
-  selection, IME, Ctrl+A, the clipboard and the caret are not worth reimplementing. They are
-  borderless (the dialog paints the field frame), themed via `WM_CTLCOLOREDIT` + `DarkMode_CFD`, and
-  subclassed so Tab/Enter/Esc still belong to the dialog.
-  Committing hands the edited `Config` to the frame via `WM_APP_SETTINGS_APPLY` — the dialog runs
-  a nested message pump, so it must never hold the `&mut App` that pump re-enters. Changes apply
-  live where that isn't hostile (watcher, backdrop, zoom/exposure steps, keybinds, menu contents),
-  on the next image where re-fitting under the user would be (open-fit, tonemap, flipbook playback
-  defaults), and on the next launch for `instance-mode`. *Not yet:* hot-reloading `config.toml`
-  when it changes on disk (only the displayed image is watched — §10).
-- **Accent color:** the highlight throughout the app (pressed toolbar buttons, the settings dialog's
-  checkboxes/OK/selection) is the user's **system accent**, read via `GetSysColor(COLOR_HIGHLIGHT)`
-  — which Windows 10/11 set from the accent, so no undocumented API or registry read is needed. The
-  text drawn *on* it flips to black for a pale accent. Re-read on theme/accent change.
+- **Settings:** stored as **TOML** in `%APPDATA%\fire\config.toml`, editable directly *and* from the
+  in-app settings window (`crate::ui::settings`) — a tabbed ImGui `BeginPopupModal` (General /
+  Flipbook / Keybinds / Context menu) with OK/Cancel/Apply.
+
+  It is drawn **inside the frame we were already painting**, which is the whole difference from the
+  2,150-line hand-painted Win32 dialog it replaced: no second HWND, no nested `GetMessageW` pump, and
+  therefore none of the `&mut App` aliasing that pump forced (the old dialog had to edit a *cloned*
+  `Config` and post it back). The state simply lives in `App`, is edited during the paint, and the
+  shell applies what the frame returns. Scrolling, the tab bar, text input, focus and hit-testing are
+  ImGui's, not ours.
+
+  It deliberately wears **ImGui's stock style**, not fire's chrome theme (`render::imgui::StockStyle`
+  snapshots the factory style at context creation, before `ui::theme` overwrites it, and pushes it for
+  the duration of the window). The chrome is a toolbar — flat, transparent, made to sit over an image;
+  a settings window is a form, and stock ImGui already knows what a form looks like. Only the font
+  (Segoe UI) and the DPI scale carry over, because "stock" must not mean "unreadable at 200%".
+
+  Two things it cannot do itself, and reports to the shell instead: **"Browse…"** (`GetOpenFileNameW`
+  pumps its own modal loop, so it is posted as `WM_APP_SETTINGS_BROWSE` and runs after the paint — §5.2)
+  and **keybind capture** (a chord is a virtual-key code, which only the wndproc sees; while a row is
+  armed the shell routes every key to it, Esc included, or ImGui would read Esc as "close the modal").
+  **Esc/Enter are the shell's too** — ImGui does not close a modal on Escape, and a dialog you cannot
+  escape is a trap.
+
+  Changes apply live where that isn't hostile (watcher, backdrop, zoom/exposure steps, keybinds, menu
+  contents), on the next image where re-fitting under the user would be (open-fit, tonemap, flipbook
+  playback defaults), and on the next launch for `instance-mode`. *Not yet:* hot-reloading
+  `config.toml` when it changes on disk (only the displayed image is watched — §10).
+- **Accent color:** the highlight throughout the **chrome** (pressed toolbar buttons, the latched
+  channel/backdrop keys) is the user's **system accent**, read via `GetSysColor(COLOR_HIGHLIGHT)` —
+  which Windows 10/11 set from the accent, so no undocumented API or registry read is needed. The
+  text drawn *on* it flips to black for a pale accent. Re-read on theme/accent change. The settings
+  window is outside this: it is stock ImGui, blue and all.
 - **Future:** a third mode — compare two images side-by-side in one window, or tabs — is
   anticipated; it reuses the frame/child-view split (one view child per slot).
 
@@ -496,10 +510,10 @@ lifecycle with **foreground activation on the forward path (§4.1)**; GPU (D3D11
 render with channel/alpha/gamma/exposure/tonemap; async worker decode; zune + image + exr +
 psd_sdk + libheif decoders; camera-raw embedded-preview decode; ICC honoring via lcms2;
 tonemap-to-SDR HDR with exposure; downscale-to-fit RAM guard; **DPI-aware, dark-mode-aware
-GDI toolbar + status bar**; open-in-editor + clipboard; association-only Explorer
-integration; unsigned installer.
+ImGui toolbar + status bar + settings window**; open-in-editor + clipboard; association-only
+Explorer integration; unsigned installer.
 
-**In progress / deferred:** pixel inspector, background-color *picker* (the settings dialog ships
+**In progress / deferred:** pixel inspector, background-color *picker* (the settings window ships
 the four preset backdrops; a custom color needs a `Params`/shader change), exposure trackbar;
 compare/tabs mode; Explorer `IThumbnailProvider`; **full raw development** (demosaic the sensor
 mosaic instead of showing the embedded preview — a separate opt-in mode, kept off the fast path);

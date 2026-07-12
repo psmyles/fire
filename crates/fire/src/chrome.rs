@@ -16,12 +16,9 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND, RECT, SIZE};
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
-use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetSysColor,
-    GetTextExtentPoint32W, COLOR_HIGHLIGHT, HDC, HFONT,
-};
+use windows_sys::Win32::Graphics::Gdi::{GetSysColor, COLOR_HIGHLIGHT};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
@@ -225,8 +222,10 @@ impl ViewSnapshot {
 
 // --- palette ----------------------------------------------------------------
 
-/// Light/dark color set. All values are GDI `COLORREF` (`0x00BBGGRR`); [`crate::ui::theme`] converts
-/// them to ImGui's float RGBA, and the settings dialog still uses them directly with GDI.
+/// Light/dark color set for fire's **chrome** (the toolbar, status bar and transport). Values are GDI
+/// `COLORREF` (`0x00BBGGRR`); [`crate::ui::theme`] is the only consumer and converts them to ImGui's
+/// float RGBA. The settings window deliberately does *not* use this — it wears ImGui's stock style
+/// (see [`crate::ui::settings`]).
 #[derive(Clone, Copy)]
 pub(crate) struct Palette {
     pub(crate) toolbar_bg: u32,
@@ -235,7 +234,6 @@ pub(crate) struct Palette {
     pub(crate) text_dim: u32,
     pub(crate) btn_hover: u32,
     pub(crate) btn_active: u32,
-    pub(crate) btn_active_text: u32,
     pub(crate) separator: u32,
     pub(crate) border: u32,
     /// Letterbox / no-image backdrop.
@@ -277,16 +275,6 @@ fn luminance(c: u32) -> f32 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
-/// Text drawn *on* the accent (a latched toolbar button, the OK button, a selected list row). A user
-/// with a pale yellow accent must not get white-on-yellow.
-fn on_accent(accent: u32) -> u32 {
-    if luminance(accent) > 150.0 {
-        rgb(0, 0, 0)
-    } else {
-        rgb(255, 255, 255)
-    }
-}
-
 impl Palette {
     pub(crate) fn for_mode(dark: bool) -> Self {
         let accent = system_accent();
@@ -298,7 +286,6 @@ impl Palette {
                 text_dim: rgb(140, 140, 140),
                 btn_hover: rgb(60, 60, 60),
                 btn_active: accent,
-                btn_active_text: on_accent(accent),
                 separator: rgb(60, 60, 60),
                 border: rgb(70, 70, 70),
                 view_clear: rgb(0, 0, 0),
@@ -311,7 +298,6 @@ impl Palette {
                 text_dim: rgb(110, 110, 110),
                 btn_hover: rgb(214, 214, 214),
                 btn_active: accent,
-                btn_active_text: on_accent(accent),
                 separator: rgb(200, 200, 200),
                 border: rgb(170, 170, 170),
                 view_clear: rgb(150, 150, 150),
@@ -415,55 +401,6 @@ pub fn apply_dark_menus(hwnd: HWND, dark: bool) {
         }
         // Deliberately no FreeLibrary: uxtheme is already loaded process-wide and stays resident.
     }
-}
-
-// --- GDI helpers (settings dialog only) -------------------------------------
-
-pub(crate) fn create_ui_font(dpi: u32) -> HFONT {
-    // 9pt at the window's DPI; negative height = character height (excludes leading).
-    let height = -(9 * dpi as i32 / 72);
-    let face = wide("Segoe UI");
-    unsafe {
-        CreateFontW(
-            height,
-            0,
-            0,
-            0,
-            400, // FW_NORMAL
-            0,
-            0,
-            0, // italic / underline / strikeout
-            1, // DEFAULT_CHARSET
-            0, // OUT_DEFAULT_PRECIS
-            0, // CLIP_DEFAULT_PRECIS
-            5, // CLEARTYPE_QUALITY
-            0, // DEFAULT_PITCH | FF_DONTCARE
-            face.as_ptr(),
-        )
-    }
-}
-
-/// Fill a rect with a solid color (creates and frees a one-shot brush).
-pub(crate) fn fill(hdc: HDC, rect: &RECT, color: u32) {
-    unsafe {
-        let brush = CreateSolidBrush(color);
-        FillRect(hdc, rect, brush);
-        DeleteObject(brush);
-    }
-}
-
-/// Draw a string into `rect` with the given DrawText flags.
-pub(crate) fn draw_text(hdc: HDC, s: &str, rect: &mut RECT, fmt: u32) {
-    let w = wide(s);
-    unsafe { DrawTextW(hdc, w.as_ptr(), -1, rect, fmt) };
-}
-
-/// Width in px of `s` using the currently-selected font.
-pub(crate) fn text_width(hdc: HDC, s: &str) -> i32 {
-    let w: Vec<u16> = s.encode_utf16().collect();
-    let mut sz = SIZE { cx: 0, cy: 0 };
-    unsafe { GetTextExtentPoint32W(hdc, w.as_ptr(), w.len() as i32, &mut sz) };
-    sz.cx
 }
 
 fn wide(s: &str) -> Vec<u16> {

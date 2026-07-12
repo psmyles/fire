@@ -22,6 +22,7 @@
 use std::ffi::c_void;
 
 use dear_imgui_rs::{Context, FontSource, TextureId, Ui};
+use dear_imgui_sys as sys;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
@@ -59,6 +60,57 @@ pub struct Imgui {
     icon_srv: Option<ID3D11ShaderResourceView>,
     icon_id: TextureId,
     dpi: u32,
+    /// ImGui's factory style, captured at creation *before* [`crate::ui::theme`] overwrites it.
+    /// The settings window is drawn with this — see [`StockStyle`].
+    stock: sys::ImGuiStyle,
+}
+
+/// ImGui's stock style — what the library ships with, before fire's chrome theme.
+///
+/// The settings window wears this deliberately. The chrome is a *toolbar*: flat, transparent, tuned
+/// to sit over an image. A settings window is a *form*, and stock ImGui already knows what a form
+/// looks like. Two things are carried over from the live style, because "stock" must not mean
+/// "wrong": the **font** (Segoe UI, registered once globally) and the **DPI scale** — an unscaled
+/// dialog on a 200% monitor is a bug, not a default.
+#[derive(Clone, Copy)]
+pub struct StockStyle(sys::ImGuiStyle);
+
+impl StockStyle {
+    /// Install it until the guard drops.
+    ///
+    /// Assigning `ImGuiStyle` mid-frame is exactly how ImGui implements `PushStyleVar` itself: the
+    /// struct is a POD, read at widget-submission time, so windows built before and after the guard
+    /// are untouched.
+    #[must_use]
+    pub fn push(self) -> StyleGuard {
+        // SAFETY: one context, made current at creation; we are inside a frame.
+        unsafe {
+            let live = sys::igGetStyle();
+            let saved = *live;
+            *live = self.0;
+            StyleGuard(saved)
+        }
+    }
+}
+
+/// Restores the style [`StockStyle::push`] replaced.
+pub struct StyleGuard(sys::ImGuiStyle);
+
+impl Drop for StyleGuard {
+    fn drop(&mut self) {
+        unsafe { *sys::igGetStyle() = self.0 };
+    }
+}
+
+/// Center the next window on the client, the first time it appears. `Appearing`, not `Always`, so
+/// the user can drag it somewhere else and it stays there.
+pub fn center_next_window(client: (f32, f32)) {
+    let center = sys::ImVec2_c {
+        x: client.0 * 0.5,
+        y: client.1 * 0.5,
+    };
+    let pivot = sys::ImVec2_c { x: 0.5, y: 0.5 };
+    unsafe { sys::igSetNextWindowPos(center, sys::ImGuiCond_Appearing as sys::ImGuiCond, pivot) };
 }
 
 impl Imgui {
@@ -87,15 +139,45 @@ impl Imgui {
             );
         }
 
+        // Snapshot the factory style *now*, before `ui::theme::apply` runs over it — this is the
+        // only moment it exists. SAFETY: `Context::create` made this context current.
+        let stock = unsafe { *sys::igGetStyle() };
+
         let mut me = Imgui {
             ctx,
             _icon_tex: None,
             icon_srv: None,
             icon_id: TextureId::new(0),
             dpi: 0,
+            stock,
         };
         me.set_dpi(device, dpi);
         me
+    }
+
+    /// ImGui's stock style, scaled for `dpi` and themed light/dark, ready to [`StockStyle::push`].
+    ///
+    /// Composed per call rather than cached: it is a ~1 KB POD copy plus two library calls, against
+    /// a frame that is only drawn when something happened. Caching it would mean invalidating it on
+    /// DPI *and* theme changes, which is more state than it saves.
+    pub fn stock_style(&self, dark: bool) -> StockStyle {
+        let mut s = self.stock;
+        // Stock geometry, scaled to the monitor.
+        unsafe { sys::ImGuiStyle_ScaleAllSizes(&mut s, self.dpi as f32 / 96.0) };
+        unsafe {
+            if dark {
+                sys::igStyleColorsDark(&mut s);
+            } else {
+                sys::igStyleColorsLight(&mut s);
+            }
+        }
+        // The font is ours (Segoe UI); its size and DPI scale come from the live style so the
+        // settings window renders text exactly like the rest of the app.
+        let live = self.ctx.style();
+        s.FontSizeBase = live.font_size_base();
+        s.FontScaleMain = live.font_scale_main();
+        s.FontScaleDpi = live.font_scale_dpi();
+        StockStyle(s)
     }
 
     /// Physical icon edge for the current DPI.
@@ -187,9 +269,16 @@ impl Imgui {
         self.ctx.io_mut().want_capture_mouse()
     }
 
-    /// True when a text field has focus, so keys are typing rather than driving the viewer.
+    /// True when ImGui wants the keys — a focused text field, or an open popup.
     pub fn wants_keyboard(&mut self) -> bool {
         self.ctx.io_mut().want_capture_keyboard()
+    }
+
+    /// True while a text field is being edited. The *only* thing in fire that needs a repaint with
+    /// no input behind it (the caret blink), so the shell arms a timer on it — and kills it the
+    /// moment this goes false, or an idle window would stop being free.
+    pub fn wants_text_input(&mut self) -> bool {
+        self.ctx.io_mut().want_text_input()
     }
 
     /// Build and render one UI frame into whatever RTV is currently bound. The caller binds the
