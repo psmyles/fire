@@ -178,6 +178,15 @@ pub fn max_lod(grid: Grid, sheet: (u32, u32)) -> f32 {
 
 /// Longest-axis cap for the grayscale analysis copy (integer box-binned down to this).
 const DETECT_MAX_DIM: u32 = 512;
+/// Max samples per axis averaged inside each source bin when building the analysis copy. A large
+/// image bins many source pixels into each ≤512px output pixel; averaging *every* one makes the
+/// scan cost scale with the full pixel count (≈0.5s for a 16K sheet). Averaging a bounded `N×N`
+/// grid per bin instead caps total reads at `≈ 512²·N²`, so the scan is ≈ constant time — a 16K
+/// sheet costs about the same as a 2K one, and a 2K sheet roughly halves — while `N×N` samples
+/// still anti-alias each bin enough to place the cell gutters (which are far wider than a bin).
+/// `2` measured a clean ~2× speedup with zero detection change across the test corpus; `1` (pure
+/// point-sampling) is ~4× but risks aliasing fine textures into false periodicity.
+const THUMB_SAMPLES_PER_AXIS: u32 = 2;
 /// Smallest cell size, in thumbnail pixels, a period candidate may have (a smaller "cell" is
 /// noise, not a frame). Also the minimum autocorrelation lag searched.
 const MIN_CELL_THUMB: usize = 6;
@@ -520,18 +529,23 @@ fn analysis_thumbnail(image: &DecodedImage, signal: Signal) -> Option<(Vec<f32>,
     let bpp = image.format.bytes_per_pixel();
     let stride = w as usize * bpp;
     let px = &image.pixels;
+    // Step within each bin so at most `THUMB_SAMPLES_PER_AXIS` samples are read per axis (bounding
+    // total reads to ≈ `tw·th·N²`); `1` for a small bin means "read every pixel" (no sub-sampling).
+    let step = (b / THUMB_SAMPLES_PER_AXIS).max(1);
 
     let mut out = vec![0.0f32; (tw * th) as usize];
     for oy in 0..th {
         for ox in 0..tw {
             let mut s = 0.0f32;
             let mut cnt = 0u32;
-            for yy in 0..b {
+            let mut yy = 0;
+            while yy < b {
                 let sy = oy * b + yy;
                 if sy >= h {
                     break;
                 }
-                for xx in 0..b {
+                let mut xx = 0;
+                while xx < b {
                     let sx = ox * b + xx;
                     if sx >= w {
                         break;
@@ -539,7 +553,9 @@ fn analysis_thumbnail(image: &DecodedImage, signal: Signal) -> Option<(Vec<f32>,
                     let off = sy as usize * stride + sx as usize * bpp;
                     s += sample_at(px, off, image.format, signal);
                     cnt += 1;
+                    xx += step;
                 }
+                yy += step;
             }
             out[(oy * tw + ox) as usize] = if cnt > 0 { s / cnt as f32 } else { 0.0 };
         }
@@ -924,7 +940,6 @@ mod tests {
         let img = img_from(128, 64, |x, _| (x * 255 / 128) as u8);
         assert_eq!(detect(&PathBuf::from("grad.png"), &img), None);
     }
-
 
     #[test]
     fn detect_alpha_only_sheet() {

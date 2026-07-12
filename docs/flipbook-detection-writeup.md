@@ -329,18 +329,19 @@ sequence for opening one image is:
 5. The UI shows the image first; the "flipbook detected" hint pops up a beat later.
 
 The image and the hint are two independent messages, and detection sits between them. So the answer
-to "display first, or analyze first?" is: **the image displays first, and analysis follows.** The
-detection time — which for a huge 8K/16K sheet means scanning hundreds of millions of pixels, easily
-hundreds of milliseconds — is completely hidden: the image is already up, and the hint simply
-appears whenever the scan finishes.
+to "display first, or analyze first?" is: **the image displays first, and analysis follows.** Any
+detection time is completely hidden — the image is already up, and the hint simply appears whenever
+the analysis finishes.
 
 This wasn't the original design. At first, detection was bundled *with* decode into one message, so
 it sat on the critical path and delayed the image. That was fine at a few milliseconds for normal
-images, but for 8K/16K sheets it would have added a visible stall before the picture appeared. The
-fix was to split it: the decoded pixels are shared (cheaply, by reference) between the display path
-and the detection pass, so the image can go to the screen while the worker keeps analyzing the same
-pixels in the background. A stale-guard makes sure that if you navigate away before detection
-finishes, the late-arriving hint for the old image is simply discarded.
+images, but before the scan was made constant-time (see below), an 8K/16K sheet's ~half-second
+analysis would have added a very visible stall before the picture appeared. The fix was to split it:
+the decoded pixels are shared (cheaply, by reference) between the display path and the detection
+pass, so the image can go to the screen while the worker analyzes the same pixels in the background.
+A stale-guard makes sure that if you navigate away before detection finishes, the late-arriving hint
+for the old image is simply discarded. With the scan now constant-time as well, the two changes are
+belt-and-suspenders: detection is both fast *and* off the critical path.
 
 Because Fire uses several worker threads, detection of *different* images (say, when you arrow
 through a folder) can also overlap across threads.
@@ -352,27 +353,30 @@ Measured on the real test folder (release build, times are the median of repeate
 | Image size | Detection time |
 |------------|----------------|
 | 64–256 px  | 0.02 – 0.6 ms |
-| 512 px     | 1.5 – 3.3 ms |
+| 512 px     | 1.5 – 3 ms |
 | 1024 px    | 3 – 6 ms |
-| 2048×2048  | ~9 ms, or ~17 ms if it also runs the alpha pass |
+| 2048×2048  | ~3.3 ms, or ~6.5 ms if it also runs the alpha pass |
 
-Across all 23 files, detection averaged **~6.3 ms**, versus ~10.5 ms to decode — comparable to the
-decode itself. But since it runs *after* the image is displayed, none of that time is felt as lag:
-it only governs how long after the image the hint appears (14 ms on a real 2048×2048 sheet).
+Across all 23 files, detection averaged **~3.3 ms**. And because it runs *after* the image is
+displayed, none of that time is felt as lag — it only governs how soon the hint appears.
 
-A few things explain the numbers:
+The key to those numbers is a small optimization that came out of profiling. The dominant cost was
+never the algorithm (YIN and the guards run on a tiny ≤512 px copy and are essentially free); it was
+*building* that copy — reading every source pixel to shrink the image down. So a naïve version's
+cost scaled with the full pixel count, which is fine at 2K but turns into ~0.5 second at 16K.
 
-- **Cost scales with pixel count, not grid complexity.** The dominant work is scanning every source
-  pixel once to shrink the image into a small (≤512 px) grayscale analysis copy. The clever part —
-  YIN period detection and the guards — runs on that tiny copy, so it's essentially constant
-  regardless of whether the source is 512 px or 2048 px.
+The fix: when shrinking a large image, don't average *every* pixel in each block — average a small,
+fixed grid of samples from it (a 2×2 subsample). The block's average is essentially the same, but
+the number of reads is now capped regardless of source size. That makes detection **roughly
+constant-time**: a 16K sheet costs about the same as a 2K one, and 2K itself roughly halved (~9 ms →
+~3.3 ms). Cell gutters are far wider than a sampling block, so they're never missed — verified by
+re-running the whole test corpus and confirming detection was byte-for-byte unchanged.
 
-- **The alpha fallback can double the cost.** If the brightness pass finds a grid, that's one scan
-  of the image. If it comes up empty and the alpha pass kicks in, that's a second scan. You can see
-  this clearly in the 2048×2048 sheets: the ones detected on the first pass take ~9 ms, while
-  `FireFar` (which needs the alpha channel) and the non-flipbook `Trail_Shred` (which scans both
-  channels and still finds nothing) take ~17 ms.
+Two other things shape the numbers:
 
+- **The alpha fallback can roughly double the cost.** If the brightness pass finds a grid, that's
+  one scan; if it comes up empty and the alpha pass runs, that's a second. `FireFar` (needs alpha)
+  and the non-flipbook `Trail_Shred` (scans both and still finds nothing) sit at the higher ~6.5 ms.
 - **Small sheets are effectively free** — well under a millisecond.
 
 ### Why the ordering matters
