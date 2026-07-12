@@ -68,6 +68,7 @@ const ICON_STEMS: &[&str] = &[
     "icon_flipbook",
     "icon_play",
     "icon_pause",
+    "icon_check",
     "icon_more",
 ];
 

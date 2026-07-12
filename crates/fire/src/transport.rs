@@ -62,8 +62,8 @@ pub struct TransportSnapshot {
 pub struct Press {
     pub edit: Option<TransportEdit>,
     pub capture: bool,
-    /// True when a slider drag started — the shell pauses playback for the scrub and resumes on
-    /// release (if it was playing).
+    /// True when a slider drag started — grabbing the playhead stops playback (the shell pauses a
+    /// playing flipbook and leaves it parked where the scrub ends).
     pub slider: bool,
 }
 
@@ -73,6 +73,15 @@ const FIELD_PX_PER_UNIT: f64 = 8.0;
 const FPS_PX_PER_UNIT: f64 = 8.0;
 /// A press that releases within this many px (no real drag) enters type-to-edit mode instead.
 const CLICK_SLOP: i32 = 3;
+
+/// Slider metrics (96-dpi logical px, DPI-scaled at layout/paint). The thumb is a grab handle, not
+/// a hairline: half-width `THUMB_HALF_W` and half-height `THUMB_HALF_H` about the track's midline.
+const THUMB_HALF_W: i32 = 5;
+const THUMB_HALF_H: i32 = 8;
+/// Half-thickness of the track groove.
+const TRACK_HALF_H: i32 = 2;
+/// Edge of the blend checkbox's square.
+const CHECK_BOX: i32 = 16;
 
 #[derive(Clone, Copy)]
 enum Drag {
@@ -95,8 +104,12 @@ struct FieldEdit {
 /// Transport band state: the laid-out widget rects, hover, and the active drag / typed edit.
 pub struct Transport {
     rects: Vec<(Widget, RECT)>,
-    /// The slider's draggable track (value ↔ x mapping); a sub-rect of the Slider widget rect.
+    /// The slider's track (the groove the thumb rides); a sub-rect of the Slider widget rect.
     slider_track: RECT,
+    /// The thumb's half-width at the current DPI. The thumb's *centre* travels the track inset by
+    /// this much at each end (so it never hangs off the groove), which is also the value ↔ x
+    /// mapping [`Self::scrub_at`] inverts — kept here so the mapping needs no `Chrome`.
+    thumb_half: i32,
     hover: Option<Widget>,
     drag: Drag,
     editing: Option<FieldEdit>,
@@ -112,6 +125,7 @@ impl Default for Transport {
                 right: 0,
                 bottom: 0,
             },
+            thumb_half: THUMB_HALF_W,
             hover: None,
             drag: Drag::None,
             editing: None,
@@ -164,15 +178,17 @@ impl Transport {
         // Right group (packed right→left): Blend checkbox, then Fps.
         let mut rx = band.right - margin;
         let blend_label_w = text_span("Blend", chrome);
-        let check = m.scale(14);
-        let blend_w = check + m.scale(4) + blend_label_w;
+        let check = m.scale(CHECK_BOX);
+        let blend_w = check + m.scale(6) + blend_label_w;
+        // The box is small, so the checkbox's hit rect spans the band's full height (and its label,
+        // which toggles too) rather than just the box.
         self.rects.push((
             Widget::Blend,
             RECT {
                 left: rx - blend_w,
-                top: cy - fh / 2,
+                top: band.top + 1,
                 right: rx,
-                bottom: cy + fh / 2,
+                bottom: band.bottom,
             },
         ));
         rx -= blend_w + sep;
@@ -187,18 +203,22 @@ impl Transport {
         let track = RECT {
             left: slider_left,
             top: cy - fh / 2,
-            right: readout_left - gap,
+            right: (readout_left - gap).max(slider_left + 1),
             bottom: cy + fh / 2,
         };
         self.slider_track = track;
-        // The Slider widget's hit rect spans the track plus its readout, so a click anywhere seeks.
+        self.thumb_half = m.scale(THUMB_HALF_W);
+        // The thumb is a few px wide but the *target* is the whole band-height strip over the
+        // track (plus a thumb's half-width of slack at each end, so the first/last frame are
+        // reachable without pixel-hunting). The readout is deliberately outside it: clicking the
+        // "37 / 64" text should not seek to the last frame.
         self.rects.push((
             Widget::Slider,
             RECT {
-                left: slider_left,
-                top: track.top,
-                right: rx - gap,
-                bottom: track.bottom,
+                left: (track.left - self.thumb_half).max(band.left),
+                top: band.top + 1,
+                right: track.right + self.thumb_half,
+                bottom: band.bottom,
             },
         ));
     }
@@ -339,16 +359,18 @@ impl Transport {
 
     fn paint_slider(&self, hdc: HDC, chrome: &Chrome, snap: &TransportSnapshot) {
         let p = chrome.palette();
+        let m = &chrome.metrics;
         let t = self.slider_track;
         let mid = (t.top + t.bottom) / 2;
-        // Track line.
+        let groove = m.scale(TRACK_HALF_H).max(1);
+        // The groove, then the played portion over it.
         fill(
             hdc,
             &RECT {
                 left: t.left,
-                top: mid - 1,
+                top: mid - groove,
                 right: t.right,
-                bottom: mid + 1,
+                bottom: mid + groove,
             },
             p.separator,
         );
@@ -358,30 +380,38 @@ impl Transport {
         } else {
             0.0
         };
-        let tw = (t.right - t.left).max(1);
-        let thumb_x = t.left + (frac * tw as f32) as i32;
-        // Filled portion + thumb.
+        let thumb_x = self.thumb_x(frac);
         fill(
             hdc,
             &RECT {
                 left: t.left,
-                top: mid - 1,
+                top: mid - groove,
                 right: thumb_x,
-                bottom: mid + 1,
+                bottom: mid + groove,
             },
             p.btn_active,
         );
-        let th = chrome.metrics.scale(5);
+        // The thumb: a real grab handle, accented while hovered or dragged, with a 1px cutout in
+        // the band color so it reads as a separate object sitting on the groove.
+        let dragging = matches!(self.drag, Drag::Slider);
+        let hw = self.thumb_half;
+        let hh = m.scale(THUMB_HALF_H);
+        let thumb = RECT {
+            left: thumb_x - hw,
+            top: mid - hh,
+            right: thumb_x + hw,
+            bottom: mid + hh,
+        };
         fill(
             hdc,
-            &RECT {
-                left: thumb_x - 1,
-                top: mid - th,
-                right: thumb_x + 2,
-                bottom: mid + th,
+            &thumb,
+            if dragging || self.hover == Some(Widget::Slider) {
+                p.btn_active
+            } else {
+                p.text
             },
-            p.btn_active,
         );
+        outline(hdc, &thumb, p.toolbar_bg);
         // Readout "frame / total" (1-based), fixed width to the right of the track.
         let frame_1 = (snap.frame_pos.floor() as u32 + 1).min(count);
         let text = format!("{frame_1} / {count}");
@@ -402,7 +432,7 @@ impl Transport {
 
     fn paint_blend(&self, hdc: HDC, chrome: &Chrome, r: RECT, on: bool) {
         let p = chrome.palette();
-        let check = chrome.metrics.scale(14);
+        let check = chrome.metrics.scale(CHECK_BOX);
         let cy = (r.top + r.bottom) / 2;
         let box_r = RECT {
             left: r.left,
@@ -422,34 +452,21 @@ impl Transport {
                 p.status_bg
             },
         );
-        outline(hdc, &box_r, p.separator);
+        outline(hdc, &box_r, if on { p.btn_active } else { p.separator });
         if on {
-            // A simple check mark: two strokes.
-            let x0 = box_r.left + check / 4;
-            let ym = cy;
-            fill(
+            // The tick comes from the same anti-aliased icon pipeline as the toolbar glyphs; the
+            // mask is transparent outside the stroke, so drawing it at the icon size (larger than
+            // the box) still only marks pixels inside.
+            chrome.icons().draw(
                 hdc,
-                &RECT {
-                    left: x0,
-                    top: ym,
-                    right: x0 + check / 4,
-                    bottom: ym + 2,
-                },
-                p.btn_active_text,
-            );
-            fill(
-                hdc,
-                &RECT {
-                    left: x0 + check / 4,
-                    top: ym - check / 3,
-                    right: box_r.right - 2,
-                    bottom: ym + 2,
-                },
+                Icon::Check,
+                (box_r.left + box_r.right) / 2,
+                cy,
                 p.btn_active_text,
             );
         }
         let mut lr = RECT {
-            left: box_r.right + chrome.metrics.scale(4),
+            left: box_r.right + chrome.metrics.scale(6),
             top: r.top,
             right: r.right,
             bottom: r.bottom,
@@ -582,10 +599,8 @@ impl Transport {
         }
     }
 
-    /// End a drag. If a field press never moved beyond the slop, enter type-to-edit mode. Returns
-    /// whether the ended drag was the slider (so the shell can resume playback).
-    pub fn release(&mut self) -> bool {
-        let was_slider = matches!(self.drag, Drag::Slider);
+    /// End a drag. If a field press never moved beyond the slop, enter type-to-edit mode.
+    pub fn release(&mut self) {
         if let Drag::Field { widget, moved, .. } = self.drag {
             if !moved {
                 self.editing = Some(FieldEdit {
@@ -595,7 +610,6 @@ impl Transport {
             }
         }
         self.drag = Drag::None;
-        was_slider
     }
 
     /// Cancel an in-progress drag without applying anything (e.g. a DPI change mid-drag).
@@ -680,10 +694,23 @@ impl Transport {
         self.editing.take().is_some()
     }
 
-    fn scrub_at(&self, x: i32, snap: &TransportSnapshot) -> TransportEdit {
+    /// The thumb's centre x for a 0..1 position along the track (the inverse of [`Self::scrub_at`]).
+    fn thumb_x(&self, frac: f32) -> i32 {
+        let (lo, hi) = self.thumb_travel();
+        lo + (frac * (hi - lo) as f32) as i32
+    }
+
+    /// The x range the thumb's centre sweeps: the track inset by the thumb's half-width at each
+    /// end, so the thumb stays on the groove at 0 and 1.
+    fn thumb_travel(&self) -> (i32, i32) {
         let t = self.slider_track;
-        let tw = (t.right - t.left).max(1) as f32;
-        let frac = ((x - t.left) as f32 / tw).clamp(0.0, 1.0);
+        let lo = t.left + self.thumb_half;
+        (lo, (t.right - self.thumb_half).max(lo + 1))
+    }
+
+    fn scrub_at(&self, x: i32, snap: &TransportSnapshot) -> TransportEdit {
+        let (lo, hi) = self.thumb_travel();
+        let frac = ((x - lo) as f32 / (hi - lo) as f32).clamp(0.0, 1.0);
         let count = snap.frame_count.max(1) as f32;
         // Map to [0, count); when blend is off, snap to an integer frame.
         let raw = (frac * count).min(count - 1e-3).max(0.0);
@@ -891,6 +918,31 @@ mod tests {
             TransportEdit::Scrub(p) => assert_eq!(p, 63.0),
             _ => panic!("expected Scrub"),
         }
+    }
+
+    #[test]
+    fn slider_target_spans_the_band_and_excludes_the_readout() {
+        let chrome = Chrome::new(96, false);
+        let band = RECT {
+            left: 0,
+            top: 100,
+            right: 800,
+            bottom: 130,
+        };
+        let mut t = Transport::default();
+        t.layout(band, &chrome);
+        let track = t.slider_track;
+        // The thumb is a few px tall, but the target is the full band height over the track: a
+        // press just under the band's top border and one just above its bottom both hit the slider.
+        let x = (track.left + track.right) / 2;
+        assert_eq!(t.hit(x, band.top + 1), Some(Widget::Slider));
+        assert_eq!(t.hit(x, band.bottom - 1), Some(Widget::Slider));
+        // The "frame / total" readout sits right of the track and is inert — clicking it must not
+        // seek to the last frame.
+        assert_eq!(t.hit(track.right + t.thumb_half + 2, band.top + 15), None);
+        // The thumb's centre stays on the groove at both extremes.
+        assert!(t.thumb_x(0.0) - t.thumb_half >= track.left);
+        assert!(t.thumb_x(1.0) + t.thumb_half <= track.right);
     }
 
     #[test]

@@ -32,8 +32,10 @@ use crate::transport::{Transport, TransportEdit, TransportSnapshot};
 
 use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
-    ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
+    DeleteObject, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, ScreenToClient,
+    SelectObject, SetViewportOrgEx, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    SRCCOPY,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -213,8 +215,6 @@ struct App {
     flipbook: HashMap<PathBuf, PerPath>,
     /// Wall-clock of the previous playback tick, for dt-based advance (robust to timer jitter).
     flipbook_last_tick: Option<Instant>,
-    /// Set while scrubbing the slider paused a playing flipbook, so release can resume it.
-    resume_after_scrub: bool,
     /// The band visibility last applied by [`App::apply_flipbook`], so it can detect an
     /// appear/disappear transition (callers mutate the map before calling it, so it can't recompute
     /// the "before" state).
@@ -973,10 +973,18 @@ impl App {
         let count = s.frame_count.max(1) as f32;
         let pos = (s.frame_pos.floor() + delta as f32).rem_euclid(count);
         // Pause, then move; two edits (TogglePlay only if currently playing).
-        if s.playing {
+        self.pause_flipbook();
+        self.apply_transport_edit(TransportEdit::Scrub(pos));
+    }
+
+    /// Stop playback if it's running. Taking hold of the playhead — the slider (click, drag, or
+    /// wheel) or the `,` / `.` step keys — is a deliberate hand-off from playback to the user, so
+    /// the flipbook stays parked on the frame they landed on rather than running away from it.
+    /// No-op when already paused or not in flipbook mode.
+    fn pause_flipbook(&mut self) {
+        if self.flipbook_state().is_some_and(|s| s.playing) {
             self.apply_transport_edit(TransportEdit::TogglePlay);
         }
-        self.apply_transport_edit(TransportEdit::Scrub(pos));
     }
 
     /// Build the snapshot the chrome renders from.
@@ -1398,7 +1406,6 @@ pub fn run(
             windowed_placement: std::mem::zeroed(),
             flipbook: HashMap::new(),
             flipbook_last_tick: None,
-            resume_after_scrub: false,
             transport_shown: false,
             chip,
             transport: Transport::default(),
@@ -1490,26 +1497,49 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             BeginPaint(hwnd, &mut ps);
-            let (w, h) = app.client();
-            let snap = app.snapshot();
-            app.chrome.paint_toolbar(ps.hdc, w, &snap);
-            app.chrome.paint_status(ps.hdc, w, h, &snap);
-            // Flipbook transport band (above the status bar) when in flipbook mode.
-            if let (Some(band), Some(tsnap)) = (app.transport_band_rect(), app.transport_snapshot())
-            {
-                app.transport.paint(ps.hdc, band, &app.chrome, &tsnap);
-            }
-            // Empty state: the D3D view is hidden, so the frame owns the viewport region and paints
-            // the drop / double-click hint there (matching the double-click-to-open wiring below).
-            if app.empty_view_active() {
-                let (vx, vy, vw, vh) = app.view_rect();
-                let vr = RECT {
-                    left: vx,
-                    top: vy,
-                    right: vx + vw,
-                    bottom: vy + vh,
-                };
-                app.chrome.paint_empty_view(ps.hdc, &vr);
+            let rc = ps.rcPaint;
+            let (bw, bh) = (rc.right - rc.left, rc.bottom - rc.top);
+            if bw > 0 && bh > 0 {
+                // Double-buffered. The chrome paints back-to-front (strip fill, then dividers, then
+                // every widget over them), so composing straight onto the screen DC flickers
+                // whenever a repaint is more than occasional — dragging the transport slider
+                // repaints the band on every mouse move. Compose into a memory bitmap the size of
+                // the invalid rect and blit it once; the widget code still works in frame-client
+                // coords, which the viewport origin maps into the bitmap.
+                let mem = CreateCompatibleDC(ps.hdc);
+                let bmp = CreateCompatibleBitmap(ps.hdc, bw, bh);
+                let old = SelectObject(mem, bmp as HGDIOBJ);
+                SetViewportOrgEx(mem, -rc.left, -rc.top, ptr::null_mut());
+
+                let (w, h) = app.client();
+                let snap = app.snapshot();
+                app.chrome.paint_toolbar(mem, w, &snap);
+                app.chrome.paint_status(mem, w, h, &snap);
+                // Flipbook transport band (above the status bar) when in flipbook mode.
+                if let (Some(band), Some(tsnap)) =
+                    (app.transport_band_rect(), app.transport_snapshot())
+                {
+                    app.transport.paint(mem, band, &app.chrome, &tsnap);
+                }
+                // Empty state: the D3D view is hidden, so the frame owns the viewport region and
+                // paints the drop / double-click hint there (matching the double-click-to-open
+                // wiring below).
+                if app.empty_view_active() {
+                    let (vx, vy, vw, vh) = app.view_rect();
+                    let vr = RECT {
+                        left: vx,
+                        top: vy,
+                        right: vx + vw,
+                        bottom: vy + vh,
+                    };
+                    app.chrome.paint_empty_view(mem, &vr);
+                }
+
+                SetViewportOrgEx(mem, 0, 0, ptr::null_mut());
+                BitBlt(ps.hdc, rc.left, rc.top, bw, bh, mem, 0, 0, SRCCOPY);
+                SelectObject(mem, old);
+                DeleteObject(bmp as HGDIOBJ);
+                DeleteDC(mem);
             }
             EndPaint(hwnd, &ps);
             0
@@ -1569,11 +1599,7 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                             SetCapture(hwnd);
                         }
                         if press.slider {
-                            // Pause during a scrub; resume on release if it was playing.
-                            app.resume_after_scrub = snap.playing;
-                            if snap.playing {
-                                app.apply_transport_edit(TransportEdit::TogglePlay);
-                            }
+                            app.pause_flipbook();
                         }
                         if let Some(edit) = press.edit {
                             app.apply_transport_edit(edit);
@@ -1599,11 +1625,7 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         WM_LBUTTONUP => {
             if app.transport.is_dragging() {
                 ReleaseCapture();
-                let was_slider = app.transport.release();
-                if was_slider && app.resume_after_scrub {
-                    app.resume_after_scrub = false;
-                    app.apply_transport_edit(TransportEdit::TogglePlay);
-                }
+                app.transport.release();
                 // A field click (no drag) entered type-edit mode → take focus so the following
                 // WM_CHAR / Enter / Esc reach the frame (the view child may have held focus).
                 if app.transport.is_editing() {
@@ -1728,6 +1750,11 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 let ctrl = (GetKeyState(0x11) as u16 & 0x8000) != 0; // VK_CONTROL
                 if let Some(snap) = app.transport_snapshot() {
                     if let Some(edit) = app.transport.wheel(pt.x, pt.y, notches, ctrl, &snap) {
+                        // Wheeling over the slider is a scrub like any other — it takes the
+                        // playhead, so it stops playback too (the fps/grid fields don't).
+                        if matches!(edit, TransportEdit::Scrub(_)) {
+                            app.pause_flipbook();
+                        }
                         app.apply_transport_edit(edit);
                     }
                 }

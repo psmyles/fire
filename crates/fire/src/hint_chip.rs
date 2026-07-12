@@ -4,8 +4,10 @@
 //! Like [`crate::tooltip`] it is a separate owned `WS_POPUP` window (it floats over the D3D11 view
 //! child, which `WS_CLIPCHILDREN` would otherwise clip), GDI-painted for dark-mode control. Unlike
 //! the tooltip it is **interactive** — a "View as flipbook" button and a `✕` dismiss — so it is not
-//! click-through (`WS_EX_TRANSPARENT` is omitted), though it still uses `WS_EX_NOACTIVATE` so a
-//! click never steals focus from the frame. Clicks post [`crate::win::WM_APP_FLIPBOOK_CHIP`] to the
+//! click-through (`WS_EX_TRANSPARENT` is omitted). Keeping a click from stealing the frame's focus
+//! takes *both* `WS_EX_NOACTIVATE` and answering `WM_MOUSEACTIVATE` with `MA_NOACTIVATE` (see
+//! [`chip_wndproc`]) — the style alone governs being shown, not being clicked.
+//! Clicks post [`crate::win::WM_APP_FLIPBOOK_CHIP`] to the
 //! owner frame with [`CHIP_ACCEPT`] / [`CHIP_DISMISS`] in WPARAM; the win shell owns all state
 //! (which grid, whether dismissed) and just calls [`HintChip::show`] / [`HintChip::hide`].
 
@@ -22,8 +24,9 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, LoadCursorW,
     PostMessageW, RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA,
-    HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_LBUTTONDOWN, WM_PAINT,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE,
+    WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::chrome::create_ui_font;
@@ -277,6 +280,14 @@ unsafe extern "system" fn chip_wndproc(
     }
     let s = &*state;
     match msg {
+        // Keep the click from activating the chip. `WS_EX_NOACTIVATE` alone is not enough: it stops
+        // the chip being activated when *shown*, but a click on its client area still runs through
+        // DefWindowProc's WM_MOUSEACTIVATE, which answers MA_ACTIVATE — so pressing "View as
+        // flipbook" made this popup the active+focused window, and hiding it a moment later left
+        // the focus on a hidden window, with no keyboard shortcuts reaching the frame until the
+        // user clicked it again. Answering MA_NOACTIVATE ourselves leaves activation where it is
+        // and still delivers WM_LBUTTONDOWN.
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             BeginPaint(hwnd, &mut ps);
