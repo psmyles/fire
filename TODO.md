@@ -1,1 +1,5 @@
+- image outline not rendering consistently
 - shortcut editor
+- vsync check / fps limit
+- fixup flipbook toolbar UI
+- tracy integration
