@@ -68,15 +68,25 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 
 - `main.rs` — entry: sets Per-Monitor-V2 DPI awareness *before any window*, reads config, then either
   opens a window (NewWindow) or acquires the single-instance mutex / forwards-and-exits (SingleInstance).
-- `win.rs` — the Win32 shell and the central `App` state. **Frame/child-view split:** a top-level
-  *frame* window owns the message loop + GDI chrome; a *child "view"* window hosts the swapchain.
-  `WS_CLIPCHILDREN` decouples chrome repaints from image repaints and makes the view client rect
-  exactly the image region.
-- `render/gpu.rs` — `GpuSurface`: the D3D11 device/swapchain/texture/shader. **This is the only place
-  that uses the typed `windows` crate** (typed COM); everything else uses `windows-sys`.
+- `win.rs` — the Win32 shell and the central `App` state. **One window**: it owns the message loop,
+  the swapchain (covering the whole client), and the ImGui layer. The image is drawn into a
+  **sub-rect** of that swapchain (`App::image_rect`, recomputed every frame — no retained layout to
+  invalidate), with the chrome drawn over the rest. The old frame/child-view split existed only
+  because GDI cannot paint on a flip-model swapchain; with the chrome on the GPU it is gone, along
+  with `WS_CLIPCHILDREN` and the second wndproc.
+- `render/gpu.rs` — `GpuSurface`: the D3D11 device/swapchain/texture/shader.
+- `render/imgui.rs` — the Dear ImGui context + the two **upstream** backends. Together with `gpu.rs`,
+  the only places that use the typed `windows` crate (typed COM); everything else uses `windows-sys`.
 - `render/view.rs` — pure pan/zoom/fit math + `Channel` (no Win32, unit-tested).
-- `chrome.rs` — GDI-painted toolbar + status bar (no Win32 common controls — they lack dark-mode
-  support). Buttons hit-test to the same `Action`s the keybinds drive (one state path).
+- `ui/` — the whole UI, rebuilt every frame in immediate mode (`mod.rs` = toolbar / status bar /
+  transport band / hint chip / empty-state hint; `theme.rs` = style, colors, metrics). **Pure UI: no
+  Win32, no COM, no GDI.** It reads a `ViewSnapshot` and returns a `ui::Frame` of what the user asked
+  for; the win shell applies it.
+- `chrome.rs` — despite the name, no longer paints anything. What survives is the shared *model* and
+  *theme*: `Action` + `ViewSnapshot` (the command vocabulary and the state the UI renders from), the
+  light/dark `Palette` — whose highlight is the user's **system accent** (`GetSysColor(COLOR_HIGHLIGHT)`
+  tracks it: documented, no registry poking) — and the dark title-bar / dark-menu plumbing. The four
+  GDI text helpers at the bottom exist *only* for the settings dialog, and go away with it.
 - `decode_pool.rs` — off-thread worker pool (no async runtime).
 - `folder.rs` — sibling-image cursor behind ←/→ navigation + the status-bar count; pure scan/
   sort/cursor logic (no Win32, unit-tested), scanned off-thread and posted back to the frame.
@@ -89,11 +99,13 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 - `keybinds.rs` — the key→`KeyAction` table (pure, unit-tested). *The* source of what a key does:
   `App::handle_key` looks up a `KeyChord`, and the toolbar's tooltips take their "(F)" suffixes from
   the same table, so a rebind relabels its button. Only non-default bindings are persisted.
-- `settings/` — the modal, tabbed, hand-painted settings dialog (`mod.rs` = window + widgets;
-  `model.rs` = pure field accessors + open-with tree edits). **It never holds an `&mut App`**: its
-  nested message pump re-enters the frame's wndproc, so it edits a cloned `Config` and posts it back
-  via `WM_APP_SETTINGS_APPLY` (see `App::apply_settings` for what applies live vs. next-image vs.
-  next-launch).
+- `settings/` — the modal, tabbed settings dialog (`mod.rs` = window + widgets; `model.rs` = pure
+  field accessors + open-with tree edits). **Still a hand-painted Win32 window** — the last of the
+  old UI, and the reason `chrome.rs`'s GDI text helpers still exist. It is being replaced by an ImGui
+  modal; don't invest in it. **It never holds an `&mut App`**: its nested message pump re-enters the
+  main wndproc, so it edits a cloned `Config` and posts it back via `WM_APP_SETTINGS_APPLY` (see
+  `App::apply_settings` for what applies live vs. next-image vs. next-launch). `model.rs` is pure and
+  survives the port unchanged.
 - `forward.rs` / `ipc_server.rs` / `foreground.rs` — SingleInstance pipe client / server / foreground raise.
 - `build.rs` — precompiles `render/shader.hlsl` to DXBC via `fxc` (embedded with `include_bytes!`) and
   embeds the `.ico` + product metadata via `winresource`.
@@ -104,17 +116,36 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   hardware mip chain *once* on adopt. Pan/zoom/exposure/channel/tonemap (and the flipbook cell
   selection) are a **112-byte** constant buffer (`Params` in `render/gpu.rs` ↔ `cbuffer` in
   `render/shader.hlsl`, kept in lockstep by hand and guarded by a `size_of` assert); each frame is
-  one fullscreen-triangle draw. Never reintroduce per-pixel CPU work or per-frame texture
-  re-uploads. Rendering is event-driven (`InvalidateRect` → `WM_PAINT` → one vsync-paced
-  `Present`); an idle window must cost ~0. *One deliberate exception:* an animated GIF re-uploads
-  the texture once **per animation frame**, paced by a Win32 timer at the GIF's own frame rate on
-  the UI thread (`GpuSurface::advance_frame` / `App::tick_animation`) — never per render frame; a
-  still image is still upload-once. **Flipbook mode** (sprite-sheet playback, `crate::flipbook`) is
-  *not* an exception: the whole sheet stays one texture and playback only changes constant-buffer
-  values (cell offsets + blend, `App::tick_flipbook` on `FLIPBOOK_TIMER_ID`), never re-uploading.
+  one fullscreen-triangle draw, scoped by `RSSetViewports` to the image's sub-rect of the window.
+  Never reintroduce per-pixel CPU work or per-frame texture re-uploads. *One deliberate exception:*
+  an animated GIF re-uploads the texture once **per animation frame**, paced by a Win32 timer at the
+  GIF's own frame rate on the UI thread (`GpuSurface::advance_frame` / `App::tick_animation`) — never
+  per render frame; a still image is still upload-once. **Flipbook mode** (sprite-sheet playback,
+  `crate::flipbook`) is *not* an exception: the whole sheet stays one texture and playback only
+  changes constant-buffer values (cell offsets + blend, `App::tick_flipbook` on `FLIPBOOK_TIMER_ID`),
+  never re-uploading.
+- **Rendering is event-driven; an idle window must cost ~0.** This is the invariant the ImGui
+  migration was most at risk of breaking, because ImGui's natural mode is to redraw forever. A frame
+  is drawn only when something happened. `App::request_frames(n)` asks for the *one or two* extra
+  frames ImGui needs to settle a hover or a click, and the count **terminates** — at zero, `WM_PAINT`
+  stops requesting itself. Never add an unconditional repaint or a free-running timer; the current
+  cost is 0.16% of a core idle (the file watcher, not ImGui) and it must stay there.
+- **Two render-target views of one backbuffer, and they are not interchangeable.** The image shader
+  emits *linear* light and writes through the `*_SRGB` view; ImGui's colors are *already* sRGB and
+  must write through the plain `UNORM` view. Drawing ImGui through the sRGB view encodes twice and
+  visibly washes the whole UI out — it doesn't crash, it just looks wrong, so it is easy to introduce
+  and hard to attribute. `GpuSurface::begin_frame` leaves the UNORM view bound for exactly this
+  reason (architecture.md §5.2).
 - **Worker/server threads never touch the window or renderer.** The decode pool and pipe server hand
   results to the UI thread *only* via `PostMessage(frame, WM_APP_*)` with a boxed payload in LPARAM;
   the wndproc reclaims the box. Keep this discipline for any new background work.
+- **Nothing that pumps messages may be entered from `WM_PAINT`, or under a live `&mut App`.** The UI
+  is built during the paint, so a click on "Open in…" or "»" is *discovered* mid-paint — but
+  `TrackPopupMenu` runs a nested modal loop that re-enters the wndproc, which would both recurse into
+  an unvalidated paint and take a second `&mut App`. So the menu is recorded and posted
+  (`WM_APP_OPEN_MENU`), and opens once the paint has finished. Same reason the settings dialog is
+  reached via `WM_APP_OPEN_SETTINGS` and never called inline. Any future modal (a file picker, a
+  message box) obeys the same rule.
 - **Stale-drop by generation.** Each decode job carries the window's monotonic `generation`; a result
   is uploaded only if it's still current, so a slow decode can't clobber a newer open.
 - **`panic = "unwind"` must stay** (see the comment in root `Cargo.toml`). Every C/C++ FFI call
@@ -138,4 +169,12 @@ core viewer (window, threaded decode, GPU viewport, pan/zoom/fit, channel isolat
 exposure/tonemap, DPI/dark chrome, folder ←/→ navigation) is in place, as is the Inno Setup
 installer with per-format Explorer associations (`installer/`, `scripts/build-installer.ps1`), and
 the settings dialog (General / Flipbook / Keybinds / Context menu).
+
+**The UI is mid-migration from hand-painted GDI to Dear ImGui.** Done: the single-window collapse,
+the toolbar, status bar, flipbook transport, hint chip, tooltips and the empty-state hint — all ImGui
+now, with the GDI paint/hit-test/hover/focus layer deleted. **Not yet:** the *settings dialog* is
+still a hand-painted Win32 window, and the *two popup menus* (open-with, overflow) are still
+`TrackPopupMenu` — which is why `chrome::apply_dark_menus`, the one undocumented API left in the
+codebase (uxtheme ordinals 133/135/136), is still here. Both are on the way out; don't build on them.
+
 In progress: pixel inspector, clipboard.

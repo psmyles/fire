@@ -1,19 +1,22 @@
-//! Native Win32 shell. The top-level **frame** window owns
-//! the message loop and paints the GDI chrome (toolbar + status bar, see [`crate::chrome`]);
-//! a **child "view" window** in the middle hosts the D3D11 [`GpuSurface`] renderer.
-//! Splitting the two means the frame can repaint its chrome without touching the image and
-//! the image can repaint without redrawing the chrome (`WS_CLIPCHILDREN`), and the surface's
-//! viewport is exactly the image region (no chrome insets to carry).
+//! Native Win32 shell: **one** top-level window that owns the message loop, the D3D11
+//! [`GpuSurface`], and the Dear ImGui layer that draws the whole UI ([`crate::ui`]).
 //!
-//! With no image loaded the view is *hidden*, handing its region back to the frame, which paints
-//! an empty-state hint there (drop a file / double-click to open); a double-click over that region
-//! opens the file picker. Once an image loads (or one is decoding) the view is shown again and owns
-//! the region. See [`App::sync_empty_view`].
+//! It used to be two windows — a frame that GDI-painted the chrome and a child that hosted the
+//! swapchain — because GDI and a flip-model swapchain cannot paint the same surface. With the chrome
+//! now drawn *by the GPU, into the same backbuffer*, that split has nothing left to buy: the child
+//! is gone, `WS_CLIPCHILDREN` is gone, and the image is simply drawn into a **sub-rect** of the one
+//! swapchain (the chrome occupies the rest). See [`App::image_rect`] and
+//! [`GpuSurface::set_image_rect`].
 //!
-//! Cross-thread wakeups (`WM_APP_OPEN` from the pipe server, `WM_APP_DECODE_DONE` from the
-//! worker pool, `WM_APP_FOLDER_SCANNED` from the folder-scan thread) are posted to the frame,
-//! which owns the title/size/lifecycle. Both windows reach the shared [`App`] through their
-//! `GWLP_USERDATA`; only the frame owns the box.
+//! Rendering stays strictly **event-driven** — the invariant this migration was most at risk of
+//! breaking. ImGui's natural mode is to redraw forever; instead a frame is drawn only when something
+//! actually happened, and [`App::request_frames`] asks for the *one or two* extra frames ImGui needs
+//! to settle a hover or a click. No input, no timer, no message → no frame → an idle window costs
+//! ~0. Measured, not assumed (architecture.md §5.2).
+//!
+//! Cross-thread wakeups (`WM_APP_OPEN` from the pipe server, `WM_APP_DECODE_DONE` from the worker
+//! pool, `WM_APP_FOLDER_SCANNED` from the folder-scan thread) are posted to this window, which
+//! reaches the shared [`App`] through its `GWLP_USERDATA` and owns the box.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -25,17 +28,17 @@ use std::time::Instant;
 use fire_decode::{DecodeOptions, DecodedImage};
 use fire_ipc::OpenRequest;
 
+use crate::chrome::{Action, ViewSnapshot};
 use crate::flipbook::{self, FlipbookState, Grid, PerPath};
-use crate::hint_chip::{HintChip, CHIP_ACCEPT, CHIP_DISMISS};
-use crate::render::gpu::FlipbookParams;
-use crate::transport::{Transport, TransportEdit, TransportSnapshot};
+use crate::render::gpu::{FlipbookParams, GpuSurface};
+use crate::render::imgui::Imgui;
+use crate::transport::{TransportEdit, TransportSnapshot};
+use crate::ui::theme::Metrics;
 
 use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
-    DeleteObject, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, ScreenToClient,
-    SelectObject, SetViewportOrgEx, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
-    SRCCOPY,
+    BeginPaint, ClientToScreen, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -49,33 +52,29 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
 };
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus,
 };
 use windows_sys::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DROPFILES, HDROP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowPlacement, IsIconic,
+    DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowPlacement,
     KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
     SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, CS_DBLCLKS, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HMENU, HWND_TOP, IDC_ARROW, MF_CHECKED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SW_FORCEMINIMIZE,
-    SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN,
-    WA_INACTIVE, WINDOWPLACEMENT, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_DROPFILES, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_PAINT, WM_RBUTTONDOWN,
+    WINDOWPLACEMENT, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_DPICHANGED, WM_DROPFILES, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSW,
-    WPF_RESTORETOMAXIMIZED, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WPF_RESTORETOMAXIMIZED, WS_OVERLAPPEDWINDOW,
 };
-
-/// `WM_MOUSELEAVE` (0x02A3) isn't surfaced by windows-sys under the enabled features; it's a
-/// stable message id, so we define it directly. Paired with `TrackMouseEvent`/`TME_LEAVE` to
-/// clear the toolbar hover when the cursor exits the frame.
-const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Clipboard format ids (stable Win32 values) not surfaced by windows-sys under the enabled
 /// features, so we define them directly — see `copy_text_to_clipboard` / `copy_file_to_clipboard`.
@@ -98,16 +97,14 @@ const OPEN_WITH_ID_BASE: usize = 100;
 /// but a distinct base keeps the two unambiguous).
 const OVERFLOW_ID_BASE: usize = 1000;
 
-use crate::chrome::{self, Action, Chrome, ViewSnapshot};
+use crate::chrome;
 use crate::config::Config;
 use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool, FlipbookGuess};
 use crate::folder::{self, Folder};
 use crate::foreground;
 use crate::ipc_server;
 use crate::keybinds::{KeyAction, KeyChord, Keybinds};
-use crate::render::gpu::GpuSurface;
 use crate::render::view::Channel;
-use crate::tooltip::Tooltip;
 use crate::watcher::FileWatcher;
 use crate::window_state::WindowState;
 
@@ -120,9 +117,6 @@ pub const WM_APP_FOLDER_SCANNED: u32 = WM_APP + 3;
 /// The displayed image's file changed on disk (hot-reload). WPARAM is the watcher's generation
 /// at arm time (stale-drop); no LPARAM payload — the UI re-decodes its own current path.
 pub const WM_APP_FILE_CHANGED: u32 = WM_APP + 4;
-/// The flipbook hint chip was clicked. WPARAM is [`crate::hint_chip::CHIP_ACCEPT`] (enter the mode)
-/// or [`crate::hint_chip::CHIP_DISMISS`] (dismiss for the session); no LPARAM.
-pub const WM_APP_FLIPBOOK_CHIP: u32 = WM_APP + 5;
 /// A finished flipbook auto-detection from a worker, posted *after* its `WM_APP_DECODE_DONE` so the
 /// per-pixel scan never delays the image. LPARAM is `Box<FlipbookGuess>`.
 pub const WM_APP_FLIPBOOK_GUESS: u32 = WM_APP + 6;
@@ -133,6 +127,10 @@ pub const WM_APP_SETTINGS_APPLY: u32 = WM_APP + 7;
 /// "Settings…" was chosen from the right-click menu. Posted rather than opened inline because that
 /// menu is tracked from inside an `&mut App` borrow, which the dialog's nested loop must not overlap.
 pub const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 8;
+
+/// Open the popup menu the UI asked for this frame. Posted (not called) so `TrackPopupMenu`'s
+/// nested modal pump runs *after* `WM_PAINT` has completed — see [`App::apply_ui`].
+pub const WM_APP_OPEN_MENU: u32 = WM_APP + 9;
 
 /// A completed sibling-image scan, delivered to the UI thread (boxed, via the message LPARAM).
 /// The win shell turns it into a [`Folder`] cursor once it confirms it's still current.
@@ -145,11 +143,6 @@ struct FolderScan {
     entries: Vec<PathBuf>,
 }
 
-/// Timer id + delay (ms) for the hover-to-show tooltip on the toolbar. The timer is (re)armed when
-/// the hovered button changes and fires once after the cursor rests; killed on any hover change,
-/// leave, or click.
-const TIP_TIMER_ID: usize = 1;
-const TIP_DELAY_MS: u32 = 500;
 
 /// Timer id for animated-image (GIF) playback on the frame window; distinct from the tooltip
 /// timer. Rescheduled on each tick with the next frame's delay, since GIF frame delays vary.
@@ -193,15 +186,22 @@ fn key_down(vk: i32) -> bool {
 
 /// UI-thread state, stashed in both windows' `GWLP_USERDATA` (the frame owns the box).
 struct App {
-    /// Top-level frame window: owns the chrome, title, size, and lifecycle.
+    /// The one window: message loop, swapchain, chrome, title, size, lifecycle.
     frame: isize,
-    /// Child view window: the D3D11 render target (middle region).
-    view: isize,
     surface: GpuSurface,
+    /// The Dear ImGui context + backends. Draws the chrome into the surface's backbuffer.
+    imgui: Imgui,
+    /// DPI-scaled chrome metrics (how tall the toolbar/status/transport are), which is what decides
+    /// the image's sub-rect. Rebuilt on DPI change.
+    metrics: Metrics,
+    /// Current theme. Re-read on `WM_SETTINGCHANGE` / `WM_DWMCOLORIZATIONCOLORCHANGED`.
+    dark: bool,
+    dpi: u32,
+    /// Event-driven render pump: frames still owed. ImGui needs a frame or two after an input to
+    /// settle hover/active state, so input asks for a couple; at zero we stop drawing and the
+    /// window costs nothing. See [`App::request_frames`].
+    frames_wanted: u8,
     pool: DecodePool,
-    chrome: Chrome,
-    /// Hover tooltip for the toolbar buttons (a separate owned popup window).
-    tooltip: Tooltip,
     /// Status-bar file name (without the metadata tail).
     file_label: String,
     /// Status-bar metadata tail (format · dims · depth/channels · ICC).
@@ -235,14 +235,17 @@ struct App {
     flipbook: HashMap<PathBuf, PerPath>,
     /// Wall-clock of the previous playback tick, for dt-based advance (robust to timer jitter).
     flipbook_last_tick: Option<Instant>,
-    /// The band visibility last applied by [`App::apply_flipbook`], so it can detect an
-    /// appear/disappear transition (callers mutate the map before calling it, so it can't recompute
-    /// the "before" state).
-    transport_shown: bool,
-    /// The flipbook detection hint chip (a floating popup over the view top).
-    chip: HintChip,
-    /// The flipbook transport band (hand-painted; shown only in flipbook mode).
-    transport: Transport,
+    /// A popup menu the UI asked for, deferred out of `WM_PAINT` (see [`App::apply_ui`]).
+    pending_menu: Option<PendingMenu>,
+}
+
+/// A Win32 popup menu requested by the UI, waiting for the paint to finish.
+struct PendingMenu {
+    action: Action,
+    /// Screen coords of the menu's top-left.
+    pt: POINT,
+    /// The overflow menu's contents (empty for the actions menu).
+    items: Vec<Action>,
 }
 
 impl App {
@@ -272,18 +275,15 @@ impl App {
             self.frame,
             &format!("{}: {name} (loading…)", crate::product::NAME),
         );
-        // SAFETY: frame is live for the App's lifetime.
-        unsafe { ShowWindow(self.frame as HWND, SW_SHOW) };
         if activate {
             // Spend the one-shot foreground grant promptly (§4.1).
             foreground::raise(self.frame);
         }
-        // Bring the D3D view up for the load (hiding the empty-state hint) before we ask it to paint.
-        self.sync_empty_view();
+        self.redraw();
         self.surface.invalidate();
         // No image yet → the HDR group (if it was showing) must drop out of the layout now.
-        self.relayout();
-        self.invalidate_chrome();
+        self.redraw();
+        self.redraw();
 
         self.begin_decode(path, false)
     }
@@ -369,7 +369,7 @@ impl App {
             return; // superseded by a newer open
         }
         self.folder = Folder::new(scan.entries, &scan.path);
-        self.invalidate_status();
+        self.redraw();
     }
 
     /// Handle a finished decode. Adopt it only if it is still the latest request (stale-drop).
@@ -409,8 +409,8 @@ impl App {
                 set_title(self.frame, &format!("{}: {name}", crate::product::NAME));
                 self.surface.invalidate();
                 // A float source brings in the HDR group; an LDR one drops it — relayout either way.
-                self.relayout();
-                self.invalidate_chrome();
+                self.redraw();
+                self.redraw();
                 // Start playback if this is an animated GIF; stop any prior animation otherwise.
                 self.sync_animation();
                 // Re-apply any per-path flipbook state for the adopted image (restores it on
@@ -452,10 +452,10 @@ impl App {
         );
         self.surface.clear_image();
         self.surface.invalidate();
-        self.relayout();
-        self.invalidate_chrome();
+        self.redraw();
+        self.redraw();
         // Back to the empty state: hide the view and paint the drop / double-click hint.
-        self.sync_empty_view();
+        self.redraw();
         // No image (or a still one) → stop any GIF playback that was running.
         self.sync_animation();
         // No image → clear any flipbook surface state, stop its timer, and hide the chip.
@@ -512,26 +512,17 @@ impl App {
         !self.fullscreen && self.flipbook_state().is_some()
     }
 
-    /// Mirror the active per-path state onto the surface (or clear it), re-arm the timer, update
-    /// the hint chip, and re-lay-out if the band's visibility changed since it was last applied.
-    /// Callers mutate the flipbook map *before* calling this, so the "before" state is tracked in
-    /// `transport_shown` rather than recomputed (which would compare `transport_visible()` to
-    /// itself and never fire).
+    /// Mirror the active per-path state onto the surface (or clear it) and re-arm the timer.
+    ///
+    /// The band appearing/disappearing changes the image's sub-rect, but nothing needs to track that
+    /// here any more: the rect is recomputed from scratch every frame in [`App::render`], which is
+    /// the whole point of an immediate-mode UI — there is no retained layout to keep in sync, and so
+    /// no "did the band's visibility change since last time?" bookkeeping to get wrong.
     fn apply_flipbook(&mut self) {
         let params = self.flipbook_state().map(surface_flipbook);
         self.surface.set_flipbook(params);
         self.sync_flipbook_timer();
-        self.sync_chip();
-        let visible = self.transport_visible();
-        if visible != self.transport_shown {
-            // The band appeared/disappeared → the view rect changed: re-lay-out the band widgets
-            // and shrink/grow the D3D view to make room (its WM_SIZE re-fits to the new region).
-            self.transport_shown = visible;
-            self.relayout();
-            self.reposition_view();
-            self.invalidate_chrome();
-        }
-        self.invalidate_transport();
+        self.redraw();
     }
 
     /// Toggle flipbook mode for the current image (K / toolbar). Enabling seeds state from the
@@ -561,7 +552,7 @@ impl App {
             }
         }
         self.apply_flipbook();
-        self.invalidate_chrome();
+        self.redraw();
     }
 
     /// Arm/kill the flipbook playback timer to match the active state. Paused/off = no timer.
@@ -613,37 +604,22 @@ impl App {
         s.frame_pos = (s.frame_pos + dt * s.fps).rem_euclid(s.frame_count as f32);
         let pos = s.frame_pos;
         self.surface.set_flipbook_pos(pos);
-        self.invalidate_transport();
+        self.redraw();
     }
 
-    /// Show or hide the detection hint chip: shown when the current image has an undismissed hint,
-    /// the mode is off, and we're windowed and not minimized.
-    fn sync_chip(&mut self) {
-        let minimized = unsafe { IsIconic(self.frame as HWND) != 0 };
-        let entry = self
-            .current_path
-            .as_ref()
-            .and_then(|p| self.flipbook.get(p));
-        let show = !self.fullscreen
-            && !minimized
-            && entry.is_some_and(|e| e.hint.is_some() && !e.enabled && !e.hint_dismissed);
-        if !show {
-            self.chip.hide();
-            return;
+    /// The flipbook detection hint, when the chip should be offered: the current image has an
+    /// undismissed hint and flipbook mode is off. Drawn by [`crate::ui`] as a panel over the image —
+    /// it used to be its own layered popup window, with all the show/hide/reposition/minimize
+    /// bookkeeping that implies. Now it is a function of state, evaluated per frame.
+    fn chip_hint(&self) -> Option<Grid> {
+        let e = self.flipbook.get(self.current_path.as_ref()?)?;
+        if e.enabled || e.hint_dismissed {
+            return None;
         }
-        let grid = entry.and_then(|e| e.hint).unwrap();
-        // Anchor at the top-center of the view rect, a small gap down.
-        let (vx, vy, vw, _) = self.view_rect();
-        let gap = self.chrome.metrics.dpi as i32 * 8 / 96;
-        let mut pt = POINT {
-            x: vx + vw / 2,
-            y: vy + gap,
-        };
-        unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
-        self.chip.show(grid, pt.x, pt.y);
+        e.hint
     }
 
-    /// Build the read model the transport band paints from.
+    /// Build the read model the transport band renders from.
     fn transport_snapshot(&self) -> Option<TransportSnapshot> {
         let s = self.flipbook_state()?;
         Some(TransportSnapshot {
@@ -656,29 +632,6 @@ impl App {
             frame_pos: s.frame_pos,
             grid_max: flipbook::GRID_MAX,
         })
-    }
-
-    /// The transport band rect (frame-client coords) when visible.
-    fn transport_band_rect(&self) -> Option<RECT> {
-        if !self.transport_visible() {
-            return None;
-        }
-        let (w, h) = self.client();
-        let th = self.chrome.metrics.transport_h;
-        let top = h - self.chrome.metrics.status_h - th;
-        Some(RECT {
-            left: 0,
-            top,
-            right: w,
-            bottom: top + th,
-        })
-    }
-
-    /// Invalidate just the transport band strip (playback tick / scrub / hover).
-    fn invalidate_transport(&self) {
-        if let Some(r) = self.transport_band_rect() {
-            unsafe { InvalidateRect(self.frame as HWND, &r, 0) };
-        }
     }
 
     /// Apply a transport edit to the active flipbook state, then sync the surface/timer/repaint.
@@ -734,7 +687,7 @@ impl App {
             // Count/scrub: just move the position on the surface.
             self.surface.set_flipbook_pos(s.frame_pos);
         }
-        self.invalidate_transport();
+        self.redraw();
     }
 
     /// Perform a toolbar action, then repaint the image + chrome.
@@ -761,73 +714,62 @@ impl App {
             Action::ExpDown => self.surface.adjust_exposure(-self.cfg.exposure_step),
             Action::ToggleOutline => self.surface.toggle_outline(),
             Action::Background(bg) => self.surface.set_background(bg),
-            // Toggling full-screen resizes the frame, which fires WM_SIZE (relayout + reposition);
-            // fall through to the shared chrome invalidate below.
+            // Toggling full-screen resizes the window, which fires WM_SIZE; fall through to the
+            // shared redraw below.
             Action::ToggleFullscreen => self.toggle_fullscreen(),
-            // Flipbook mode runs its own relayout/reposition/invalidate; return without the shared
-            // chrome invalidate below.
+            // Flipbook mode runs its own surface/timer sync + redraw.
             Action::ToggleFlipbook => return self.toggle_flipbook(),
-            // The two popup menus need their button's screen rect, and the settings dialog runs a
-            // nested modal loop that must not be entered under a live `&mut App` borrow — all three
-            // are driven directly from the click handler and never reach this shared dispatch.
-            Action::OpenWithMenu | Action::Overflow | Action::OpenSettings => return,
+            // The settings dialog runs a nested modal loop, which re-enters this wndproc and would
+            // take a second `&mut App` while ours is live. Hand it to the message loop, which drops
+            // our borrow first. (Same reason the popup menus are deferred — see `apply_ui`.)
+            Action::OpenSettings => {
+                unsafe { PostMessageW(self.frame as HWND, WM_APP_OPEN_SETTINGS, 0, 0) };
+                return;
+            }
+            // These are reported as menu anchors, not actions; they never reach here.
+            Action::OpenWithMenu | Action::Overflow => return,
         }
-        self.invalidate_chrome();
+        self.redraw();
     }
 
-    /// Open the toolbar's actions popup under its button: the fixed file actions (show in folder,
-    /// copy file / path / name) followed by any configured "Open in…" external apps, then perform
-    /// the chosen entry on the current image. A no-op if there's no image (the button is disabled
-    /// then anyway). All on the UI thread — `TrackPopupMenu` runs its own modal pump but touches no
-    /// worker/renderer.
-    fn actions_menu(&mut self) {
-        let Some(rect) = self.chrome.button_rect_for(Action::OpenWithMenu) else {
+    /// Open the deferred popup menu (posted by [`Self::apply_ui`]). `TrackPopupMenu` runs its own
+    /// modal pump, so this must happen *after* the paint that requested it has finished — never
+    /// inside `WM_PAINT`, where a nested pump would re-enter the still-unvalidated paint.
+    fn open_pending_menu(&mut self) {
+        let Some(pending) = self.pending_menu.take() else {
             return;
         };
-        // Anchor the menu at the button's bottom-left, in screen coords.
-        let mut pt = POINT {
-            x: rect.left,
-            y: rect.bottom,
-        };
-        unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
-        self.show_actions_menu(pt);
+        match pending.action {
+            Action::Overflow => self.overflow_menu(pending.pt, &pending.items),
+            _ => self.show_actions_menu(pending.pt),
+        }
+        self.redraw();
     }
 
-    /// Open the "»" overflow popup under its button: the left-group controls that didn't fit the
-    /// current window width, each dispatching through the normal action path when chosen. The menu
-    /// items mirror the toolbar buttons' enabled/checked state. A no-op if nothing overflowed. On
-    /// the UI thread, like the actions popup.
-    fn overflow_menu(&mut self) {
-        let Some(rect) = self.chrome.button_rect_for(Action::Overflow) else {
-            return;
-        };
-        let snap = self.snapshot();
-        let items = self.chrome.overflow_menu(&snap);
+    /// The "»" overflow popup: the left-group controls that didn't fit the window width, each
+    /// dispatching through the normal action path when chosen. Items mirror the toolbar buttons'
+    /// enabled/checked state.
+    fn overflow_menu(&mut self, pt: POINT, items: &[Action]) {
         if items.is_empty() {
             return;
         }
-        // Anchor the menu at the button's bottom-left, in screen coords.
-        let mut pt = POINT {
-            x: rect.left,
-            y: rect.bottom,
-        };
-        unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
+        let snap = self.snapshot();
         let chosen = unsafe {
-            // Same foreground idiom as the actions popup so an outside click dismisses cleanly.
+            // The documented foreground idiom, so an outside click dismisses cleanly.
             SetForegroundWindow(self.frame as HWND);
             let menu = CreatePopupMenu();
             if menu.is_null() {
                 return;
             }
-            for (i, item) in items.iter().enumerate() {
+            for (i, action) in items.iter().enumerate() {
                 let mut flags = MF_STRING;
-                if !item.enabled {
+                if !snap.enabled(*action) {
                     flags |= MF_GRAYED;
                 }
-                if item.checked {
+                if snap.active(*action) {
                     flags |= MF_CHECKED;
                 }
-                let label = wide(&item.label);
+                let label = wide(&snap.tooltip(*action));
                 AppendMenuW(menu, flags, OVERFLOW_ID_BASE + i, label.as_ptr());
             }
             let cmd = TrackPopupMenu(
@@ -844,19 +786,11 @@ impl App {
             (cmd as usize)
                 .checked_sub(OVERFLOW_ID_BASE)
                 .and_then(|idx| items.get(idx))
-                .map(|item| item.action)
+                .copied()
         };
         if let Some(action) = chosen {
             self.do_action(action);
         }
-    }
-
-    /// Open the same actions popup at a point in the *view* window's client area — the right-click
-    /// menu over the image (`x`/`y` are the WM_RBUTTONUP coordinates).
-    fn actions_menu_at_view(&mut self, x: i32, y: i32) {
-        let mut pt = POINT { x, y };
-        unsafe { ClientToScreen(self.view as HWND, &mut pt) };
-        self.show_actions_menu(pt);
     }
 
     /// Build the actions popup at a screen point, track it, and perform the chosen entry on the
@@ -946,29 +880,10 @@ impl App {
     /// — the `WM_SYSKEYDOWN` path uses that to let unbound Alt chords (Alt+F4, the system menu)
     /// fall through to `DefWindowProc`.
     fn handle_key(&mut self, vk: u32) -> bool {
-        // While a transport field is being typed into, Enter/Tab/Esc belong to the editor. These
-        // are *editor* keys, not bindings — they stay hardcoded so rebinding (say) Esc can't strand
-        // a half-typed field.
-        if self.transport.is_editing() {
-            match vk {
-                0x0D | 0x09 => {
-                    // Enter / Tab commit.
-                    if let Some(snap) = self.transport_snapshot() {
-                        if let Some(edit) = self.transport.commit(&snap) {
-                            self.apply_transport_edit(edit);
-                        }
-                    }
-                    self.invalidate_transport();
-                }
-                0x1B => {
-                    // Esc cancels the edit (does not leave the mode / close the window).
-                    self.transport.cancel_edit();
-                    self.invalidate_transport();
-                }
-                _ => {} // other keys handled via WM_CHAR
-            }
-            return true;
-        }
+        // There is no "is a transport field being typed into?" preamble any more. ImGui answers that
+        // with `want_capture_keyboard`, checked in the wndproc before we are ever called — so a key
+        // that reaches here is, by construction, not text input. That *deletes* a class of bug (a
+        // half-typed field stranded by a rebound Esc) rather than guarding against it.
         let chord = KeyChord {
             vk,
             ctrl: key_down(VK_CONTROL),
@@ -1021,7 +936,7 @@ impl App {
             KeyAction::FlipbookPrevFrame => return self.flipbook_step(-1),
             KeyAction::FlipbookNextFrame => return self.flipbook_step(1),
         }
-        self.invalidate_chrome();
+        self.redraw();
     }
 
     /// Apply a playback edit from a keybind (Space) and repaint the band.
@@ -1057,12 +972,9 @@ impl App {
     /// therefore reaches it via a `PostMessage`, never inline from a click handler.
     fn open_settings(&mut self) {
         let cfg = self.cfg.clone();
-        let (frame, dark) = (self.frame, self.chrome.dark);
-        // Any hover/tooltip state is stale the moment the modal window takes over.
-        self.cancel_tooltip();
-        self.chrome.hover = None;
-        self.invalidate_chrome();
+        let (frame, dark) = (self.frame, self.dark);
         crate::settings::run_modal(frame, cfg, dark);
+        self.redraw();
     }
 
     /// Adopt the settings the dialog committed (OK / Apply): push each field wherever it lives, then
@@ -1095,9 +1007,7 @@ impl App {
 
         // The toolbar's tooltips carry the (possibly rebound) shortcuts, and the backdrop buttons
         // reflect the new default; the open-with menu is rebuilt per-show, so it needs nothing.
-        self.relayout();
-        self.invalidate_chrome();
-        self.surface.invalidate();
+        self.redraw();
     }
 
     /// Build the snapshot the chrome renders from.
@@ -1140,6 +1050,7 @@ impl App {
             tonemap: s.tonemap(),
             is_hdr,
             has_image,
+            loading: self.loading,
             has_alpha: s.has_alpha(),
             background: s.background(),
             outline: s.outline(),
@@ -1160,22 +1071,53 @@ impl App {
         ((rc.right - rc.left).max(0), (rc.bottom - rc.top).max(0))
     }
 
-    /// The rect reserved for the image view. In full-screen the chrome is hidden and the view
-    /// covers the entire client; otherwise it sits between the toolbar and status bar.
-    fn view_rect(&self) -> (i32, i32, i32, i32) {
+    /// Cursor position from a mouse message's `LPARAM`, translated into **image-region** coords.
+    ///
+    /// All the pan/zoom math in [`crate::render::view`] is relative to the image's sub-rect, not the
+    /// window — which is what the old child-view window used to give us for free. With one window we
+    /// subtract the origin ourselves; forgetting it would offset every drag by the toolbar's height,
+    /// so it lives in one place rather than at each call site.
+    fn image_cursor(&self, lparam: LPARAM) -> (f32, f32) {
+        let x = (lparam & 0xffff) as u16 as i16 as f32;
+        let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
+        let (ox, oy) = self.surface.image_origin();
+        (x - ox, y - oy)
+    }
+
+    /// The image's sub-rect of the client, in physical px. In full-screen the chrome is hidden and
+    /// the image owns the whole client; otherwise it sits between the toolbar and the status bar,
+    /// minus the transport band when flipbook mode is on.
+    ///
+    /// This is the *only* definition of the image region. It is recomputed each frame and pushed
+    /// into the surface — nothing caches it, so there is no layout to invalidate.
+    fn image_rect(&self) -> (f32, f32, f32, f32) {
         let (w, h) = self.client();
+        let (w, h) = (w as f32, h as f32);
         if self.fullscreen {
-            return (0, 0, w.max(0), h.max(0));
+            return (0.0, 0.0, w.max(0.0), h.max(0.0));
         }
-        let top = self.chrome.metrics.toolbar_h;
-        // The flipbook transport band, when shown, sits between the view and the status bar.
+        let top = self.metrics.toolbar_h;
         let band = if self.transport_visible() {
-            self.chrome.metrics.transport_h
+            self.metrics.transport_h
         } else {
-            0
+            0.0
         };
-        let vh = (h - top - self.chrome.metrics.status_h - band).max(0);
-        (0, top, w.max(0), vh)
+        let ih = (h - top - self.metrics.status_h - band).max(0.0);
+        (0.0, top, w.max(0.0), ih)
+    }
+
+    /// Ask for `n` more frames and dirty the window. ImGui is immediate-mode: hover, click and
+    /// active states settle over a frame or two, so a single repaint after input can leave a button
+    /// visibly stuck mid-hover. Two is enough, and — crucially — it *terminates*: once the count
+    /// hits zero no more `WM_PAINT` is requested and the window goes back to costing nothing.
+    fn request_frames(&mut self, n: u8) {
+        self.frames_wanted = self.frames_wanted.max(n);
+        unsafe { InvalidateRect(self.frame as HWND, ptr::null(), 0) };
+    }
+
+    /// The everyday repaint: something changed, draw it.
+    fn redraw(&mut self) {
+        self.request_frames(2);
     }
 
     /// Flip in/out of borderless full-screen (toolbar button, F11, Esc, or middle-click).
@@ -1186,9 +1128,9 @@ impl App {
     /// Enter (`on`) or leave borderless full-screen. Entering strips the window's border/caption and
     /// grows it to cover the monitor it's on (Raymond Chen's documented technique), saving the
     /// windowed placement so exit restores the exact prior position/size + maximized state. The
-    /// chrome isn't painted while full-screen because [`Self::view_rect`] lets the child view cover
-    /// the whole client — the `SetWindowPos` here fires `WM_SIZE`, which relays out and repositions
-    /// the view for the new mode. No-op if already in the requested state.
+    /// chrome simply isn't drawn while full-screen (see [`crate::ui::build`]), and
+    /// [`Self::image_rect`] hands the whole client to the image. No-op if already in the requested
+    /// state.
     fn set_fullscreen(&mut self, on: bool) {
         if on == self.fullscreen {
             return;
@@ -1239,50 +1181,12 @@ impl App {
         }
     }
 
-    /// Reposition the child view to the current view rect (its own WM_SIZE resizes/refits the
-    /// surface).
-    fn reposition_view(&self) {
-        let (x, y, w, h) = self.view_rect();
-        unsafe {
-            SetWindowPos(
-                self.view as HWND,
-                ptr::null_mut(),
-                x,
-                y,
-                w,
-                h,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-    }
-
-    /// The empty state: no image loaded and none loading. Here the frame paints the drop /
-    /// double-click hint (and the D3D view is hidden), and a double-click over the viewport opens
-    /// the file picker. During a load we keep the view up (still showing the previous image, or the
-    /// backdrop for the very first open) so the hint never flashes over a file the user just opened.
+    /// The empty state: no image loaded and none loading. The UI draws a drop / double-click hint
+    /// over the image region, and a double-click there opens the file picker. During a load we stay
+    /// out of this state (the previous image, or the backdrop, keeps showing) so the hint never
+    /// flashes over a file the user just opened.
     fn empty_view_active(&self) -> bool {
         self.surface.current_image().is_none() && !self.loading
-    }
-
-    /// Show the D3D view when there's an image (or one is loading); otherwise hide it so the frame
-    /// can paint the empty-state hint in the same region. Hiding a `WS_CLIPCHILDREN` child hands its
-    /// rect back to the parent, so the frame's `WM_PAINT` gets the viewport area to draw the hint.
-    /// Idempotent — called after every image-state change (load / decode / fail) and once at startup.
-    fn sync_empty_view(&self) {
-        let empty = self.empty_view_active();
-        unsafe { ShowWindow(self.view as HWND, if empty { SW_HIDE } else { SW_SHOW }) };
-        // Repaint the hint when we just went empty; when going non-empty the freshly shown view
-        // repaints itself (via the load/decode `surface.invalidate`), so no frame repaint is needed.
-        if empty {
-            let (x, y, w, h) = self.view_rect();
-            let vr = RECT {
-                left: x,
-                top: y,
-                right: x + w,
-                bottom: y + h,
-            };
-            unsafe { InvalidateRect(self.frame as HWND, &vr, 0) };
-        }
     }
 
     /// Open the system file picker (empty-viewport double-click / on-screen hint) and load the
@@ -1294,77 +1198,93 @@ impl App {
         }
     }
 
-    /// Recompute the toolbar layout for the current DPI/size and visible button set (the HDR group
-    /// shows only for float sources, so this also re-runs when an image is adopted/cleared).
-    fn relayout(&mut self) {
-        let (w, _) = self.client();
+    /// Draw one frame: clear, the image into its sub-rect, then the whole UI over it, then present.
+    ///
+    /// This is the entire paint path — the `WM_PAINT` handler is a call to this. Note the ordering
+    /// constraint baked into [`GpuSurface::begin_frame`]: it leaves the **UNORM** render target
+    /// bound, which is what ImGui must draw through (its colors are already sRGB). Getting that
+    /// wrong doesn't crash; it just washes the UI out.
+    fn render(&mut self) {
+        // The chrome fill, so the parts of the window the image doesn't cover start from a known
+        // color rather than last frame's garbage.
+        let bg = crate::ui::theme::chrome_bg(self.dark);
+        self.surface.set_chrome_clear(bg);
+
+        // Recomputed every frame — the transport band appearing, a resize, and a DPI change all just
+        // fall out of this. Nothing to keep in sync.
+        let (ix, iy, iw, ih) = self.image_rect();
+        self.surface.set_image_rect(ix, iy, iw, ih);
+
+        if !self.surface.begin_frame() {
+            return; // no render target this frame (device lost / mid-resize); skip cleanly
+        }
+
         let snap = self.snapshot();
-        self.chrome.relayout(w, &snap);
-        // Lay out the transport band's widgets when it's shown (its rect depends on the client size).
-        if let Some(band) = self.transport_band_rect() {
-            self.transport.layout(band, &self.chrome);
+        let transport = self.transport_snapshot();
+        let chip = self.chip_hint();
+        let (cw, ch) = self.client();
+        let metrics = self.metrics;
+        let dark = self.dark;
+        let fullscreen = self.fullscreen;
+        let icon_px = self.imgui.icon_px();
+
+        let frame = self.imgui.frame(|ui, tex| {
+            crate::ui::build(
+                ui,
+                tex,
+                &snap,
+                transport.as_ref(),
+                chip,
+                &metrics,
+                icon_px,
+                dark,
+                (cw as f32, ch as f32),
+                (ix, iy, iw, ih),
+                fullscreen,
+            )
+        });
+
+        self.surface.present();
+        self.apply_ui(frame);
+    }
+
+    /// Apply what the UI asked for this frame.
+    fn apply_ui(&mut self, frame: crate::ui::Frame) {
+        for edit in frame.edits {
+            self.apply_transport_edit(edit);
+        }
+        for action in frame.actions {
+            self.do_action(action);
+        }
+        if frame.chip_accept {
+            self.toggle_flipbook();
+        }
+        if frame.chip_dismiss {
+            if let Some(e) = self.flipbook_entry() {
+                e.hint_dismissed = true;
+            }
+            self.redraw();
+        }
+        // The two Win32 popup menus. `TrackPopupMenu` pumps its own modal loop, which re-enters this
+        // wndproc — and we are currently *inside* `WM_PAINT`, between BeginPaint and EndPaint, with
+        // an `&mut App` live. Opening one here would recurse into an unvalidated paint. So record it
+        // and post: the loop delivers WM_APP_OPEN_MENU once this paint has finished and our borrow
+        // is gone.
+        if let Some(anchor) = frame.menu {
+            let mut pt = POINT {
+                x: anchor.x,
+                y: anchor.y,
+            };
+            unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
+            self.pending_menu = Some(PendingMenu {
+                action: anchor.action,
+                pt,
+                items: frame.overflow,
+            });
+            unsafe { PostMessageW(self.frame as HWND, WM_APP_OPEN_MENU, 0, 0) };
         }
     }
 
-    /// Invalidate the toolbar + status strips (the chrome) without disturbing the view child.
-    fn invalidate_chrome(&self) {
-        let (w, h) = self.client();
-        let tb = RECT {
-            left: 0,
-            top: 0,
-            right: w,
-            bottom: self.chrome.metrics.toolbar_h,
-        };
-        let sb = RECT {
-            left: 0,
-            top: h - self.chrome.metrics.status_h,
-            right: w,
-            bottom: h,
-        };
-        unsafe {
-            InvalidateRect(self.frame as HWND, &tb, 0);
-            InvalidateRect(self.frame as HWND, &sb, 0);
-        }
-        // The transport band sits above the status bar; refresh it too when present.
-        self.invalidate_transport();
-    }
-
-    /// Invalidate only the status strip (e.g. on a zoom change).
-    fn invalidate_status(&self) {
-        let (w, h) = self.client();
-        let sb = RECT {
-            left: 0,
-            top: h - self.chrome.metrics.status_h,
-            right: w,
-            bottom: h,
-        };
-        unsafe { InvalidateRect(self.frame as HWND, &sb, 0) };
-    }
-
-    /// Show the tooltip for the currently-hovered toolbar button (called when the hover-delay
-    /// timer fires). Anchors the bubble just below the toolbar, left-aligned to the button.
-    fn show_tooltip(&mut self) {
-        let Some(idx) = self.chrome.hover else { return };
-        let snap = self.snapshot();
-        let Some((rect, text)) = self.chrome.button_tooltip(idx, &snap) else {
-            return;
-        };
-        // Drop the bubble below the whole toolbar (a small DPI-scaled gap), left-aligned to the
-        // button; convert from frame-client coords to the screen coords the popup wants.
-        let gap = self.chrome.metrics.dpi as i32 * 2 / 96;
-        let mut pt = POINT {
-            x: rect.left,
-            y: self.chrome.metrics.toolbar_h + gap,
-        };
-        unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
-        self.tooltip.show(&text, pt.x, pt.y);
-    }
-
-    /// Hide the tooltip and cancel any pending hover-delay timer.
-    fn cancel_tooltip(&mut self) {
-        unsafe { KillTimer(self.frame as HWND, TIP_TIMER_ID) };
-        self.tooltip.hide();
-    }
 }
 
 /// Push the view-related settings into the renderer. The one place that maps `Config` onto
@@ -1409,21 +1329,6 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             lpszClassName: frame_class.as_ptr(),
         });
 
-        // Child view window class (D3D11 swapchain target). No background brush: it paints fully.
-        let view_class = wide("FireViewClass");
-        RegisterClassW(&WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(view_wndproc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinstance,
-            hIcon: ptr::null_mut(),
-            hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
-            hbrBackground: ptr::null_mut(),
-            lpszMenuName: ptr::null(),
-            lpszClassName: view_class.as_ptr(),
-        });
-
         let dark = chrome::system_uses_dark_mode();
 
         // Restore the remembered size now (so the GPU viewport starts at the right size); the
@@ -1440,7 +1345,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             0,
             frame_class.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             init_w,
@@ -1451,73 +1356,58 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             ptr::null(),
         );
         if frame.is_null() {
-            eprintln!("fire: CreateWindowExW(frame) failed");
+            eprintln!("fire: CreateWindowExW failed");
             return;
         }
         chrome::apply_dark_titlebar(frame, dark);
         chrome::apply_dark_menus(frame, dark);
 
         let dpi = GetDpiForWindow(frame).max(96);
-        let ch = Chrome::new(dpi, dark);
-        let tooltip = Tooltip::new(frame as isize, dpi, dark);
-        let chip = HintChip::new(frame as isize, dpi, dark);
+        let metrics = Metrics::new(dpi);
 
-        // Initial view rect from the frame client size and chrome metrics.
-        let (fw, fh) = client_size(frame);
-        let top = ch.metrics.toolbar_h;
-        let vw = (fw as i32).max(1);
-        let vh = (fh as i32 - top - ch.metrics.status_h).max(1);
-
-        let view = CreateWindowExW(
-            0,
-            view_class.as_ptr(),
-            ptr::null(),
-            WS_CHILD | WS_VISIBLE,
-            0,
-            top,
-            vw,
-            vh,
-            frame,
-            ptr::null_mut(),
-            hinstance,
-            ptr::null(),
-        );
-        if view.is_null() {
-            eprintln!("fire: CreateWindowExW(view) failed");
-            return;
-        }
-
-        // Accept files dropped from Explorer onto either window. A drop can land on the chrome
-        // (frame) or the image region (the view child); WS_CLIPCHILDREN means the view owns its
-        // own client rect, so registering only the frame would miss drops over the image.
+        // One window, so one drop target.
         DragAcceptFiles(frame, 1);
-        DragAcceptFiles(view, 1);
 
+        // The swapchain covers the whole client; the image is drawn into a sub-rect of it, recomputed
+        // every frame (see `App::image_rect`).
+        let (fw, fh) = client_size(frame);
         let mut surface = GpuSurface::new(
-            view as isize,
+            frame as isize,
             hinstance as isize,
-            vw as u32,
-            vh as u32,
+            fw.max(1),
+            fh.max(1),
             cfg.fit_upscale,
         );
-        surface.set_clear(ch.view_clear_packed());
+        surface.set_clear(crate::chrome::Palette::for_mode(dark).view_clear_packed());
         // The view-related config the surface owns (backdrop / open-fit / tonemap defaults). Same
         // path the settings dialog re-runs on Apply — see `App::apply_view_config`.
         apply_view_config(&mut surface, &cfg);
-        // Workers and the pipe server post to the frame (it owns title/size/lifecycle).
+
+        // ImGui needs the live D3D11 device/context, so it is built from the surface.
+        let mut imgui = Imgui::new(
+            frame as isize,
+            surface.device(),
+            surface.device_context(),
+            dpi,
+        );
+        crate::ui::theme::apply(imgui.style_mut(), dark, metrics.scale);
+
+        // Workers and the pipe server post here (this window owns title/size/lifecycle).
         let pool = DecodePool::new(frame as isize);
-        // Hot-reload watcher (config-gated); posts WM_APP_FILE_CHANGED to the frame, same as the
-        // pool. None when disabled, so no watch thread is spawned.
+        // Hot-reload watcher (config-gated); posts WM_APP_FILE_CHANGED, same as the pool. None when
+        // disabled, so no watch thread is spawned.
         let watcher = cfg.hot_reload.then(|| FileWatcher::spawn(frame as isize));
         let keybinds = Keybinds::from_config(&cfg.keybinds);
 
         let mut app = Box::new(App {
             frame: frame as isize,
-            view: view as isize,
             surface,
+            imgui,
+            metrics,
+            dark,
+            dpi,
+            frames_wanted: 0,
             pool,
-            chrome: ch,
-            tooltip,
             file_label: String::new(),
             meta: String::new(),
             loading: false,
@@ -1530,11 +1420,8 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             windowed_placement: std::mem::zeroed(),
             flipbook: HashMap::new(),
             flipbook_last_tick: None,
-            transport_shown: false,
-            chip,
-            transport: Transport::default(),
+            pending_menu: None,
         });
-        app.relayout();
 
         // Open the launch path immediately (decode is async; the image swaps in via
         // WM_APP_DECODE_DONE once the loop runs).
@@ -1542,15 +1429,8 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             app.open(OpenRequest::new(path));
         }
 
-        // Set the initial view visibility: hidden (frame paints the drop / double-click hint) when
-        // launched empty, shown when a launch path is loading. `open` above already synced for the
-        // with-file case; this covers the no-file case before the frame is first shown.
-        app.sync_empty_view();
-
-        // Attach the shared App to both windows so either wndproc can reach it.
         let app_raw = Box::into_raw(app);
         SetWindowLongPtrW(frame, GWLP_USERDATA, app_raw as isize);
-        SetWindowLongPtrW(view, GWLP_USERDATA, app_raw as isize);
 
         // Always show the frame (even if launched without a file). The launcher's "Run"
         // setting (the shortcut's Normal/Minimized/Maximized) wins for the show state;
@@ -1617,78 +1497,82 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
     }
     let app = &mut *app_ptr;
 
+    // ImGui sees every message first (except WM_PAINT, which is ours) so it can update its input
+    // state. Then two booleans decide who owns the event — replacing the entire hand-rolled
+    // hover/capture/hit-test/focus layer the GDI chrome needed:
+    //
+    //   * `want_capture_mouse`    — the pointer is over a widget (toolbar, transport, popup).
+    //   * `want_capture_keyboard` — a text field has focus, so keys are typing, not commands.
+    //
+    // Note this is *not* the wnd-proc handler's return value: upstream returns true only for the
+    // handful of messages it fully consumes (WM_SETCURSOR and friends), never for "that click was
+    // mine". Gating on the return value instead would let a click on a toolbar button *also* pan the
+    // image underneath it.
+    if msg != WM_PAINT {
+        if app.imgui.wnd_proc(hwnd as isize, msg, wparam, lparam) {
+            return 0;
+        }
+
+        let mouse_msg = matches!(
+            msg,
+            WM_MOUSEMOVE
+                | WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_LBUTTONDBLCLK
+                | WM_RBUTTONDOWN
+                | WM_RBUTTONUP
+                | WM_MBUTTONDOWN
+                | WM_MOUSEWHEEL
+        );
+        let key_msg = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+
+        // Any input can change a hover or an active state, so give ImGui its settle frames.
+        if mouse_msg || key_msg {
+            app.request_frames(2);
+        }
+
+        // A pan/zoom drag already in flight owns the mouse to the end of the gesture, even if the
+        // cursor strays over the chrome — otherwise the drag would stick the moment it crossed the
+        // toolbar.
+        if mouse_msg && !app.surface.is_mouse_captured() && app.imgui.wants_mouse() {
+            return 0;
+        }
+        if key_msg && app.imgui.wants_keyboard() {
+            return 0;
+        }
+    }
+
     match msg {
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             BeginPaint(hwnd, &mut ps);
-            let rc = ps.rcPaint;
-            let (bw, bh) = (rc.right - rc.left, rc.bottom - rc.top);
-            if bw > 0 && bh > 0 {
-                // Double-buffered. The chrome paints back-to-front (strip fill, then dividers, then
-                // every widget over them), so composing straight onto the screen DC flickers
-                // whenever a repaint is more than occasional — dragging the transport slider
-                // repaints the band on every mouse move. Compose into a memory bitmap the size of
-                // the invalid rect and blit it once; the widget code still works in frame-client
-                // coords, which the viewport origin maps into the bitmap.
-                let mem = CreateCompatibleDC(ps.hdc);
-                let bmp = CreateCompatibleBitmap(ps.hdc, bw, bh);
-                let old = SelectObject(mem, bmp as HGDIOBJ);
-                SetViewportOrgEx(mem, -rc.left, -rc.top, ptr::null_mut());
-
-                let (w, h) = app.client();
-                let snap = app.snapshot();
-                app.chrome.paint_toolbar(mem, w, &snap);
-                app.chrome.paint_status(mem, w, h, &snap);
-                // Flipbook transport band (above the status bar) when in flipbook mode.
-                if let (Some(band), Some(tsnap)) =
-                    (app.transport_band_rect(), app.transport_snapshot())
-                {
-                    app.transport.paint(mem, band, &app.chrome, &tsnap);
-                }
-                // Empty state: the D3D view is hidden, so the frame owns the viewport region and
-                // paints the drop / double-click hint there (matching the double-click-to-open
-                // wiring below).
-                if app.empty_view_active() {
-                    let (vx, vy, vw, vh) = app.view_rect();
-                    let vr = RECT {
-                        left: vx,
-                        top: vy,
-                        right: vx + vw,
-                        bottom: vy + vh,
-                    };
-                    app.chrome.paint_empty_view(mem, &vr);
-                }
-
-                SetViewportOrgEx(mem, 0, 0, ptr::null_mut());
-                BitBlt(ps.hdc, rc.left, rc.top, bw, bh, mem, 0, 0, SRCCOPY);
-                SelectObject(mem, old);
-                DeleteObject(bmp as HGDIOBJ);
-                DeleteDC(mem);
+            // The event-driven pump: draw the frame we were asked for, and stop when the debt is
+            // paid. If `frames_wanted` is still positive afterwards, dirty the window so exactly one
+            // more WM_PAINT arrives — never a self-sustaining loop.
+            app.frames_wanted = app.frames_wanted.saturating_sub(1);
+            app.render();
+            if app.frames_wanted > 0 {
+                InvalidateRect(hwnd, ptr::null(), 0);
             }
             EndPaint(hwnd, &ps);
             0
         }
         WM_SIZE => {
-            app.cancel_tooltip();
-            app.relayout();
-            app.reposition_view();
-            app.invalidate_chrome();
-            // Reposition/hide the hint chip for the new size (also handles minimize/restore).
-            app.sync_chip();
+            let w = (lparam & 0xffff) as u32;
+            let h = ((lparam >> 16) & 0xffff) as u32;
+            // The swapchain covers the whole client; the image's sub-rect of it is recomputed in
+            // `render`, so there is nothing else to lay out.
+            app.surface.resize(w, h);
+            app.redraw();
             0
         }
-        WM_MOVE => {
-            // The hint chip is a separate top-level popup, so it must follow the frame.
-            app.sync_chip();
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
         WM_GETMINMAXINFO => {
-            // Clamp the minimum track size so the toolbar can't be squeezed until its buttons
-            // overlap: the chrome reports the smallest *client* size that still lays out (right group
-            // + collapsed "»"), which we widen to an outer window rect for the frame's current style
-            // and DPI. Windows pre-fills the other MINMAXINFO fields, so we override only the min.
+            // Keep the window wide enough that the toolbar can still lay out (the right group plus
+            // a collapsed "»"), and tall enough for the chrome plus a sliver of image.
             let mmi = &mut *(lparam as *mut MINMAXINFO);
-            let (cw, ch) = app.chrome.min_client_size();
+            let m = Metrics::new(GetDpiForWindow(hwnd).max(96));
+            let cw = (420.0 * m.scale) as i32;
+            let ch = (m.toolbar_h + m.status_h + 80.0 * m.scale) as i32;
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
             let dpi = GetDpiForWindow(hwnd).max(96);
             let mut r = RECT {
@@ -1702,212 +1586,81 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             mmi.ptMinTrackSize.y = r.bottom - r.top;
             0
         }
+
+        // --- image input (only reached when ImGui didn't want the event) ---------------------
+
+        WM_MOUSEMOVE => {
+            let (x, y) = app.image_cursor(lparam);
+            app.surface.on_cursor_moved((x, y));
+            if app.surface.is_zoom_dragging() {
+                app.redraw(); // the RMB drag changes the zoom %, which the status bar shows
+            }
+            0
+        }
         WM_LBUTTONDOWN => {
-            let x = (lparam & 0xffff) as u16 as i16 as i32;
-            let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
-            app.cancel_tooltip();
-            // A press anywhere commits any in-progress typed field edit first.
-            if app.transport.is_editing() {
-                if let Some(snap) = app.transport_snapshot() {
-                    if let Some(edit) = app.transport.commit(&snap) {
-                        app.apply_transport_edit(edit);
-                    }
-                }
-            }
-            // Transport band press (grid/count/play/slider/fps/blend).
-            if let Some(band) = app.transport_band_rect() {
-                if y >= band.top && y < band.bottom {
-                    if let Some(snap) = app.transport_snapshot() {
-                        let press = app.transport.press(x, y, &snap);
-                        if press.capture {
-                            SetCapture(hwnd);
-                        }
-                        if press.slider {
-                            app.pause_flipbook();
-                        }
-                        if let Some(edit) = press.edit {
-                            app.apply_transport_edit(edit);
-                        }
-                        app.invalidate_transport();
-                    }
-                    return 0;
-                }
-            }
-            let snap = app.snapshot();
-            if let Some(action) = app.chrome.hit_test(x, y, &snap) {
-                // The actions button opens a popup menu, which needs the button's screen rect, so
-                // it's handled here rather than in the rect-less `do_action`.
-                match action {
-                    Action::OpenWithMenu => app.actions_menu(),
-                    // The "»" popup, like the actions menu, needs the button's screen rect.
-                    Action::Overflow => app.overflow_menu(),
-                    // Post rather than open inline: `app` is borrowed from GWLP_USERDATA for this
-                    // message, and the dialog's nested loop re-enters this wndproc, which takes its
-                    // own borrow. Handing it to the message loop drops ours first.
-                    Action::OpenSettings => {
-                        PostMessageW(hwnd, WM_APP_OPEN_SETTINGS, 0, 0);
-                    }
-                    _ => app.do_action(action),
-                }
-            }
+            let (x, y) = app.image_cursor(lparam);
+            SetCapture(hwnd);
+            SetFocus(hwnd);
+            // Sync the pan origin to the press point so the first move's delta is measured from
+            // here, not a stale position. Matters after the context menu (or any gap where we saw
+            // no WM_MOUSEMOVE): without this the first drag lurches the image toward the click.
+            app.surface.on_cursor_moved((x, y));
+            app.surface.begin_drag();
             0
         }
         WM_LBUTTONUP => {
-            if app.transport.is_dragging() {
-                ReleaseCapture();
-                app.transport.release();
-                // A field click (no drag) entered type-edit mode → take focus so the following
-                // WM_CHAR / Enter / Esc reach the frame (the view child may have held focus).
-                if app.transport.is_editing() {
-                    SetFocus(hwnd);
-                }
-                app.invalidate_transport();
-            }
+            ReleaseCapture();
+            app.surface.end_drag();
             0
         }
         WM_LBUTTONDBLCLK => {
-            // Double-clicking the empty viewport opens the file picker (matches the on-screen hint).
-            // Only the empty state reaches here: once an image loads the D3D view is shown and
-            // catches its own clicks. The region check keeps double-clicks on the chrome inert.
+            // Double-clicking the empty viewport opens the file picker (matching the on-screen hint).
             if app.empty_view_active() {
-                let x = (lparam & 0xffff) as u16 as i16 as i32;
-                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
-                let (vx, vy, vw, vh) = app.view_rect();
-                if x >= vx && x < vx + vw && y >= vy && y < vy + vh {
+                let x = (lparam & 0xffff) as u16 as i16 as f32;
+                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
+                let (ix, iy, iw, ih) = app.image_rect();
+                if x >= ix && x < ix + iw && y >= iy && y < iy + ih {
                     app.open_via_dialog();
                 }
             }
             0
         }
-        WM_MOUSEMOVE => {
-            let x = (lparam & 0xffff) as u16 as i16 as i32;
-            let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
-            // An active transport drag (mouse captured) takes moves anywhere, even outside the band.
-            if app.transport.is_dragging() {
-                if let Some(snap) = app.transport_snapshot() {
-                    if let Some(edit) = app.transport.drag_to(x, &snap) {
-                        app.apply_transport_edit(edit);
-                    }
-                }
-                return 0;
-            }
-            // Transport band hover (below the toolbar): repaint on change.
-            if let Some(band) = app.transport_band_rect() {
-                if y >= band.top && y < band.bottom {
-                    if app.transport.set_hover(x, y) {
-                        app.invalidate_transport();
-                    }
-                    if app.chrome.hover.is_some() {
-                        app.chrome.hover = None;
-                        app.invalidate_chrome();
-                    }
-                    return 0;
-                } else if app.transport.clear_hover() {
-                    app.invalidate_transport();
-                }
-            }
-            let hov = if y < app.chrome.metrics.toolbar_h {
-                app.chrome.hover_index(x, y)
-            } else {
-                None
-            };
-            if hov != app.chrome.hover {
-                app.chrome.hover = hov;
-                app.invalidate_chrome();
-                // The hovered button changed: drop any showing tip and re-arm the hover delay.
-                app.cancel_tooltip();
-                if hov.is_some() {
-                    // Ask for WM_MOUSELEAVE so the hover clears when the cursor exits.
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    TrackMouseEvent(&mut tme);
-                    SetTimer(hwnd, TIP_TIMER_ID, TIP_DELAY_MS, None);
-                }
+        WM_RBUTTONDOWN => {
+            let (x, y) = app.image_cursor(lparam);
+            SetCapture(hwnd);
+            SetFocus(hwnd);
+            app.surface.on_cursor_moved((x, y)); // pin the pivot to the press point
+            app.surface.begin_zoom_drag();
+            0
+        }
+        WM_RBUTTONUP => {
+            ReleaseCapture();
+            // A right *click* (the gesture never moved past the zoom-drag slop) opens the actions
+            // menu at the cursor; an actual zoom-drag just ends.
+            if !app.surface.end_zoom_drag() {
+                let x = (lparam & 0xffff) as u16 as i16 as i32;
+                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
+                let mut pt = POINT { x, y };
+                ClientToScreen(hwnd, &mut pt);
+                app.show_actions_menu(pt);
+                app.redraw();
             }
             0
         }
-        WM_TIMER => {
-            match wparam {
-                TIP_TIMER_ID => {
-                    KillTimer(hwnd, TIP_TIMER_ID);
-                    app.show_tooltip();
-                }
-                ANIM_TIMER_ID => app.tick_animation(),
-                FLIPBOOK_TIMER_ID => app.tick_flipbook(),
-                _ => {}
-            }
+        WM_MBUTTONDOWN => {
+            // A middle-click over the image toggles full-screen. Take focus so Esc/F11 land here.
+            SetFocus(hwnd);
+            app.toggle_fullscreen();
             0
-        }
-        WM_MOUSELEAVE => {
-            app.cancel_tooltip();
-            if app.chrome.hover.is_some() {
-                app.chrome.hover = None;
-                app.invalidate_chrome();
-            }
-            if app.transport.clear_hover() {
-                app.invalidate_transport();
-            }
-            0
-        }
-        WM_ACTIVATE => {
-            // Losing activation (alt-tab / click away): drop the topmost tip and the hint chip so
-            // they can't linger over other windows; on regaining activation, re-show the chip if it
-            // still applies. Still defer to DefWindowProc for the default focus handling.
-            if (wparam & 0xffff) == WA_INACTIVE as usize {
-                app.cancel_tooltip();
-                app.chip.hide();
-            } else {
-                app.sync_chip();
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_MOUSEWHEEL => {
-            // WM_MOUSEWHEEL carries *screen* coords; convert to client to test the transport band.
-            let notches = ((wparam >> 16) & 0xffff) as u16 as i16 as i32 / 120;
-            let mut pt = POINT {
-                x: (lparam & 0xffff) as u16 as i16 as i32,
-                y: ((lparam >> 16) & 0xffff) as u16 as i16 as i32,
-            };
-            ScreenToClient(hwnd, &mut pt);
-            let over_band = app
-                .transport_band_rect()
-                .is_some_and(|b| pt.y >= b.top && pt.y < b.bottom);
-            if over_band {
-                let ctrl = (GetKeyState(0x11) as u16 & 0x8000) != 0; // VK_CONTROL
-                if let Some(snap) = app.transport_snapshot() {
-                    if let Some(edit) = app.transport.wheel(pt.x, pt.y, notches, ctrl, &snap) {
-                        // Wheeling over the slider is a scrub like any other — it takes the
-                        // playhead, so it stops playback too (the fps/grid fields don't).
-                        if matches!(edit, TransportEdit::Scrub(_)) {
-                            app.pause_flipbook();
-                        }
-                        app.apply_transport_edit(edit);
-                    }
-                }
-            } else if notches != 0 {
-                // Over the image: zoom about the surface's tracked cursor (position ignored here).
+            let delta = ((wparam >> 16) & 0xffff) as u16 as i16 as f32 / 120.0;
+            if delta != 0.0 {
                 let step = app.cfg.zoom_step;
-                app.surface.zoom_at_cursor(step.powf(notches as f32));
-                app.invalidate_status();
+                app.surface.zoom_at_cursor(step.powf(delta));
+                app.redraw();
             }
             0
-        }
-        WM_CHAR => {
-            // Typed input for a transport numeric field (the codebase's only typed field). Digits
-            // (and `.` for fps) and Backspace go to the active edit; nothing else consumes them.
-            if app.transport.is_editing() {
-                if let Some(ch) = char::from_u32(wparam as u32) {
-                    if app.transport.type_char(ch) {
-                        app.invalidate_transport();
-                    }
-                }
-                return 0;
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_KEYDOWN => {
             app.handle_key(wparam as u32);
@@ -1922,10 +1675,21 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
         }
+        WM_TIMER => {
+            match wparam {
+                ANIM_TIMER_ID => app.tick_animation(),
+                FLIPBOOK_TIMER_ID => app.tick_flipbook(),
+                _ => {}
+            }
+            0
+        }
         WM_DROPFILES => {
             handle_drop(app, wparam as HDROP);
             0
         }
+
+        // --- cross-thread wakeups ------------------------------------------------------------
+
         WM_APP_OPEN => {
             let req = Box::from_raw(lparam as *mut OpenRequest);
             app.open(*req);
@@ -1954,27 +1718,22 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.open_settings();
             0
         }
+        WM_APP_OPEN_MENU => {
+            app.open_pending_menu();
+            0
+        }
         WM_APP_SETTINGS_APPLY => {
             let cfg = Box::from_raw(lparam as *mut Config);
             app.apply_settings(*cfg);
             0
         }
-        WM_APP_FLIPBOOK_CHIP => {
-            // The hint chip was clicked: accept enters flipbook mode, dismiss hides it for good.
-            match wparam {
-                CHIP_ACCEPT => app.toggle_flipbook(),
-                CHIP_DISMISS => {
-                    if let Some(e) = app.flipbook_entry() {
-                        e.hint_dismissed = true;
-                    }
-                    app.sync_chip();
-                }
-                _ => {}
-            }
-            0
-        }
+
+        // --- window / system -----------------------------------------------------------------
+
         WM_DPICHANGED => {
-            // Adopt the OS-suggested rect, then rescale chrome + view for the new DPI.
+            // Adopt the OS-suggested rect, then rescale the UI for the new DPI. ImGui 1.92 re-bakes
+            // glyphs lazily, so this is a style rescale plus one icon-atlas re-raster — no font
+            // atlas to rebuild.
             let new_dpi = (wparam & 0xffff) as u32;
             let prc = lparam as *const RECT;
             if !prc.is_null() {
@@ -1989,32 +1748,28 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
-            app.cancel_tooltip();
-            // Cancel any in-progress transport drag/edit (their pixel anchors are DPI-stale).
-            app.transport.cancel_drag();
-            app.transport.cancel_edit();
-            app.chrome.set_dpi(new_dpi);
-            app.tooltip.set_dpi(new_dpi);
-            app.chip.set_dpi(new_dpi);
-            app.relayout();
-            app.reposition_view();
-            app.sync_chip();
-            InvalidateRect(hwnd, ptr::null(), 0);
+            app.dpi = new_dpi.max(96);
+            app.metrics = Metrics::new(app.dpi);
+            let (dark, scale) = (app.dark, app.metrics.scale);
+            app.imgui.set_dpi(app.surface.device(), app.dpi);
+            crate::ui::theme::apply(app.imgui.style_mut(), dark, scale);
+            app.redraw();
             0
         }
-        WM_SETTINGCHANGE => {
-            // A theme switch (and much else) arrives here; re-detect and re-skin if changed.
+        // A light/dark switch arrives as WM_SETTINGCHANGE (along with much else); an accent-color
+        // change arrives as WM_DWMCOLORIZATIONCOLORCHANGED. Both mean "re-read the theme".
+        WM_SETTINGCHANGE | WM_DWMCOLORIZATIONCOLORCHANGED => {
             let dark = chrome::system_uses_dark_mode();
-            if dark != app.chrome.dark {
-                app.chrome.set_dark(dark);
-                app.tooltip.set_dark(dark);
-                app.chip.set_dark(dark);
-                app.surface.set_clear(app.chrome.view_clear_packed());
-                chrome::apply_dark_titlebar(hwnd, dark);
-                chrome::apply_dark_menus(hwnd, dark);
-                InvalidateRect(hwnd, ptr::null(), 0);
-                app.surface.invalidate();
-            }
+            // The accent can move without the light/dark mode changing, so restyle unconditionally
+            // rather than gating on `dark != app.dark` (that was a real bug in the GDI chrome).
+            app.dark = dark;
+            let scale = app.metrics.scale;
+            crate::ui::theme::apply(app.imgui.style_mut(), dark, scale);
+            app.surface
+                .set_clear(crate::chrome::Palette::for_mode(dark).view_clear_packed());
+            chrome::apply_dark_titlebar(hwnd, dark);
+            chrome::apply_dark_menus(hwnd, dark);
+            app.redraw();
             0
         }
         WM_CLOSE => {
@@ -2025,132 +1780,6 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             // Remember where/how the window was before it goes away, to restore next launch.
             save_window_state(hwnd, app);
             PostQuitMessage(0);
-            0
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-/// Child view proc. Same panic firewall as [`frame_wndproc`]: the real handling is in
-/// [`view_wndproc_impl`], behind `catch_unwind`, so a panic in (e.g.) a paint can't unwind into
-/// the Win32 dispatcher and abort.
-unsafe extern "system" fn view_wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        view_wndproc_impl(hwnd, msg, wparam, lparam)
-    })) {
-        Ok(lr) => lr,
-        Err(_) => {
-            eprintln!("fire: recovered from a panic in view_wndproc (msg {msg:#06x})");
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-    }
-}
-
-/// Child view handling: D3D11 present + image navigation (LMB-drag pan, wheel + RMB-drag zoom,
-/// keys). Wrapped by [`view_wndproc`]'s panic firewall.
-unsafe fn view_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let app_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
-    if app_ptr.is_null() {
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    }
-    let app = &mut *app_ptr;
-
-    match msg {
-        WM_PAINT => {
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            BeginPaint(hwnd, &mut ps);
-            app.surface.render();
-            EndPaint(hwnd, &ps);
-            0
-        }
-        WM_SIZE => {
-            let w = (lparam & 0xffff) as u32;
-            let h = ((lparam >> 16) & 0xffff) as u32;
-            app.surface.resize(w, h);
-            0
-        }
-        WM_MOUSEMOVE => {
-            let x = (lparam & 0xffff) as u16 as i16 as f32;
-            let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
-            app.surface.on_cursor_moved((x, y));
-            if app.surface.is_zoom_dragging() {
-                app.invalidate_status(); // RMB drag changes the zoom %
-            }
-            0
-        }
-        WM_LBUTTONDOWN => {
-            let x = (lparam & 0xffff) as u16 as i16 as f32;
-            let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
-            SetCapture(hwnd);
-            SetFocus(hwnd); // take keyboard focus so nav keys reach this window
-                            // Sync the pan origin to the press point so the first move's delta is measured from
-                            // here, not a stale position. Matters after the context menu (or any gap where the
-                            // view saw no WM_MOUSEMOVE): without this, the cursor is still at the right-click
-                            // point and the first drag lurches the image toward the click. (RMB does the same.)
-            app.surface.on_cursor_moved((x, y));
-            app.surface.begin_drag();
-            0
-        }
-        WM_LBUTTONUP => {
-            ReleaseCapture();
-            app.surface.end_drag();
-            0
-        }
-        WM_RBUTTONDOWN => {
-            let x = (lparam & 0xffff) as u16 as i16 as f32;
-            let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
-            SetCapture(hwnd);
-            SetFocus(hwnd);
-            app.surface.on_cursor_moved((x, y)); // pin the pivot to the press point
-            app.surface.begin_zoom_drag();
-            0
-        }
-        WM_RBUTTONUP => {
-            ReleaseCapture();
-            // A right *click* (the gesture never moved past the zoom-drag slop) opens the actions
-            // menu at the cursor; an actual zoom-drag just ends.
-            if !app.surface.end_zoom_drag() {
-                let x = (lparam & 0xffff) as u16 as i16 as i32;
-                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
-                app.actions_menu_at_view(x, y);
-            }
-            0
-        }
-        WM_MBUTTONDOWN => {
-            // A middle-click anywhere over the image toggles full-screen. Take focus so Esc/F11
-            // reach this window afterward.
-            SetFocus(hwnd);
-            app.toggle_fullscreen();
-            0
-        }
-        WM_MOUSEWHEEL => {
-            let delta = ((wparam >> 16) & 0xffff) as u16 as i16 as f32 / 120.0;
-            if delta != 0.0 {
-                let step = app.cfg.zoom_step;
-                app.surface.zoom_at_cursor(step.powf(delta));
-                app.invalidate_status();
-            }
-            0
-        }
-        WM_KEYDOWN => {
-            app.handle_key(wparam as u32);
-            0
-        }
-        // See the frame's WM_SYSKEYDOWN: Alt chords come through here.
-        WM_SYSKEYDOWN => {
-            if app.handle_key(wparam as u32) {
-                0
-            } else {
-                DefWindowProcW(hwnd, msg, wparam, lparam)
-            }
-        }
-        WM_DROPFILES => {
-            handle_drop(app, wparam as HDROP);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),

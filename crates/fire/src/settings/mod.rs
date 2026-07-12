@@ -29,32 +29,43 @@ mod model;
 use std::path::PathBuf;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
-    DeleteObject, EndPaint, GetDC, IntersectClipRect, InvalidateRect, ReleaseDC, SelectObject,
-    SetBkMode, SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_PATH_ELLIPSIS,
-    DT_SINGLELINE, DT_VCENTER, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateRectRgn,
+    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, GetDC, IntersectClipRect, InvalidateRect,
+    ReleaseDC, RestoreDC, SaveDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC,
+    HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
     OPENFILENAMEW,
 };
+use windows_sys::Win32::UI::Controls::SetWindowTheme;
 use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetKeyState, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    EnableWindow, GetFocus, GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW,
-    LoadIconW, PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TrackPopupMenu, TranslateMessage, GWLP_USERDATA, IDC_ARROW, MF_CHECKED, MF_STRING,
-    MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD,
-    TPM_TOPALIGN, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WNDCLASSW, WS_CAPTION,
-    WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU,
+    AppendMenuW, CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW, GetParent, GetWindowLongPtrW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, LoadCursorW, LoadIconW, PostMessageW,
+    RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, ES_AUTOHSCROLL,
+    GWLP_USERDATA, GWLP_WNDPROC, HMENU, IDC_ARROW, MF_CHECKED, MF_STRING, MSG, SWP_NOACTIVATE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOW, TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN,
+    WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WNDCLASSW, WNDPROC, WS_CAPTION,
+    WS_CHILD, WS_CLIPCHILDREN, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
 };
+
+/// `EDIT` notification codes (the HIWORD of `WM_COMMAND`'s WPARAM). Stable Win32 values; windows-sys
+/// doesn't surface them under the enabled features.
+const EN_SETFOCUS: u32 = 0x0100;
+const EN_KILLFOCUS: u32 = 0x0200;
+const EN_CHANGE: u32 = 0x0300;
 
 use crate::chrome::{self, create_ui_font, draw_text, fill, text_width, Palette};
 use crate::config::Config;
@@ -78,18 +89,19 @@ const VK_ESCAPE: u32 = 0x1B;
 const VK_SPACE: u32 = 0x20;
 const VK_LEFT: u32 = 0x25;
 const VK_RIGHT: u32 = 0x27;
-const VK_HOME: u32 = 0x24;
-const VK_END: u32 = 0x23;
-const VK_DELETE: u32 = 0x2E;
-const VK_BACK: u32 = 0x08;
+const VK_A: u32 = 0x41;
+
+/// `EM_SETSEL` — select a character range in an `EDIT` (`0, -1` = everything).
+const EM_SETSEL: u32 = 0x00B1;
 
 const CLASS_NAME: &str = "FireSettingsClass";
 static REGISTER: std::sync::Once = std::sync::Once::new();
 
 /// Dialog client size in logical (96-dpi) px. Fixed: the content is a single column, and a resizable
 /// settings window buys nothing but layout code.
-const DLG_W: i32 = 580;
-const DLG_H: i32 = 520;
+const DLG_W: i32 = 600;
+/// Tall enough that the General and Flipbook tabs never scroll — only Keybinds (22 rows) does.
+const DLG_H: i32 = 600;
 
 /// The tabs, in strip order.
 const TABS: &[&str] = &["General", "Flipbook", "Keybinds", "Context menu"];
@@ -108,6 +120,9 @@ struct Theme {
     p: Palette,
     /// Text-input / dropdown fill — sunken relative to the body.
     field_bg: u32,
+    /// `field_bg` as a brush, for `WM_CTLCOLOREDIT`. Cached: that message fires on every repaint of
+    /// every text box, and a brush created per call would leak GDI handles steadily.
+    field_brush: HBRUSH,
     /// The dialog body (behind the tab content).
     body_bg: u32,
     /// The tab strip and the button bar, a shade off the body so the content reads as a panel.
@@ -117,8 +132,14 @@ struct Theme {
 impl Theme {
     fn new(dark: bool) -> Self {
         let p = Palette::for_mode(dark);
+        let field_bg = if dark {
+            rgb(30, 30, 30)
+        } else {
+            rgb(255, 255, 255)
+        };
         Theme {
-            field_bg: if dark { rgb(30, 30, 30) } else { rgb(255, 255, 255) },
+            field_bg,
+            field_brush: unsafe { CreateSolidBrush(field_bg) },
             body_bg: p.toolbar_bg,
             bar_bg: p.status_bg,
             p,
@@ -126,26 +147,41 @@ impl Theme {
     }
 }
 
+impl Drop for Theme {
+    fn drop(&mut self) {
+        unsafe { DeleteObject(self.field_brush as HGDIOBJ) };
+    }
+}
+
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
-/// DPI-scaled dialog metrics (all inputs are 96-dpi logical px).
+/// DPI-scaled dialog metrics. Every logical value is a multiple of 4 — Windows' own dialog layouts
+/// sit on a 4px grid, and an ad-hoc rhythm is exactly what reads as "not quite native". `ctl_h` (24)
+/// is the classic Win32 control height; `row_h` (32) leaves 4px of air above and below it.
+///
+/// `label_w` is *not* a constant: it is measured per tab from the longest label on it
+/// ([`Dialog::label_column`]). A fixed column is what left the checkbox tabs with a dead gutter
+/// down the left third of the dialog.
 struct Metrics {
     dpi: u32,
     font: HFONT,
+    /// Page margin.
     pad: i32,
+    /// Gap between a control and its neighbour.
+    gap: i32,
+    /// Space between two sections.
+    section: i32,
     tabstrip_h: i32,
     buttonbar_h: i32,
     row_h: i32,
     ctl_h: i32,
-    label_w: i32,
     drop_w: i32,
     step_w: i32,
     check: i32,
     head_h: i32,
     note_h: i32,
-    gap: i32,
     btn_w: i32,
     /// Width of the chord box on a keybind row.
     key_w: i32,
@@ -157,20 +193,20 @@ impl Metrics {
         Metrics {
             dpi,
             font: create_ui_font(dpi),
-            pad: s(16),
-            tabstrip_h: s(36),
-            buttonbar_h: s(52),
-            row_h: s(30),
-            ctl_h: s(24),
-            label_w: s(170),
-            drop_w: s(190),
-            step_w: s(110),
-            check: s(16),
-            head_h: s(32),
-            note_h: s(20),
+            pad: s(20),
             gap: s(8),
-            btn_w: s(84),
-            key_w: s(150),
+            section: s(16),
+            tabstrip_h: s(40),
+            buttonbar_h: s(56),
+            row_h: s(32),
+            ctl_h: s(24),
+            drop_w: s(200),
+            step_w: s(104),
+            check: s(16),
+            head_h: s(24),
+            note_h: s(20),
+            btn_w: s(88),
+            key_w: s(152),
         }
     }
 
@@ -262,6 +298,9 @@ struct Dialog {
     focus: Option<usize>,
     hover: Option<usize>,
     tracking_leave: bool,
+    /// Width of the current tab's label column, measured from its longest label (see
+    /// [`Self::label_column`]) rather than fixed — the controls sit right where the words end.
+    label_w: i32,
 
     /// Scroll offset of the content area, and its full laid-out height.
     scroll: i32,
@@ -276,12 +315,26 @@ struct Dialog {
     tree: Vec<TreeRow>,
     tree_sel: Option<Vec<usize>>,
 
-    /// The text box being typed into (its field, buffer and caret). Held separately from the draft
-    /// so normalizing writes (`args` splitting) can't fight the keystrokes.
-    edit: Option<(TextField, String, usize)>,
+    /// The three text boxes of the Context-menu tab's detail form, indexed by [`TEXT_FIELDS`].
+    ///
+    /// These are the dialog's **only** child windows, and the only real controls: they are genuine
+    /// `EDIT`s. Everything a text box has to get right — selection, double-click-to-word, IME,
+    /// Ctrl+A/C/V/X, the caret, right-to-left — is not worth reimplementing, and a hand-drawn
+    /// version of it is exactly the kind of thing that feels wrong without being able to say why.
+    /// They are created once and moved/shown/hidden as the tab and selection change.
+    edits: [HWND; 3],
+    /// Ignore `EN_CHANGE` while we are the ones setting the text (see [`Self::seed_edits`]).
+    seeding: bool,
+    /// The tree selection the edits currently hold the text of, so a relayout mid-typing doesn't
+    /// reset them under the caret.
+    seeded_for: Option<Vec<usize>>,
 
     alive: bool,
 }
+
+/// The Context-menu tab's text boxes, in tab order. The index into this array is also the index into
+/// [`Dialog::edits`] and the child control id.
+const TEXT_FIELDS: [TextField; 3] = [TextField::Name, TextField::Program, TextField::Args];
 
 /// Open the settings dialog modally over `owner`, seeded with `cfg`. Returns when it closes; any
 /// Apply/OK has been posted to `owner` as [`WM_APP_SETTINGS_APPLY`] by then (the frame applies it
@@ -321,7 +374,9 @@ pub fn run_modal(owner: isize, cfg: Config, dark: bool) {
             WS_EX_DLGMODALFRAME,
             class.as_ptr(),
             title.as_ptr(),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            // WS_CLIPCHILDREN: the EDIT children paint themselves, so our full-client blit must not
+            // overdraw them.
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
             x,
             y,
             w,
@@ -340,12 +395,17 @@ pub fn run_modal(owner: isize, cfg: Config, dark: bool) {
     chrome::apply_dark_titlebar(hwnd, dark);
     chrome::apply_dark_menus(hwnd, dark);
 
+    let m = Metrics::new(dpi);
+    // Control ids are 1-based: `GetDlgCtrlID` returns 0 for "not a child control", so a control
+    // *with* id 0 is indistinguishable from none.
+    let edits = std::array::from_fn(|i| create_edit(hwnd, hinstance, i + 1, m.font, dark));
+
     let keys = Keybinds::from_config(&cfg.keybinds);
     let mut dlg = Box::new(Dialog {
         hwnd,
         owner,
         th: Theme::new(dark),
-        m: Metrics::new(dpi),
+        m,
         dark,
         applied: cfg.clone(),
         draft: cfg,
@@ -356,13 +416,16 @@ pub fn run_modal(owner: isize, cfg: Config, dark: bool) {
         focus: None,
         hover: None,
         tracking_leave: false,
+        label_w: 0,
         scroll: 0,
         content_h: 0,
         capture: None,
         key_note: String::new(),
         tree: Vec::new(),
         tree_sel: None,
-        edit: None,
+        edits,
+        seeding: false,
+        seeded_for: None,
         alive: true,
     });
     dlg.relayout();
@@ -388,6 +451,84 @@ pub fn run_modal(owner: isize, cfg: Config, dark: bool) {
         SetForegroundWindow(owner);
         drop(Box::from_raw(dlg_raw));
     }
+}
+
+/// The original `EDIT` window proc, saved when the first text box is subclassed (all three share the
+/// same class, so it is the same proc for all of them). Classic `GWLP_WNDPROC` subclassing rather
+/// than comctl32's `SetWindowSubclass` — it keeps the dialog on plain user32, like the rest of the app.
+static EDIT_PROC: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+
+/// Create one of the dialog's `EDIT` children (hidden; [`Dialog::relayout`] places and shows it).
+///
+/// Borderless, because the dialog paints the field's fill and border itself — so the control lines
+/// up with the custom widgets around it. That also means the *only* theming it needs is
+/// `WM_CTLCOLOREDIT` (fully documented) to hand it our background brush and text color. The
+/// `DarkMode_CFD` theme on top of that is what gives the **caret** and the selection highlight their
+/// dark-mode colors; without it the caret is drawn black on a black field and is invisible.
+fn create_edit(parent: HWND, hinstance: HINSTANCE, id: usize, font: HFONT, dark: bool) -> HWND {
+    let class = wide("EDIT");
+    let h = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            ptr::null(),
+            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            0,
+            0,
+            0,
+            0,
+            parent,
+            id as HMENU,
+            hinstance,
+            ptr::null(),
+        )
+    };
+    if h.is_null() {
+        eprintln!("fire: CreateWindowExW(settings EDIT) failed");
+        return h;
+    }
+    unsafe {
+        SendMessageW(h, WM_SETFONT, font as WPARAM, 1);
+        apply_edit_theme(h, dark);
+        let proc: WNDPROC = Some(edit_proc);
+        let prev = SetWindowLongPtrW(h, GWLP_WNDPROC, std::mem::transmute::<WNDPROC, isize>(proc));
+        let _ = EDIT_PROC.set(prev);
+    }
+    h
+}
+
+/// Dark-mode the parts of an `EDIT` we don't paint: the caret and the selection highlight.
+fn apply_edit_theme(h: HWND, dark: bool) {
+    let theme = wide(if dark { "DarkMode_CFD" } else { "CFD" });
+    unsafe { SetWindowTheme(h, theme.as_ptr(), ptr::null()) };
+}
+
+/// Keep the dialog's keyboard contract working while an `EDIT` has focus: Tab / Shift+Tab / Enter /
+/// Esc belong to the dialog. Everything else — selection, double-click-to-word, the clipboard, IME,
+/// arrows, Home/End — belongs to the control, which is the entire reason for using a real one
+/// instead of the hand-drawn box this replaced.
+///
+/// The one thing a plain `EDIT` famously does *not* do is **Ctrl+A**: select-all has never been part
+/// of the control (Notepad and friends supply it from their own accelerator table), so we supply it
+/// here.
+unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_KEYDOWN {
+        let vk = wp as u32;
+        if vk == VK_A && key_down(VK_CONTROL) {
+            SendMessageW(hwnd, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        if matches!(vk, VK_TAB | VK_RETURN | VK_ESCAPE) {
+            let d = GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA) as *mut Dialog;
+            if !d.is_null() {
+                // The panic firewall matters here too: this is an `extern "system"` boundary.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*d).key(vk)));
+                return 0;
+            }
+        }
+    }
+    let prev = *EDIT_PROC.get().unwrap_or(&0);
+    CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(prev), hwnd, msg, wp, lp)
 }
 
 /// The outer window size for a `DLG_W`×`DLG_H` client at `dpi`.
@@ -435,6 +576,36 @@ impl Dialog {
         }
     }
 
+    /// The labels that share the current tab's label column. Measured, not guessed: a fixed column
+    /// stranded the short-label tabs' controls in the middle of the dialog.
+    fn tab_labels(&self) -> Vec<&'static str> {
+        match self.tab {
+            TAB_GENERAL => vec![
+                "Opening an image",
+                "Images open",
+                "Backdrop",
+                "HDR tone map",
+                "Zoom step",
+                "Exposure step",
+            ],
+            TAB_FLIPBOOK => vec!["Frame rate"],
+            TAB_KEYBINDS => ALL_ACTIONS.iter().map(|a| a.label()).collect(),
+            TAB_CONTEXT => TEXT_FIELDS.iter().map(|f| f.label()).collect(),
+            _ => vec![],
+        }
+    }
+
+    /// Width of the label column: the longest label on the tab, plus a gutter, within sane bounds.
+    fn label_column(&self, hdc: HDC) -> i32 {
+        let widest = self
+            .tab_labels()
+            .iter()
+            .map(|s| text_width(hdc, s))
+            .max()
+            .unwrap_or(0);
+        (widest + 2 * self.m.gap).clamp(self.m.scale(72), self.m.scale(240))
+    }
+
     /// Rebuild every rect for the current tab, DPI, and scroll offset. Cheap (a few dozen widgets),
     /// so it runs on any change rather than being patched incrementally.
     fn relayout(&mut self) {
@@ -442,7 +613,7 @@ impl Dialog {
         self.widgets.clear();
         self.tab_rects.clear();
 
-        // Tab strip: labels sized to their text.
+        // Tab strip: labels sized to their text. The same DC measures the label column.
         let hdc = unsafe { GetDC(self.hwnd) };
         let prev = unsafe { SelectObject(hdc, self.m.font as HGDIOBJ) };
         let mut x = self.m.pad;
@@ -456,13 +627,14 @@ impl Dialog {
             });
             x += tw;
         }
+        self.label_w = self.label_column(hdc);
         unsafe {
             SelectObject(hdc, prev);
             ReleaseDC(self.hwnd, hdc);
         }
 
         // Tab content, laid out in a single column from the top of the content area. `y` is a
-        // content-space cursor; `push_*` converts to client coords by subtracting the scroll.
+        // content-space cursor; the `row` helpers convert to client coords by subtracting the scroll.
         self.tree = m::flatten(&self.draft.open_with);
         let mut y = self.m.pad;
         match self.tab {
@@ -515,6 +687,66 @@ impl Dialog {
         }) {
             self.focus = None;
         }
+        self.place_edits();
+    }
+
+    /// Move the `EDIT` children onto the rects their `Ctl::Text` widgets just got, and hide the ones
+    /// this tab/selection doesn't use.
+    ///
+    /// A visible edit is clipped to the content area with `SetWindowRgn`: a child HWND doesn't know
+    /// about our scroll, so without this it would happily draw over the button bar when the content
+    /// is scrolled.
+    fn place_edits(&mut self) {
+        let content = self.content_rect();
+        for (i, field) in TEXT_FIELDS.iter().enumerate() {
+            let h = self.edits[i];
+            if h.is_null() {
+                continue;
+            }
+            let rect = self.widgets.iter().find_map(|w| match w.ctl {
+                Ctl::Text(f) if f == *field => Some(w.rect),
+                _ => None,
+            });
+            // The text sits inside the border we paint, with a gap of breathing room.
+            let Some(r) = rect.map(|r| RECT {
+                left: r.left + self.m.gap,
+                top: r.top + 2,
+                right: r.right - self.m.gap,
+                bottom: r.bottom - 2,
+            }) else {
+                unsafe { ShowWindow(h, SW_HIDE) };
+                continue;
+            };
+            let visible = r.top < content.bottom && r.bottom > content.top;
+            unsafe {
+                if !visible {
+                    ShowWindow(h, SW_HIDE);
+                    continue;
+                }
+                SetWindowPos(
+                    h,
+                    ptr::null_mut(),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                // Clip to the part of the content area the edit actually occupies (client coords of
+                // the edit itself). A fully-visible edit gets no region at all.
+                let clipped = r.top < content.top || r.bottom > content.bottom;
+                let rgn = clipped.then(|| {
+                    CreateRectRgn(
+                        0,
+                        (content.top - r.top).max(0),
+                        r.right - r.left,
+                        (content.bottom - r.top).min(r.bottom - r.top),
+                    )
+                });
+                SetWindowRgn(h, rgn.unwrap_or(ptr::null_mut()), 1);
+                ShowWindow(h, SW_SHOW);
+            }
+        }
     }
 
     /// The client-coords rect for a content row at content-space `y`.
@@ -538,22 +770,39 @@ impl Dialog {
         });
     }
 
+    /// A section heading with a rule under it, then a little air before the first row.
     fn heading(&mut self, y: &mut i32, text: &str) {
         let r = self.inset(self.row(*y, self.m.head_h), self.m.pad);
         self.push(r, Ctl::Heading, text);
-        *y += self.m.head_h;
+        *y += self.m.head_h + self.m.gap;
     }
 
-    /// Dim explanatory text under a *control*, aligned with the control column.
+    /// The x a control starts at: right where the label column ends.
+    fn ctl_x(&self) -> i32 {
+        self.m.pad + self.label_w
+    }
+
+    /// Dim explanatory text under a *labelled control*, aligned with the control column.
     fn note(&mut self, y: &mut i32, text: &str) {
-        let r = self.inset(self.row(*y, self.m.note_h), self.m.pad + self.m.label_w);
-        self.push(r, Ctl::Note, text);
-        *y += self.m.note_h;
+        let x = self.ctl_x();
+        self.note_at(y, x, text);
+    }
+
+    /// Dim explanatory text under a *checkbox*, aligned with the checkbox's label so the two read as
+    /// one block rather than two stray sentences.
+    fn check_note(&mut self, y: &mut i32, text: &str) {
+        let x = self.m.pad + self.m.check + self.m.gap;
+        self.note_at(y, x, text);
     }
 
     /// Dim explanatory text for a whole *section*, at the left margin so it has the full width.
     fn section_note(&mut self, y: &mut i32, text: &str) {
-        let r = self.inset(self.row(*y, self.m.note_h), self.m.pad);
+        let x = self.m.pad;
+        self.note_at(y, x, text);
+    }
+
+    fn note_at(&mut self, y: &mut i32, x: i32, text: &str) {
+        let r = self.inset(self.row(*y, self.m.note_h), x);
         self.push(r, Ctl::Note, text);
         *y += self.m.note_h;
     }
@@ -570,13 +819,13 @@ impl Dialog {
     /// A `label: <control>` row. Returns the control's rect (the caller sizes its width).
     fn labeled(&mut self, y: &mut i32, label: &str, ctl_w: i32) -> RECT {
         let row = self.row(*y, self.m.row_h);
+        let cx = self.ctl_x();
         let lr = RECT {
             left: self.m.pad,
-            right: self.m.pad + self.m.label_w,
+            right: cx - self.m.gap,
             ..row
         };
         self.push(lr, Ctl::Label, label);
-        let cx = self.m.pad + self.m.label_w;
         let cy = row.top + (self.m.row_h - self.m.ctl_h) / 2;
         *y += self.m.row_h;
         RECT {
@@ -597,12 +846,14 @@ impl Dialog {
         self.push(r, Ctl::Step(f), "");
     }
 
-    /// A checkbox, aligned with the control column so a mixed column still reads as one.
+    /// A checkbox, at the **page margin** — not the control column. Windows aligns a checkbox with
+    /// its section, because the box *is* the label's bullet; parking it in the control column leaves
+    /// a dead gutter down the left of the dialog with nothing in it.
     fn checkbox(&mut self, y: &mut i32, f: BoolField, label: &str) {
         let row = self.row(*y, self.m.row_h);
         let cy = row.top + (self.m.row_h - self.m.ctl_h) / 2;
-        let left = self.m.pad + self.m.label_w;
-        let w = self.m.check + self.m.gap + 2 + text_w(self.hwnd, self.m.font, label);
+        let left = self.m.pad;
+        let w = self.m.check + self.m.gap + text_w(self.hwnd, self.m.font, label) + self.m.gap;
         self.push(
             RECT {
                 left,
@@ -626,18 +877,18 @@ impl Dialog {
             "Reload the image when the file changes on disk",
         );
 
-        *y += self.m.gap;
+        *y += self.m.section;
         self.heading(y, "View");
         self.dropdown(y, "Images open", ChoiceField::DefaultFit);
         self.dropdown(y, "Backdrop", ChoiceField::Background);
+        self.dropdown(y, "HDR tone map", ChoiceField::DefaultTonemap);
         self.checkbox(
             y,
             BoolField::FitUpscale,
             "\"Fit to window\" also enlarges small images",
         );
-        self.dropdown(y, "HDR tone map", ChoiceField::DefaultTonemap);
 
-        *y += self.m.gap;
+        *y += self.m.section;
         self.heading(y, "Input");
         self.stepper(y, "Zoom step", NumField::ZoomStep);
         self.note(y, "Zoom factor per wheel notch or key press.");
@@ -652,19 +903,19 @@ impl Dialog {
             BoolField::FlipbookAutoDetect,
             "Offer flipbook mode when an image looks like a sprite sheet",
         );
-        self.note(
+        self.check_note(
             y,
             "Off skips the scan entirely; flipbook mode still works by hand.",
         );
 
-        *y += self.m.gap;
+        *y += self.m.section;
         self.heading(y, "Playback defaults");
         self.section_note(
             y,
-            "Applied when flipbook mode is switched on for an image. The transport bar under",
+            "Applied when flipbook mode is switched on for an image. The transport bar",
         );
-        self.section_note(y, "the image still changes the one you are watching.");
-        *y += self.m.gap / 2;
+        self.section_note(y, "under the image still changes the one you are watching.");
+        *y += self.m.gap;
         self.stepper(y, "Frame rate", NumField::FlipbookFps);
         self.checkbox(y, BoolField::FlipbookAutoplay, "Start playing immediately");
         self.checkbox(y, BoolField::FlipbookBlend, "Crossfade between frames");
@@ -674,6 +925,10 @@ impl Dialog {
         let mut group = "";
         for action in ALL_ACTIONS.iter().copied() {
             if action.group() != group {
+                // Air between groups (but not above the first one, which already has the page pad).
+                if !group.is_empty() {
+                    *y += self.m.section;
+                }
                 group = action.group();
                 self.heading(y, group);
             }
@@ -682,12 +937,12 @@ impl Dialog {
             *y += self.m.row_h;
         }
         *y += self.m.gap;
-        let left = self.m.pad + self.m.label_w;
+        let top = self.row(*y, self.m.ctl_h).top;
         let r = RECT {
-            left,
-            top: self.row(*y, self.m.ctl_h).top,
-            right: left + self.m.scale(130),
-            bottom: self.row(*y, self.m.ctl_h).top + self.m.ctl_h,
+            left: self.m.pad,
+            top,
+            right: self.m.pad + self.m.scale(132),
+            bottom: top + self.m.ctl_h,
         };
         self.push(r, Ctl::Button(Btn::ResetKeys), "Restore defaults");
         *y += self.m.row_h;
@@ -704,13 +959,13 @@ impl Dialog {
             self.checkbox(y, f, label);
         }
 
-        *y += self.m.gap;
+        *y += self.m.section;
         self.heading(y, "\"Open in\u{2026}\" entries");
         self.section_note(
             y,
             "Programs to open the current image with. Nest entries to make submenus.",
         );
-        *y += self.m.gap / 2;
+        *y += self.m.gap;
 
         // The tree: one row per entry (they share a fill, so they read as one list panel), then the
         // tools beneath it.
@@ -739,7 +994,7 @@ impl Dialog {
             (Btn::Indent, "\u{2192}|", has_sel),
             (Btn::Outdent, "|\u{2190}", has_sel),
         ] {
-            let w = text_w(self.hwnd, self.m.font, label) + 2 * self.m.gap + self.m.scale(6);
+            let w = (text_w(self.hwnd, self.m.font, label) + 3 * self.m.gap).max(self.m.row_h);
             self.widgets.push(Widget {
                 rect: RECT {
                     left: bx,
@@ -756,11 +1011,14 @@ impl Dialog {
         }
         *y += self.m.row_h + self.m.gap;
 
-        // The selected entry's detail form.
+        // The selected entry's detail form. The text boxes stretch to the right margin — a path is
+        // the one value here that is never short.
         let Some(path) = sel else { return };
         let is_submenu =
             m::entry_at(&mut self.draft.open_with, &path).is_some_and(|e| e.is_submenu());
-        let r = self.labeled(y, TextField::Name.label(), self.m.scale(300));
+        let full_w = self.client().0 - self.m.pad - self.ctl_x();
+
+        let r = self.labeled(y, TextField::Name.label(), full_w);
         self.push(r, Ctl::Text(TextField::Name), "");
         if is_submenu {
             self.section_note(
@@ -769,8 +1027,11 @@ impl Dialog {
             );
             return;
         }
-        let path_w = self.m.scale(300) - self.m.btn_w - self.m.gap;
-        let r = self.labeled(y, TextField::Program.label(), path_w);
+        let r = self.labeled(
+            y,
+            TextField::Program.label(),
+            full_w - self.m.btn_w - self.m.gap,
+        );
         self.push(r, Ctl::Text(TextField::Program), "");
         let browse = RECT {
             left: r.right + self.m.gap,
@@ -778,7 +1039,7 @@ impl Dialog {
             ..r
         };
         self.push(browse, Ctl::Button(Btn::Browse), "Browse\u{2026}");
-        let r = self.labeled(y, TextField::Args.label(), self.m.scale(300));
+        let r = self.labeled(y, TextField::Args.label(), full_w);
         self.push(r, Ctl::Text(TextField::Args), "");
         self.note(y, "{path} is replaced with the image's full path.");
     }
@@ -803,7 +1064,6 @@ impl Dialog {
     /// Commit the draft: hand it to the frame (which applies it live and saves it) and make it the
     /// new baseline, so Apply greys out until something else changes.
     fn apply(&mut self) {
-        self.flush_edit();
         self.draft.sanitize();
         self.applied = self.draft.clone();
         let payload = Box::new(self.draft.clone());
@@ -825,83 +1085,71 @@ impl Dialog {
         unsafe { InvalidateRect(self.hwnd, ptr::null(), 0) };
     }
 
-    /// Re-lay-out and repaint — the tail of every state change.
+    /// Re-lay-out and repaint — the tail of every state change. Also refills the text boxes if the
+    /// tree selection moved (a no-op otherwise, so typing is never interrupted).
     fn refresh(&mut self) {
+        self.relayout();
+        self.seed_edits();
+        self.invalidate();
+    }
+
+    // --- the EDIT children --------------------------------------------------
+
+    /// Load the selected entry's values into the text boxes. Called when the *selection* changes —
+    /// never on a plain relayout, or every keystroke would rewrite the box under its own caret.
+    fn seed_edits(&mut self) {
+        if self.seeded_for == self.tree_sel {
+            return;
+        }
+        self.seeded_for = self.tree_sel.clone();
+        let values: Vec<String> = TEXT_FIELDS
+            .iter()
+            .map(|f| {
+                self.tree_sel
+                    .clone()
+                    .and_then(|p| entry_ref(&self.draft.open_with, &p).map(|e| f.get(e)))
+                    .unwrap_or_default()
+            })
+            .collect();
+        self.seeding = true;
+        for (h, v) in self.edits.iter().zip(values) {
+            let w = wide(&v);
+            unsafe { SetWindowTextW(*h, w.as_ptr()) };
+        }
+        self.seeding = false;
+    }
+
+    /// An `EN_CHANGE` from the edit with control id `id` (1-based): read the control and write it
+    /// through to the draft, so the tree row's name tracks what is being typed and Apply lights up.
+    fn edit_changed(&mut self, id: usize) {
+        let Some(i) = id.checked_sub(1).filter(|i| *i < TEXT_FIELDS.len()) else {
+            return;
+        };
+        if self.seeding {
+            return;
+        }
+        let text = window_text(self.edits[i]);
+        let field = TEXT_FIELDS[i];
+        if let Some(e) = self.selected_entry() {
+            field.set(e, &text);
+        }
+        // Relayout (the tree row's width/name changed, and so may Apply's state) but *not*
+        // `seed_edits` — the control already holds the truth.
         self.relayout();
         self.invalidate();
     }
 
-    // --- text editing -------------------------------------------------------
-
-    /// Write the in-progress text box back to the draft (also called on every keystroke, so the tree
-    /// row's name tracks what you type).
-    fn flush_edit(&mut self) {
-        let Some((field, text, _)) = self.edit.clone() else {
-            return;
-        };
-        if let Some(e) = self.selected_entry() {
-            field.set(e, &text);
-        }
-    }
-
-    /// Seed the text buffer when focus lands on a text box (and flush the one we're leaving).
-    fn sync_edit_focus(&mut self) {
+    /// Give the keyboard to the `EDIT` behind the focused widget, or take it back to the dialog.
+    fn sync_native_focus(&self) {
         let target = self
             .focus
             .and_then(|f| match self.widgets.get(f).map(|w| &w.ctl) {
-                Some(Ctl::Text(field)) => Some(*field),
+                Some(Ctl::Text(field)) => TEXT_FIELDS.iter().position(|f| f == field),
                 _ => None,
-            });
-        if self.edit.as_ref().map(|(f, _, _)| *f) == target {
-            return;
-        }
-        self.flush_edit();
-        self.edit = target.and_then(|field| {
-            let entry = self.selected_entry()?;
-            let text = field.get(entry);
-            let caret = text.chars().count();
-            Some((field, text, caret))
-        });
-    }
-
-    /// Apply a text-box editing key. Returns whether it was consumed.
-    fn edit_key(&mut self, vk: u32) -> bool {
-        let Some((_, text, caret)) = &mut self.edit else {
-            return false;
-        };
-        let len = text.chars().count();
-        match vk {
-            VK_LEFT => *caret = caret.saturating_sub(1),
-            VK_RIGHT => *caret = (*caret + 1).min(len),
-            VK_HOME => *caret = 0,
-            VK_END => *caret = len,
-            VK_BACK if *caret > 0 => {
-                let at = byte_at(text, *caret - 1);
-                text.remove(at);
-                *caret -= 1;
-            }
-            VK_DELETE if *caret < len => {
-                let at = byte_at(text, *caret);
-                text.remove(at);
-            }
-            _ => return false,
-        }
-        self.flush_edit();
-        true
-    }
-
-    fn edit_char(&mut self, ch: char) -> bool {
-        if ch.is_control() {
-            return false;
-        }
-        let Some((_, text, caret)) = &mut self.edit else {
-            return false;
-        };
-        let at = byte_at(text, *caret);
-        text.insert(at, ch);
-        *caret += 1;
-        self.flush_edit();
-        true
+            })
+            .map(|i| self.edits[i])
+            .unwrap_or(self.hwnd);
+        unsafe { SetFocus(target) };
     }
 
     // --- input --------------------------------------------------------------
@@ -929,12 +1177,12 @@ impl Dialog {
             // A click on dead space cancels an armed capture and drops focus.
             self.capture = None;
             self.focus = None;
-            self.sync_edit_focus();
+            self.sync_native_focus();
             self.refresh();
             return;
         };
         self.focus = Some(i);
-        self.sync_edit_focus();
+        self.sync_native_focus();
         self.activate(i, x, y);
     }
 
@@ -974,9 +1222,9 @@ impl Dialog {
             Ctl::TreeRow(idx) => {
                 self.tree_sel = self.tree.get(idx).map(|r| r.path.clone());
                 self.focus = None;
-                self.edit = None;
             }
-            Ctl::Text(_) => {} // focus alone starts editing
+            // The EDIT already has the keyboard (`sync_native_focus`); it takes it from here.
+            Ctl::Text(_) => {}
             Ctl::Button(b) => return self.press(b),
             _ => {}
         }
@@ -1006,12 +1254,10 @@ impl Dialog {
                 let sel = self.tree_sel.clone();
                 let at = m::insert_after(&mut self.draft.open_with, sel.as_deref(), entry);
                 self.tree_sel = Some(at);
-                self.edit = None;
             }
             Btn::Remove => {
                 if let Some(p) = self.tree_sel.clone() {
                     self.tree_sel = m::remove_at(&mut self.draft.open_with, &p);
-                    self.edit = None;
                 }
             }
             Btn::MoveUp | Btn::MoveDown | Btn::Indent | Btn::Outdent => {
@@ -1033,11 +1279,11 @@ impl Dialog {
                     if let Some(e) = self.selected_entry() {
                         TextField::Program.set(e, &text);
                     }
-                    // Re-seed the box if it is the one being typed into.
-                    if let Some((TextField::Program, buf, caret)) = &mut self.edit {
-                        *caret = text.chars().count();
-                        *buf = text;
-                    }
+                    // Push it into the control too — it holds the text, not us.
+                    let w = wide(&text);
+                    self.seeding = true;
+                    unsafe { SetWindowTextW(self.edits[1], w.as_ptr()) };
+                    self.seeding = false;
                 }
             }
         }
@@ -1081,13 +1327,12 @@ impl Dialog {
     }
 
     fn set_tab(&mut self, tab: usize) {
-        self.flush_edit();
         self.tab = tab.min(TABS.len() - 1);
         self.scroll = 0;
         self.focus = None;
         self.capture = None;
-        self.edit = None;
         self.key_note.clear();
+        self.sync_native_focus();
         self.refresh();
     }
 
@@ -1141,13 +1386,11 @@ impl Dialog {
         self.refresh();
     }
 
+    /// Dialog-level keys. Note this is also called *by the EDIT subclass* for the four keys the
+    /// dialog owns; everything else a text box gets, it keeps.
     fn key(&mut self, vk: u32) {
         if self.capture.is_some() {
             return self.capture_key(vk);
-        }
-        // A focused text box owns its editing keys before anything else looks at them.
-        if self.edit.is_some() && self.edit_key(vk) {
-            return self.invalidate();
         }
         match vk {
             VK_TAB => {
@@ -1168,6 +1411,8 @@ impl Dialog {
                 self.close();
             }
             VK_ESCAPE => self.close(),
+            // Space activates the focused widget — but never reaches here for a text box, whose
+            // WM_KEYDOWN the EDIT keeps (it's typing a space).
             VK_SPACE => {
                 if let Some(i) = self.focus {
                     let c = center(&self.widgets[i].rect);
@@ -1214,8 +1459,9 @@ impl Dialog {
             .unwrap_or(if back { items.len() - 1 } else { 0 });
         self.focus = Some(items[pos]);
         self.scroll_into_view();
-        self.sync_edit_focus();
         self.refresh();
+        // After the relayout, so the EDIT is where it will be drawn.
+        self.sync_native_focus();
     }
 
     /// Nudge the scroll so the focused widget is fully inside the content area.
@@ -1272,15 +1518,17 @@ impl Dialog {
         // Content first, clipped to its region so scrolled rows can't bleed into the bars.
         let content = self.content_rect();
         unsafe {
-            let saved = windows_sys::Win32::Graphics::Gdi::SaveDC(hdc);
+            let saved = SaveDC(hdc);
             IntersectClipRect(hdc, content.left, content.top, content.right, content.bottom);
             for (i, widget) in self.widgets.iter().enumerate() {
-                if widget.scrolls && widget.rect.bottom > content.top && widget.rect.top < content.bottom
+                if widget.scrolls
+                    && widget.rect.bottom > content.top
+                    && widget.rect.top < content.bottom
                 {
                     self.paint_widget(hdc, i, widget);
                 }
             }
-            windows_sys::Win32::Graphics::Gdi::RestoreDC(hdc, saved);
+            RestoreDC(hdc, saved);
         }
         self.paint_scrollbar(hdc, &content);
 
@@ -1486,13 +1734,13 @@ impl Dialog {
                 }
                 let label_r = RECT {
                     left: self.m.pad,
-                    right: self.m.pad + self.m.label_w,
+                    right: self.ctl_x() - self.m.gap,
                     ..w.rect
                 };
-                text_in(hdc, &w.text, &label_r, p.text, DT_LEFT_VC);
+                text_in(hdc, &w.text, &label_r, p.text, DT_LEFT_VC | DT_END_ELLIPSIS);
 
                 let capturing = self.capture == Some(action);
-                let bx = self.m.pad + self.m.label_w;
+                let bx = self.ctl_x();
                 let box_r = RECT {
                     left: bx,
                     top: w.rect.top + (self.m.row_h - self.m.ctl_h) / 2,
@@ -1570,53 +1818,30 @@ impl Dialog {
                 };
                 text_in(hdc, &label, &r, fg, DT_LEFT_VC);
             }
-            Ctl::Text(f) => {
+            // A real `EDIT` child sits inside this rect and paints its own text, selection and
+            // caret. All we own is the field's fill and border — the frame around the control, so it
+            // lines up with the custom widgets above and below it.
+            Ctl::Text(_) => {
+                let focused = unsafe { GetFocus() } == self.edit_for(&w.ctl);
                 fill(hdc, &w.rect, self.th.field_bg);
                 frame(hdc, &w.rect, border_of(p, focused, hovered));
-                let editing = self.edit.as_ref().filter(|(ef, _, _)| *ef == f);
-                let owned;
-                let text: &str = match editing {
-                    Some((_, buf, _)) => buf,
-                    None => {
-                        owned = self
-                            .tree_sel
-                            .clone()
-                            .and_then(|path| {
-                                // `paint` is &self, so read the entry immutably.
-                                entry_ref(&self.draft.open_with, &path).map(|e| f.get(e))
-                            })
-                            .unwrap_or_default();
-                        &owned
-                    }
-                };
-                let tr = RECT {
-                    left: w.rect.left + self.m.gap,
-                    right: w.rect.right - self.m.gap,
-                    ..w.rect
-                };
-                let flags = if f == TextField::Program {
-                    DT_LEFT_VC | DT_PATH_ELLIPSIS
-                } else {
-                    DT_LEFT_VC | DT_END_ELLIPSIS
-                };
-                text_in(hdc, text, &tr, p.text, flags);
-                // Caret: a 1px bar after the typed prefix (no selection support — Browse… covers the
-                // long-path case that would need it).
-                if let Some((_, buf, caret)) = editing {
-                    let upto: String = buf.chars().take(*caret).collect();
-                    let cx = (tr.left + text_width(hdc, &upto)).min(tr.right);
-                    fill(
-                        hdc,
-                        &RECT {
-                            left: cx,
-                            top: tr.top + self.m.scale(4),
-                            right: cx + 1,
-                            bottom: tr.bottom - self.m.scale(4),
-                        },
-                        p.text,
-                    );
-                }
             }
+        }
+    }
+
+    fn field_brush(&self) -> HBRUSH {
+        self.th.field_brush
+    }
+
+    /// The `EDIT` behind a `Ctl::Text` widget (null for anything else).
+    fn edit_for(&self, ctl: &Ctl) -> HWND {
+        match ctl {
+            Ctl::Text(field) => TEXT_FIELDS
+                .iter()
+                .position(|f| f == field)
+                .map(|i| self.edits[i])
+                .unwrap_or(ptr::null_mut()),
+            _ => ptr::null_mut(),
         }
     }
 }
@@ -1696,14 +1921,45 @@ unsafe fn wndproc_impl(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
             }
             DefWindowProcW(hwnd, msg, wp, lp)
         }
-        WM_CHAR => {
-            if let Some(ch) = char::from_u32(wp as u32) {
-                if d.edit.is_some() && d.edit_char(ch) {
+        // Dark-mode an EDIT child: hand it our field background (as a brush *and* as the text
+        // background color, or ClearType antialiases against the wrong color) and our text color.
+        // The one documented call that makes a real control fit a custom theme.
+        WM_CTLCOLOREDIT => {
+            SetTextColor(wp as HDC, d.th.p.text);
+            SetBkColor(wp as HDC, d.th.field_bg);
+            d.field_brush() as LRESULT
+        }
+        WM_COMMAND => {
+            let code = ((wp >> 16) & 0xffff) as u32;
+            let id = wp & 0xffff;
+            match code {
+                EN_CHANGE => d.edit_changed(id),
+                // Focus moving into or out of an edit must move the painted focus ring with it —
+                // these controls can be reached by clicking them directly, which the dialog's own
+                // click handler never sees.
+                EN_SETFOCUS | EN_KILLFOCUS => {
+                    let widget = id
+                        .checked_sub(1)
+                        .and_then(|i| TEXT_FIELDS.get(i))
+                        .and_then(|field| {
+                            d.widgets
+                                .iter()
+                                .position(|w| matches!(w.ctl, Ctl::Text(f) if f == *field))
+                        });
+                    if code == EN_SETFOCUS {
+                        d.focus = widget;
+                    } else if d.focus == widget {
+                        // Kill-focus clears the ring *only* if nothing has already claimed it.
+                        // Tabbing from an edit to a custom widget sets `focus` to the new widget and
+                        // *then* hands the caret back to the dialog — the kill-focus that follows
+                        // must not undo that, or the next Shift+Tab has nowhere to step back from.
+                        d.focus = None;
+                    }
                     d.invalidate();
-                    return 0;
                 }
+                _ => {}
             }
-            DefWindowProcW(hwnd, msg, wp, lp)
+            0
         }
         WM_DPICHANGED => {
             let new_dpi = (wp & 0xffff) as u32;
@@ -1721,18 +1977,30 @@ unsafe fn wndproc_impl(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
                 );
             }
             d.m = Metrics::new(new_dpi.max(96));
+            // The old font died with the old Metrics — hand the controls the new one before they
+            // are asked to paint with it.
+            for h in d.edits {
+                SendMessageW(h, WM_SETFONT, d.m.font as WPARAM, 1);
+            }
             d.refresh();
             0
         }
         // The frame re-skins itself on a theme flip; do the same rather than sit there in the old
         // colors for as long as the dialog is open.
-        WM_SETTINGCHANGE => {
+        // A light/dark flip or an accent change while the dialog is open: re-skin rather than sit
+        // there in the old colors. (The frame does the same — see its handler.)
+        WM_SETTINGCHANGE | WM_DWMCOLORIZATIONCOLORCHANGED => {
             let dark = chrome::system_uses_dark_mode();
-            if dark != d.dark {
+            let accent = chrome::system_accent();
+            if dark != d.dark || accent != d.th.p.btn_active {
                 d.dark = dark;
-                d.th = Theme::new(dark);
+                d.th = Theme::new(dark); // drops the old brush
                 chrome::apply_dark_titlebar(hwnd, dark);
                 chrome::apply_dark_menus(hwnd, dark);
+                for h in d.edits {
+                    apply_edit_theme(h, dark);
+                    InvalidateRect(h, ptr::null(), 1);
+                }
                 d.invalidate();
             }
             0
@@ -1751,8 +2019,7 @@ unsafe fn wndproc_impl(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT 
 // ---------------------------------------------------------------------------------------------
 
 const DT_LEFT_VC: u32 = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
-const DT_CENTER_VC: u32 =
-    windows_sys::Win32::Graphics::Gdi::DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+const DT_CENTER_VC: u32 = DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
 
 fn text_in(hdc: HDC, s: &str, r: &RECT, color: u32, flags: u32) {
     let mut rc = *r;
@@ -1813,9 +2080,17 @@ fn entry_ref<'a>(
     Some(cur)
 }
 
-/// The byte offset of character `n` (the caret's index is in chars, the buffer's in bytes).
-fn byte_at(s: &str, n: usize) -> usize {
-    s.char_indices().nth(n).map_or(s.len(), |(i, _)| i)
+/// Read an `EDIT`'s text back out (the control, not us, holds the truth while it is being typed in).
+fn window_text(h: HWND) -> String {
+    unsafe {
+        let len = GetWindowTextLengthW(h);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let n = GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32);
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
 }
 
 fn key_down(vk: i32) -> bool {

@@ -130,8 +130,16 @@ pub struct GpuSurface {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     swapchain: IDXGISwapChain1,
+    /// The image pass's view: `*_SRGB`, so the shader's linear output is encoded on write.
     /// Recreated lazily after a resize (the backbuffer changes).
     rtv: Option<ID3D11RenderTargetView>,
+    /// The UI pass's view of the *same* backbuffer: plain `UNORM`, because ImGui's colors are
+    /// already sRGB and must not be encoded a second time. See [`GpuSurface::ensure_rtv`].
+    rtv_ui: Option<ID3D11RenderTargetView>,
+    /// The image sub-rect's origin within the client (the chrome occupies the rest).
+    origin: (f32, f32),
+    /// What the non-image parts of the backbuffer are cleared to before the UI draws over them.
+    chrome_clear: [f32; 4],
 
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
@@ -209,8 +217,10 @@ pub struct GpuSurface {
 }
 
 impl GpuSurface {
-    /// Build the D3D11 device + flip-model swapchain on the child view HWND. `_hinstance` is
-    /// unused (D3D needs only the HWND); kept for signature parity with the CPU surface.
+    /// Build the D3D11 device + flip-model swapchain on the window. `width`/`height` are the whole
+    /// client: the swapchain covers it all, and the image is drawn into a sub-rect of it (see
+    /// [`Self::set_image_rect`]) with the chrome painted over the remainder. `_hinstance` is unused
+    /// (D3D needs only the HWND); kept for signature parity with the CPU surface.
     pub fn new(hwnd: isize, _hinstance: isize, width: u32, height: u32, fit_upscale: bool) -> Self {
         let (device, context) = create_device();
         let win_hwnd = HWND(hwnd as *mut c_void);
@@ -226,6 +236,9 @@ impl GpuSurface {
             context,
             swapchain,
             rtv: None,
+            rtv_ui: None,
+            origin: (0.0, 0.0),
+            chrome_clear: [0.0, 0.0, 0.0, 1.0],
             vs,
             ps,
             samp_aniso,
@@ -552,14 +565,15 @@ impl GpuSurface {
         Ok(())
     }
 
-    /// Resize the view to a new client size (physical px): resize the swapchain buffers, drop
-    /// the stale RTV, and re-fit or clamp the pan.
+    /// Resize the swapchain to a new *client* size (physical px) and drop the stale views. The
+    /// image's sub-rect within it is a separate concern — the shell calls [`Self::set_image_rect`]
+    /// right after, because only it knows how tall the chrome is.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
-        self.viewport = Viewport::new(width, height);
         self.rtv = None;
+        self.rtv_ui = None;
         unsafe {
             if let Err(e) = self.swapchain.ResizeBuffers(
                 0,
@@ -569,18 +583,8 @@ impl GpuSurface {
                 DXGI_SWAP_CHAIN_FLAG(0),
             ) {
                 // A failed resize leaves the backbuffer at its old size; log it (ensure_rtv will
-                // recreate the RTV from whatever the swapchain reports next paint).
+                // recreate the views from whatever the swapchain reports next paint).
                 eprintln!("fire: swapchain ResizeBuffers failed: {e}");
-            }
-        }
-        if let Some(dims) = self.view_dims() {
-            if self.view.fit {
-                // Re-fit with the rule the active fit used (load = no upscale, explicit fit =
-                // `fit_upscale`), so a resize doesn't silently switch a small image's scaling.
-                self.view
-                    .fit_to_window(dims, &self.viewport, self.view.fit_upscale);
-            } else {
-                self.view.clamp_pan(dims, &self.viewport);
             }
         }
         self.request_redraw();
@@ -600,12 +604,18 @@ impl GpuSurface {
         self.request_redraw();
     }
 
-    /// (Re)create the render-target view over the current backbuffer, as an `*_SRGB` view so the
-    /// shader's linear output is sRGB-encoded on write. On failure (e.g. a device-removed / TDR
-    /// reset) it leaves `rtv` as `None` and logs; `render` then skips drawing this frame rather
-    /// than panicking inside the paint wndproc.
+    /// (Re)create the two render-target views over the current backbuffer.
+    ///
+    /// **Two views of the same pixels, deliberately.** The image shader emits *linear* light, so it
+    /// writes through an `*_SRGB` view and the hardware encodes on write. Dear ImGui's colors are
+    /// *already* sRGB, so it must write through a plain `UNORM` view — pushing it through the sRGB
+    /// view would encode twice and visibly wash the whole UI out. The flip-model swapchain's
+    /// backbuffer is typeless-compatible `R8G8B8A8_UNORM`, which is exactly why both views are legal.
+    ///
+    /// On failure (e.g. a device-removed / TDR reset) the views stay `None` and the frame is skipped
+    /// rather than panicking inside the paint wndproc.
     fn ensure_rtv(&mut self) {
-        if self.rtv.is_some() {
+        if self.rtv.is_some() && self.rtv_ui.is_some() {
             return;
         }
         unsafe {
@@ -616,38 +626,122 @@ impl GpuSurface {
                     return;
                 }
             };
-            let desc = D3D11_RENDER_TARGET_VIEW_DESC {
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-                ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
-                },
+            let make = |format| {
+                let desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+                        Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
+                    },
+                };
+                let mut rtv: Option<ID3D11RenderTargetView> = None;
+                match self
+                    .device
+                    .CreateRenderTargetView(&back, Some(&desc), Some(&mut rtv))
+                {
+                    Ok(()) => rtv,
+                    Err(e) => {
+                        eprintln!("fire: CreateRenderTargetView failed: {e}");
+                        None
+                    }
+                }
             };
-            let mut rtv: Option<ID3D11RenderTargetView> = None;
-            if let Err(e) = self
-                .device
-                .CreateRenderTargetView(&back, Some(&desc), Some(&mut rtv))
-            {
-                eprintln!("fire: CreateRenderTargetView failed: {e}");
-                return;
-            }
-            self.rtv = rtv;
+            self.rtv = make(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+            self.rtv_ui = make(DXGI_FORMAT_R8G8B8A8_UNORM);
         }
     }
 
-    /// Draw the image (or the letterbox) and present. Called from the view child's `WM_PAINT`.
-    /// One fullscreen triangle; the pixel shader does the sampling + color pipeline.
-    pub fn render(&mut self) {
+    /// The image's sub-rect of the client, in physical px. The chrome owns the rest.
+    pub fn set_image_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let (w, h) = (w.max(0.0), h.max(0.0));
+        if self.origin == (x, y) && self.viewport.width == w && self.viewport.height == h {
+            return;
+        }
+        self.origin = (x, y);
+        self.viewport = Viewport::new(w as u32, h as u32);
+        if let Some(dims) = self.view_dims() {
+            if self.view.fit {
+                self.view
+                    .fit_to_window(dims, &self.viewport, self.view.fit_upscale);
+            } else {
+                self.view.clamp_pan(dims, &self.viewport);
+            }
+        }
+    }
+
+    /// The image sub-rect's origin in client coords — the shell subtracts it before handing us
+    /// cursor positions, so all the pan/zoom math stays in image-region space.
+    pub fn image_origin(&self) -> (f32, f32) {
+        self.origin
+    }
+
+    pub fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    pub fn device_context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
+    /// The chrome fill: what the parts of the window the image doesn't cover get cleared to.
+    pub fn set_chrome_clear(&mut self, rgba: [f32; 4]) {
+        self.chrome_clear = rgba;
+    }
+
+    /// Clear the backbuffer and draw the image into its sub-rect, leaving the **UI** render target
+    /// bound so the caller can draw the chrome over it and then [`Self::present`].
+    ///
+    /// This is the front half of what used to be `render()`. The split exists because the chrome is
+    /// now GPU-drawn too: the frame is `clear → image pass (sRGB view, viewport = image sub-rect) →
+    /// ImGui pass (UNORM view, whole client) → Present`. Returns `false` if the device has no usable
+    /// render target this frame, in which case the caller must skip the frame entirely.
+    ///
+    /// The image is still **one fullscreen triangle**: `RSSetViewports` maps NDC onto the sub-rect
+    /// and clips to it, so the shader (background, checkerboard, letterbox and all) fills exactly the
+    /// image region and nothing else. No per-pixel CPU work, no extra draws.
+    #[must_use]
+    pub fn begin_frame(&mut self) -> bool {
+        self.ensure_rtv();
+        let (Some(rtv), Some(rtv_ui)) = (self.rtv.clone(), self.rtv_ui.clone()) else {
+            return false;
+        };
+
+        unsafe {
+            // The chrome fill, through the UNORM view (the color is already sRGB).
+            self.context
+                .ClearRenderTargetView(&rtv_ui, &self.chrome_clear);
+        }
+
         let w = self.viewport.width as u32;
         let h = self.viewport.height as u32;
         if w == 0 || h == 0 {
-            return;
+            // No image region (e.g. the window is collapsed to just chrome). Still a valid frame.
+            unsafe {
+                self.context
+                    .OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
+            }
+            return true;
         }
-        self.ensure_rtv();
-        let rtv = match &self.rtv {
-            Some(r) => r.clone(),
-            None => return,
-        };
+
+        self.draw_image(&rtv, w, h);
+
+        unsafe {
+            self.context
+                .OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
+        }
+        true
+    }
+
+    /// Present the completed frame, vsync-paced.
+    pub fn present(&mut self) {
+        unsafe {
+            // Sync interval 1 → vsync-paced (tear-free); event-driven, so no idle frames.
+            let _ = self.swapchain.Present(1, DXGI_PRESENT(0));
+        }
+    }
+
+    /// The image pass: the fullscreen triangle, scoped to the image sub-rect.
+    fn draw_image(&mut self, rtv: &ID3D11RenderTargetView, w: u32, h: u32) {
 
         let is_hdr = self.is_hdr();
         // Flipbook mode maps the surface into a single frame rect: `img_w/img_h` become the
@@ -739,9 +833,11 @@ impl GpuSurface {
                 self.context.Unmap(&self.cbuffer, 0);
             }
 
+            // The viewport *is* the image's sub-rect: NDC maps onto it and clips to it, so the one
+            // triangle covers the image region exactly and never bleeds under the chrome.
             let vp = D3D11_VIEWPORT {
-                TopLeftX: 0.0,
-                TopLeftY: 0.0,
+                TopLeftX: self.origin.0,
+                TopLeftY: self.origin.1,
                 Width: w as f32,
                 Height: h as f32,
                 MinDepth: 0.0,
@@ -763,8 +859,6 @@ impl GpuSurface {
                 Some(&[Some(self.samp_aniso.clone()), Some(self.samp_point.clone())]),
             );
             self.context.Draw(3, 0);
-            // Sync interval 1 → vsync-paced (tear-free); event-driven, so no idle frames.
-            let _ = self.swapchain.Present(1, DXGI_PRESENT(0));
         }
     }
 
@@ -806,6 +900,13 @@ impl GpuSurface {
 
     pub fn end_drag(&mut self) {
         self.dragging = false;
+    }
+
+    /// A pan or zoom drag is in progress, i.e. the image owns the mouse until the button comes up —
+    /// even if the cursor has wandered over the toolbar. Without this the shell would hand the drag
+    /// to ImGui mid-gesture the moment the pointer crossed the chrome, and the pan would stick.
+    pub fn is_mouse_captured(&self) -> bool {
+        self.dragging || self.zoom_dragging
     }
 
     /// Begin an RMB zoom-drag, pivoting on the current cursor (the press point).

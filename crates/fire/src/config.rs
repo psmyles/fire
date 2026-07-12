@@ -151,6 +151,7 @@ pub enum FitCfg {
 #[serde(default, rename_all = "kebab-case")]
 pub struct FlipbookCfg {
     /// Playback rate a new flipbook starts at, in frames per second.
+    #[serde(serialize_with = "serialize_f32")]
     pub fps: f32,
     /// Whether a new flipbook crossfades between frames.
     pub blend: bool,
@@ -237,8 +238,10 @@ pub struct Config {
     /// `default-fit`, so a small image is shown at 100% on load and folder navigation.
     pub fit_upscale: bool,
     /// Multiplicative zoom per wheel notch / zoom keypress. Clamped to `1.01..=4.0`.
+    #[serde(serialize_with = "serialize_f32")]
     pub zoom_step: f32,
     /// Exposure step per `[` / `]` press (HDR sources), in stops. Clamped to `0.01..=4.0`.
+    #[serde(serialize_with = "serialize_f32")]
     pub exposure_step: f32,
     /// The tonemap operator a freshly adopted HDR image starts on.
     pub default_tonemap: TonemapCfg,
@@ -347,6 +350,16 @@ fn clamp_finite(v: f32, fallback: f32, lo: f32, hi: f32) -> f32 {
     } else {
         fallback
     }
+}
+
+/// Write an `f32` to TOML without the widening artifact.
+///
+/// TOML floats are `f64`, so serializing `1.15f32` straight through prints its exact binary value —
+/// `1.149999976158142`. Nobody wants to open their config and find that. Rounding to four decimals
+/// on the way out is lossless for every value these fields can hold (the steppers move in hundredths)
+/// and prints as the number the user actually chose.
+fn serialize_f32<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64((*v as f64 * 10_000.0).round() / 10_000.0)
 }
 
 /// Write the commented [`DEFAULT_CONFIG`] template to `config.toml` *iff* it doesn't already exist,
@@ -492,6 +505,22 @@ mod tests {
         let text = toml::to_string(&cfg).expect("serializes");
         let back: Config = toml::from_str(&text).expect("deserializes");
         assert_eq!(back, cfg);
+    }
+
+    /// A saved config reads like a human wrote it: `1.15`, not `1.149999976158142` (what an f32
+    /// widened to a TOML f64 prints as).
+    #[test]
+    fn floats_serialize_without_the_widening_artifact() {
+        let text = toml::to_string(&Config::default()).unwrap();
+        assert!(
+            text.contains("zoom-step = 1.15"),
+            "expected a clean float, got:\n{text}"
+        );
+        assert!(text.contains("exposure-step = 0.25"));
+        assert!(text.contains("fps = 24.0"));
+        // …and it still round-trips exactly.
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, Config::default());
     }
 
     /// The header `save` prepends is a comment block, so a saved file still parses.
