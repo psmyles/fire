@@ -109,8 +109,20 @@ pub fn center_next_window(client: (f32, f32)) {
         x: client.0 * 0.5,
         y: client.1 * 0.5,
     };
-    let pivot = sys::ImVec2_c { x: 0.5, y: 0.5 };
-    unsafe { sys::igSetNextWindowPos(center, sys::ImGuiCond_Appearing as sys::ImGuiCond, pivot) };
+    place(center, sys::ImVec2_c { x: 0.5, y: 0.5 });
+}
+
+/// Put the next window's top-left at `pos` (client coords) when it appears — how a popup menu is
+/// anchored to the cursor, or dropped from under the button that opened it. Left to itself, ImGui
+/// would place a popup at the mouse, which is *nearly* right for a toolbar button and visibly wrong
+/// for anything else.
+pub fn position_next_window(pos: (f32, f32)) {
+    let p = sys::ImVec2_c { x: pos.0, y: pos.1 };
+    place(p, sys::ImVec2_c { x: 0.0, y: 0.0 });
+}
+
+fn place(pos: sys::ImVec2_c, pivot: sys::ImVec2_c) {
+    unsafe { sys::igSetNextWindowPos(pos, sys::ImGuiCond_Appearing as sys::ImGuiCond, pivot) };
 }
 
 impl Imgui {

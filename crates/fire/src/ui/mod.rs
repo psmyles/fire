@@ -1,14 +1,15 @@
-//! The whole UI, rebuilt every frame in immediate mode: toolbar, status bar, flipbook transport,
-//! and the empty-state hint.
+//! The whole UI, rebuilt every frame in immediate mode: toolbar, status bar, flipbook transport, the
+//! empty-state hint, the popup menus, and the settings window.
 //!
 //! This module is **pure UI**: no Win32, no COM, no GDI. It reads a [`ViewSnapshot`] (and, in
 //! flipbook mode, a [`TransportSnapshot`]) and returns a [`Frame`] describing what the user asked
 //! for. The win shell applies it. That separation is why the layout can be reasoned about at all —
 //! and why scrolling, hit-testing, focus and hover are ImGui's problem now, not ours.
 //!
-//! The one thing still owned by Win32 is the two *popup menus* (Open-with, overflow): they remain
-//! `TrackPopupMenu` for now, so this module only reports where to anchor them. They become ImGui
-//! popups in a later phase, which is what finally retires the undocumented uxtheme ordinals.
+//! Nothing here is Win32 any more. The last two holdouts — the *popup menus* — were `TrackPopupMenu`,
+//! which is drawn by the system and therefore could only be dark-moded through three undocumented
+//! `uxtheme.dll` ordinals. They are [`MenuState`] now, and those ordinals are gone with them: **the
+//! app no longer calls a single undocumented API.**
 
 pub mod settings;
 pub mod theme;
@@ -16,9 +17,10 @@ pub mod theme;
 use dear_imgui_rs::{Condition, StyleColor, TextureId, Ui, WindowFlags};
 
 use crate::chrome::{Action, ViewSnapshot};
-use crate::config::Config;
+use crate::config::{Config, MenuEntry};
 use crate::icons::Icon;
 use crate::flipbook::Grid;
+use crate::render;
 use crate::render::imgui::StockStyle;
 use crate::transport::{TransportEdit, TransportSnapshot};
 use theme::Metrics;
@@ -40,12 +42,56 @@ const BAR: WindowFlags = WindowFlags::from_bits_truncate(
 const OVERLAY: WindowFlags =
     WindowFlags::from_bits_truncate(BAR.bits() | WindowFlags::NO_MOUSE_INPUTS.bits());
 
-/// A button that needs a Win32 popup anchored under it, in client coords.
+/// A popup menu that is currently up.
+///
+/// This is the whole of what used to be `TrackPopupMenu` + `CreatePopupMenu` + `AppendMenuW` + a
+/// command-id numbering scheme + `DestroyMenu` + the uxtheme ordinal hack that dark-moded it. A Win32
+/// popup runs its own modal message pump, which is why the old one had to be *posted* out of
+/// `WM_PAINT` and rebuilt from scratch on every show; an ImGui popup is drawn in the frame we were
+/// already painting, so it is just state.
+pub struct MenuState {
+    pub kind: MenuKind,
+    /// Client-coords top-left the popup drops from (the cursor, or the button's bottom edge).
+    pub pos: (f32, f32),
+    /// ImGui opens a popup by *event*, not by state, so this fires `open_popup` exactly once.
+    requested: bool,
+}
+
+impl MenuState {
+    pub fn new(kind: MenuKind, pos: (f32, f32)) -> Self {
+        MenuState {
+            kind,
+            pos,
+            requested: false,
+        }
+    }
+}
+
+pub enum MenuKind {
+    /// The actions menu: right-click on the image, or the "Open in…" toolbar button.
+    Actions,
+    /// The "»" overflow menu — the toolbar buttons that didn't fit the window width. They carry their
+    /// own enabled/checked state, so a dropped button behaves in the menu exactly as it would on the
+    /// bar.
+    Overflow(Vec<Action>),
+}
+
+/// Something chosen from the actions menu that isn't a view [`Action`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    ShowInExplorer,
+    CopyFile,
+    CopyPath,
+    CopyFileName,
+    OpenSettings,
+    /// Launch the "Open in…" entry at this index path (from the root of the configured tree).
+    OpenWith(Vec<usize>),
+}
+
+/// A button asking for a popup to be anchored under it, in client coords.
 pub struct MenuAnchor {
-    pub action: Action,
-    pub x: i32,
-    /// Bottom edge of the button — the menu drops from here.
-    pub y: i32,
+    pub kind: MenuKind,
+    pub pos: (f32, f32),
 }
 
 /// What one UI frame produced.
@@ -53,10 +99,12 @@ pub struct MenuAnchor {
 pub struct Frame {
     pub actions: Vec<Action>,
     pub edits: Vec<TransportEdit>,
-    /// The overflow menu's contents, when the "»" button was clicked (empty otherwise). The shell
-    /// builds the Win32 popup from these, so a dropped button keeps its enabled/active state.
-    pub overflow: Vec<Action>,
+    /// A toolbar button wants a popup opened under it.
     pub menu: Option<MenuAnchor>,
+    /// Something was chosen from the actions menu.
+    pub command: Option<Command>,
+    /// The open popup went away (an item was chosen, or it was dismissed).
+    pub menu_close: bool,
     /// The flipbook hint chip: enter flipbook mode / never ask again for this image.
     pub chip_accept: bool,
     pub chip_dismiss: bool,
@@ -108,27 +156,47 @@ use crate::render::view::{Background as Bg, Channel as Ch};
 /// The HDR group: laid out only for float sources.
 const HDR_GROUP: u8 = 3;
 
+/// Everything one UI frame reads. Bundled because it is a dozen values and a positional argument
+/// list that long is a bug waiting to happen (two `f32` pairs and three `bool`s, all interchangeable
+/// to the compiler).
+pub struct Inputs<'a> {
+    pub snap: &'a ViewSnapshot,
+    pub transport: Option<&'a TransportSnapshot>,
+    pub chip: Option<Grid>,
+    pub settings: Option<&'a mut settings::State>,
+    pub menu: Option<&'a mut MenuState>,
+    /// The live config — the actions menu is built straight from it (which items are shown, and the
+    /// "Open in…" tree).
+    pub cfg: &'a Config,
+    pub stock: StockStyle,
+    pub m: &'a Metrics,
+    pub icon_px: f32,
+    pub dark: bool,
+    /// Window client size, physical px.
+    pub client: (f32, f32),
+    /// The sub-rect the image occupies (see `App::image_rect`).
+    pub image: (f32, f32, f32, f32),
+    pub fullscreen: bool,
+}
+
 /// Build the whole UI for one frame.
-///
-/// `client` is the window client size in physical px; `image` is the sub-rect the image occupies
-/// (see `App::image_rect`).
-#[allow(clippy::too_many_arguments)]
-pub fn build(
-    ui: &Ui,
-    tex: TextureId,
-    snap: &ViewSnapshot,
-    transport: Option<&TransportSnapshot>,
-    chip: Option<Grid>,
-    settings: Option<&mut settings::State>,
-    stock: StockStyle,
-    m: &Metrics,
-    icon_px: f32,
-    dark: bool,
-    client: (f32, f32),
-    image: (f32, f32, f32, f32),
-    fullscreen: bool,
-) -> Frame {
+pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
     let mut out = Frame::default();
+    let Inputs {
+        snap,
+        transport,
+        chip,
+        settings,
+        menu,
+        cfg,
+        stock,
+        m,
+        icon_px,
+        dark,
+        client,
+        image,
+        fullscreen,
+    } = inp;
     let (w, h) = client;
 
     // Full-screen hides the chrome entirely — the image owns the monitor.
@@ -149,13 +217,110 @@ pub fn build(
         empty_hint(ui, image);
     }
 
-    // Last, so it lands on top of the chrome — and outside any window, which is where popups live.
-    // It brings its own style (stock ImGui, not fire's chrome theme).
+    // The popups last, and outside any window — which is where ImGui expects them to live.
+    if let Some(st) = menu {
+        menus(ui, st, cfg, snap, &mut out);
+    }
     if let Some(st) = settings {
         settings::build(ui, st, stock, client, m.scale, &mut out);
     }
 
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Popup menus
+// ---------------------------------------------------------------------------------------------
+
+/// The popup's ImGui id. There is only ever one up at a time, so one id serves both kinds.
+const MENU_ID: &str = "##menu";
+
+fn menus(ui: &Ui, st: &mut MenuState, cfg: &Config, snap: &ViewSnapshot, out: &mut Frame) {
+    if !st.requested {
+        st.requested = true;
+        ui.open_popup(MENU_ID);
+    }
+    render::imgui::position_next_window(st.pos);
+
+    ui.popup(MENU_ID, || match &st.kind {
+        MenuKind::Actions => actions_menu(ui, cfg, out),
+        MenuKind::Overflow(items) => overflow_menu(ui, snap, items, out),
+    });
+
+    // ImGui closes a popup on an outside click, on Esc, and when an item is picked. Whichever it was,
+    // the shell drops the state.
+    if !ui.is_popup_open(MENU_ID) {
+        out.menu_close = true;
+    }
+}
+
+/// Right-click on the image (and the "Open in…" toolbar button): the fixed file actions, the
+/// configured "Open in…" tree, and Settings.
+fn actions_menu(ui: &Ui, cfg: &Config, out: &mut Frame) {
+    let cm = cfg.context_menu;
+    let mut shown = false;
+    for (on, label, cmd) in [
+        (cm.show_in_explorer, "Show in Explorer", Command::ShowInExplorer),
+        (cm.copy_file, "Copy File", Command::CopyFile),
+        (cm.copy_path, "Copy Path", Command::CopyPath),
+        (cm.copy_file_name, "Copy File Name", Command::CopyFileName),
+    ] {
+        if !on {
+            continue; // hidden in `[context-menu]`; all four can be off
+        }
+        if ui.menu_item(label) {
+            out.command = Some(cmd);
+        }
+        shown = true;
+    }
+
+    if !cfg.open_with.is_empty() {
+        if shown {
+            ui.separator();
+        }
+        open_with(ui, &cfg.open_with, &mut Vec::new(), out);
+        shown = true;
+    }
+
+    // Settings always comes last, after a rule — it's the one entry that isn't about the image.
+    if shown {
+        ui.separator();
+    }
+    if ui.menu_item("Settings\u{2026}") {
+        out.command = Some(Command::OpenSettings);
+    }
+}
+
+/// The "Open in…" tree. A submenu nests; a leaf reports its index path, which the shell resolves back
+/// to the entry — so there is no command-id numbering scheme to keep in step any more, and no way for
+/// the menu and the launcher to disagree about which app a click meant.
+///
+/// A malformed entry (no program *and* no children) is skipped: the settings window creates an entry
+/// before it has a program, and a half-filled one simply doesn't appear yet.
+fn open_with(ui: &Ui, entries: &[MenuEntry], path: &mut Vec<usize>, out: &mut Frame) {
+    for (i, e) in entries.iter().enumerate() {
+        path.push(i);
+        if e.is_submenu() {
+            ui.menu(&e.name, || open_with(ui, &e.items, path, out));
+        } else if e.path.as_deref().is_some_and(|p| !p.trim().is_empty()) && ui.menu_item(&e.name) {
+            out.command = Some(Command::OpenWith(path.clone()));
+        }
+        path.pop();
+    }
+}
+
+/// The "»" menu: the toolbar buttons that didn't fit, each carrying the enabled/checked state it
+/// would have had on the bar, and each dispatching through the normal action path.
+fn overflow_menu(ui: &Ui, snap: &ViewSnapshot, items: &[Action], out: &mut Frame) {
+    for a in items {
+        if ui.menu_item_enabled_selected_no_shortcut(
+            snap.tooltip(*a),
+            snap.active(*a),
+            snap.enabled(*a),
+        ) {
+            out.actions.push(*a);
+        }
+    }
 }
 
 /// The flipbook detection chip: a small card floating at the top of the image when a sprite-sheet
@@ -285,11 +450,9 @@ fn toolbar(
             // The overflow "»", immediately after the left strip.
             if !dropped.is_empty() {
                 if button(ui, tex, Icon::More, "##overflow", [x, y], bs, icon_px, true, false, m) {
-                    out.overflow = dropped.clone();
                     out.menu = Some(MenuAnchor {
-                        action: Action::Overflow,
-                        x: x as i32,
-                        y: (y + bs[1]) as i32,
+                        kind: MenuKind::Overflow(dropped.clone()),
+                        pos: (x, y + bs[1]),
                     });
                 }
                 if ui.is_item_hovered() {
@@ -367,14 +530,15 @@ fn icon_button(
 
     if button(ui, tex, icon, &id, pos, bs, icon_px, enabled, active, m) {
         match action {
-            // These two open Win32 popups, which need the button's rect; the shell does that.
-            Action::OpenWithMenu | Action::Overflow => {
+            // Not an action — it drops a menu from under itself.
+            Action::OpenWithMenu => {
                 out.menu = Some(MenuAnchor {
-                    action,
-                    x: pos[0] as i32,
-                    y: (pos[1] + bs[1]) as i32,
+                    kind: MenuKind::Actions,
+                    pos: (pos[0], pos[1] + bs[1]),
                 });
             }
+            // The overflow button is handled where it is laid out (it needs the dropped list).
+            Action::Overflow => {}
             _ => out.actions.push(action),
         }
     }

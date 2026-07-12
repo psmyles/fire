@@ -88,10 +88,12 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   settings window is a form. Two things it can't do itself are reported to the shell instead —
   "Browse…" (the file dialog pumps a modal loop) and keybind *capture* (chords are virtual keys, which
   only the wndproc sees).
-- `chrome.rs` — despite the name, no longer paints anything. What survives is the shared *model* and
-  *theme*: `Action` + `ViewSnapshot` (the command vocabulary and the state the UI renders from), the
-  light/dark `Palette` — whose highlight is the user's **system accent** (`GetSysColor(COLOR_HIGHLIGHT)`
-  tracks it: documented, no registry poking) — and the dark title-bar / dark-menu plumbing.
+- `chrome.rs` — despite the name, no longer paints anything, and is down to ~330 lines. What survives
+  is the shared *model* and *theme*: `Action` + `ViewSnapshot` (the command vocabulary and the state
+  the UI renders from), the light/dark `Palette` — whose highlight is the user's **system accent**
+  (`GetSysColor(COLOR_HIGHLIGHT)` tracks it: documented, no registry poking) — and `apply_dark_titlebar`
+  (documented DWM). **Every API it calls is documented**; the uxtheme ordinal hack went out with the
+  Win32 menus.
 - `decode_pool.rs` — off-thread worker pool (no async runtime).
 - `folder.rs` — sibling-image cursor behind ←/→ navigation + the status-bar count; pure scan/
   sort/cursor logic (no Win32, unit-tested), scanned off-thread and posted back to the frame.
@@ -142,13 +144,18 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   results to the UI thread *only* via `PostMessage(frame, WM_APP_*)` with a boxed payload in LPARAM;
   the wndproc reclaims the box. Keep this discipline for any new background work.
 - **Nothing that pumps messages may be entered from `WM_PAINT`, or under a live `&mut App`.** The UI
-  is built during the paint, so a click on "Open in…", "»", or the settings window's "Browse…" is
-  *discovered* mid-paint — but `TrackPopupMenu` and `GetOpenFileNameW` run nested modal loops that
-  re-enter the wndproc, which would both recurse into an unvalidated paint and take a second
-  `&mut App`. So each is recorded and posted (`WM_APP_OPEN_MENU`, `WM_APP_SETTINGS_BROWSE`) and runs
-  once the paint has finished. Any future *Win32* modal obeys the same rule. **ImGui modals do not**,
-  and that is the point of them: the settings window is drawn inside the frame we were already
-  painting, so it pumps nothing and borrows nothing — its state just lives in `App`.
+  is built during the paint, so a click is *discovered* mid-paint — and a Win32 modal
+  (`GetOpenFileNameW`, `TrackPopupMenu`, a message box) runs a nested loop that re-enters the wndproc,
+  which would both recurse into an unvalidated paint and take a second `&mut App`. So it is recorded
+  and posted, and runs once the paint has finished. **Exactly one thing still needs this**: the
+  settings window's "Browse…" (`WM_APP_SETTINGS_BROWSE`). Any future Win32 modal obeys the same rule.
+  **ImGui modals and popups do not**, and that is the point of them: the settings window and both
+  menus are drawn inside the frame we were already painting, so they pump nothing and borrow nothing —
+  their state just lives in `App`, and a chosen command can simply run.
+- **The app calls no undocumented API.** It did — `TrackPopupMenu` menus are system-drawn, so the only
+  way to dark-mode one was three `uxtheme.dll` ordinals (133/135/136) resolved by `GetProcAddress` and
+  `transmute`d. The menus are ImGui popups now and that hack is gone. Keep it that way: if a Win32
+  control can't be themed without an ordinal, the answer is to not use the Win32 control.
 - **Stale-drop by generation.** Each decode job carries the window's monotonic `generation`; a result
   is uploaded only if it's still current, so a slow decode can't clobber a newer open.
 - **`panic = "unwind"` must stay** (see the comment in root `Cargo.toml`). Every C/C++ FFI call
@@ -173,12 +180,10 @@ exposure/tonemap, DPI/dark chrome, folder ←/→ navigation) is in place, as is
 installer with per-format Explorer associations (`installer/`, `scripts/build-installer.ps1`), and
 the settings window (General / Flipbook / Keybinds / Context menu).
 
-**The UI is almost entirely Dear ImGui.** Done: the single-window collapse, the toolbar, status bar,
-flipbook transport, hint chip, tooltips, the empty-state hint, and the **settings window** — with the
-GDI paint/hit-test/hover/focus layer and the hand-painted Win32 dialog both deleted. **Not yet:** the
-*two popup menus* (open-with, overflow) are still `TrackPopupMenu`, which is why
-`chrome::apply_dark_menus` — the one undocumented API left in the codebase (uxtheme ordinals
-133/135/136) — is still here. It is on the way out; don't build on it.
+**The UI is Dear ImGui, end to end.** The single-window collapse, toolbar, status bar, flipbook
+transport, hint chip, tooltips, empty-state hint, settings window, and both popup menus — with the GDI
+paint/hit-test/hover/focus layer, the hand-painted Win32 dialog, and the `TrackPopupMenu` menus all
+deleted. No GDI painting and no undocumented APIs remain.
 
 The settings window is deliberately **unstyled**: it runs on ImGui's stock look while the chrome runs
 on fire's theme. That is a decision, not an oversight (see `ui/settings`), and the style pass is still

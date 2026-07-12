@@ -70,6 +70,21 @@ pub struct MenuEntry {
     pub items: Vec<MenuEntry>,
 }
 
+/// The entry at `path` — an index chain from the root (`[1, 0]` = second top-level entry's first
+/// child), which is how the actions menu names the item that was clicked.
+///
+/// Naming it by *path* rather than by a flat command-id index is what makes it impossible for the
+/// menu and the launcher to disagree about which app a click meant: there is no second walk of the
+/// tree to keep in step with the first.
+pub fn entry_at<'a>(entries: &'a [MenuEntry], path: &[usize]) -> Option<&'a MenuEntry> {
+    let (&last, parents) = path.split_last()?;
+    let mut cur = entries;
+    for &i in parents {
+        cur = &cur.get(i)?.items;
+    }
+    cur.get(last)
+}
+
 impl MenuEntry {
     /// Whether this entry is a submenu (has children). A submenu's `path`/`args` are ignored.
     pub fn is_submenu(&self) -> bool {
@@ -444,6 +459,18 @@ mod tests {
         );
         // A leaf with no `args` falls back to passing the image path alone.
         assert_eq!(convert.items[1].resolved_args(Path::new(r"D:\a.tga")), vec![r"D:\a.tga"]);
+
+        // The actions menu names a clicked entry by its index path, and `entry_at` is what turns that
+        // back into the app to launch — so a wrong answer here launches the wrong program.
+        assert_eq!(entry_at(&cfg.open_with, &[0]).unwrap().name, "ImageMagick");
+        assert_eq!(entry_at(&cfg.open_with, &[0, 0]).unwrap().name, "Convert");
+        assert_eq!(entry_at(&cfg.open_with, &[0, 0, 1]).unwrap().name, "PNG");
+        // Out of range at any level, and the empty path, are all `None` rather than a panic or a
+        // neighbouring entry.
+        assert!(entry_at(&cfg.open_with, &[]).is_none());
+        assert!(entry_at(&cfg.open_with, &[1]).is_none());
+        assert!(entry_at(&cfg.open_with, &[0, 0, 2]).is_none());
+        assert!(entry_at(&cfg.open_with, &[0, 9, 0]).is_none());
     }
 
     /// The shipped default template is valid TOML and deserializes (its `[[open-with]]` examples are

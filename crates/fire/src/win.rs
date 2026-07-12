@@ -37,7 +37,7 @@ use crate::ui::theme::Metrics;
 
 use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
     MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::DataExchange::{
@@ -58,16 +58,16 @@ use windows_sys::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DROPFILES, HDROP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowPlacement,
     KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
-    SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage, CS_DBLCLKS, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HMENU, HWND_TOP, IDC_ARROW, MF_CHECKED,
-    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, SWP_FRAMECHANGED,
+    SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HWND_TOP, IDC_ARROW,
+    MINMAXINFO, MSG, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SW_FORCEMINIMIZE,
     SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
-    SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_LEFTBUTTON, TPM_RETURNCMD, TPM_TOPALIGN,
+    SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
     WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
     WM_DWMCOLORIZATIONCOLORCHANGED, WM_DPICHANGED, WM_DROPFILES, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
@@ -80,22 +80,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// features, so we define them directly — see `copy_text_to_clipboard` / `copy_file_to_clipboard`.
 const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
-
-/// `TrackPopupMenu(TPM_RETURNCMD)` command ids for the toolbar actions popup (see
-/// [`App::actions_menu`]). The fixed file actions take low ids; configured "Open in…" *leaf* apps
-/// take `OPEN_WITH_ID_BASE + index`, where `index` is the leaf's position in a pre-order walk of the
-/// (possibly nested) menu tree — submenus carry no id of their own. The two ranges never collide. A
-/// 0 return means "dismissed", so ids start at 1.
-const ID_SHOW_IN_EXPLORER: usize = 1;
-const ID_COPY_FILE: usize = 2;
-const ID_COPY_PATH: usize = 3;
-const ID_COPY_NAME: usize = 4;
-const ID_SETTINGS: usize = 5;
-const OPEN_WITH_ID_BASE: usize = 100;
-/// Command ids for the "»" overflow popup: `OVERFLOW_ID_BASE + index` into the items returned by
-/// [`Chrome::overflow_menu`]. Kept clear of the actions-popup ranges above (this menu is separate,
-/// but a distinct base keeps the two unambiguous).
-const OVERFLOW_ID_BASE: usize = 1000;
 
 use crate::chrome;
 use crate::config::Config;
@@ -120,16 +104,11 @@ pub const WM_APP_FILE_CHANGED: u32 = WM_APP + 4;
 /// A finished flipbook auto-detection from a worker, posted *after* its `WM_APP_DECODE_DONE` so the
 /// per-pixel scan never delays the image. LPARAM is `Box<FlipbookGuess>`.
 pub const WM_APP_FLIPBOOK_GUESS: u32 = WM_APP + 6;
-/// "Settings…" was chosen from the right-click menu. Posted rather than opened inline because that
-/// menu is tracked inside `TrackPopupMenu`'s nested pump, which re-enters this wndproc.
-pub const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 8;
 /// The settings window's "Browse…" button. Posted, not called: `GetOpenFileNameW` pumps its own
-/// modal loop, and the click that asked for it was discovered *during* `WM_PAINT`.
+/// modal loop, and the click that asked for it was discovered *during* `WM_PAINT`. It is now the
+/// **only** thing in the app that needs this treatment — the popup menus and the settings window
+/// itself are ImGui, and pump nothing.
 pub const WM_APP_SETTINGS_BROWSE: u32 = WM_APP + 10;
-
-/// Open the popup menu the UI asked for this frame. Posted (not called) so `TrackPopupMenu`'s
-/// nested modal pump runs *after* `WM_PAINT` has completed — see [`App::apply_ui`].
-pub const WM_APP_OPEN_MENU: u32 = WM_APP + 9;
 
 /// A completed sibling-image scan, delivered to the UI thread (boxed, via the message LPARAM).
 /// The win shell turns it into a [`Folder`] cursor once it confirms it's still current.
@@ -241,23 +220,15 @@ struct App {
     flipbook: HashMap<PathBuf, PerPath>,
     /// Wall-clock of the previous playback tick, for dt-based advance (robust to timer jitter).
     flipbook_last_tick: Option<Instant>,
-    /// A popup menu the UI asked for, deferred out of `WM_PAINT` (see [`App::apply_ui`]).
-    pending_menu: Option<PendingMenu>,
+    /// The popup menu that is up, if any (actions or overflow). Like the settings window, an ImGui
+    /// popup drawn inside our own frame: no `TrackPopupMenu`, no nested pump, no command-id table.
+    menu: Option<crate::ui::MenuState>,
     /// The settings window, while it is open. It is an ImGui modal drawn inside our own frame, so —
     /// unlike the Win32 dialog it replaced — it runs no nested message pump and holds no borrow: its
     /// state simply lives here and is edited during the paint. `None` = closed.
     settings: Option<crate::ui::settings::State>,
     /// Whether the caret-blink timer is currently armed (see [`App::sync_caret_timer`]).
     caret_timer: bool,
-}
-
-/// A Win32 popup menu requested by the UI, waiting for the paint to finish.
-struct PendingMenu {
-    action: Action,
-    /// Screen coords of the menu's top-left.
-    pt: POINT,
-    /// The overflow menu's contents (empty for the actions menu).
-    items: Vec<Action>,
 }
 
 impl App {
@@ -740,146 +711,43 @@ impl App {
         self.redraw();
     }
 
-    /// Open the deferred popup menu (posted by [`Self::apply_ui`]). `TrackPopupMenu` runs its own
-    /// modal pump, so this must happen *after* the paint that requested it has finished — never
-    /// inside `WM_PAINT`, where a nested pump would re-enter the still-unvalidated paint.
-    fn open_pending_menu(&mut self) {
-        let Some(pending) = self.pending_menu.take() else {
+    /// Show a popup menu, anchored at `pos` in client coords. The UI draws it on the next frame; all
+    /// this does is say which menu, and where.
+    ///
+    /// The actions menu is about the open image, so it doesn't exist without one.
+    fn open_menu(&mut self, kind: crate::ui::MenuKind, pos: (f32, f32)) {
+        if matches!(kind, crate::ui::MenuKind::Actions) && self.current_path.is_none() {
             return;
-        };
-        match pending.action {
-            Action::Overflow => self.overflow_menu(pending.pt, &pending.items),
-            _ => self.show_actions_menu(pending.pt),
         }
+        self.menu = Some(crate::ui::MenuState::new(kind, pos));
         self.redraw();
     }
 
-    /// The "»" overflow popup: the left-group controls that didn't fit the window width, each
-    /// dispatching through the normal action path when chosen. Items mirror the toolbar buttons'
-    /// enabled/checked state.
-    fn overflow_menu(&mut self, pt: POINT, items: &[Action]) {
-        if items.is_empty() {
-            return;
-        }
-        let snap = self.snapshot();
-        let chosen = unsafe {
-            // The documented foreground idiom, so an outside click dismisses cleanly.
-            SetForegroundWindow(self.frame as HWND);
-            let menu = CreatePopupMenu();
-            if menu.is_null() {
-                return;
-            }
-            for (i, action) in items.iter().enumerate() {
-                let mut flags = MF_STRING;
-                if !snap.enabled(*action) {
-                    flags |= MF_GRAYED;
-                }
-                if snap.active(*action) {
-                    flags |= MF_CHECKED;
-                }
-                let label = wide(&snap.tooltip(*action));
-                AppendMenuW(menu, flags, OVERFLOW_ID_BASE + i, label.as_ptr());
-            }
-            let cmd = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON,
-                pt.x,
-                pt.y,
-                0,
-                self.frame as HWND,
-                ptr::null(),
-            );
-            DestroyMenu(menu);
-            // 0 = dismissed; otherwise map the id back to the item's action.
-            (cmd as usize)
-                .checked_sub(OVERFLOW_ID_BASE)
-                .and_then(|idx| items.get(idx))
-                .copied()
-        };
-        if let Some(action) = chosen {
-            self.do_action(action);
-        }
-    }
-
-    /// Build the actions popup at a screen point, track it, and perform the chosen entry on the
-    /// current image. Shared by [`Self::actions_menu`] (toolbar button) and [`Self::actions_menu_at_view`]
-    /// (right-click). A no-op if there's no image.
-    fn show_actions_menu(&mut self, pt: POINT) {
+    /// Perform a command chosen from the actions menu.
+    ///
+    /// Every one of these is safe to run inline from the paint that discovered the click: they spawn
+    /// detached processes or touch the clipboard, and none of them pumps a message loop — which is
+    /// exactly what `TrackPopupMenu` did, and the reason this whole path used to be deferred.
+    fn do_command(&mut self, cmd: crate::ui::Command) {
+        use crate::ui::Command;
         let Some(image) = self.current_path.clone() else {
+            // Settings isn't about the image, so it still works with nothing open.
+            if cmd == Command::OpenSettings {
+                self.open_settings();
+            }
             return;
         };
-        unsafe {
-            // The documented idiom so the menu dismisses correctly on an outside click.
-            SetForegroundWindow(self.frame as HWND);
-            let menu = CreatePopupMenu();
-            if menu.is_null() {
-                return;
-            }
-            // Fixed file actions first, each shown unless hidden in `[context-menu]`. All four can
-            // be off, leaving just the open-with tree.
-            let cm = self.cfg.context_menu;
-            let fixed = [
-                (cm.show_in_explorer, ID_SHOW_IN_EXPLORER, "Show in Explorer"),
-                (cm.copy_file, ID_COPY_FILE, "Copy File"),
-                (cm.copy_path, ID_COPY_PATH, "Copy Path"),
-                (cm.copy_file_name, ID_COPY_NAME, "Copy File Name"),
-            ];
-            let mut shown = 0usize;
-            for (on, id, text) in fixed {
-                if on {
-                    let label = wide(text);
-                    AppendMenuW(menu, MF_STRING, id, label.as_ptr());
-                    shown += 1;
+        let hwnd = self.frame as HWND;
+        match cmd {
+            Command::ShowInExplorer => show_in_explorer(&image),
+            Command::CopyFile => copy_file_to_clipboard(hwnd, &image),
+            Command::CopyPath => copy_text_to_clipboard(hwnd, &image.to_string_lossy()),
+            Command::CopyFileName => copy_text_to_clipboard(hwnd, &file_name(&image)),
+            Command::OpenSettings => self.open_settings(),
+            Command::OpenWith(path) => {
+                if let Some(app) = crate::config::entry_at(&self.cfg.open_with, &path) {
+                    launch_external(app, &image);
                 }
-            }
-            // Then the configured "Open in…" tree, after a divider. Submenus become nested popups;
-            // each leaf app gets an id of OPEN_WITH_ID_BASE + its pre-order index, collected into
-            // `leaves` so the returned command id maps straight back to the app to launch. Ids start
-            // at OPEN_WITH_ID_BASE so they never collide with the fixed actions above.
-            let mut leaves: Vec<&crate::config::MenuEntry> = Vec::new();
-            if !self.cfg.open_with.is_empty() {
-                if shown > 0 {
-                    AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-                }
-                build_open_with_menu(menu, &self.cfg.open_with, &mut leaves);
-                shown += 1;
-            }
-            // "Settings…" always comes last, after a divider — it's the one entry that isn't about
-            // the image.
-            if shown > 0 {
-                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-            }
-            let settings = wide("Settings\u{2026}");
-            AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
-            let cmd = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON,
-                pt.x,
-                pt.y,
-                0,
-                self.frame as HWND,
-                ptr::null(),
-            );
-            DestroyMenu(menu); // recursive — also frees the nested submenu popups appended above
-            match cmd as usize {
-                ID_SHOW_IN_EXPLORER => show_in_explorer(&image),
-                ID_COPY_FILE => copy_file_to_clipboard(self.frame as HWND, &image),
-                ID_COPY_PATH => {
-                    copy_text_to_clipboard(self.frame as HWND, &image.to_string_lossy())
-                }
-                ID_COPY_NAME => copy_text_to_clipboard(self.frame as HWND, &file_name(&image)),
-                // Not opened inline: we're inside an `&mut self` borrow, and the dialog's nested
-                // message loop re-enters the wndproc, which takes its own. Post and let the loop
-                // deliver it once this borrow is gone.
-                ID_SETTINGS => {
-                    PostMessageW(self.frame as HWND, WM_APP_OPEN_SETTINGS, 0, 0);
-                }
-                id if id >= OPEN_WITH_ID_BASE => {
-                    if let Some(app) = leaves.get(id - OPEN_WITH_ID_BASE) {
-                        launch_external(app, &image);
-                    }
-                }
-                _ => {} // 0 = dismissed, or an unknown id
             }
         }
     }
@@ -1313,27 +1181,37 @@ impl App {
         let icon_px = self.imgui.icon_px();
         let stock = self.imgui.stock_style(dark);
 
-        // The settings state is *edited* by the UI, so it has to go in by `&mut`. Move it out for the
-        // duration rather than borrow a field of `self` across `self.imgui.frame(…)`.
+        // The settings and menu state are *edited* by the UI, so they go in by `&mut`. Move them out
+        // for the duration rather than borrow fields of `self` across `self.imgui.frame(…)`.
         let mut settings = self.settings.take();
+        let mut menu = self.menu.take();
+        // Borrowed, not cloned: `Config` owns the open-with tree and the keybind map, and a frame is
+        // drawn on every mouse move. Rust's disjoint-field capture makes this fine — the closure
+        // takes `&self.cfg` while the call takes `&mut self.imgui`.
+        let cfg = &self.cfg;
         let frame = self.imgui.frame(|ui, tex| {
             crate::ui::build(
                 ui,
                 tex,
-                &snap,
-                transport.as_ref(),
-                chip,
-                settings.as_mut(),
-                stock,
-                &metrics,
-                icon_px,
-                dark,
-                (cw as f32, ch as f32),
-                (ix, iy, iw, ih),
-                fullscreen,
+                crate::ui::Inputs {
+                    snap: &snap,
+                    transport: transport.as_ref(),
+                    chip,
+                    settings: settings.as_mut(),
+                    menu: menu.as_mut(),
+                    cfg,
+                    stock,
+                    m: &metrics,
+                    icon_px,
+                    dark,
+                    client: (cw as f32, ch as f32),
+                    image: (ix, iy, iw, ih),
+                    fullscreen,
+                },
             )
         });
         self.settings = settings;
+        self.menu = menu;
 
         self.surface.present();
         self.sync_caret_timer();
@@ -1357,23 +1235,17 @@ impl App {
             }
             self.redraw();
         }
-        // The two Win32 popup menus. `TrackPopupMenu` pumps its own modal loop, which re-enters this
-        // wndproc — and we are currently *inside* `WM_PAINT`, between BeginPaint and EndPaint, with
-        // an `&mut App` live. Opening one here would recurse into an unvalidated paint. So record it
-        // and post: the loop delivers WM_APP_OPEN_MENU once this paint has finished and our borrow
-        // is gone.
+        // The popup menus. Nothing is deferred any more: an ImGui popup pumps no messages, so a
+        // toolbar button can simply ask for one and a chosen command can simply run.
+        if let Some(cmd) = frame.command {
+            self.do_command(cmd);
+        }
+        if frame.menu_close {
+            self.menu = None;
+            self.redraw();
+        }
         if let Some(anchor) = frame.menu {
-            let mut pt = POINT {
-                x: anchor.x,
-                y: anchor.y,
-            };
-            unsafe { ClientToScreen(self.frame as HWND, &mut pt) };
-            self.pending_menu = Some(PendingMenu {
-                action: anchor.action,
-                pt,
-                items: frame.overflow,
-            });
-            unsafe { PostMessageW(self.frame as HWND, WM_APP_OPEN_MENU, 0, 0) };
+            self.open_menu(anchor.kind, anchor.pos);
         }
 
         // The settings window. Apply *before* close, so OK (which does both) commits.
@@ -1466,7 +1338,6 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             return;
         }
         chrome::apply_dark_titlebar(frame, dark);
-        chrome::apply_dark_menus(frame, dark);
 
         let dpi = GetDpiForWindow(frame).max(96);
         let metrics = Metrics::new(dpi);
@@ -1526,7 +1397,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             windowed_placement: std::mem::zeroed(),
             flipbook: HashMap::new(),
             flipbook_last_tick: None,
-            pending_menu: None,
+            menu: None,
             settings: None,
             caret_timer: false,
         });
@@ -1672,6 +1543,19 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             }
             return 0;
         }
+        // A popup menu is up. It isn't modal, so — unlike the settings window — ImGui leaves
+        // `want_capture_keyboard` false and every key would fall straight through to the viewer: Esc
+        // would *close the window* out from under the open menu. So the menu takes the keys, and Esc
+        // dismisses it (which ImGui also does itself; doing it here as well is harmless and is the
+        // part that doesn't depend on a default we don't own).
+        if key_msg && app.menu.is_some() {
+            const VK_ESCAPE: u32 = 0x1B;
+            if wparam as u32 == VK_ESCAPE {
+                app.menu = None;
+                app.redraw();
+            }
+            return 0;
+        }
         if key_msg && app.imgui.wants_keyboard() {
             return 0;
         }
@@ -1773,12 +1657,9 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             // A right *click* (the gesture never moved past the zoom-drag slop) opens the actions
             // menu at the cursor; an actual zoom-drag just ends.
             if !app.surface.end_zoom_drag() {
-                let x = (lparam & 0xffff) as u16 as i16 as i32;
-                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as i32;
-                let mut pt = POINT { x, y };
-                ClientToScreen(hwnd, &mut pt);
-                app.show_actions_menu(pt);
-                app.redraw();
+                let x = (lparam & 0xffff) as u16 as i16 as f32;
+                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
+                app.open_menu(crate::ui::MenuKind::Actions, (x, y));
             }
             0
         }
@@ -1851,14 +1732,6 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.reload(wparam as u64);
             0
         }
-        WM_APP_OPEN_SETTINGS => {
-            app.open_settings();
-            0
-        }
-        WM_APP_OPEN_MENU => {
-            app.open_pending_menu();
-            0
-        }
         WM_APP_SETTINGS_BROWSE => {
             app.settings_browse();
             0
@@ -1904,7 +1777,6 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.surface
                 .set_clear(crate::chrome::Palette::for_mode(dark).view_clear_packed());
             chrome::apply_dark_titlebar(hwnd, dark);
-            chrome::apply_dark_menus(hwnd, dark);
             app.redraw();
             0
         }
@@ -2035,45 +1907,6 @@ fn browse_for_program(owner: HWND) -> Option<PathBuf> {
     }
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     Some(PathBuf::from(String::from_utf16_lossy(&buf[..end])))
-}
-
-/// Recursively append the "Open in…" `entries` to `menu`: a submenu (an entry with children) becomes
-/// a nested `MF_POPUP`, and a leaf app (an entry with a `path`) becomes a command item whose id is
-/// `OPEN_WITH_ID_BASE + leaves.len()`. `leaves` accumulates the launch targets in command-id order,
-/// so [`App::show_actions_menu`] can map the returned id straight back to the app. Malformed entries
-/// (neither `path` nor `items`) are skipped. The created submenu popups are owned by `menu` once
-/// appended, so the caller's single `DestroyMenu(menu)` frees them all.
-///
-/// # Safety
-/// `menu` must be a valid menu handle; called only from inside the `unsafe` block in
-/// [`App::show_actions_menu`].
-unsafe fn build_open_with_menu<'a>(
-    menu: HMENU,
-    entries: &'a [crate::config::MenuEntry],
-    leaves: &mut Vec<&'a crate::config::MenuEntry>,
-) {
-    for entry in entries {
-        let label = wide(&entry.name);
-        if entry.is_submenu() {
-            let sub = unsafe { CreatePopupMenu() };
-            if sub.is_null() {
-                continue; // out of menu handles; skip this submenu rather than abort the whole menu
-            }
-            unsafe {
-                build_open_with_menu(sub, &entry.items, leaves);
-                // MF_POPUP reinterprets the id argument as the submenu handle; ownership transfers
-                // to `menu`, so `sub` needs no separate DestroyMenu.
-                AppendMenuW(menu, MF_POPUP, sub as usize, label.as_ptr());
-            }
-        } else if entry.path.as_deref().is_some_and(|p| !p.trim().is_empty()) {
-            let id = OPEN_WITH_ID_BASE + leaves.len();
-            leaves.push(entry);
-            unsafe { AppendMenuW(menu, MF_STRING, id, label.as_ptr()) };
-        }
-        // else: malformed entry (no usable `path`, no `items`) — silently skipped. The settings
-        // dialog creates entries before they have a program, so a half-filled one just doesn't show
-        // up in the menu yet.
-    }
 }
 
 /// Launch a configured external app on `image` (the "Open in…" menu action). Best-effort: the child

@@ -19,7 +19,6 @@ use std::ptr;
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows_sys::Win32::Graphics::Gdi::{GetSysColor, COLOR_HIGHLIGHT};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
 use crate::icons::Icon;
@@ -349,60 +348,13 @@ pub fn apply_dark_titlebar(hwnd: HWND, dark: bool) {
     }
 }
 
-/// Make Win32 popup menus (the actions menu / the right-click menu) follow the dark theme.
-///
-/// A `TrackPopupMenu` menu is system-drawn (border, gutter, rounded corners and all), so
-/// owner-drawing only its item rects would still leave a light frame around them. The one thing that
-/// darkens the whole menu is the same undocumented `uxtheme.dll` ordinal path File Explorer /
-/// Terminal use: opt the process into the dark app mode (`SetPreferredAppMode`, ordinal 135), mark
-/// the owner window dark-allowed (`AllowDarkModeForWindow`, 133), then flush the cached menu theme
-/// (`FlushMenuThemes`, 136). Process-global and persistent, so callers invoke it on theme setup /
-/// change rather than per menu. Strictly best-effort: if any ordinal can't be resolved (older
-/// Windows) the menu just stays light.
-///
-/// **This is the only undocumented API left in the codebase**, and it exists solely because these
-/// two menus are still Win32. When they become ImGui popups, this function and the ordinals go with
-/// them.
-pub fn apply_dark_menus(hwnd: HWND, dark: bool) {
-    // uxtheme.dll private ordinals (stable since Win10 1809; SetPreferredAppMode since 1903).
-    const ALLOW_DARK_MODE_FOR_WINDOW: usize = 133;
-    const SET_PREFERRED_APP_MODE: usize = 135;
-    const FLUSH_MENU_THEMES: usize = 136;
-    // PreferredAppMode: Default = 0, AllowDark = 1, ForceDark = 2, ForceLight = 3.
-    const APP_MODE_FORCE_DARK: i32 = 2;
-    const APP_MODE_DEFAULT: i32 = 0;
-
-    // BOOL is plain i32 in windows-sys; spell it out to avoid an import that varies by version.
-    type AllowDarkModeForWindowFn = unsafe extern "system" fn(HWND, i32) -> i32;
-    type SetPreferredAppModeFn = unsafe extern "system" fn(i32) -> i32;
-    type FlushMenuThemesFn = unsafe extern "system" fn();
-
-    unsafe {
-        let lib = LoadLibraryW(wide("uxtheme.dll").as_ptr());
-        if lib.is_null() {
-            return;
-        }
-        // GetProcAddress by ordinal: the ordinal is passed as the pointer value (MAKEINTRESOURCE).
-        if let Some(p) = GetProcAddress(lib, ALLOW_DARK_MODE_FOR_WINDOW as *const u8) {
-            let f: AllowDarkModeForWindowFn = std::mem::transmute(p);
-            f(hwnd, dark as i32);
-        }
-        if let Some(p) = GetProcAddress(lib, SET_PREFERRED_APP_MODE as *const u8) {
-            let f: SetPreferredAppModeFn = std::mem::transmute(p);
-            f(if dark {
-                APP_MODE_FORCE_DARK
-            } else {
-                APP_MODE_DEFAULT
-            });
-        }
-        if let Some(p) = GetProcAddress(lib, FLUSH_MENU_THEMES as *const u8) {
-            let f: FlushMenuThemesFn = std::mem::transmute(p);
-            f();
-        }
-        // Deliberately no FreeLibrary: uxtheme is already loaded process-wide and stays resident.
-    }
-}
-
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
+
+// There used to be an `apply_dark_menus` here: three undocumented `uxtheme.dll` ordinals (133/135/136
+// — `AllowDarkModeForWindow` / `SetPreferredAppMode` / `FlushMenuThemes`), resolved by `GetProcAddress`
+// and `transmute`d into function pointers. It was the only undocumented API in the codebase, and it
+// existed for exactly one reason: a `TrackPopupMenu` menu is drawn by the system — border, gutter,
+// rounded corners and all — so nothing short of that hack could make it follow the app's dark theme.
+// The menus are ImGui popups now. We draw them; they are whatever color we say.

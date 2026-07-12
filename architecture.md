@@ -320,6 +320,19 @@ for, which the win shell applies.
   is too narrow the left group sheds its lowest-priority slots into a "»" popup.
 - **Status bar:** file name, format, W×H, bit depth / channel layout, ICC presence, and on the right
   the folder position and zoom % (plus `EV ±` for HDR).
+- **Popup menus** (`ui::MenuState`): the *actions* menu (right-click on the image, or the "Open in…"
+  toolbar button) and the *overflow* menu behind "»". Both are ImGui popups.
+
+  They were `TrackPopupMenu` — and that one choice dragged in everything else: a `CreatePopupMenu` /
+  `AppendMenuW` / `DestroyMenu` rebuild on every show, a command-id numbering scheme (`OPEN_WITH_ID_BASE
+  + pre-order index`) to map a returned id back to the app to launch, a `PostMessage` deferral because
+  the menu pumps its own modal loop and must never open from inside `WM_PAINT`, and — because a Win32
+  menu is *system-drawn*, frame and gutter and all — **three undocumented `uxtheme.dll` ordinals**
+  (`AllowDarkModeForWindow` / `SetPreferredAppMode` / `FlushMenuThemes`, 133/135/136) resolved by
+  `GetProcAddress` and `transmute`d, purely to make it dark. All of that is gone. The menu is drawn in
+  the frame we were already painting; a clicked "Open in…" entry names itself by its **index path**
+  into the configured tree (`config::entry_at`), so there is no second walk to keep in step and no way
+  for the menu and the launcher to disagree; and the app now calls **no undocumented API at all**.
 - **Input routing:** ImGui sees every message first, then two booleans decide who owns it —
   `want_capture_mouse` (the pointer is over a widget) and `want_capture_keyboard` (a text field has
   focus, so keys are typing, not commands). That *replaces* the entire hand-rolled
@@ -328,6 +341,14 @@ for, which the win shell applies.
   — gating on it would let a click on a toolbar button also pan the image underneath. One exception:
   a pan/zoom drag already in flight keeps the mouse to the end of the gesture even if the cursor
   strays over the chrome (`GpuSurface::is_mouse_captured`), or the drag would stick on crossing it.
+
+  Keys need three cases ImGui's booleans don't cover, and each is a bug if you skip it. A **keybind
+  capture** takes every key *before* ImGui sees it, Esc included (ImGui would read Esc as "close the
+  modal" instead of "cancel the capture"). The **settings window** is modal, so keys are its, not the
+  viewer's — but `want_capture_keyboard` can't express that, because ImGui sets it `true` for the whole
+  time *any* modal is open (`ActiveId != 0 || modal_window != NULL`); `want_text_input` is the one that
+  means "a text box has focus". And an open **popup menu** is *not* modal, so ImGui leaves the flag
+  false and every key falls straight through — Esc would close the window out from under the menu.
 - **DPI awareness:** `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` is declared before any
   window exists, so the non-client area auto-scales and `WM_DPICHANGED` fires on monitor moves. On a
   DPI change we adopt the OS-suggested rect, rescale the style, and re-raster the icon atlas — and
