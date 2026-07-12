@@ -93,12 +93,21 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
     float2 f = img_size * 0.5 + (sp - ctr) * inv_zoom;   // image texel coords
     // A 1px (screen-space) outline hugging the OUTSIDE of the image boundary, drawn in the
     // letterbox gutter so it never covers image content. `sd` is the box signed distance in
-    // texels (>0 outside the image, <0 inside); a pixel whose center lands within one screen
-    // pixel (inv_zoom texels) just outside the image → outline. White on a black backdrop,
-    // else black, so it always contrasts. (At fit the image meets the viewport edge on its
-    // constraining axis, leaving no gutter there, so those edges have no room for an outline.)
+    // texels (>0 outside the image, <0 inside), `sd_px` the same in screen pixels: the outline
+    // is the ring of pixels whose centers land within one screen pixel outside the boundary.
+    // White on a black backdrop, else black, so it always contrasts.
+    //
+    // The window is biased inward by EPS to kill a degenerate case. A naive (0, 1) window is one
+    // pixel wide with both ends open, so when an edge lands exactly on a column/row of pixel
+    // centers — surf_size and img_size*zoom of opposite parity at pan 0, i.e. routinely — the
+    // pixel inside it has sd_px == 0 and its outer neighbour sd_px == 1, neither passes, and that
+    // whole edge vanishes until a pan/zoom nudge breaks the tie. Biasing makes the on-boundary
+    // pixel (half outside the image anyway) the outline pixel there. Any unit-length half-open
+    // window catches exactly one center per row/column, so nothing else changes.
+    const float EPS = 1.0 / 256.0;
     float sd = max(max(-f.x, f.x - img_size.x), max(-f.y, f.y - img_size.y));
-    if (outline != 0 && sd > 0.0 && sd < inv_zoom) {
+    float sd_px = sd / inv_zoom;
+    if (outline != 0 && sd_px > -EPS && sd_px < 1.0 - EPS) {
         float v = (background == 0) ? 1.0 : 0.0;
         return float4(v, v, v, 1.0);
     }
