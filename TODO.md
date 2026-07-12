@@ -1,3 +1,4 @@
+- image position and fit at load time
 - vsync check / fps limit
 - tracy integration
 - settings: custom background color (needs a `Params` cbuffer + shader extension)

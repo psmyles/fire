@@ -118,6 +118,33 @@
 # copy-file-name = true
 
 # ----------------------------------------------------------------------------------------------
+# [keybinds] — keyboard shortcuts. Easiest edited in Settings ▸ Keybinds, but you can write them
+#              here too. Only the ones you CHANGE are listed: anything absent keeps its default (so
+#              you also pick up any new defaults a future version ships).
+#
+# Write a key as "F", "F11", "Left", "Esc", "Space", "[", "Num+", or with modifiers:
+# "Ctrl+F", "Ctrl+Alt+Shift+K". Give a list to bind several keys to one action. An empty string
+# unbinds an action entirely. An unknown action name or an unreadable key is simply ignored.
+#
+# Action names and their defaults:
+#   fit = "F"                          actual-size = "1"
+#   zoom-in = ["=", "Shift+=", "Num+"] zoom-out = ["-", "Num-"]
+#   all-channels = "C"                 red-channel = "R"
+#   green-channel = "G"                blue-channel = "B"
+#   alpha-channel = "A"                toggle-tonemap = "T"
+#   exposure-up = "]"                  exposure-down = "["
+#   exposure-reset = ""                toggle-outline = ""      (both unbound by default)
+#   previous-image = "Left"            next-image = "Right"
+#   toggle-fullscreen = "F11"          close-or-exit-fullscreen = "Esc"
+#   toggle-flipbook = "K"
+#   flipbook-play-pause = "Space"      (these three act only in flipbook mode)
+#   flipbook-previous-frame = ","      flipbook-next-frame = "."
+#
+# [keybinds]
+# toggle-flipbook = "Ctrl+K"
+# exposure-reset = "0"
+
+# ----------------------------------------------------------------------------------------------
 # [[open-with]] — entries for the "Open in…" button on the toolbar (the rightmost button) and the
 #                 right-click menu over the image. Each [[open-with]] block adds one entry. With no
 #                 entries configured the button is disabled (greyed out).

@@ -70,6 +70,21 @@ pub struct MenuEntry {
     pub items: Vec<MenuEntry>,
 }
 
+/// The entry at `path` — an index chain from the root (`[1, 0]` = second top-level entry's first
+/// child), which is how the actions menu names the item that was clicked.
+///
+/// Naming it by *path* rather than by a flat command-id index is what makes it impossible for the
+/// menu and the launcher to disagree about which app a click meant: there is no second walk of the
+/// tree to keep in step with the first.
+pub fn entry_at<'a>(entries: &'a [MenuEntry], path: &[usize]) -> Option<&'a MenuEntry> {
+    let (&last, parents) = path.split_last()?;
+    let mut cur = entries;
+    for &i in parents {
+        cur = &cur.get(i)?.items;
+    }
+    cur.get(last)
+}
+
 impl MenuEntry {
     /// Whether this entry is a submenu (has children). A submenu's `path`/`args` are ignored.
     pub fn is_submenu(&self) -> bool {
@@ -151,6 +166,7 @@ pub enum FitCfg {
 #[serde(default, rename_all = "kebab-case")]
 pub struct FlipbookCfg {
     /// Playback rate a new flipbook starts at, in frames per second.
+    #[serde(serialize_with = "serialize_f32")]
     pub fps: f32,
     /// Whether a new flipbook crossfades between frames.
     pub blend: bool,
@@ -237,8 +253,10 @@ pub struct Config {
     /// `default-fit`, so a small image is shown at 100% on load and folder navigation.
     pub fit_upscale: bool,
     /// Multiplicative zoom per wheel notch / zoom keypress. Clamped to `1.01..=4.0`.
+    #[serde(serialize_with = "serialize_f32")]
     pub zoom_step: f32,
     /// Exposure step per `[` / `]` press (HDR sources), in stops. Clamped to `0.01..=4.0`.
+    #[serde(serialize_with = "serialize_f32")]
     pub exposure_step: f32,
     /// The tonemap operator a freshly adopted HDR image starts on.
     pub default_tonemap: TonemapCfg,
@@ -349,6 +367,16 @@ fn clamp_finite(v: f32, fallback: f32, lo: f32, hi: f32) -> f32 {
     }
 }
 
+/// Write an `f32` to TOML without the widening artifact.
+///
+/// TOML floats are `f64`, so serializing `1.15f32` straight through prints its exact binary value —
+/// `1.149999976158142`. Nobody wants to open their config and find that. Rounding to four decimals
+/// on the way out is lossless for every value these fields can hold (the steppers move in hundredths)
+/// and prints as the number the user actually chose.
+fn serialize_f32<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64((*v as f64 * 10_000.0).round() / 10_000.0)
+}
+
 /// Write the commented [`DEFAULT_CONFIG`] template to `config.toml` *iff* it doesn't already exist,
 /// so a fresh install has a discoverable, self-documenting settings file. Best-effort and never
 /// destructive: `create_new` atomically fails if the file is present (closing the check-then-write
@@ -431,6 +459,18 @@ mod tests {
         );
         // A leaf with no `args` falls back to passing the image path alone.
         assert_eq!(convert.items[1].resolved_args(Path::new(r"D:\a.tga")), vec![r"D:\a.tga"]);
+
+        // The actions menu names a clicked entry by its index path, and `entry_at` is what turns that
+        // back into the app to launch — so a wrong answer here launches the wrong program.
+        assert_eq!(entry_at(&cfg.open_with, &[0]).unwrap().name, "ImageMagick");
+        assert_eq!(entry_at(&cfg.open_with, &[0, 0]).unwrap().name, "Convert");
+        assert_eq!(entry_at(&cfg.open_with, &[0, 0, 1]).unwrap().name, "PNG");
+        // Out of range at any level, and the empty path, are all `None` rather than a panic or a
+        // neighbouring entry.
+        assert!(entry_at(&cfg.open_with, &[]).is_none());
+        assert!(entry_at(&cfg.open_with, &[1]).is_none());
+        assert!(entry_at(&cfg.open_with, &[0, 0, 2]).is_none());
+        assert!(entry_at(&cfg.open_with, &[0, 9, 0]).is_none());
     }
 
     /// The shipped default template is valid TOML and deserializes (its `[[open-with]]` examples are
@@ -492,6 +532,22 @@ mod tests {
         let text = toml::to_string(&cfg).expect("serializes");
         let back: Config = toml::from_str(&text).expect("deserializes");
         assert_eq!(back, cfg);
+    }
+
+    /// A saved config reads like a human wrote it: `1.15`, not `1.149999976158142` (what an f32
+    /// widened to a TOML f64 prints as).
+    #[test]
+    fn floats_serialize_without_the_widening_artifact() {
+        let text = toml::to_string(&Config::default()).unwrap();
+        assert!(
+            text.contains("zoom-step = 1.15"),
+            "expected a clean float, got:\n{text}"
+        );
+        assert!(text.contains("exposure-step = 0.25"));
+        assert!(text.contains("fps = 24.0"));
+        // …and it still round-trips exactly.
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, Config::default());
     }
 
     /// The header `save` prepends is a comment block, so a saved file still parses.

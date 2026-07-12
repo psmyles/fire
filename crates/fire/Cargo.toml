@@ -59,6 +59,16 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Dxgi_Common",       # DXGI_FORMAT / sample desc / swap enums
 ] }
 
+# Dear ImGui: the whole UI (toolbar, status bar, transport, popups, settings). `dear-imgui-rs` is
+# the safe Rust API; `dear-imgui-sys` is named directly *only* to enable the two backend-shim
+# features, which compile ocornut's own imgui_impl_win32.cpp / imgui_impl_dx11.cpp. We own no
+# backend code — that is the entire reason this dependency is acceptable (see architecture.md §5.2).
+dear-imgui-rs = { version = "0.15.1", default-features = false }
+dear-imgui-sys = { version = "0.15.1", features = [
+    "backend-shim-win32",
+    "backend-shim-dx11",
+] }
+
 [build-dependencies]
 # build.rs precompiles the viewport HLSL with `fxc` (Windows SDK) and embeds the Fire .ico +
 # product metadata into the exe (Explorer file icon).

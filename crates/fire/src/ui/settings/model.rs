@@ -161,18 +161,6 @@ impl NumField {
             NumField::FlipbookFps => c.flipbook.fps = v,
         }
     }
-
-    /// The value as the stepper shows (and lets you type) it.
-    pub(crate) fn format(self, v: f32) -> String {
-        let (_, _, _, dp) = self.spec();
-        format!("{v:.dp$}")
-    }
-
-    /// Nudge by ±1 step (the `−` / `+` buttons, the arrow keys, the wheel).
-    pub(crate) fn nudge(self, c: &mut Config, dir: i32) {
-        let (_, _, step, _) = self.spec();
-        self.set(c, self.get(c) + step * dir as f32);
-    }
 }
 
 /// A text box's target: one field of the *selected* open-with entry.
@@ -589,20 +577,30 @@ mod tests {
         assert!(split_args("   ").is_empty());
     }
 
-    /// A stepper can't push a value outside the range `Config::sanitize` would clamp it to.
+    /// A numeric field's range **is** `Config::sanitize`'s clamp. The settings window's sliders are
+    /// bounded by [`NumField::spec`], so if the two ever drift, a value the user set would be
+    /// silently moved on the way to disk — the setting would just not take.
     #[test]
-    fn steppers_stay_in_range() {
-        let mut c = Config::default();
-        for _ in 0..500 {
-            NumField::ZoomStep.nudge(&mut c, 1);
-            NumField::FlipbookFps.nudge(&mut c, -1);
-        }
-        assert_eq!(c.zoom_step, 4.0);
-        assert_eq!(c.flipbook.fps, FPS_MIN);
+    fn num_fields_cannot_leave_the_sanitized_range() {
+        for f in [
+            NumField::ZoomStep,
+            NumField::ExposureStep,
+            NumField::FlipbookFps,
+        ] {
+            let (min, max, _, _) = f.spec();
+            // Ctrl+click on an ImGui slider lets you *type* a value, so `set` has to survive
+            // nonsense, not just the ends of the track.
+            for probe in [min - 1.0, min, max, max + 1.0, f32::MIN, f32::MAX, f32::NAN] {
+                let mut c = Config::default();
+                f.set(&mut c, probe);
+                let got = f.get(&c);
+                assert!((min..=max).contains(&got), "{f:?}: set({probe}) → {got}");
 
-        let mut sanitized = c.clone();
-        sanitized.sanitize();
-        assert_eq!(sanitized, c, "the dialog's range must match Config::sanitize");
+                let mut sanitized = c.clone();
+                sanitized.sanitize();
+                assert_eq!(sanitized, c, "{f:?}: the range must match Config::sanitize");
+            }
+        }
     }
 
     /// Every dropdown's option list and its `set` arms agree, and `get` inverts `set`.

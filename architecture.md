@@ -29,7 +29,7 @@ Two consequences shape the whole design:
   whole per-pixel pipeline on *every* pan/zoom event; on a large window at a high refresh rate
   (a 240 Hz monitor) that pegs a CPU core during fast interaction. Instead the image is
   uploaded **once** as a D3D11 texture with a hardware-generated mip chain, and pan / zoom /
-  exposure / channel / tonemap (and flipbook cell selection) become a **112-byte constant
+  exposure / channel / tonemap (and flipbook cell selection) become a **128-byte constant
   buffer** — each frame is one
   fullscreen-triangle draw that re-samples the texture (**~0 CPU per frame**). A **DXGI
   flip-model swapchain** paces presentation to vsync, so interaction is tear-free and smooth at
@@ -127,20 +127,25 @@ This path only runs in SingleInstance mode; NewWindow has nothing to forward.
 ## 5. Rendering pipeline (GPU)
 
 - **Stack:** **Direct3D 11** with a **DXGI flip-model swapchain** (`DXGI_SWAP_EFFECT_FLIP_DISCARD`)
-  on the child view window's HWND. The decoded image is uploaded **once** as a GPU texture; a
+  on the window's HWND. The decoded image is uploaded **once** as a GPU texture; a
   short HLSL vertex+pixel shader (precompiled to DXBC at build time by `fxc` and embedded in the
   exe — no runtime `D3DCompile`) does the sampling and the whole color pipeline. The device is
   created lazily at window open — hardware preferred, with
   the **WARP** software rasterizer as a fallback for RDP/headless — so there is no warm-up step.
-- **Window split:** a top-level **frame** window owns the message loop and paints the GDI chrome
-  (toolbar + status bar); a **child "view" window** in the middle owns the swapchain.
-  `WS_CLIPCHILDREN` lets the frame repaint chrome without touching the image and vice-versa, and
-  makes the view's client rect *exactly* the image region (no chrome insets in the view math).
+- **One window.** The swapchain covers the whole client and the image is drawn into a **sub-rect**
+  of it, with the chrome (Dear ImGui — §5.2) drawn over the remainder *into the same backbuffer*.
+  There used to be a frame/child-view split, because GDI and a flip-model swapchain cannot paint the
+  same surface; with the chrome on the GPU that reason is gone, and with it `WS_CLIPCHILDREN`, the
+  second window class, and the second wndproc. `App::image_rect` is the single definition of the
+  image region; it is recomputed every frame and pushed into `GpuSurface::set_image_rect`, so there
+  is no retained layout to invalidate. `RSSetViewports` maps the fullscreen triangle onto that
+  sub-rect and clips to it, so the shader still fills the image region — background, checkerboard,
+  letterbox and all — in **one draw**.
 - **The image is a texture, not a per-frame computation.** On adopt, the decoded pixels are
   uploaded to a `USAGE_DEFAULT` texture created with a full mip chain
   (`D3D11_RESOURCE_MISC_GENERATE_MIPS`); `GenerateMips` builds the pyramid on the GPU. Each of the
   four `PixelFormat`s maps to a native DXGI format (see §5.1). After that, pan / zoom / exposure /
-  channel / tonemap (and the flipbook cell offsets + blend) are just values in a **112-byte
+  channel / tonemap (and the flipbook cell offsets + blend) are just values in a **128-byte
   constant buffer**; the source texture never changes until a new image is opened (flipbook
   playback only moves the cell offsets — never re-uploads).
 - **Per-frame work is one draw.** A frame maps the constant buffer (`MAP_WRITE_DISCARD`), writes
@@ -182,6 +187,46 @@ so the hardware does the final sRGB encode on write. (The flip model disallows a
 *swapchain* format, so the backbuffer is `R8G8B8A8_UNORM` and only the **RTV** is `_UNORM_SRGB` —
 the standard trick.) The backdrop/letterbox clear color is the theme-aware chrome color, unpacked
 from its `0x00RRGGBB` value and sRGB-decoded to linear on the CPU so it matches.
+
+### 5.2 The UI pass (Dear ImGui)
+
+The chrome is drawn by **Dear ImGui 1.92** into the *same backbuffer*, between the image draw and
+the `Present`:
+
+```
+WM_PAINT →  clear the whole backbuffer to the chrome fill   (UNORM view)
+            image pass  : viewport = image sub-rect, one fullscreen triangle   (SRGB view)
+            UI pass     : ImGui_ImplDX11_RenderDrawData, whole client          (UNORM view)
+            Present(1)  — vsync-paced
+```
+
+**Two render-target views of the same pixels, deliberately.** The image shader emits linear light and
+writes through the `*_SRGB` view (above). ImGui's colors are *already* sRGB, so it must write through
+a plain `UNORM` view — pushing it through the sRGB view would encode twice and visibly wash the
+entire UI out. Both views are legal on the one backbuffer precisely because that backbuffer is plain
+`R8G8B8A8_UNORM`. `GpuSurface::begin_frame` leaves the UNORM view bound for exactly this reason;
+getting it wrong does not crash, it just looks bad.
+
+**We own no backend code.** `dear-imgui-sys`'s `backend-shim-win32` / `backend-shim-dx11` features
+compile ocornut's own `imgui_impl_win32.cpp` / `imgui_impl_dx11.cpp` and expose them over a
+~10-function C ABI (`render/imgui.rs` declares them and nothing more). That is the whole reason this
+dependency was acceptable: the platform/renderer glue — historically the part that rots — is
+upstream's problem. There is no maintained Rust D3D11 backend, and writing one would have recreated
+the very "constantly patching small issues" problem the migration existed to end.
+
+**Rendering stays event-driven** — the invariant most at risk here, since ImGui's natural mode is to
+redraw forever. A frame is drawn only when something happened; `App::request_frames(2)` asks for the
+one or two extra frames ImGui needs to settle a hover or a click, and the count *terminates* — at
+zero, no further `WM_PAINT` is requested. No input, no timer, no message → no frame. Measured, not
+assumed: **0.16% of one core idle with the chrome up**, which is the file watcher, not ImGui.
+
+**Cost, measured** (release, median of 12 launches, from the kernel's process-creation time so the
+loader is included): time-to-first-pixel **+2.8 ms** on a 38 KB image — the unfair case, where decode
+is instant so ImGui init has nothing to hide behind — and **+0.3 ms (noise)** on a real 8.9 MB one,
+where the ~4.5 ms of ImGui init runs on the UI thread while the decode is still going and vanishes
+into its shadow. The exe grows ~1.34 MB. Of that 4.5 ms, ~2.7 ms is D3D11 device-object creation and
+under 1 ms is the first frame *including* rasterizing every glyph it draws — the fonts are not the
+cost.
 
 ---
 
@@ -258,27 +303,73 @@ Notes:
 
 ---
 
-## 8. Native UI chrome (DPI + dark mode)
+## 8. UI chrome (DPI + dark mode)
 
-The toolbar and status bar are **custom GDI-painted**, not Win32 common controls. Common
-controls were rejected because they have no documented dark-mode support; painting the
-chrome ourselves gives full color control for light/dark with zero undocumented APIs.
+The UI is **Dear ImGui**, drawn on the GPU into the same backbuffer as the image (§5.2). It used to
+be hand-painted GDI — chosen because the Win32 common controls have no documented dark mode, which
+is true but led somewhere worse: we ended up owning *layout, scrolling, tab bars, text input, hover,
+focus and hit-testing*, and every one of those produced bugs (a scrollbar that didn't drag, a focus
+ring wiped by `EN_KILLFOCUS`). ImGui is not "more native" — it is themeable, not native — but those
+are solved, tested primitives now, so that class of defect cannot occur. `ui/` is pure immediate-mode
+code with no Win32 in it; it reads a `ViewSnapshot` and returns a `ui::Frame` of what the user asked
+for, which the win shell applies.
 
-- **Toolbar:** channel-isolation toggles (R/G/B/A/RGB), fit/1:1, HDR tonemap (ACES) and
-  exposure (EV ±), with hover highlight, blue active-state for toggles, and disabled/dimmed
-  state (e.g. ACES/EV are greyed out on non-HDR images). Buttons hit-test to the same view
-  actions the keybinds drive — one state path.
-- **Status bar:** file name, format, W×H, bit depth / channel layout, ICC presence, and on
-  the right the zoom % (plus `EV ±` for HDR). The pixel-inspector eyedropper readout slots
-  in here.
-- **DPI awareness:** `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` is declared
-  before any window exists, so the non-client area auto-scales and `WM_DPICHANGED` fires on
-  monitor moves. All chrome metrics and the Segoe UI font scale from `GetDpiForWindow`; on
-  `WM_DPICHANGED` we adopt the OS-suggested rect and rebuild metrics/font/layout.
-- **Dark mode:** the system preference is read from the registry (`AppsUseLightTheme`); the
-  title bar is darkened via `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)`; the
-  chrome and the letterbox backdrop use a self-painted dark/light palette; `WM_SETTINGCHANGE`
-  re-skins live when the user flips the system theme.
+- **Toolbar:** channel isolation (R/G/B/A/RGB), fit/1:1, zoom, flipbook, HDR tonemap + exposure
+  (float sources only), and a right-docked group (outline, backdrop, full-screen, menu). Buttons
+  dispatch the same `Action`s the keybinds drive — one state path. When the window is too narrow the
+  left group sheds its lowest-priority slots into a "»" popup. There is **no gear**: Settings is the
+  last entry of the menu button's popup, which is the same menu the viewport's right-click opens — one
+  place to look, not two. That menu therefore stays enabled with no image loaded (its file entries
+  hide themselves), or Settings would be unreachable from an empty window.
+- **Status bar:** file name, format, W×H, bit depth / channel layout, ICC presence, and on the right
+  the folder position and zoom % (plus `EV ±` for HDR).
+- **Popup menus** (`ui::MenuState`): the *actions* menu (right-click on the image, or the "Open in…"
+  toolbar button) and the *overflow* menu behind "»". Both are ImGui popups.
+
+  They were `TrackPopupMenu` — and that one choice dragged in everything else: a `CreatePopupMenu` /
+  `AppendMenuW` / `DestroyMenu` rebuild on every show, a command-id numbering scheme (`OPEN_WITH_ID_BASE
+  + pre-order index`) to map a returned id back to the app to launch, a `PostMessage` deferral because
+  the menu pumps its own modal loop and must never open from inside `WM_PAINT`, and — because a Win32
+  menu is *system-drawn*, frame and gutter and all — **three undocumented `uxtheme.dll` ordinals**
+  (`AllowDarkModeForWindow` / `SetPreferredAppMode` / `FlushMenuThemes`, 133/135/136) resolved by
+  `GetProcAddress` and `transmute`d, purely to make it dark. All of that is gone. The menu is drawn in
+  the frame we were already painting; a clicked "Open in…" entry names itself by its **index path**
+  into the configured tree (`config::entry_at`), so there is no second walk to keep in step and no way
+  for the menu and the launcher to disagree; and the app now calls **no undocumented API at all**.
+- **Input routing:** ImGui sees every message first, then two booleans decide who owns it —
+  `want_capture_mouse` (the pointer is over a widget) and `want_capture_keyboard` (a text field has
+  focus, so keys are typing, not commands). That *replaces* the entire hand-rolled
+  hover/capture/hit-test/focus layer. Note this is **not** the wnd-proc handler's return value:
+  upstream returns true only for the few messages it fully consumes, never for "that click was mine"
+  — gating on it would let a click on a toolbar button also pan the image underneath. One exception:
+  a pan/zoom drag already in flight keeps the mouse to the end of the gesture even if the cursor
+  strays over the chrome (`GpuSurface::is_mouse_captured`), or the drag would stick on crossing it.
+
+  Keys need three cases ImGui's booleans don't cover, and each is a bug if you skip it. A **keybind
+  capture** takes every key *before* ImGui sees it, Esc included (ImGui would read Esc as "close the
+  modal" instead of "cancel the capture"). The **settings window** is modal, so keys are its, not the
+  viewer's — but `want_capture_keyboard` can't express that, because ImGui sets it `true` for the whole
+  time *any* modal is open (`ActiveId != 0 || modal_window != NULL`); `want_text_input` is the one that
+  means "a text box has focus". And an open **popup menu** is *not* modal, so ImGui leaves the flag
+  false and every key falls straight through — Esc would close the window out from under the menu.
+- **DPI awareness:** `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` is declared before any
+  window exists, so the non-client area auto-scales and `WM_DPICHANGED` fires on monitor moves. On a
+  DPI change we adopt the OS-suggested rect, rescale the style, and re-raster the icon atlas — and
+  that is *all*: ImGui 1.92's dynamic font system rasterizes glyphs on first use, so **there is no
+  font atlas to rebuild**. (Do not build one, either: caching it would mean serializing ImGui's
+  internal glyph structures, and it would save ~1 ms — the fonts are not the cost, the D3D11 device
+  objects are.) Note `font_scale_dpi` scales *glyphs only*: every other metric is in logical px and
+  is scaled in `ui::theme::apply`, or the chrome stays 96-dpi-sized on a HiDPI monitor.
+- **Dark mode:** the system preference is read from the registry (`AppsUseLightTheme`); the title bar
+  is darkened via `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)`; the ImGui style and the
+  letterbox backdrop come from `chrome::Palette`, whose highlight is the user's **system accent**
+  (`GetSysColor(COLOR_HIGHLIGHT)` — documented, no registry poking). `WM_SETTINGCHANGE` /
+  `WM_DWMCOLORIZATIONCOLORCHANGED` re-skin live; the restyle is unconditional, because the accent can
+  move without the light/dark mode changing.
+- **Icons:** `build.rs` still rasterizes the SVGs to A8 coverage masks; they are now packed into one
+  RGBA8 **atlas strip** (white RGB, coverage in alpha) uploaded as a single D3D11 texture. ImGui's
+  shader multiplies texel by vertex color, so `(1,1,1,a) * tint` gives any tint from one texture —
+  no per-tint CPU work, which is what the old GDI path did on every repaint.
 
 ---
 
@@ -299,17 +390,55 @@ chrome ourselves gives full color control for light/dark with zero undocumented 
   mode (`set_image` fits to the current viewport). The launcher's "Run" setting (the shortcut's
   Normal/Minimized/Maximized, read from `STARTUPINFO.wShowWindow`) overrides the show state:
   an explicit Maximized/Minimized wins, otherwise the remembered maximized state is restored.
-- **Settings:** stored as **TOML** in `%APPDATA%\fire\config.toml`, editable directly *and* from
-  the in-app settings dialog (`crate::settings`) — a modal, tabbed, hand-painted native Win32
-  window (General / Flipbook / Keybinds / Context menu) with OK/Cancel/Apply. It is custom-drawn
-  for the same reason the toolbar is (no dark mode in the common controls), so it has no child
-  controls at all: one HWND, a list of widget rects, and the chrome's `Palette` + GDI helpers.
-  Committing hands the edited `Config` to the frame via `WM_APP_SETTINGS_APPLY` — the dialog runs
-  a nested message pump, so it must never hold the `&mut App` that pump re-enters. Changes apply
-  live where that isn't hostile (watcher, backdrop, zoom/exposure steps, keybinds, menu contents),
-  on the next image where re-fitting under the user would be (open-fit, tonemap, flipbook playback
-  defaults), and on the next launch for `instance-mode`. *Not yet:* hot-reloading `config.toml`
-  when it changes on disk (only the displayed image is watched — §10).
+- **Settings:** stored as **TOML** in `%APPDATA%\fire\config.toml`, editable directly *and* from the
+  in-app settings window (`crate::ui::settings`) — a tabbed ImGui `BeginPopupModal` (General /
+  Flipbook / Keybinds / Context menu) with OK/Cancel/Apply.
+
+  It is drawn **inside the frame we were already painting**, which is the whole difference from the
+  2,150-line hand-painted Win32 dialog it replaced: no second HWND, no nested `GetMessageW` pump, and
+  therefore none of the `&mut App` aliasing that pump forced (the old dialog had to edit a *cloned*
+  `Config` and post it back). The state simply lives in `App`, is edited during the paint, and the
+  shell applies what the frame returns. Scrolling, the tab bar, text input, focus and hit-testing are
+  ImGui's, not ours.
+
+  **It has its own style** (`ui::theme::form`), and that is a decision rather than an omission. The
+  chrome's style (`ui::theme::apply`) is a *toolbar*: buttons transparent until touched, no field
+  frames, tight spacing — because it sits over an image and must not compete with it. A dialog that
+  inherited it has invisible buttons and inputs whose edges you cannot see. So the settings window
+  starts from ImGui's *factory geometry* (`render::imgui::FormStyle` snapshots the style at context
+  creation, before `ui::theme` overwrites it — the only moment it exists) and `theme::form` paints
+  fire's own palette and the user's accent onto it. Same colours as the chrome, form shape. Two
+  ImGui-default behaviours are corrected on the way: `WindowBg`/`PopupBg` are ~94 % opaque (right for a
+  debug overlay on a 3D scene, wrong here — the viewport's empty-state hint ghosted through), and the
+  tab bar fills the *unselected* tabs while leaving the selected one to blend into the page, which
+  reads as "this tab is disabled and those are buttons".
+
+  **Its layout has no pixel constants.** It opens at a fraction of the viewport and is resizable from
+  there; the footer is pinned to the bottom by giving the tab content a *negative-height* `BeginChild`
+  (`[0, -footer]`), so the settings scroll above OK/Cancel/Apply instead of the scrollbar running past
+  them; and each control's width is `content_region_avail − (the tab's longest label, measured in the
+  live font)`, which both stretches the controls to the window and aligns every label into one column,
+  from the same number. Labels are drawn on the **left**, with the widget given a hidden `##id` —
+  ImGui's native order puts a widget's label *after* it, which reads as "New window ▼ Opening an
+  image" and strands the labels in a ragged right-hand column. Nothing here to re-tune for a font, a
+  DPI, or a resize.
+
+  Two things it cannot do itself, and reports to the shell instead: **"Browse…"** (`GetOpenFileNameW`
+  pumps its own modal loop, so it is posted as `WM_APP_SETTINGS_BROWSE` and runs after the paint — §5.2)
+  and **keybind capture** (a chord is a virtual-key code, which only the wndproc sees; while a row is
+  armed the shell routes every key to it, Esc included, or ImGui would read Esc as "close the modal").
+  **Esc/Enter are the shell's too** — ImGui does not close a modal on Escape, and a dialog you cannot
+  escape is a trap.
+
+  Changes apply live where that isn't hostile (watcher, backdrop, zoom/exposure steps, keybinds, menu
+  contents), on the next image where re-fitting under the user would be (open-fit, tonemap, flipbook
+  playback defaults), and on the next launch for `instance-mode`. *Not yet:* hot-reloading
+  `config.toml` when it changes on disk (only the displayed image is watched — §10).
+- **Accent color:** the highlight throughout the **chrome** (pressed toolbar buttons, the latched
+  channel/backdrop keys) is the user's **system accent**, read via `GetSysColor(COLOR_HIGHLIGHT)` —
+  which Windows 10/11 set from the accent, so no undocumented API or registry read is needed. The
+  text drawn *on* it flips to black for a pale accent. Re-read on theme/accent change. The settings
+  window is outside this: it is stock ImGui, blue and all.
 - **Future:** a third mode — compare two images side-by-side in one window, or tabs — is
   anticipated; it reuses the frame/child-view split (one view child per slot).
 
@@ -421,10 +550,10 @@ lifecycle with **foreground activation on the forward path (§4.1)**; GPU (D3D11
 render with channel/alpha/gamma/exposure/tonemap; async worker decode; zune + image + exr +
 psd_sdk + libheif decoders; camera-raw embedded-preview decode; ICC honoring via lcms2;
 tonemap-to-SDR HDR with exposure; downscale-to-fit RAM guard; **DPI-aware, dark-mode-aware
-GDI toolbar + status bar**; open-in-editor + clipboard; association-only Explorer
-integration; unsigned installer.
+ImGui toolbar + status bar + settings window**; open-in-editor + clipboard; association-only
+Explorer integration; unsigned installer.
 
-**In progress / deferred:** pixel inspector, background-color *picker* (the settings dialog ships
+**In progress / deferred:** pixel inspector, background-color *picker* (the settings window ships
 the four preset backdrops; a custom color needs a `Params`/shader change), exposure trackbar;
 compare/tabs mode; Explorer `IThumbnailProvider`; **full raw development** (demosaic the sensor
 mosaic instead of showing the embedded preview — a separate opt-in mode, kept off the fast path);
