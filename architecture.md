@@ -29,7 +29,7 @@ Two consequences shape the whole design:
   whole per-pixel pipeline on *every* pan/zoom event; on a large window at a high refresh rate
   (a 240 Hz monitor) that pegs a CPU core during fast interaction. Instead the image is
   uploaded **once** as a D3D11 texture with a hardware-generated mip chain, and pan / zoom /
-  exposure / channel / tonemap (and flipbook cell selection) become a **112-byte constant
+  exposure / channel / tonemap (and flipbook cell selection) become a **128-byte constant
   buffer** — each frame is one
   fullscreen-triangle draw that re-samples the texture (**~0 CPU per frame**). A **DXGI
   flip-model swapchain** paces presentation to vsync, so interaction is tear-free and smooth at
@@ -145,7 +145,7 @@ This path only runs in SingleInstance mode; NewWindow has nothing to forward.
   uploaded to a `USAGE_DEFAULT` texture created with a full mip chain
   (`D3D11_RESOURCE_MISC_GENERATE_MIPS`); `GenerateMips` builds the pyramid on the GPU. Each of the
   four `PixelFormat`s maps to a native DXGI format (see §5.1). After that, pan / zoom / exposure /
-  channel / tonemap (and the flipbook cell offsets + blend) are just values in a **112-byte
+  channel / tonemap (and the flipbook cell offsets + blend) are just values in a **128-byte
   constant buffer**; the source texture never changes until a new image is opened (flipbook
   playback only moves the cell offsets — never re-uploads).
 - **Per-frame work is one draw.** A frame maps the constant buffer (`MAP_WRITE_DISCARD`), writes
@@ -315,9 +315,12 @@ code with no Win32 in it; it reads a `ViewSnapshot` and returns a `ui::Frame` of
 for, which the win shell applies.
 
 - **Toolbar:** channel isolation (R/G/B/A/RGB), fit/1:1, zoom, flipbook, HDR tonemap + exposure
-  (float sources only), and a right-docked group (outline, backdrop, full-screen, open-with,
-  settings). Buttons dispatch the same `Action`s the keybinds drive — one state path. When the window
-  is too narrow the left group sheds its lowest-priority slots into a "»" popup.
+  (float sources only), and a right-docked group (outline, backdrop, full-screen, menu). Buttons
+  dispatch the same `Action`s the keybinds drive — one state path. When the window is too narrow the
+  left group sheds its lowest-priority slots into a "»" popup. There is **no gear**: Settings is the
+  last entry of the menu button's popup, which is the same menu the viewport's right-click opens — one
+  place to look, not two. That menu therefore stays enabled with no image loaded (its file entries
+  hide themselves), or Settings would be unreachable from an empty window.
 - **Status bar:** file name, format, W×H, bit depth / channel layout, ICC presence, and on the right
   the folder position and zoom % (plus `EV ±` for HDR).
 - **Popup menus** (`ui::MenuState`): the *actions* menu (right-click on the image, or the "Open in…"
@@ -398,11 +401,27 @@ for, which the win shell applies.
   shell applies what the frame returns. Scrolling, the tab bar, text input, focus and hit-testing are
   ImGui's, not ours.
 
-  It deliberately wears **ImGui's stock style**, not fire's chrome theme (`render::imgui::StockStyle`
-  snapshots the factory style at context creation, before `ui::theme` overwrites it, and pushes it for
-  the duration of the window). The chrome is a toolbar — flat, transparent, made to sit over an image;
-  a settings window is a form, and stock ImGui already knows what a form looks like. Only the font
-  (Segoe UI) and the DPI scale carry over, because "stock" must not mean "unreadable at 200%".
+  **It has its own style** (`ui::theme::form`), and that is a decision rather than an omission. The
+  chrome's style (`ui::theme::apply`) is a *toolbar*: buttons transparent until touched, no field
+  frames, tight spacing — because it sits over an image and must not compete with it. A dialog that
+  inherited it has invisible buttons and inputs whose edges you cannot see. So the settings window
+  starts from ImGui's *factory geometry* (`render::imgui::FormStyle` snapshots the style at context
+  creation, before `ui::theme` overwrites it — the only moment it exists) and `theme::form` paints
+  fire's own palette and the user's accent onto it. Same colours as the chrome, form shape. Two
+  ImGui-default behaviours are corrected on the way: `WindowBg`/`PopupBg` are ~94 % opaque (right for a
+  debug overlay on a 3D scene, wrong here — the viewport's empty-state hint ghosted through), and the
+  tab bar fills the *unselected* tabs while leaving the selected one to blend into the page, which
+  reads as "this tab is disabled and those are buttons".
+
+  **Its layout has no pixel constants.** It opens at a fraction of the viewport and is resizable from
+  there; the footer is pinned to the bottom by giving the tab content a *negative-height* `BeginChild`
+  (`[0, -footer]`), so the settings scroll above OK/Cancel/Apply instead of the scrollbar running past
+  them; and each control's width is `content_region_avail − (the tab's longest label, measured in the
+  live font)`, which both stretches the controls to the window and aligns every label into one column,
+  from the same number. Labels are drawn on the **left**, with the widget given a hidden `##id` —
+  ImGui's native order puts a widget's label *after* it, which reads as "New window ▼ Opening an
+  image" and strands the labels in a ragged right-hand column. Nothing here to re-tune for a font, a
+  DPI, or a resize.
 
   Two things it cannot do itself, and reports to the shell instead: **"Browse…"** (`GetOpenFileNameW`
   pumps its own modal loop, so it is posted as `WM_APP_SETTINGS_BROWSE` and runs after the paint — §5.2)

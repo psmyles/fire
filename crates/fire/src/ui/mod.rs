@@ -19,9 +19,9 @@ use dear_imgui_rs::{Condition, StyleColor, TextureId, Ui, WindowFlags};
 use crate::chrome::{Action, ViewSnapshot};
 use crate::config::{Config, MenuEntry};
 use crate::icons::Icon;
-use crate::flipbook::Grid;
+use crate::flipbook::{Grid, FPS_MAX};
 use crate::render;
-use crate::render::imgui::StockStyle;
+use crate::render::imgui::FormStyle;
 use crate::transport::{TransportEdit, TransportSnapshot};
 use theme::Metrics;
 
@@ -140,6 +140,9 @@ const LEFT: &[(Action, u8, u8)] = &[
 ];
 
 /// Right-docked slots, in visual left→right order. Never overflow (anchored to the far edge).
+///
+/// No gear: Settings is the last entry of the menu behind [`Action::OpenWithMenu`], which is also
+/// where the viewport's right-click menu puts it. One place to look, not two.
 const RIGHT: &[(Action, u8)] = &[
     (Action::ToggleOutline, 0),
     (Action::Background(Bg::Black), 1),
@@ -148,7 +151,6 @@ const RIGHT: &[(Action, u8)] = &[
     (Action::Background(Bg::Checker), 1),
     (Action::ToggleFullscreen, 3),
     (Action::OpenWithMenu, 2),
-    (Action::OpenSettings, 2),
 ];
 
 use crate::render::view::{Background as Bg, Channel as Ch};
@@ -168,7 +170,9 @@ pub struct Inputs<'a> {
     /// The live config — the actions menu is built straight from it (which items are shown, and the
     /// "Open in…" tree).
     pub cfg: &'a Config,
-    pub stock: StockStyle,
+    /// The settings window's style (see `theme::form`) — composed once per frame, pushed only
+    /// for the duration of that window.
+    pub form: FormStyle,
     pub m: &'a Metrics,
     pub icon_px: f32,
     pub dark: bool,
@@ -189,7 +193,7 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
         settings,
         menu,
         cfg,
-        stock,
+        form,
         m,
         icon_px,
         dark,
@@ -222,7 +226,7 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
         menus(ui, st, cfg, snap, &mut out);
     }
     if let Some(st) = settings {
-        settings::build(ui, st, stock, client, m.scale, &mut out);
+        settings::build(ui, st, form, dark, m.scale, client, &mut out);
     }
 
     out
@@ -243,7 +247,7 @@ fn menus(ui: &Ui, st: &mut MenuState, cfg: &Config, snap: &ViewSnapshot, out: &m
     render::imgui::position_next_window(st.pos);
 
     ui.popup(MENU_ID, || match &st.kind {
-        MenuKind::Actions => actions_menu(ui, cfg, out),
+        MenuKind::Actions => actions_menu(ui, cfg, snap.has_image, out),
         MenuKind::Overflow(items) => overflow_menu(ui, snap, items, out),
     });
 
@@ -254,32 +258,38 @@ fn menus(ui: &Ui, st: &mut MenuState, cfg: &Config, snap: &ViewSnapshot, out: &m
     }
 }
 
-/// Right-click on the image (and the "Open in…" toolbar button): the fixed file actions, the
-/// configured "Open in…" tree, and Settings.
-fn actions_menu(ui: &Ui, cfg: &Config, out: &mut Frame) {
+/// Right-click on the image, and the toolbar's menu button: the fixed file actions, the configured
+/// "Open in…" tree, and Settings.
+///
+/// Everything above Settings acts on the open image, so with nothing open the menu collapses to
+/// Settings alone — which is fine, and necessary: this menu is now the only route to it.
+fn actions_menu(ui: &Ui, cfg: &Config, has_image: bool, out: &mut Frame) {
     let cm = cfg.context_menu;
     let mut shown = false;
-    for (on, label, cmd) in [
-        (cm.show_in_explorer, "Show in Explorer", Command::ShowInExplorer),
-        (cm.copy_file, "Copy File", Command::CopyFile),
-        (cm.copy_path, "Copy Path", Command::CopyPath),
-        (cm.copy_file_name, "Copy File Name", Command::CopyFileName),
-    ] {
-        if !on {
-            continue; // hidden in `[context-menu]`; all four can be off
-        }
-        if ui.menu_item(label) {
-            out.command = Some(cmd);
-        }
-        shown = true;
-    }
 
-    if !cfg.open_with.is_empty() {
-        if shown {
-            ui.separator();
+    if has_image {
+        for (on, label, cmd) in [
+            (cm.show_in_explorer, "Show in Explorer", Command::ShowInExplorer),
+            (cm.copy_file, "Copy File", Command::CopyFile),
+            (cm.copy_path, "Copy Path", Command::CopyPath),
+            (cm.copy_file_name, "Copy File Name", Command::CopyFileName),
+        ] {
+            if !on {
+                continue; // hidden in `[context-menu]`; all four can be off
+            }
+            if ui.menu_item(label) {
+                out.command = Some(cmd);
+            }
+            shown = true;
         }
-        open_with(ui, &cfg.open_with, &mut Vec::new(), out);
-        shown = true;
+
+        if !cfg.open_with.is_empty() {
+            if shown {
+                ui.separator();
+            }
+            open_with(ui, &cfg.open_with, &mut Vec::new(), out);
+            shown = true;
+        }
     }
 
     // Settings always comes last, after a rule — it's the one entry that isn't about the image.
@@ -323,44 +333,56 @@ fn overflow_menu(ui: &Ui, snap: &ViewSnapshot, items: &[Action], out: &mut Frame
     }
 }
 
-/// The flipbook detection chip: a small card floating at the top of the image when a sprite-sheet
+/// The flipbook detection chip: a small card floating over the top of the image when a sprite-sheet
 /// grid was detected. Used to be its own layered popup HWND; it is an ImGui panel now.
+///
+/// The **wording** is the GDI chip's, deliberately: it read as a sentence with a button in it ("Looks
+/// like a 6×6 flipbook · *View as flipbook*"), which is what makes an unprompted popup feel like an
+/// offer rather than an error. The **layout** is not the GDI chip's — the window auto-sizes to its
+/// content and the anchor centers it by *pivot*, so nothing here measures a width in order to halve
+/// it, and the row is aligned by `align_text_to_frame_padding` rather than by hand.
 fn hint_chip(ui: &Ui, g: Grid, m: &Metrics, image: (f32, f32, f32, f32), out: &mut Frame) {
     let (ix, iy, iw, _) = image;
     if iw <= 0.0 {
         return;
     }
-    let label = format!("{}\u{00d7}{} sprite sheet?", g.cols, g.rows);
-    let pad = (10.0 * m.scale).round();
-    let spacing = (theme::ITEM_SPACING * m.scale).round();
-    let btn_pad = (theme::FRAME_PAD_X * m.scale).round() * 2.0;
+    let label = format!("Looks like a {}\u{00d7}{} flipbook", g.cols, g.rows);
+    let accent = ui.clone_style().color(StyleColor::ButtonActive);
 
-    // Centered horizontally over the image. There is no position-pivot in this binding, so measure
-    // the content and place the top-left ourselves: label + "Play" + "×", plus padding and spacing.
-    let w = pad * 2.0
-        + text_w(ui, &label)
-        + spacing
-        + (text_w(ui, "Play") + btn_pad)
-        + spacing
-        + (text_w(ui, "\u{00d7}") + btn_pad);
-    let h = ui.frame_height() + pad * 2.0;
-    let x = (ix + (iw - w) * 0.5).round().max(ix);
-    let y = (iy + (10.0 * m.scale)).round();
+    // Centered on the image, a little in from its top edge.
+    render::imgui::anchor_next_window(
+        (ix + iw * 0.5, iy + (12.0 * m.scale).round()),
+        (0.5, 0.0),
+    );
 
     ui.window("##chip")
-        .position([x, y], Condition::Always)
-        .size([w, h], Condition::Always)
-        .flags(BAR)
+        .flags(BAR | WindowFlags::ALWAYS_AUTO_RESIZE)
         .build(|| {
-            ui.set_cursor_pos([pad, ((h - ui.text_line_height()) * 0.5).round()]);
+            // Drop the text by a frame's padding so it sits on the buttons' centre line instead of
+            // riding at their top edge — which is exactly what was wrong before.
+            ui.align_text_to_frame_padding();
             ui.text(&label);
+
             ui.same_line();
-            if ui.button("Play") {
+            // The one thing on screen asking to be clicked, so it wears the accent.
+            let _fill = ui.push_style_color(StyleColor::Button, accent);
+            let _hover = ui.push_style_color(StyleColor::ButtonHovered, accent);
+            let _text = ui.push_style_color(StyleColor::Text, on_accent(accent));
+            if ui.button("View as flipbook") {
                 out.chip_accept = true;
             }
+            drop((_text, _hover, _fill));
+
             ui.same_line();
-            if ui.button("\u{00d7}##chipclose") {
+            // A plain capital X. The dedicated close glyphs (U+2715 and friends) are not in Segoe UI
+            // — a missing glyph renders as tofu, it does not fall back — and U+00D7 (×) is a
+            // *multiplication sign*, drawn small to sit between operands, so it reads as a speck at
+            // button size.
+            if ui.button("X##chipclose") {
                 out.chip_dismiss = true;
+            }
+            if ui.is_item_hovered() {
+                ui.tooltip_text("Don't ask again for this image");
             }
         });
 }
@@ -648,6 +670,14 @@ fn empty_hint(ui: &Ui, image: (f32, f32, f32, f32)) {
         });
 }
 
+/// The flipbook transport: `cols × rows`, the frame count, play/pause, a scrub slider with its
+/// `frame / total` readout, the frame rate, and the crossfade toggle.
+///
+/// It is one horizontal row. Every item flows from the last with `same_line`, and the only two
+/// positions computed by hand are the ones that *have* to be: where the right-docked group starts
+/// (so the slider knows how much room it has), and the readout's column (so the slider doesn't shuffle
+/// left and right as the frame number gains and loses a digit). Both are derived from measured text,
+/// not from a table of pixel constants.
 #[allow(clippy::too_many_arguments)]
 fn transport_band(
     ui: &Ui,
@@ -661,8 +691,7 @@ fn transport_band(
     dark: bool,
     out: &mut Frame,
 ) {
-    let _ = (snap, dark);
-    let bs = button_size(icon_px, m);
+    let _ = (snap, dark, icon_px);
     let y0 = h - m.status_h - m.transport_h;
 
     ui.window("##transport")
@@ -670,97 +699,153 @@ fn transport_band(
         .size([w, m.transport_h], Condition::Always)
         .flags(BAR)
         .build(|| {
-            let pad = (8.0 * m.scale).round();
-            let cy = ((m.transport_h - bs[1]) * 0.5).round();
-            let field_w = (46.0 * m.scale).round();
-            let mut x = pad;
+            let style = ui.clone_style();
+            let spacing = style.item_spacing()[0];
+            let inner = style.item_inner_spacing()[0];
+            let pad = style.window_padding()[0];
+            let fh = ui.frame_height();
 
-            // Grid: cols x rows, and the frame count.
+            // The row is centred in the band; from here everything flows.
+            ui.set_cursor_pos([pad, ((m.transport_h - fh) * 0.5).round()]);
+
+            // Each field is as wide as the widest value it can actually hold, measured in the live
+            // font — so it neither clips nor leaves a gutter, at any DPI, without a table of widths
+            // to maintain.
+            let field = |digits: usize| {
+                text_w(ui, &"0".repeat(digits)) + style.frame_padding()[0] * 2.0
+            };
+            let digits = |n: u32| n.to_string().len();
+            let grid_w = field(digits(t.grid_max));
+            let count_w = field(digits((t.cols * t.rows).max(1)));
+            let fps_w = field(digits(FPS_MAX as u32) + 2); // room for a ".5"
+
             let mut cols = t.cols as i32;
             let mut rows = t.rows as i32;
             let mut count = t.frame_count as i32;
+            let mut fps = t.fps;
+            let mut blend = t.blend;
 
-            let text_y = ((m.transport_h - ui.text_line_height()) * 0.5).round();
-
-            ui.set_cursor_pos([x, text_y]);
-            ui.text("Grid");
-            x += text_w(ui, "Grid") + pad;
-
-            ui.set_cursor_pos([x, cy]);
-            ui.set_next_item_width(field_w);
-            if ui.input_int("##cols", &mut cols) {
+            // --- left: the grid, the frame count, play/pause ---------------------------------
+            ui.set_next_item_width(grid_w);
+            if int_field(ui, "##cols", &mut cols) {
                 out.edits
                     .push(TransportEdit::SetCols(cols.clamp(1, t.grid_max as i32) as u32));
             }
-            x += field_w + (4.0 * m.scale);
-
-            ui.set_cursor_pos([x, text_y]);
-            ui.text("x");
-            x += text_w(ui, "x") + (4.0 * m.scale);
-
-            ui.set_cursor_pos([x, cy]);
-            ui.set_next_item_width(field_w);
-            if ui.input_int("##rows", &mut rows) {
+            ui.same_line();
+            ui.align_text_to_frame_padding();
+            ui.text("\u{00d7}");
+            ui.same_line();
+            ui.set_next_item_width(grid_w);
+            if int_field(ui, "##rows", &mut rows) {
                 out.edits
                     .push(TransportEdit::SetRows(rows.clamp(1, t.grid_max as i32) as u32));
             }
-            x += field_w + pad;
 
-            ui.set_cursor_pos([x, text_y]);
-            ui.text("Frames");
-            x += text_w(ui, "Frames") + pad;
-
-            ui.set_cursor_pos([x, cy]);
-            ui.set_next_item_width(field_w);
-            if ui.input_int("##count", &mut count) {
+            ui.same_line_with_spacing(0.0, spacing * 3.0); // a group break, not a gap
+            ui.set_next_item_width(count_w);
+            if int_field(ui, "##count", &mut count) {
                 let max = (t.cols * t.rows).max(1) as i32;
-                out.edits
-                    .push(TransportEdit::SetCount(count.clamp(1, max) as u32));
+                out.edits.push(TransportEdit::SetCount(count.clamp(1, max) as u32));
             }
-            x += field_w + pad;
+            if ui.is_item_hovered() {
+                ui.tooltip_text("Frames used from the sheet");
+            }
 
-            // Play / pause.
-            let play_icon = if t.playing { Icon::Pause } else { Icon::Play };
-            if button(ui, tex, play_icon, "##play", [x, cy], bs, icon_px, true, false, m) {
+            ui.same_line_with_spacing(0.0, spacing * 3.0);
+            // Sized to the text beside it, so the button is exactly as tall as the fields it sits in
+            // line with. (The toolbar's icons are bigger; there they stand alone.)
+            let glyph = ui.text_line_height().round();
+            let play = if t.playing { Icon::Pause } else { Icon::Play };
+            if icon_button_inline(ui, tex, play, "##play", glyph) {
                 out.edits.push(TransportEdit::TogglePlay);
             }
             if ui.is_item_hovered() {
                 ui.tooltip_text(if t.playing { "Pause" } else { "Play" });
             }
-            x += bs[0] + pad;
 
-            // Blend + fps are right-docked; the slider takes everything in between.
-            let mut blend = t.blend;
-            let blend_w = text_w(ui, "Blend") + (26.0 * m.scale);
-            let fps_label_w = text_w(ui, "fps");
-            let right_w = blend_w + pad + field_w + (4.0 * m.scale) + fps_label_w + pad;
-            let slider_w = (w - pad - right_w - x).max(40.0 * m.scale);
+            // --- right: the readout, the frame rate, blend -----------------------------------
+            let total = t.frame_count.max(1);
+            let frame = (t.frame_pos.floor() as u32 + 1).min(total);
+            let readout = format!("{frame} / {total}");
+            // Reserve the *widest* readout this clip can produce, or the slider would resize under
+            // the cursor every time the frame number crossed a power of ten.
+            let readout_w = text_w(ui, &format!("{total} / {total}"));
+            let blend_w = fh + inner + text_w(ui, "Blend");
+            let right_w =
+                readout_w + spacing + fps_w + inner + text_w(ui, "fps") + spacing * 2.0 + blend_w;
+            let right_x = w - pad - right_w;
 
+            // --- middle: the slider takes what's left ----------------------------------------
             let mut pos = t.frame_pos;
-            let last = (t.frame_count.max(1) - 1) as f32;
-            ui.set_cursor_pos([x, cy]);
+            let last = (total - 1) as f32;
+            // `same_line` *first*: until it runs, the cursor is parked at the start of the next line,
+            // and measuring from there would size the slider as if the left group weren't in front of
+            // it — it would then overshoot `right_x` and paint its own frame under the fps field and
+            // the checkbox, which is exactly what it did.
+            ui.same_line();
+            let slider_w = (right_x - spacing - ui.cursor_pos_x()).max(fh * 2.0);
             ui.set_next_item_width(slider_w);
-            if ui.slider_f32("##pos", &mut pos, 0.0, last) {
-                out.edits.push(TransportEdit::Scrub(pos));
+            // The number lives in the readout, so the track shows none: an empty format, not a
+            // hidden label.
+            if ui
+                .slider_config("##pos", 0.0f32, last)
+                .display_format("")
+                .build(&mut pos)
+            {
+                // With crossfade off there is nothing between frames to land on.
+                out.edits
+                    .push(TransportEdit::Scrub(if t.blend { pos } else { pos.floor() }));
             }
 
-            let mut rx = w - pad - right_w + pad;
-            ui.set_cursor_pos([rx, cy]);
-            ui.set_next_item_width(field_w);
-            let mut fps = t.fps;
-            if ui.input_float("##fps", &mut fps) {
+            ui.same_line_with_pos(right_x);
+            ui.align_text_to_frame_padding();
+            ui.text_disabled(&readout);
+
+            ui.same_line_with_pos(right_x + readout_w + spacing);
+            ui.set_next_item_width(fps_w);
+            if fps_field(ui, "##fps", &mut fps) {
                 out.edits.push(TransportEdit::SetFps(fps));
             }
-            rx += field_w + (4.0 * m.scale);
-            ui.set_cursor_pos([rx, text_y]);
+            ui.same_line_with_spacing(0.0, inner);
+            ui.align_text_to_frame_padding();
             ui.text("fps");
-            rx += fps_label_w + pad;
 
-            ui.set_cursor_pos([rx, cy]);
+            ui.same_line_with_spacing(0.0, spacing * 2.0);
             if ui.checkbox("Blend", &mut blend) {
                 out.edits.push(TransportEdit::ToggleBlend);
             }
+            if ui.is_item_hovered() {
+                ui.tooltip_text("Crossfade between frames");
+            }
         });
+}
+
+/// A plain numeric box. `step(0)` is the whole point: ImGui's `InputInt` ships as a *stepper*, with
+/// `−`/`+` buttons that eat the field and leave the value with nowhere to render.
+fn int_field(ui: &Ui, id: &str, v: &mut i32) -> bool {
+    ui.input_int_config(id).step(0).step_fast(0).build(v)
+}
+
+/// The frame-rate box. `%g` prints `24`, not `24.000`, and still gives `12.5` when it needs to.
+fn fps_field(ui: &Ui, id: &str, v: &mut f32) -> bool {
+    ui.input_float_config(id)
+        .step(0.0)
+        .step_fast(0.0)
+        .format("%g")
+        .build(v)
+}
+
+/// An icon button at the current cursor, sized to `px` — for a row that *flows* (the toolbar
+/// positions its buttons instead, so it uses [`button`]).
+fn icon_button_inline(ui: &Ui, tex: TextureId, icon: Icon, id: &str, px: f32) -> bool {
+    let (uv0, uv1) = icon.uv();
+    let tint = ui.clone_style().color(StyleColor::Text);
+    ui.image_button_config(id, tex, [px, px])
+        .uv0(uv0)
+        .uv1(uv1)
+        .bg_color([0.0, 0.0, 0.0, 0.0])
+        .tint_color(tint)
+        .build()
 }
 
 /// A stable per-action id for ImGui's widget ids (two buttons must never collide).
@@ -788,7 +873,6 @@ fn action_id(a: Action) -> u32 {
         Action::ToggleFullscreen => 50,
         Action::ToggleFlipbook => 51,
         Action::OpenWithMenu => 60,
-        Action::OpenSettings => 61,
         Action::Overflow => 62,
     }
 }

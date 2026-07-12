@@ -702,9 +702,6 @@ impl App {
             Action::ToggleFullscreen => self.toggle_fullscreen(),
             // Flipbook mode runs its own surface/timer sync + redraw.
             Action::ToggleFlipbook => return self.toggle_flipbook(),
-            // The settings window is an ImGui modal drawn in our own frame — no nested pump, no
-            // second `&mut App` — so switching it on is just setting state.
-            Action::OpenSettings => return self.open_settings(),
             // These are reported as menu anchors, not actions; they never reach here.
             Action::OpenWithMenu | Action::Overflow => return,
         }
@@ -714,11 +711,9 @@ impl App {
     /// Show a popup menu, anchored at `pos` in client coords. The UI draws it on the next frame; all
     /// this does is say which menu, and where.
     ///
-    /// The actions menu is about the open image, so it doesn't exist without one.
+    /// The actions menu opens even with no image: its file entries hide themselves, but it still
+    /// carries Settings, and since the toolbar's gear is gone this menu is the only way there.
     fn open_menu(&mut self, kind: crate::ui::MenuKind, pos: (f32, f32)) {
-        if matches!(kind, crate::ui::MenuKind::Actions) && self.current_path.is_none() {
-            return;
-        }
         self.menu = Some(crate::ui::MenuState::new(kind, pos));
         self.redraw();
     }
@@ -1179,7 +1174,7 @@ impl App {
         let dark = self.dark;
         let fullscreen = self.fullscreen;
         let icon_px = self.imgui.icon_px();
-        let stock = self.imgui.stock_style(dark);
+        let form = self.imgui.form_style(dark);
 
         // The settings and menu state are *edited* by the UI, so they go in by `&mut`. Move them out
         // for the duration rather than borrow fields of `self` across `self.imgui.frame(…)`.
@@ -1200,7 +1195,7 @@ impl App {
                     settings: settings.as_mut(),
                     menu: menu.as_mut(),
                     cfg,
-                    stock,
+                    form,
                     m: &metrics,
                     icon_px,
                     dark,

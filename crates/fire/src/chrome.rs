@@ -52,10 +52,11 @@ pub enum Action {
     /// Enter/leave flipbook (sprite-sheet) viewer mode (K); disabled for animated sources.
     ToggleFlipbook,
     /// The far-right button: open the actions popup menu — file actions (show in folder, copy
-    /// file / path / name) plus any configured "Open in…" external apps.
+    /// file / path / name), any configured "Open in…" external apps, and Settings.
+    ///
+    /// There is no separate gear button. Settings lives at the bottom of this menu, exactly as it
+    /// does on the viewport's right-click menu, so there is one place to look rather than two.
     OpenWithMenu,
-    /// Open the settings dialog ([`crate::settings`]).
-    OpenSettings,
     /// A synthetic "»" button that only appears when the left group can't fit the window width: it
     /// opens a popup listing the buttons that were dropped.
     Overflow,
@@ -102,11 +103,12 @@ impl ViewSnapshot {
             Action::ToggleTonemap | Action::ExpUp | Action::ExpReset | Action::ExpDown => {
                 self.is_hdr
             }
-            // The actions menu (copy / show in folder / open in app) needs an image to act on.
-            Action::OpenWithMenu => self.has_image,
-            // Full-screen is a window mode, independent of whether an image is loaded. So are the
-            // settings — you can configure Fire from an empty window.
-            Action::ToggleFullscreen | Action::OpenSettings => true,
+            // The menu's *file* entries need an image, but it always carries Settings — and since the
+            // toolbar no longer has a gear of its own, this button is the only way to reach it. It
+            // must never be dead. (The menu itself hides the entries that need a file.)
+            Action::OpenWithMenu => true,
+            // Full-screen is a window mode, independent of whether an image is loaded.
+            Action::ToggleFullscreen => true,
             // Flipbook needs a still image (a GIF is already an animation, not a sprite sheet).
             Action::ToggleFlipbook => self.has_image && !self.has_animation,
             // The overflow button is only ever laid out when it holds dropped controls; opening its
@@ -167,11 +169,10 @@ impl ViewSnapshot {
             Action::Background(Background::White) => "White backdrop".into(),
             Action::Background(Background::Grey) => "Grey backdrop".into(),
             Action::Background(Background::Checker) => "Checkerboard backdrop".into(),
-            Action::OpenWithMenu => "Copy, show in folder, or open in app\u{2026}".into(),
+            Action::OpenWithMenu => "Copy, open in app, settings\u{2026}".into(),
             Action::ToggleFullscreen => format!("Full screen{}", k(KeyAction::ToggleFullscreen)),
             Action::ToggleFlipbook => format!("Flipbook mode{}", k(KeyAction::ToggleFlipbook)),
             Action::Overflow => "More controls\u{2026}".into(),
-            Action::OpenSettings => "Settings\u{2026}".into(),
         }
     }
 
@@ -213,7 +214,6 @@ impl ViewSnapshot {
             Action::OpenWithMenu => Icon::OpenWith,
             Action::ToggleFullscreen => Icon::Fullscreen,
             Action::ToggleFlipbook => Icon::Flipbook,
-            Action::OpenSettings => Icon::Settings,
             Action::Overflow => Icon::More,
         }
     }

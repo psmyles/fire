@@ -27,30 +27,23 @@
 
 pub mod model;
 
-use dear_imgui_rs::Ui;
+use dear_imgui_rs::{StyleColor, TabBarFlags, Ui};
 
 use crate::config::Config;
 use crate::keybinds::{KeyAction, KeyChord, Keybinds, ALL_ACTIONS};
-use crate::render::imgui::{center_next_window, StockStyle};
+use crate::render::imgui::{center_next_window, size_next_window, FormStyle};
 
 use model::{BoolField, ChoiceField, NumField, TextField, {self as m}};
 
-use super::Frame;
+use super::{text_w, Frame};
 
 /// The popup's ImGui id *and* its title bar.
 const TITLE: &str = "Settings";
 
-/// The tab content area, in logical px. Fixed, and the same for every tab, so the window doesn't
-/// resize under the cursor when you switch tabs.
-const CONTENT_W: f32 = 560.0;
-const CONTENT_H: f32 = 400.0;
-
-/// Where a labelled control starts. One column for the whole window.
-const LABEL_W: f32 = 210.0;
-/// Width of a combo / slider / chord button.
-const FIELD_W: f32 = 190.0;
-/// Width of a dialog button (OK / Cancel / Apply).
-const BUTTON_W: f32 = 84.0;
+/// The window's opening size as a fraction of the viewport. It is resizable from there, and ImGui
+/// clamps it to the screen — so this is a proportion, not a size, and there is no pixel width
+/// anywhere in this module for a font or a DPI to invalidate.
+const OPEN_FRACTION: (f32, f32) = (0.62, 0.78);
 
 /// Esc, read raw from the wndproc during a key capture (see [`State::capture_key`]).
 const VK_ESCAPE: u32 = 0x1B;
@@ -168,24 +161,28 @@ impl State {
 
 /// Build the settings window for one frame.
 ///
-/// `client` is the window client size in physical px (the modal centers on it); `scale` is the DPI
-/// factor.
+/// `client` is the viewer's client size in physical px — the window centers on it and opens
+/// proportioned to it.
 pub fn build(
     ui: &Ui,
     st: &mut State,
-    stock: StockStyle,
-    client: (f32, f32),
+    mut base: FormStyle,
+    dark: bool,
     scale: f32,
+    client: (f32, f32),
     out: &mut Frame,
 ) {
-    // Everything from here to the end of the function is drawn in ImGui's own style, not fire's.
-    let _style = stock.push();
+    // Everything from here to the end of the function is drawn in the settings window's own style —
+    // fire's colors on ImGui's *form* geometry, not the chrome's toolbar geometry.
+    super::theme::form(base.style_mut(), dark, scale);
+    let _style = base.push();
 
     if !st.requested {
         ui.open_popup(TITLE);
         st.requested = true;
     }
     center_next_window(client);
+    size_next_window((client.0 * OPEN_FRACTION.0, client.1 * OPEN_FRACTION.1));
 
     // `opened` gives the title bar its × — ImGui clears it and closes the popup in one go, so we
     // don't read it back; `is_popup_open` below is the single source of "ImGui closed it".
@@ -194,9 +191,16 @@ pub fn build(
     // them (`App::settings_key`) and simply drops this state.
     let mut opened = true;
     ui.modal_popup_with_opened(TITLE, &mut opened, || {
-        tabs(ui, st, scale, out);
+        // The footer is *pinned to the bottom* and the tabs scroll above it. That is what the child's
+        // negative height buys: a `BeginChild` sized `-footer` takes all the remaining height except
+        // that much, so OK/Cancel/Apply sit on the window's bottom edge at any size, and the
+        // scrollbar covers the settings rather than the buttons.
+        let style = ui.clone_style();
+        let footer = ui.frame_height() + style.item_spacing()[1] * 2.0 + style.separator_size();
+        tabs(ui, st, footer, out);
+
         ui.separator();
-        buttons(ui, st, scale, out);
+        buttons(ui, st, out);
         if out.settings_close {
             ui.close_current_popup();
         }
@@ -207,29 +211,35 @@ pub fn build(
     }
 }
 
-fn tabs(ui: &Ui, st: &mut State, scale: f32, out: &mut Frame) {
-    let size = [CONTENT_W * scale, CONTENT_H * scale];
-    let Some(_bar) = ui.tab_bar("##tabs") else { return };
+fn tabs(ui: &Ui, st: &mut State, footer: f32, out: &mut Frame) {
+    // Full width, and everything down to the footer. Every tab is the same box, so the window doesn't
+    // jump when you switch between them.
+    let size = [0.0, -footer];
+    // The accent rule along the selected tab's top edge is opt-in — `TabSelectedOverline` is a color
+    // ImGui won't draw at all without this flag.
+    let Some(_bar) = ui.tab_bar_with_flags("##tabs", TabBarFlags::DRAW_SELECTED_OVERLINE) else {
+        return;
+    };
 
     if let Some(_tab) = ui.tab_item("General") {
         ui.child_window("##general")
             .size(size)
-            .build(ui, || general(ui, st, scale));
+            .build(ui, || general(ui, st));
     }
     if let Some(_tab) = ui.tab_item("Flipbook") {
         ui.child_window("##flipbook")
             .size(size)
-            .build(ui, || flipbook(ui, st, scale));
+            .build(ui, || flipbook(ui, st));
     }
     if let Some(_tab) = ui.tab_item("Keybinds") {
         ui.child_window("##keybinds")
             .size(size)
-            .build(ui, || keybinds(ui, st, scale));
+            .build(ui, || keybinds(ui, st));
     }
     if let Some(_tab) = ui.tab_item("Context menu") {
         ui.child_window("##context")
             .size(size)
-            .build(ui, || context_menu(ui, st, scale, out));
+            .build(ui, || context_menu(ui, st, out));
     }
 }
 
@@ -237,17 +247,57 @@ fn tabs(ui: &Ui, st: &mut State, scale: f32, out: &mut Frame) {
 // Tabs
 // ---------------------------------------------------------------------------------------------
 
-fn general(ui: &Ui, st: &mut State, scale: f32) {
+/// The width of a tab's label column: its longest label, plus a gutter. Measured in the live font, so
+/// it follows the font, the DPI and nothing else.
+fn label_col(ui: &Ui, labels: &[&str]) -> f32 {
+    let widest = labels.iter().map(|s| text_w(ui, s)).fold(0.0f32, f32::max);
+    widest + ui.clone_style().item_spacing()[0] * 2.0
+}
+
+/// Start a form row: **label on the left**, control filling the rest of the line. Returns the width
+/// the control gets.
+///
+/// ImGui's native order is the reverse — it draws a widget's label *after* the widget — which reads
+/// as "New window ▼ Opening an image" and puts the labels in a ragged column on the right. So the
+/// label is drawn here and each control below is given a hidden `##id` instead.
+fn row(ui: &Ui, label: &str, label_w: f32) -> f32 {
+    ui.align_text_to_frame_padding();
+    ui.text(label);
+    ui.same_line_with_pos(label_w);
+    ui.content_region_avail()[0]
+}
+
+/// Explanatory text under a labelled control, aligned with the control rather than the margin — so it
+/// reads as a footnote to *that* setting and not to the section.
+fn row_note(ui: &Ui, label_w: f32, text: &str) {
+    ui.indent_by(label_w);
+    note(ui, text);
+    ui.unindent_by(label_w);
+}
+
+fn general(ui: &Ui, st: &mut State) {
+    let lw = label_col(
+        ui,
+        &[
+            "Opening an image",
+            "Images open",
+            "Backdrop",
+            "HDR tone map",
+            "Zoom step",
+            "Exposure step",
+        ],
+    );
+
     ui.separator_with_text("Window");
-    choice(ui, st, scale, ChoiceField::InstanceMode, "Opening an image");
-    note(ui, "Takes effect for images opened from now on.");
+    choice(ui, st, lw, ChoiceField::InstanceMode, "Opening an image");
+    row_note(ui, lw, "Takes effect for images opened from now on.");
     check(ui, st, BoolField::HotReload, "Reload the image when the file changes on disk");
 
     ui.spacing();
     ui.separator_with_text("View");
-    choice(ui, st, scale, ChoiceField::DefaultFit, "Images open");
-    choice(ui, st, scale, ChoiceField::Background, "Backdrop");
-    choice(ui, st, scale, ChoiceField::DefaultTonemap, "HDR tone map");
+    choice(ui, st, lw, ChoiceField::DefaultFit, "Images open");
+    choice(ui, st, lw, ChoiceField::Background, "Backdrop");
+    choice(ui, st, lw, ChoiceField::DefaultTonemap, "HDR tone map");
     check(
         ui,
         st,
@@ -257,13 +307,15 @@ fn general(ui: &Ui, st: &mut State, scale: f32) {
 
     ui.spacing();
     ui.separator_with_text("Input");
-    num(ui, st, scale, NumField::ZoomStep, "Zoom step");
-    note(ui, "Zoom factor per wheel notch or key press.");
-    num(ui, st, scale, NumField::ExposureStep, "Exposure step");
-    note(ui, "Stops per press of the exposure keys (HDR images).");
+    num(ui, st, lw, NumField::ZoomStep, "Zoom step");
+    row_note(ui, lw, "Zoom factor per wheel notch or key press.");
+    num(ui, st, lw, NumField::ExposureStep, "Exposure step");
+    row_note(ui, lw, "Stops per press of the exposure keys (HDR images).");
 }
 
-fn flipbook(ui: &Ui, st: &mut State, scale: f32) {
+fn flipbook(ui: &Ui, st: &mut State) {
+    let lw = label_col(ui, &["Frame rate"]);
+
     ui.separator_with_text("Detection");
     check(
         ui,
@@ -277,11 +329,11 @@ fn flipbook(ui: &Ui, st: &mut State, scale: f32) {
     ui.separator_with_text("Playback defaults");
     note(
         ui,
-        "Applied when flipbook mode is switched on for an image. The transport bar",
+        "Applied when flipbook mode is switched on for an image. The transport bar under the \
+         image still changes the one you are watching.",
     );
-    note(ui, "under the image still changes the one you are watching.");
     ui.spacing();
-    num(ui, st, scale, NumField::FlipbookFps, "Frame rate");
+    num(ui, st, lw, NumField::FlipbookFps, "Frame rate");
     check(ui, st, BoolField::FlipbookAutoplay, "Start playing immediately");
     check(ui, st, BoolField::FlipbookBlend, "Crossfade between frames");
 }
@@ -289,10 +341,21 @@ fn flipbook(ui: &Ui, st: &mut State, scale: f32) {
 /// The rebind editor: every action, its chord, and a per-row reset. Clicking the chord arms a
 /// capture — from then until the next key press, the shell routes keys to [`State::capture_key`]
 /// rather than to the viewer.
-fn keybinds(ui: &Ui, st: &mut State, scale: f32) {
+fn keybinds(ui: &Ui, st: &mut State) {
     let defaults = Keybinds::defaults();
-    let mut group = "";
+    let style = ui.clone_style();
+    let spacing = style.item_spacing()[0];
 
+    // One label column, sized to the longest action name; the chord button then takes the whole row
+    // except what Reset needs.
+    let label_w = ALL_ACTIONS
+        .iter()
+        .map(|a| text_w(ui, a.label()))
+        .fold(0.0f32, f32::max)
+        + spacing * 2.0;
+    let reset_w = text_w(ui, "Reset") + style.frame_padding()[0] * 2.0;
+
+    let mut group = "";
     for action in ALL_ACTIONS.iter().copied() {
         if action.group() != group {
             group = action.group();
@@ -315,13 +378,16 @@ fn keybinds(ui: &Ui, st: &mut State, scale: f32) {
                 .join(", ")
         };
 
+        ui.align_text_to_frame_padding();
         ui.text(action.label());
-        ui.same_line_with_pos(LABEL_W * scale);
-        // The label is the chord, so the id has to come from the action — two actions bound to the
+        ui.same_line_with_pos(label_w);
+
+        let chord_w = (ui.content_region_avail()[0] - reset_w - spacing).max(ui.frame_height());
+        // The label *is* the chord, so the id has to come from the action — two actions bound to the
         // same key would otherwise collide into one button.
         if ui.button_with_size(
             format!("{chord_text}##bind-{}", action.name()),
-            [FIELD_W * scale, 0.0],
+            [chord_w, 0.0],
         ) {
             st.capture = Some(action);
             st.note = format!("Press a key for {}\u{2026}  (Esc cancels)", action.label());
@@ -329,7 +395,7 @@ fn keybinds(ui: &Ui, st: &mut State, scale: f32) {
 
         ui.same_line();
         let _dis = is_default.then(|| ui.begin_disabled());
-        if ui.button(format!("Reset##reset-{}", action.name())) {
+        if ui.button_with_size(format!("Reset##reset-{}", action.name()), [reset_w, 0.0]) {
             st.keys.reset(action);
             st.sync_keys();
             st.capture = None;
@@ -351,7 +417,7 @@ fn keybinds(ui: &Ui, st: &mut State, scale: f32) {
     }
 }
 
-fn context_menu(ui: &Ui, st: &mut State, scale: f32, out: &mut Frame) {
+fn context_menu(ui: &Ui, st: &mut State, out: &mut Frame) {
     ui.separator_with_text("Built-in items");
     check(ui, st, BoolField::CtxShowInExplorer, "Show in Explorer");
     check(ui, st, BoolField::CtxCopyFile, "Copy File");
@@ -362,17 +428,19 @@ fn context_menu(ui: &Ui, st: &mut State, scale: f32, out: &mut Frame) {
     ui.separator_with_text("\"Open in\u{2026}\" entries");
     note(ui, "Programs to open the current image with. Nest entries to make submenus.");
 
-    // The tree, as a scrolling list of indented rows.
+    // The tree, as a scrolling list of indented rows: full width, and six rows tall — measured in
+    // rows, so it holds six of them whatever the font and the DPI happen to be.
+    let row_h = ui.frame_height();
     let tree = m::flatten(&st.draft.open_with);
     ui.child_window("##tree")
-        .size([0.0, 150.0 * scale])
+        .size([0.0, row_h * 6.0])
         .border(true)
         .build(ui, || {
             if tree.is_empty() {
                 ui.text_disabled("No entries yet \u{2014} \"Add item\" creates one.");
             }
             for row in &tree {
-                let indent = row.depth as f32 * 16.0 * scale;
+                let indent = row.depth as f32 * ui.clone_style().indent_spacing();
                 if indent > 0.0 {
                     ui.indent_by(indent);
                 }
@@ -449,7 +517,7 @@ fn context_menu(ui: &Ui, st: &mut State, scale: f32, out: &mut Frame) {
     }
     drop(_dis);
 
-    detail_form(ui, st, scale, out);
+    detail_form(ui, st, out);
 }
 
 /// A tree-tool button that moves the selected entry.
@@ -462,7 +530,7 @@ enum Move {
 }
 
 /// The selected entry's name / program / arguments.
-fn detail_form(ui: &Ui, st: &mut State, scale: f32, out: &mut Frame) {
+fn detail_form(ui: &Ui, st: &mut State, out: &mut Frame) {
     let Some(path) = st.sel.clone() else { return };
 
     // Refill the text boxes when the *selection* moves — never on a plain redraw, or every frame
@@ -476,37 +544,45 @@ fn detail_form(ui: &Ui, st: &mut State, scale: f32, out: &mut Frame) {
     }
     let is_submenu = m::entry_at(&mut st.draft.open_with, &path).is_some_and(|e| e.is_submenu());
 
-    let field_w = FIELD_W * 1.6 * scale;
+    let labels: Vec<&str> = TEXT_FIELDS.iter().map(|f| f.label()).collect();
+    let lw = label_col(ui, &labels);
+    let style = ui.clone_style();
+    let browse_w = text_w(ui, "Browse\u{2026}") + style.frame_padding()[0] * 2.0;
 
     ui.spacing();
-    ui.set_next_item_width(field_w);
-    if ui.input_text(TEXT_FIELDS[0].label(), &mut st.fields[0]).build() {
+    let w = row(ui, TEXT_FIELDS[0].label(), lw);
+    ui.set_next_item_width(w);
+    if ui.input_text("##name", &mut st.fields[0]).build() {
         write_field(st, &path, 0);
     }
 
     if is_submenu {
-        note(
+        row_note(
             ui,
+            lw,
             "A submenu \u{2014} its program and arguments are unused while it has children.",
         );
         return;
     }
 
-    ui.set_next_item_width(field_w);
-    if ui.input_text(TEXT_FIELDS[1].label(), &mut st.fields[1]).build() {
+    // A path is the one value here that is never short, so the box takes the row — minus Browse.
+    let w = row(ui, TEXT_FIELDS[1].label(), lw);
+    ui.set_next_item_width(w - browse_w - style.item_spacing()[0]);
+    if ui.input_text("##program", &mut st.fields[1]).build() {
         write_field(st, &path, 1);
     }
     ui.same_line();
     // The file picker pumps its own modal loop, so the shell runs it once this paint has finished.
-    if ui.button("Browse\u{2026}") {
+    if ui.button_with_size("Browse\u{2026}", [browse_w, 0.0]) {
         out.settings_browse = true;
     }
 
-    ui.set_next_item_width(field_w);
-    if ui.input_text(TEXT_FIELDS[2].label(), &mut st.fields[2]).build() {
+    let w = row(ui, TEXT_FIELDS[2].label(), lw);
+    ui.set_next_item_width(w);
+    if ui.input_text("##args", &mut st.fields[2]).build() {
         write_field(st, &path, 2);
     }
-    note(ui, "{path} is replaced with the image's full path.");
+    row_note(ui, lw, "{path} is replaced with the image's full path.");
 }
 
 /// Push the text box's contents into the selected entry.
@@ -517,10 +593,18 @@ fn write_field(st: &mut State, path: &[usize], i: usize) {
     }
 }
 
-/// OK / Cancel / Apply, right-aligned. Apply is live exactly while there is something to apply.
-fn buttons(ui: &Ui, st: &mut State, scale: f32, out: &mut Frame) {
-    let w = BUTTON_W * scale;
-    let spacing = ui.clone_style().item_spacing()[0];
+/// OK / Cancel / Apply, right-aligned on the window's bottom edge. Apply is live exactly while there
+/// is something to apply.
+fn buttons(ui: &Ui, st: &mut State, out: &mut Frame) {
+    let style = ui.clone_style();
+    let spacing = style.item_spacing()[0];
+    // All three get the width of the widest, so they read as one set of choices rather than three
+    // buttons that happen to be adjacent.
+    let w = ["OK", "Cancel", "Apply"]
+        .iter()
+        .map(|s| text_w(ui, s))
+        .fold(0.0f32, f32::max)
+        + style.frame_padding()[0] * 4.0;
     let total = w * 3.0 + spacing * 2.0;
     let avail = ui.content_region_avail()[0];
     ui.set_cursor_pos_x(ui.cursor_pos_x() + (avail - total).max(0.0));
@@ -551,10 +635,13 @@ fn check(ui: &Ui, st: &mut State, f: BoolField, label: &str) {
     }
 }
 
-fn choice(ui: &Ui, st: &mut State, scale: f32, f: ChoiceField, label: &str) {
+fn choice(ui: &Ui, st: &mut State, label_w: f32, f: ChoiceField, label: &str) {
+    let w = row(ui, label, label_w);
     let mut i = f.get(&st.draft);
-    ui.set_next_item_width(FIELD_W * scale);
-    if ui.combo_simple_string(label, &mut i, f.options()) {
+    ui.set_next_item_width(w);
+    // `##` hides ImGui's own label (which would land on the *right*) while keeping it as the widget's
+    // id. The visible text was drawn by `row`, on the left, where a form's label belongs.
+    if ui.combo_simple_string(format!("##{label}"), &mut i, f.options()) {
         f.set(&mut st.draft, i);
     }
 }
@@ -562,12 +649,13 @@ fn choice(ui: &Ui, st: &mut State, scale: f32, f: ChoiceField, label: &str) {
 /// A numeric field. The slider's range *is* [`crate::config::Config::sanitize`]'s clamp (they are
 /// checked against each other in `model`'s tests), so a value out of range can't be produced here in
 /// the first place. Ctrl+click still lets you type one.
-fn num(ui: &Ui, st: &mut State, scale: f32, f: NumField, label: &str) {
+fn num(ui: &Ui, st: &mut State, label_w: f32, f: NumField, label: &str) {
+    let w = row(ui, label, label_w);
     let (min, max, _, dp) = f.spec();
     let mut v = f.get(&st.draft);
-    ui.set_next_item_width(FIELD_W * scale);
+    ui.set_next_item_width(w);
     if ui
-        .slider_config(label, min, max)
+        .slider_config(format!("##{label}"), min, max)
         .display_format(format!("%.{dp}f"))
         .build(&mut v)
     {
@@ -575,7 +663,10 @@ fn num(ui: &Ui, st: &mut State, scale: f32, f: NumField, label: &str) {
     }
 }
 
-/// Dim explanatory text under a control.
+/// Dim explanatory text under a control. **Wrapped**, because the window is resizable now — a note
+/// that ran off the edge would simply be cut in half.
 fn note(ui: &Ui, text: &str) {
-    ui.text_disabled(text);
+    let dim = ui.clone_style().color(StyleColor::TextDisabled);
+    let _c = ui.push_style_color(StyleColor::Text, dim);
+    ui.text_wrapped(text);
 }

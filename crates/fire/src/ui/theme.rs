@@ -125,6 +125,132 @@ pub fn apply(style: &mut Style, dark: bool, scale: f32) {
     style.set_color(StyleColor::ScrollbarGrabActive, accent);
 }
 
+/// The **settings window's** style: fire's palette and the user's accent, on ImGui's form geometry.
+///
+/// Deliberately not [`apply`]. That one styles a *toolbar* — buttons transparent until touched, tight
+/// spacing, no field frames, because it sits over an image and must not compete with it. A dialog
+/// that inherited it would have invisible buttons and inputs you can't see the edges of. So the
+/// settings window starts from ImGui's factory *shape* (see [`crate::render::imgui::FormStyle`]) and
+/// gets the app's *color* here — same greys, same system accent, arranged for a form.
+pub fn form(style: &mut Style, dark: bool, scale: f32) {
+    let p = Palette::for_mode(dark);
+    let s = |v: f32| (v * scale).round();
+
+    let text = col(p.text, 1.0);
+    let dim = col(p.text_dim, 1.0);
+    let accent = col(p.btn_active, 1.0);
+    let surface = col(p.toolbar_bg, 1.0);
+    let sunken = col(p.status_bg, 1.0);
+    let hover = col(p.btn_hover, 1.0);
+    // An input is a hole in the surface, not a raised chip — so it goes *below* the window, not above.
+    let field = if dark {
+        [0.10, 0.10, 0.10, 1.0]
+    } else {
+        [1.0, 1.0, 1.0, 1.0]
+    };
+
+    // Geometry: a form, but a tight one. The complaint that started this migration was that the old
+    // dialog was too airy and its tab strip too tall — so this stays close-packed.
+    style.set_window_padding([s(12.0), s(10.0)]);
+    style.set_frame_padding([s(8.0), s(5.0)]);
+    style.set_item_spacing([s(8.0), s(6.0)]);
+    style.set_item_inner_spacing([s(6.0), s(4.0)]);
+    style.set_indent_spacing(s(16.0));
+    style.set_scrollbar_size(s(13.0));
+    style.set_grab_min_size(s(12.0));
+
+    style.set_window_rounding(s(6.0));
+    style.set_child_rounding(s(4.0));
+    style.set_frame_rounding(s(4.0));
+    style.set_popup_rounding(s(4.0));
+    style.set_grab_rounding(s(4.0));
+    style.set_scrollbar_rounding(s(4.0));
+    style.set_tab_rounding(s(4.0));
+    style.set_window_border_size(1.0);
+    style.set_child_border_size(1.0);
+    style.set_popup_border_size(1.0);
+    style.set_frame_border_size(0.0);
+
+    style.set_color(StyleColor::Text, text);
+    style.set_color(StyleColor::TextDisabled, dim);
+    style.set_color(StyleColor::WindowBg, surface);
+    style.set_color(StyleColor::PopupBg, surface);
+    style.set_color(StyleColor::ChildBg, [0.0, 0.0, 0.0, 0.0]);
+    style.set_color(StyleColor::Border, col(p.border, 1.0));
+    style.set_color(StyleColor::BorderShadow, [0.0, 0.0, 0.0, 0.0]);
+    style.set_color(StyleColor::Separator, col(p.separator, 1.0));
+
+    // The title bar reads as part of the window, not as a blue band across the top of it.
+    style.set_color(StyleColor::TitleBg, sunken);
+    style.set_color(StyleColor::TitleBgActive, sunken);
+    style.set_color(StyleColor::TitleBgCollapsed, sunken);
+
+    style.set_color(StyleColor::FrameBg, field);
+    style.set_color(StyleColor::FrameBgHovered, lift(field, 0.06));
+    style.set_color(StyleColor::FrameBgActive, lift(field, 0.10));
+
+    // Buttons here *are* visible (unlike the toolbar's): a dialog's OK is a thing you press.
+    style.set_color(StyleColor::Button, hover);
+    style.set_color(StyleColor::ButtonHovered, lift(hover, 0.08));
+    style.set_color(StyleColor::ButtonActive, accent);
+
+    // Everything that says "this one is chosen" is the user's accent — the same one the toolbar
+    // latches with, so the two windows are recognisably the same app.
+    style.set_color(StyleColor::CheckMark, on_accent(accent));
+    style.set_color(StyleColor::CheckboxSelectedBg, accent);
+    style.set_color(StyleColor::SliderGrab, accent);
+    style.set_color(StyleColor::SliderGrabActive, lift(accent, 0.10));
+    style.set_color(StyleColor::Header, accent);
+    style.set_color(StyleColor::HeaderHovered, hover);
+    style.set_color(StyleColor::HeaderActive, accent);
+    style.set_color(StyleColor::NavCursor, accent);
+    style.set_color(StyleColor::TextSelectedBg, [accent[0], accent[1], accent[2], 0.45]);
+    style.set_color(StyleColor::InputTextCursor, text);
+
+    // The selected tab is the *raised* one, with the accent ruled along its top edge; the rest are
+    // bare text on the window. ImGui's default is the reverse — an unselected tab gets a fill and the
+    // selected one is left to blend into the page behind it, which reads as "this tab is disabled and
+    // those are buttons".
+    style.set_color(StyleColor::Tab, [0.0, 0.0, 0.0, 0.0]);
+    style.set_color(StyleColor::TabHovered, hover);
+    style.set_color(StyleColor::TabSelected, hover);
+    style.set_color(StyleColor::TabSelectedOverline, accent);
+    style.set_color(StyleColor::TabDimmed, [0.0, 0.0, 0.0, 0.0]);
+    style.set_color(StyleColor::TabDimmedSelected, hover);
+    style.set_color(StyleColor::TabDimmedSelectedOverline, col(p.separator, 1.0));
+    style.set_tab_bar_overline_size(s(2.0));
+
+    style.set_color(StyleColor::ScrollbarBg, [0.0, 0.0, 0.0, 0.0]);
+    style.set_color(StyleColor::ScrollbarGrab, col(p.separator, 1.0));
+    style.set_color(StyleColor::ScrollbarGrabHovered, hover);
+    style.set_color(StyleColor::ScrollbarGrabActive, accent);
+
+    style.set_color(StyleColor::ResizeGrip, [0.0, 0.0, 0.0, 0.0]);
+    style.set_color(StyleColor::ResizeGripHovered, hover);
+    style.set_color(StyleColor::ResizeGripActive, accent);
+}
+
+/// Nudge a color toward white (or, for an already-bright one, toward black) — the "one step more
+/// prominent" a hover needs, without a second hand-picked color per token.
+fn lift(c: [f32; 4], amount: f32) -> [f32; 4] {
+    let target = if luminance(c) > 0.5 { -1.0 } else { 1.0 };
+    let f = |v: f32| (v + target * amount).clamp(0.0, 1.0);
+    [f(c[0]), f(c[1]), f(c[2]), c[3]]
+}
+
+/// Black or white, whichever stays readable on `c`.
+fn on_accent(c: [f32; 4]) -> [f32; 4] {
+    if luminance(c) > 0.59 {
+        [0.0, 0.0, 0.0, 1.0]
+    } else {
+        [1.0, 1.0, 1.0, 1.0]
+    }
+}
+
+fn luminance(c: [f32; 4]) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
 /// The status bar sits on its own slightly darker fill; the caller pushes this for that window.
 pub fn status_bg(dark: bool) -> [f32; 4] {
     col(Palette::for_mode(dark).status_bg, 1.0)

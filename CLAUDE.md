@@ -83,11 +83,19 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   the settings window). **Pure UI: no Win32, no COM, no GDI.** It reads a `ViewSnapshot` and returns a
   `ui::Frame` of what the user asked for; the win shell applies it.
 - `ui/settings/` — the settings window, an ImGui `BeginPopupModal` (`mod.rs` = the modal + its four
-  tabs; `model.rs` = pure field accessors + open-with tree edits, unit-tested). It wears **ImGui's
-  stock style, not fire's chrome theme** (`render::imgui::StockStyle`): the chrome is a toolbar, a
-  settings window is a form. Two things it can't do itself are reported to the shell instead —
-  "Browse…" (the file dialog pumps a modal loop) and keybind *capture* (chords are virtual keys, which
-  only the wndproc sees).
+  tabs; `model.rs` = pure field accessors + open-with tree edits, unit-tested). Two things it can't do
+  itself are reported to the shell instead — "Browse…" (the file dialog pumps a modal loop) and keybind
+  *capture* (chords are virtual keys, which only the wndproc sees).
+  **It has its own style, and that is deliberate** (`theme::form` over `render::imgui::FormStyle`):
+  fire's palette and the user's accent, applied on ImGui's *form* geometry rather than the chrome's.
+  `theme::apply` styles a **toolbar** — buttons transparent until touched, no field frames, tight
+  spacing, because it sits over an image — and a dialog that inherits it has invisible buttons and
+  inputs with no visible edges. Same colors, different shape. Don't merge the two.
+  **It contains no pixel constants**: it opens at a fraction of the viewport, the footer is pinned by
+  a negative-height `BeginChild` (so the tabs scroll *above* OK/Cancel/Apply), and every control width
+  is `content_region_avail − (the tab's longest label, measured in the live font)` — which both
+  stretches the controls and aligns the labels into one column. Labels are drawn on the **left** with
+  the widget given a hidden `##id`, because ImGui's native order is the reverse.
 - `chrome.rs` — despite the name, no longer paints anything, and is down to ~330 lines. What survives
   is the shared *model* and *theme*: `Action` + `ViewSnapshot` (the command vocabulary and the state
   the UI renders from), the light/dark `Palette` — whose highlight is the user's **system accent**
@@ -115,7 +123,7 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 
 - **GPU = upload once, redraw is one draw.** The decoded image becomes a D3D11 texture with a
   hardware mip chain *once* on adopt. Pan/zoom/exposure/channel/tonemap (and the flipbook cell
-  selection) are a **112-byte** constant buffer (`Params` in `render/gpu.rs` ↔ `cbuffer` in
+  selection) are a **128-byte** constant buffer (`Params` in `render/gpu.rs` ↔ `cbuffer` in
   `render/shader.hlsl`, kept in lockstep by hand and guarded by a `size_of` assert); each frame is
   one fullscreen-triangle draw, scoped by `RSSetViewports` to the image's sub-rect of the window.
   Never reintroduce per-pixel CPU work or per-frame texture re-uploads. *One deliberate exception:*
@@ -134,6 +142,15 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   behind it is the **caret blink** (`App::sync_caret_timer`), and it is armed *only* while
   `io.want_text_input` — i.e. while a settings text field is actually being edited — and killed the
   instant focus leaves.
+- **`SV_Position` is render-target space, not viewport space.** D3D applies the viewport transform
+  *before* the fragment stage, so a viewport parked below the toolbar still hands the pixel shader
+  absolute client coordinates. Everything in `shader.hlsl` — centering, the outline, the checkerboard —
+  is written in viewport-relative pixels, so `ps_main` subtracts `surf_origin` (the image sub-rect's
+  top-left, `GpuSurface::origin`) from `pos.xy` **first**. Forget it and every image opens exactly
+  `toolbar_h` px too high with its top clipped off, which is easy to misread as a fit/centering bug in
+  `render/view.rs` — where it is not. This only became possible with the single-window collapse: the
+  old child view's render target *started* at the image region, so `SV_Position` was viewport-relative
+  by construction.
 - **Two render-target views of one backbuffer, and they are not interchangeable.** The image shader
   emits *linear* light and writes through the `*_SRGB` view; ImGui's colors are *already* sRGB and
   must write through the plain `UNORM` view. Drawing ImGui through the sRGB view encodes twice and
@@ -185,8 +202,8 @@ transport, hint chip, tooltips, empty-state hint, settings window, and both popu
 paint/hit-test/hover/focus layer, the hand-painted Win32 dialog, and the `TrackPopupMenu` menus all
 deleted. No GDI painting and no undocumented APIs remain.
 
-The settings window is deliberately **unstyled**: it runs on ImGui's stock look while the chrome runs
-on fire's theme. That is a decision, not an oversight (see `ui/settings`), and the style pass is still
-to come.
+There are **two styles**, on purpose: `theme::apply` for the chrome (a toolbar) and `theme::form` for
+the settings window (a form). Both draw from the same `Palette` and the same system accent, so the app
+looks like one thing; they differ in *shape*, not colour. See `ui/settings`.
 
 In progress: pixel inspector, clipboard.

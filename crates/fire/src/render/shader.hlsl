@@ -34,6 +34,7 @@ cbuffer Params : register(b0) {
     float2 cell_b;         // frame-B cell origin (== cell_a when not blending)
     float  fb_blend;       // 0..1 crossfade toward frame B (0 = hard cut)
     float  fb_max_lod;     // mip clamp so minified samples can't bleed across cells
+    float2 surf_origin;    // image sub-rect's top-left in RENDER-TARGET px (see ps_main)
 };
 
 struct VSOut { float4 pos : SV_Position; };
@@ -88,7 +89,12 @@ float4 sample_cell(float2 f, float2 cell) {
 
 float4 ps_main(float4 pos : SV_Position) : SV_Target {
     if (has_image == 0) return clear_lin;
-    float2 sp = pos.xy;                       // surface pixel center (origin top-left)
+    // SV_Position is in RENDER-TARGET space, not viewport space: D3D applies the viewport transform
+    // before the fragment stage, so a viewport parked below the toolbar still hands us absolute
+    // client coordinates. Subtracting the sub-rect's origin puts us back in the viewport's own frame,
+    // which is what every line below (centering, the outline, the checkerboard) assumes. Skip it and
+    // the image opens `toolbar_h` px too high, with its top clipped off.
+    float2 sp = pos.xy - surf_origin;         // viewport pixel center (origin top-left)
     float2 ctr = surf_size * 0.5 + pan;
     float2 f = img_size * 0.5 + (sp - ctr) * inv_zoom;   // image texel coords
     // A 1px (screen-space) outline hugging the OUTSIDE of the image boundary, drawn in the

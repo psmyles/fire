@@ -49,13 +49,11 @@ pub enum Icon {
     Flipbook,
     Play,
     Pause,
-    /// The gear that opens the settings dialog.
-    Settings,
     More,
 }
 
 /// The embedded A8 masters, indexed by `Icon as usize`. Same order as the enum / `build.rs`.
-const MASTERS: [&[u8]; 26] = [
+const MASTERS: [&[u8]; 25] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_left.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_right.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_zoom_out.a8")),
@@ -80,7 +78,6 @@ const MASTERS: [&[u8]; 26] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_flipbook.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_play.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_pause.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_settings.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_more.a8")),
 ];
 

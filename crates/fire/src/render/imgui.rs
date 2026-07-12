@@ -65,17 +65,28 @@ pub struct Imgui {
     stock: sys::ImGuiStyle,
 }
 
-/// ImGui's stock style — what the library ships with, before fire's chrome theme.
+/// A second, independent ImGui style — the settings window's.
 ///
-/// The settings window wears this deliberately. The chrome is a *toolbar*: flat, transparent, tuned
-/// to sit over an image. A settings window is a *form*, and stock ImGui already knows what a form
-/// looks like. Two things are carried over from the live style, because "stock" must not mean
-/// "wrong": the **font** (Segoe UI, registered once globally) and the **DPI scale** — an unscaled
-/// dialog on a 200% monitor is a bug, not a default.
+/// It starts from ImGui's *factory* style (captured before `ui::theme` overwrites the live one, which
+/// is the only moment it exists), because that is a **form** geometry: visible buttons, framed inputs,
+/// sane padding. The chrome's style is a *toolbar* — transparent buttons, tight spacing, tuned to sit
+/// over an image — and a dialog that inherits it has invisible buttons and no field frames.
+///
+/// The caller then paints it: [`Self::style_mut`] hands it to [`crate::ui::theme::form`], which
+/// applies fire's palette and the user's accent on top. So the settings window shares the app's
+/// *colors* without inheriting the toolbar's *shape*.
 #[derive(Clone, Copy)]
-pub struct StockStyle(sys::ImGuiStyle);
+pub struct FormStyle(sys::ImGuiStyle);
 
-impl StockStyle {
+impl FormStyle {
+    /// Mutable access, so the UI layer can theme it. `Style` is a `#[repr(transparent)]` wrapper over
+    /// `ImGuiStyle` (the crate asserts the layout), which keeps every color decision in `ui::theme`
+    /// and out of this FFI module.
+    pub fn style_mut(&mut self) -> &mut dear_imgui_rs::Style {
+        // SAFETY: layout-compatible by the wrapper's own const assertions.
+        unsafe { &mut *(&mut self.0 as *mut sys::ImGuiStyle as *mut dear_imgui_rs::Style) }
+    }
+
     /// Install it until the guard drops.
     ///
     /// Assigning `ImGuiStyle` mid-frame is exactly how ImGui implements `PushStyleVar` itself: the
@@ -109,7 +120,11 @@ pub fn center_next_window(client: (f32, f32)) {
         x: client.0 * 0.5,
         y: client.1 * 0.5,
     };
-    place(center, sys::ImVec2_c { x: 0.5, y: 0.5 });
+    place(
+        center,
+        sys::ImVec2_c { x: 0.5, y: 0.5 },
+        sys::ImGuiCond_Appearing,
+    );
 }
 
 /// Put the next window's top-left at `pos` (client coords) when it appears — how a popup menu is
@@ -118,11 +133,37 @@ pub fn center_next_window(client: (f32, f32)) {
 /// for anything else.
 pub fn position_next_window(pos: (f32, f32)) {
     let p = sys::ImVec2_c { x: pos.0, y: pos.1 };
-    place(p, sys::ImVec2_c { x: 0.0, y: 0.0 });
+    place(p, sys::ImVec2_c { x: 0.0, y: 0.0 }, sys::ImGuiCond_Appearing);
 }
 
-fn place(pos: sys::ImVec2_c, pivot: sys::ImVec2_c) {
-    unsafe { sys::igSetNextWindowPos(pos, sys::ImGuiCond_Appearing as sys::ImGuiCond, pivot) };
+/// Anchor the next window at `pos` with `pivot` (`0.0` = leading edge, `0.5` = centered, `1.0` =
+/// trailing) on each axis, **every frame**.
+///
+/// This is what lets a window be auto-sized *and* centered: with `ALWAYS_AUTO_RESIZE`, ImGui measures
+/// the content, and the pivot places that measured box — so nothing has to compute a width in order
+/// to halve it. `Always`, not `Appearing`, because the anchor is derived from the layout (the image's
+/// sub-rect) and has to follow a resize.
+pub fn anchor_next_window(pos: (f32, f32), pivot: (f32, f32)) {
+    let p = sys::ImVec2_c { x: pos.0, y: pos.1 };
+    let v = sys::ImVec2_c {
+        x: pivot.0,
+        y: pivot.1,
+    };
+    place(p, v, sys::ImGuiCond_Always);
+}
+
+fn place(pos: sys::ImVec2_c, pivot: sys::ImVec2_c, cond: sys::ImGuiCond_) {
+    unsafe { sys::igSetNextWindowPos(pos, cond as sys::ImGuiCond, pivot) };
+}
+
+/// Size the next window, **the first time it appears** — so it opens proportioned to the viewport it
+/// is opening over, and stays wherever the user then drags or resizes it to.
+pub fn size_next_window(size: (f32, f32)) {
+    let s = sys::ImVec2_c {
+        x: size.0,
+        y: size.1,
+    };
+    unsafe { sys::igSetNextWindowSize(s, sys::ImGuiCond_Appearing as sys::ImGuiCond) };
 }
 
 impl Imgui {
@@ -167,15 +208,18 @@ impl Imgui {
         me
     }
 
-    /// ImGui's stock style, scaled for `dpi` and themed light/dark, ready to [`StockStyle::push`].
+    /// The settings window's base style: ImGui's factory geometry, scaled for the monitor, carrying
+    /// our font — for [`crate::ui::theme::form`] to paint and [`FormStyle::push`] to install.
     ///
-    /// Composed per call rather than cached: it is a ~1 KB POD copy plus two library calls, against
-    /// a frame that is only drawn when something happened. Caching it would mean invalidating it on
-    /// DPI *and* theme changes, which is more state than it saves.
-    pub fn stock_style(&self, dark: bool) -> StockStyle {
+    /// Composed per call rather than cached: it is a ~1 KB POD copy plus two library calls, against a
+    /// frame that is only drawn when something happened. Caching it would mean invalidating it on DPI
+    /// *and* theme changes, which is more state than it saves.
+    pub fn form_style(&self, dark: bool) -> FormStyle {
         let mut s = self.stock;
-        // Stock geometry, scaled to the monitor.
+        // Factory geometry, scaled to the monitor. `ui::theme::form` then overrides the metrics it
+        // cares about; the rest (cell padding, separator-text padding, …) stay correctly scaled.
         unsafe { sys::ImGuiStyle_ScaleAllSizes(&mut s, self.dpi as f32 / 96.0) };
+        // Seeds every color, including the dozens the theme doesn't name (plots, drag-drop, tables).
         unsafe {
             if dark {
                 sys::igStyleColorsDark(&mut s);
@@ -189,7 +233,7 @@ impl Imgui {
         s.FontSizeBase = live.font_size_base();
         s.FontScaleMain = live.font_scale_main();
         s.FontScaleDpi = live.font_scale_dpi();
-        StockStyle(s)
+        FormStyle(s)
     }
 
     /// Physical icon edge for the current DPI.

@@ -103,12 +103,24 @@ struct Params {
     fb_blend: f32,
     /// Mip-LOD clamp so minified samples can't bleed across cell boundaries (`f32::MAX` = none).
     fb_max_lod: f32,
+    /// The image sub-rect's top-left in **render-target** px — i.e. [`GpuSurface::origin`].
+    ///
+    /// The pixel shader's `SV_Position` is in render-target space, *not* viewport space: D3D applies
+    /// the viewport transform before the fragment stage, so a viewport at `y = toolbar_h` still hands
+    /// the shader absolute client coordinates. Without this the shader centres the image on
+    /// `surf_size * 0.5` measured from the *client's* origin rather than the viewport's, and every
+    /// image opens exactly `toolbar_h` px too high, its top clipped away by the viewport.
+    surf_origin_x: f32,
+    surf_origin_y: f32,
+    /// Pad the struct out to a whole 16-byte register (HLSL allocates `b7` in full either way; this
+    /// keeps the `memcpy` from copying uninitialised bytes).
+    _pad: [f32; 2],
 }
 
 // The cbuffer layout is kept in lockstep with the HLSL `cbuffer Params` in `render/shader.hlsl`
 // by hand (there is no reflection); these guard the size so a field added on only one side is a
-// build error rather than silent visual corruption. 112 bytes = 7 × 16-byte float4 registers.
-const _: () = assert!(std::mem::size_of::<Params>() == 112);
+// build error rather than silent visual corruption. 128 bytes = 8 × 16-byte float4 registers.
+const _: () = assert!(std::mem::size_of::<Params>() == 128);
 const _: () = assert!(std::mem::size_of::<Params>().is_multiple_of(16));
 
 /// Flipbook render parameters mirrored onto the surface from the active per-path state (the
@@ -810,6 +822,9 @@ impl GpuSurface {
             cell_b_y: cb.1,
             fb_blend,
             fb_max_lod,
+            surf_origin_x: self.origin.0,
+            surf_origin_y: self.origin.1,
+            _pad: [0.0; 2],
         };
 
         unsafe {
