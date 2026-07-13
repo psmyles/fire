@@ -73,8 +73,8 @@ pub struct Imgui {
 /// over an image — and a dialog that inherits it has invisible buttons and no field frames.
 ///
 /// The caller then paints it: [`Self::style_mut`] hands it to [`crate::ui::theme::form`], which
-/// applies fire's palette and the user's accent on top. So the settings window shares the app's
-/// *colors* without inheriting the toolbar's *shape*.
+/// applies the stylesheet's palette on top. So the settings window shares the app's *colors* without
+/// inheriting the toolbar's *shape*.
 #[derive(Clone, Copy)]
 pub struct FormStyle(sys::ImGuiStyle);
 
@@ -110,6 +110,31 @@ pub struct StyleGuard(sys::ImGuiStyle);
 impl Drop for StyleGuard {
     fn drop(&mut self) {
         unsafe { *sys::igGetStyle() = self.0 };
+    }
+}
+
+/// Seed a style's colors from ImGui's factory palette for the mode, before [`crate::ui::theme`]
+/// paints ours over the top.
+///
+/// Both styles need this, for the same reason. The stylesheet names the colors fire actually uses;
+/// ImGui has *dozens* more (plots, tables, drag-drop, nav, text selection). Without a seed, those
+/// keep whatever was in the style already — for the chrome that is the factory **dark** palette, from
+/// context creation, *whatever mode the user is in*. So a light-mode window would draw its text
+/// selection, its nav cursor and its resize grips out of a dark palette, and any color we later stop
+/// naming would silently freeze at an ImGui default. Seeding makes "unnamed" mean "ImGui's sensible
+/// value for this mode" instead of "a stale value from startup".
+///
+/// (`FormStyle` seeds itself the same way in [`Imgui::form_style`] — this is that, for the live style.)
+pub fn seed_colors(style: &mut dear_imgui_rs::Style, dark: bool) {
+    // SAFETY: `Style` is `#[repr(transparent)]` over `ImGuiStyle` (the crate asserts the layout), and
+    // `igStyleColors*` only writes the color array — the metrics and font fields are untouched.
+    let raw = style as *mut dear_imgui_rs::Style as *mut sys::ImGuiStyle;
+    unsafe {
+        if dark {
+            sys::igStyleColorsDark(raw);
+        } else {
+            sys::igStyleColorsLight(raw);
+        }
     }
 }
 

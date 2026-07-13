@@ -2,11 +2,15 @@
 //!
 //! Every color, metric and spacing value the UI draws with lives in that file, next to this one.
 //! This module is the machinery around it: it parses the stylesheet, resolves its little color
-//! grammar (`#hex` / `accent` / `lift(…)` / `alpha(…)` / `contrast(…)`) against the light or dark
-//! token set and the user's system accent, and applies the result to ImGui's two styles — [`apply`]
-//! for the chrome (a *toolbar*) and [`form`] for the settings window (a *form*). The mapping from a
-//! semantic token to an ImGui `StyleColor` is the only styling decision that stays in the code, and
-//! it is deliberately mechanical: one line per color, no arithmetic.
+//! grammar (`#hex` / a token name / `lift(…)` / `alpha(…)` / `contrast(…)`) against the light or dark
+//! token set, and applies the result to ImGui's two styles — [`apply`] for the chrome (a *toolbar*)
+//! and [`form`] for the settings window (a *form*). The mapping from a semantic token to an ImGui
+//! `StyleColor` is the only styling decision that stays in the code, and it is deliberately
+//! mechanical: one line per color, no arithmetic.
+//!
+//! **Every color is the stylesheet's**, `accent` included — it is an ordinary token, not the Windows
+//! highlight color. The only theme input still taken from the system is the light/dark *preference*,
+//! which picks which of the two token blocks is in force.
 //!
 //! **Where the stylesheet comes from:**
 //! * *release* — [`EMBEDDED`], compiled in with `include_str!`. The disk is never touched.
@@ -23,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
-use dear_imgui_rs::{Style, StyleColor};
+use dear_imgui_rs::{Style, StyleColor, StyleStackToken, StyleVar, Ui};
 use serde::Deserialize;
 
 /// The stylesheet, compiled into the exe. This is what a release build always uses.
@@ -86,7 +90,6 @@ fn load() -> Theme {
 #[serde(deny_unknown_fields)]
 pub struct Theme {
     pub font: Font,
-    pub accent: Accent,
     pub colors: Modes,
     pub chrome: Chrome,
     pub form: Form,
@@ -100,20 +103,13 @@ pub struct Font {
     pub icon_size: f32,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Accent {
-    fallback: Hex,
-    min_luminance: f32,
-    max_luminance: f32,
-    contrast_threshold: f32,
-}
-
-/// The per-mode token sets. Free-form: a stylesheet may invent tokens, and a color may name any of
-/// them (plus the built-in `accent`).
+/// The per-mode token sets, and the one rule that spans them. Free-form: a stylesheet may invent
+/// tokens, and any color may name any of them — including `accent`, which is a token like the rest.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Modes {
+    /// The `contrast(X)` cut-off (see the grammar in `theme.toml`).
+    contrast_threshold: f32,
     dark: Tokens,
     light: Tokens,
 }
@@ -133,6 +129,7 @@ pub struct Chrome {
     divider_bottom: f32,
     empty_hint_line_gap: f32,
     geom: Geom,
+    pub controls: ChromeControls,
     colors: ChromeColors,
 }
 
@@ -142,7 +139,53 @@ pub struct Form {
     /// The settings window's opening size, as a fraction of the viewport.
     pub open_fraction: [f32; 2],
     geom: Geom,
+    pub controls: FormControls,
     colors: FormColors,
+}
+
+/// Per-control sizes — the knobs `Geom` cannot give you.
+///
+/// ImGui has no "tab height" and no "checkbox size": it derives *every* control's height the same
+/// way, `font size + 2 × frame_padding.y`. So `frame_padding` moves the tabs, the inputs and the
+/// buttons **together**, and there is no style field to separate them. What there is is a style
+/// *stack*: a `FramePadding` pushed around one widget sizes that widget alone. These tables are
+/// that, as data — [`push_control`] turns a height into the padding that produces it.
+///
+/// Every value is a height (or a square edge) in **logical px**, and **`0` means "leave it to
+/// `frame_padding`"**, which is what the app looked like before these existed.
+///
+/// For everything with text *inside* it — a tab, an input, a button — the **font size is the floor**:
+/// ImGui gives it room for that text, and a pushed `FramePadding` may not be negative. That is a real
+/// constraint, not an implementation limit, so ask for less and you get zero padding.
+///
+/// **`checkbox_size` is exempt, and is an exact edge.** A checkbox has no text in its box, so the
+/// font has no business flooring it; [`crate::ui::checkbox`] separates the box from its label and
+/// sizes it directly, at any font. That is the one control where the number you write is the number
+/// of pixels you get.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChromeControls {
+    /// The transport band's "Blend" box. An exact square edge (see above).
+    pub checkbox_size: f32,
+    /// The transport band's number fields, the scrub slider, and the play button beside them.
+    pub input_height: f32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormControls {
+    /// An exact square edge (see above) — not floored by the font, unlike the rest of these.
+    pub checkbox_size: f32,
+    /// Text boxes, combos and sliders.
+    pub input_height: f32,
+    pub button_height: f32,
+    /// Horizontal padding inside a button (`0` = the style's `frame_padding.x`). Buttons are sized to
+    /// their label plus this, so it also sets how wide OK/Cancel/Apply come out.
+    pub button_padding_x: f32,
+    /// The settings tab strip.
+    pub tab_height: f32,
+    /// Horizontal padding inside a tab (`0` = the style's `frame_padding.x`).
+    pub tab_padding_x: f32,
 }
 
 /// The shape of a style: everything ImGui calls a "style var". Both styles carry a full set — that
@@ -211,6 +254,10 @@ color_block!(ChromeColors {
     header_active,
     slider_grab,
     slider_grab_active,
+    // A *checked* box is filled with `checkbox_selected_bg` and the tick is drawn on it in
+    // `check_mark` (imgui_widgets.cpp: `(mixed_value || checked) ? ImGuiCol_CheckboxSelectedBg : …`).
+    // Both, or the box is half ours and half ImGui's.
+    checkbox_selected_bg,
     check_mark,
     scrollbar_bg,
     scrollbar_grab,
@@ -266,18 +313,14 @@ color_block!(FormColors {
 });
 
 impl Theme {
-    /// Parse a stylesheet **and prove it**: every color in it is resolved, in both modes, against a
-    /// stand-in accent. So `reload` either installs a stylesheet that will draw correctly or reports
-    /// exactly which key is wrong — an unknown token name never reaches a widget.
+    /// Parse a stylesheet **and prove it**: every color in it is resolved, in both modes. So `reload`
+    /// either installs a stylesheet that will draw correctly or reports exactly which key is wrong —
+    /// an unknown token name never reaches a widget.
     fn parse(src: &str) -> Result<Theme, String> {
         let theme: Theme = toml::from_str(src).map_err(|e| format!("theme.toml: {e}"))?;
         for dark in [true, false] {
             let mode = if dark { "colors.dark" } else { "colors.light" };
-            let cx = Cx {
-                tokens: theme.tokens(dark),
-                accent: [0.0, 0.5, 1.0, 1.0], // stand-in: only *names* are being checked here
-                threshold: theme.accent.contrast_threshold,
-            };
+            let cx = theme.cx(dark);
             let blocks = [
                 ("chrome.colors", theme.chrome.colors.entries()),
                 ("form.colors", theme.form.colors.entries()),
@@ -300,31 +343,12 @@ impl Theme {
         }
     }
 
-    /// A resolver bound to one mode: the tokens of that mode, plus the live system accent.
+    /// A resolver bound to one mode: that mode's tokens, and the `contrast()` cut-off.
     fn cx(&self, dark: bool) -> Cx<'_> {
         Cx {
             tokens: self.tokens(dark),
-            accent: self.accent_rgba(),
-            threshold: self.accent.contrast_threshold,
+            threshold: self.colors.contrast_threshold,
         }
-    }
-
-    /// The `accent` built-in: the user's Windows highlight color, or the stylesheet's fallback when
-    /// that highlight is so dark or so bright that text on top of it would be unreadable (which
-    /// includes some high-contrast themes).
-    fn accent_rgba(&self) -> [f32; 4] {
-        let c = crate::chrome::system_highlight();
-        // COLORREF is 0x00BBGGRR.
-        let (r, g, b) = (
-            (c & 0xFF) as f32,
-            ((c >> 8) & 0xFF) as f32,
-            ((c >> 16) & 0xFF) as f32,
-        );
-        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        if lum < self.accent.min_luminance || lum > self.accent.max_luminance {
-            return self.accent.fallback.0;
-        }
-        [r / 255.0, g / 255.0, b / 255.0, 1.0]
     }
 }
 
@@ -400,6 +424,9 @@ pub fn apply(style: &mut Style, dark: bool, scale: f32) {
     style.set_font_size_base(t.font.size);
     style.set_font_scale_dpi(scale);
     geom(style, &t.chrome.geom, scale);
+    // The colors the stylesheet doesn't name (tables, plots, drag-drop, …) come from ImGui's palette
+    // *for this mode* rather than from whatever was left in the style — see `seed_colors`.
+    crate::render::imgui::seed_colors(style, dark);
 
     style.set_color(StyleColor::Text, cx.c(&c.text));
     style.set_color(StyleColor::TextDisabled, cx.c(&c.text_disabled));
@@ -424,6 +451,7 @@ pub fn apply(style: &mut Style, dark: bool, scale: f32) {
 
     style.set_color(StyleColor::SliderGrab, cx.c(&c.slider_grab));
     style.set_color(StyleColor::SliderGrabActive, cx.c(&c.slider_grab_active));
+    style.set_color(StyleColor::CheckboxSelectedBg, cx.c(&c.checkbox_selected_bg));
     style.set_color(StyleColor::CheckMark, cx.c(&c.check_mark));
 
     style.set_color(StyleColor::ScrollbarBg, cx.c(&c.scrollbar_bg));
@@ -528,6 +556,37 @@ fn geom(style: &mut Style, g: &Geom, scale: f32) {
     style.set_image_border_size(g.image_border);
 }
 
+/// Push the frame padding that makes one control come out `height` logical px tall (and, when
+/// `pad_x` is non-zero, that wide inside), for as long as the returned guard lives.
+///
+/// This is the whole mechanism behind `[chrome.controls]` / `[form.controls]` — see
+/// [`FormControls`]. `None` when the stylesheet leaves this control alone (a `0`), so a caller's
+/// `let _p = push_control(…);` is simply a no-op and the style's own `frame_padding` applies.
+///
+/// Read the *live* style rather than taking a scale: inside the settings window that is the form's
+/// style, and its `frame_padding` and font scale are the ones this control will actually be laid out
+/// with. Anything measured under the guard (`ui.frame_height()`, a button's width) measures the
+/// control as it will be drawn — which is why the callers do exactly that.
+pub(crate) fn push_control(ui: &Ui, height: f32, pad_x: f32) -> Option<StyleStackToken<'_>> {
+    if height <= 0.0 && pad_x <= 0.0 {
+        return None;
+    }
+    let style = ui.clone_style();
+    let base = style.frame_padding();
+    let scale = style.font_scale_dpi().max(0.01);
+    let s = |v: f32| (v * scale).round();
+
+    let x = if pad_x > 0.0 { s(pad_x) } else { base[0] };
+    let y = if height > 0.0 {
+        // ImGui: height = font size + 2 × pad.y. A negative padding is rejected outright (it would
+        // assert), so the font size is the floor — see the note on `FormControls`.
+        ((s(height) - ui.current_font_size()) * 0.5).max(0.0).round()
+    } else {
+        base[1]
+    };
+    Some(ui.push_style_var(StyleVar::FramePadding([x, y])))
+}
+
 /// The status bar's fill — its own window, one step deeper than the toolbar's.
 pub fn status_bg(dark: bool) -> [f32; 4] {
     let t = current();
@@ -549,9 +608,9 @@ pub fn view_clear_packed(dark: bool) -> u32 {
 }
 
 /// Black or white, whichever stays readable **on** `c` — the tint for an icon sitting on an
-/// accent-filled button, and the same rule the stylesheet's `contrast(…)` uses.
+/// accent-filled button. The stylesheet's `contrast(…)` is the same rule, off the same cut-off.
 pub(crate) fn on_accent(c: [f32; 4]) -> [f32; 4] {
-    contrast(c, current().accent.contrast_threshold)
+    contrast(c, current().colors.contrast_threshold)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -563,26 +622,12 @@ pub(crate) fn on_accent(c: [f32; 4]) -> [f32; 4] {
 #[derive(Debug, Clone)]
 enum Expr {
     Lit([f32; 4]),
-    /// A token from the current mode's block — or the built-in `accent`.
+    /// A token from the current mode's block. There are no built-in names: `accent` is a token the
+    /// stylesheet defines like any other.
     Name(String),
     Lift(Box<Expr>, f32),
     Alpha(Box<Expr>, f32),
     Contrast(Box<Expr>),
-}
-
-/// A literal color, for the one place an expression makes no sense (the accent's own fallback).
-#[derive(Debug, Deserialize)]
-#[serde(try_from = "String")]
-struct Hex([f32; 4]);
-
-impl TryFrom<String> for Hex {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, String> {
-        let h = s
-            .strip_prefix('#')
-            .ok_or_else(|| format!("`{s}` must be a literal color, e.g. \"#0078d7\""))?;
-        parse_hex(h).map(Hex)
-    }
 }
 
 impl<'de> Deserialize<'de> for Expr {
@@ -592,10 +637,9 @@ impl<'de> Deserialize<'de> for Expr {
     }
 }
 
-/// Resolves an [`Expr`] to RGBA, in one mode, against one accent.
+/// Resolves an [`Expr`] to RGBA against one mode's tokens.
 struct Cx<'a> {
     tokens: &'a Tokens,
-    accent: [f32; 4],
     threshold: f32,
 }
 
@@ -613,7 +657,6 @@ impl Cx<'_> {
         let sub = |e: &Expr| self.resolve(e, depth + 1);
         Ok(match e {
             Expr::Lit(c) => *c,
-            Expr::Name(n) if n == "accent" => self.accent,
             Expr::Name(n) => {
                 let e = self
                     .tokens
@@ -633,8 +676,7 @@ impl Cx<'_> {
 }
 
 /// Nudge a color toward white — or, if it is already bright, toward black. The "one step more
-/// prominent" a hover needs, without a second hand-picked color per token (and without knowing, at
-/// authoring time, what the user's accent is).
+/// prominent" a hover needs, without a second hand-picked color per token.
 fn lift(c: [f32; 4], amount: f32) -> [f32; 4] {
     let dir = if luminance(c) > 0.5 { -1.0 } else { 1.0 };
     let f = |v: f32| (v + dir * amount).clamp(0.0, 1.0);
@@ -757,10 +799,9 @@ mod tests {
         Theme::parse(&src).expect("theme.toml");
     }
 
-    fn cx<'a>(tokens: &'a Tokens, accent: [f32; 4]) -> Cx<'a> {
+    fn cx(tokens: &Tokens) -> Cx<'_> {
         Cx {
             tokens,
-            accent,
             threshold: 0.59,
         }
     }
@@ -770,14 +811,16 @@ mod tests {
         let mut tokens = Tokens::new();
         tokens.insert("surface".into(), parse_color("#2b2b2b").unwrap());
         tokens.insert("hover".into(), parse_color("lift(surface, 0.1)").unwrap());
-        let cx = cx(&tokens, [0.0, 0.47, 0.84, 1.0]);
+        tokens.insert("accent".into(), parse_color("#0078d7").unwrap());
+        let cx = cx(&tokens);
 
         let c = |s: &str| cx.resolve(&parse_color(s).unwrap(), 0).unwrap();
 
         assert_eq!(c("#fff"), [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(c("#000000"), [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(c("none"), [0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(c("accent"), [0.0, 0.47, 0.84, 1.0]);
+        // `accent` is a token like any other — there is no built-in name.
+        assert_eq!(c("accent"), c("#0078d7"));
         assert_eq!(c("alpha(accent, 0.5)")[3], 0.5);
         // A token that is itself derived from another token.
         assert!(c("hover")[0] > c("surface")[0]);
@@ -801,8 +844,9 @@ mod tests {
     #[test]
     fn an_unknown_token_is_an_error_not_a_magenta_widget() {
         let tokens = Tokens::new();
-        let cx = cx(&tokens, [0.0; 4]);
-        let e = cx.resolve(&parse_color("surfce").unwrap(), 0).unwrap_err();
+        let e = cx(&tokens)
+            .resolve(&parse_color("surfce").unwrap(), 0)
+            .unwrap_err();
         assert!(e.contains("surfce"), "{e}");
     }
 
@@ -811,8 +855,7 @@ mod tests {
         let mut tokens = Tokens::new();
         tokens.insert("a".into(), parse_color("b").unwrap());
         tokens.insert("b".into(), parse_color("a").unwrap());
-        let cx = cx(&tokens, [0.0; 4]);
-        assert!(cx.resolve(&parse_color("a").unwrap(), 0).is_err());
+        assert!(cx(&tokens).resolve(&parse_color("a").unwrap(), 0).is_err());
     }
 
     #[test]

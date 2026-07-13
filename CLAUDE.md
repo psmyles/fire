@@ -84,11 +84,28 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   `ViewSnapshot` and returns a `ui::Frame` of what the user asked for; the win shell applies it.
 - `ui/theme.toml` — **the stylesheet: every color, metric and spacing value, in one commented file.**
   Both palettes, both styles (chrome + settings form), the bar heights, paddings, roundings, the icon
-  and font size. Nothing visual is hardcoded in the Rust. Colors are a tiny grammar — `#hex`, `none`,
-  `accent` (the system accent), a token name from `[colors.dark]` / `[colors.light]`, and the derived
-  forms `lift(X, 0.08)` / `alpha(X, 0.45)` / `contrast(X)` — so a hover shade or a readable tick on an
-  accent nobody knows at authoring time stays *in the data*. `theme.rs` parses it, resolves it, and
-  maps a token to each ImGui `StyleColor`; that mapping is the only styling decision left in code.
+  and font size. Nothing visual is hardcoded in the Rust, and **no color comes from the system** —
+  `accent` is a token you set per mode like any other; the light/dark *preference* is the only theme
+  input still read from Windows, and all it does is pick which token block is in force. Colors are a
+  tiny grammar — `#hex`, `none`, a token name from `[colors.dark]` / `[colors.light]`, and the derived
+  forms `lift(X, 0.08)` / `alpha(X, 0.45)` / `contrast(X)` — so a hover shade, or a tick that stays
+  legible whatever accent you pick, stays *in the data*. `theme.rs` parses it, resolves it, and maps a
+  token to each ImGui `StyleColor`; that mapping is the only styling decision left in code.
+  **`[chrome.controls]` / `[form.controls]` are the per-control sizes**, and they exist because ImGui
+  has no "tab height" or "checkbox size" var: it derives *every* control's height as `font size +
+  2 × frame_padding.y`, so the style alone moves the tabs, the inputs and the buttons together. Each
+  entry is a height in logical px (`0` = "leave it to `frame_padding`"), and `theme::push_control`
+  turns it into a `FramePadding` pushed around that one widget. For anything with text *inside* it the
+  **font size is the floor** — a pushed `FramePadding` may not be negative — and anything the layout
+  measures (a button's width, the footer's reserve, the transport's row) is measured *under* the push,
+  or the layout and the widget disagree about the size.
+  **The checkbox is the exception** (`ui::checkbox`): its box holds no text, so the font has no
+  business flooring it. The box is submitted with a hidden label under a pushed *font size* and zero
+  padding — which makes `GetFrameHeight()`, and so the square, exactly the size asked for — and the
+  label is drawn afterwards in the real font, centred on it. Note `push_font_with_size` takes the
+  **base** size: ImGui's live font size is `FontSizeBase × FontScaleMain × FontScaleDpi`, so pushing a
+  physical px value gets scaled by the DPI a second time (a 16 px box comes out 36 at 150%, which
+  reads as "the setting does nothing"). Divide the scaling back out.
   **Tweak it and watch:** a debug build loads it from the source tree and `hotstyle.rs` watches it, so
   saving the file restyles the running window (no rebuild). A release build embeds it with
   `include_str!` and never reads the disk. A stylesheet is only installed once it parses *and* every
@@ -103,7 +120,7 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   itself are reported to the shell instead — "Browse…" (the file dialog pumps a modal loop) and keybind
   *capture* (chords are virtual keys, which only the wndproc sees).
   **It has its own style, and that is deliberate** (`theme::form` over `render::imgui::FormStyle`):
-  fire's palette and the user's accent, applied on ImGui's *form* geometry rather than the chrome's.
+  the stylesheet's palette, applied on ImGui's *form* geometry rather than the chrome's.
   `theme::apply` styles a **toolbar** — buttons transparent until touched, no field frames, tight
   spacing, because it sits over an image — and a dialog that inherits it has invisible buttons and
   inputs with no visible edges. Same colors, different shape. Don't merge the two.
@@ -113,12 +130,11 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   stretches the controls and aligns the labels into one column. Labels are drawn on the **left** with
   the widget given a hidden `##id`, because ImGui's native order is the reverse.
 - `chrome.rs` — despite the name, no longer paints anything, and no longer holds the palette either
-  (that moved to `ui/theme.toml`). What survives is the shared *model* and the Win32 half of the
-  theme: `Action` + `ViewSnapshot` (the command vocabulary and the state the UI renders from),
-  `system_highlight` — the user's **system accent**, `GetSysColor(COLOR_HIGHLIGHT)`: documented, no
-  registry poking (the *policy* around it, the fallback and the readability guard, is stylesheet
-  data) — and `apply_dark_titlebar` (documented DWM). **Every API it calls is documented**; the
-  uxtheme ordinal hack went out with the Win32 menus.
+  (that moved to `ui/theme.toml`). What survives is the shared *model* — `Action` + `ViewSnapshot`
+  (the command vocabulary and the state the UI renders from) — plus the two window-manager bits:
+  reading the light/dark preference (`AppsUseLightTheme`), which is the app's **only** remaining
+  system theme input, and `apply_dark_titlebar` (documented DWM). **Every API it calls is
+  documented**; the uxtheme ordinal hack went out with the Win32 menus.
 - `decode_pool.rs` — off-thread worker pool (no async runtime).
 - `folder.rs` — sibling-image cursor behind ←/→ navigation + the status-bar count; pure scan/
   sort/cursor logic (no Win32, unit-tested), scanned off-thread and posted back to the frame.
@@ -220,7 +236,7 @@ paint/hit-test/hover/focus layer, the hand-painted Win32 dialog, and the `TrackP
 deleted. No GDI painting and no undocumented APIs remain.
 
 There are **two styles**, on purpose: `theme::apply` for the chrome (a toolbar) and `theme::form` for
-the settings window (a form). Both draw from the same `Palette` and the same system accent, so the app
-looks like one thing; they differ in *shape*, not colour. See `ui/settings`.
+the settings window (a form). Both draw from the same palette in `ui/theme.toml`, so the app looks
+like one thing; they differ in *shape*, not colour. See `ui/settings`.
 
 In progress: pixel inspector, clipboard.

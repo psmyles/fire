@@ -6,10 +6,9 @@
 //!
 //! * [`Action`] and [`ViewSnapshot`] — the command vocabulary and the read-only state the UI renders
 //!   from. Pure data; [`crate::ui`] reads them, the win shell applies them.
-//! * [`system_highlight`] — the user's **system accent**, read from `COLOR_HIGHLIGHT` (documented,
-//!   no registry poking). The colors it feeds are in `ui/theme.toml`, not here: this module owns the
-//!   Win32 call, [`crate::ui::theme`] owns what the app does with it.
-//! * The dark title bar plumbing, which is a window-manager concern, not a paint one.
+//! * The dark title bar plumbing, which is a window-manager concern, not a paint one — and reading
+//!   the light/dark *preference*, which is the only theme input the app still takes from the system.
+//!   Every color is the stylesheet's (`ui/theme.toml`), including the accent.
 //!
 //! Nothing here paints any more, and nothing here is GDI: the hand-painted Win32 settings dialog
 //! that the last few text helpers existed for is now an ImGui window ([`crate::ui::settings`]), and
@@ -21,7 +20,6 @@ use std::ptr;
 
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND};
 use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
-use windows_sys::Win32::Graphics::Gdi::{GetSysColor, COLOR_HIGHLIGHT};
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 
 use crate::icons::Icon;
@@ -220,22 +218,6 @@ impl ViewSnapshot {
             Action::Overflow => Icon::More,
         }
     }
-}
-
-// --- the system accent ------------------------------------------------------
-
-/// The user's accent color, raw, as a GDI `COLORREF` (`0x00BBGGRR`).
-///
-/// `COLOR_HIGHLIGHT` is the *documented* way to read it: Windows 10/11 set the highlight (selection)
-/// color from the accent the user picks in Settings, so this tracks it with no undocumented API and
-/// no registry poking. It also does the right thing under a high-contrast theme, where the highlight
-/// is whatever that theme says it is.
-///
-/// Raw because the *policy* around it — the readability guard, and the blue it falls back to when the
-/// system highlight is so dark or so bright that nothing is legible on it — is a styling decision,
-/// and styling decisions live in `ui/theme.toml` (`[accent]`). This function is only the Win32 half.
-pub fn system_highlight() -> u32 {
-    unsafe { GetSysColor(COLOR_HIGHLIGHT) }
 }
 
 // --- dark mode / title bar --------------------------------------------------

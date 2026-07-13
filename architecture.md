@@ -360,25 +360,27 @@ for, which the win shell applies.
   internal glyph structures, and it would save ~1 ms — the fonts are not the cost, the D3D11 device
   objects are.) Note `font_scale_dpi` scales *glyphs only*: every other metric is in logical px and
   is scaled in `ui::theme::apply`, or the chrome stays 96-dpi-sized on a HiDPI monitor.
-- **Dark mode:** the system preference is read from the registry (`AppsUseLightTheme`); the title bar
-  is darkened via `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)`; the ImGui style and the
-  letterbox backdrop come from the light/dark token sets in the **stylesheet** (`ui/theme.toml`,
-  below), whose `accent` is the user's **system accent** (`GetSysColor(COLOR_HIGHLIGHT)` —
-  documented, no registry poking; `chrome::system_highlight`). `WM_SETTINGCHANGE` /
-  `WM_DWMCOLORIZATIONCOLORCHANGED` re-skin live; the restyle is unconditional, because the accent can
-  move without the light/dark mode changing.
+- **Dark mode:** the system preference is read from the registry (`AppsUseLightTheme`) and the title
+  bar is darkened via `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)`. That preference is the
+  **only** theme input the app takes from the system, and all it decides is which of the stylesheet's
+  two token blocks (`[colors.dark]` / `[colors.light]`) is in force; every color, accent included, is
+  the stylesheet's. `WM_SETTINGCHANGE` re-skins live.
 - **The stylesheet (`crates/fire/src/ui/theme.toml`):** every color, metric and spacing value the UI
   draws with, in one commented file — the two styles (chrome and settings form), both palettes, the
-  bar heights, the paddings and roundings. Colors are a small grammar (`#hex`, `none`, `accent`, a
-  token name, `lift(X, a)`, `alpha(X, a)`, `contrast(X)`), so *derived* colors — a hover state, a
-  readable tick on an accent of unknown brightness — stay in the data rather than the code.
-  `ui::theme` parses it, resolves it against the mode's tokens and the live accent, and applies it;
-  the token → `StyleColor` mapping is the only styling decision left in Rust. **Release builds embed
-  it** (`include_str!`) and never touch the disk; **debug builds** load it from the source tree and
-  `hotstyle.rs` watches it — save the file and the running window restyles (`WM_APP_THEME_RELOADED` →
-  `App::restyle`: metrics, both styles, the icon atlas, the clear color, repaint). A stylesheet is
-  installed only once it parses *and* every color in it resolves, so a typo prints and changes
-  nothing rather than putting a broken window on screen.
+  bar heights, the paddings and roundings. Colors are a small grammar (`#hex`, `none`, a token name,
+  `lift(X, a)`, `alpha(X, a)`, `contrast(X)`), so *derived* colors — a hover state, a tick that stays
+  readable on whatever accent is set — stay in the data rather than the code. `ui::theme` parses it,
+  resolves it against the mode's tokens, and applies it; the token → `StyleColor` mapping is the only
+  styling decision left in Rust. **Control sizes** (`[chrome.controls]` / `[form.controls]`) are the
+  one thing that cannot be a style field: ImGui derives a checkbox, a tab, an input and a button all
+  from `font size + 2 × frame_padding.y`, so sizing one without the others means pushing a
+  `FramePadding` around that widget — `theme::push_control` does it, and every width or reserve the
+  layout measures for that control is measured under the same push. **Release builds embed it** (`include_str!`) and never touch the
+  disk; **debug builds** load it from the source tree and `hotstyle.rs` watches it — save the file and
+  the running window restyles (`WM_APP_THEME_RELOADED` → `App::restyle`: metrics, both styles, the
+  icon atlas, the clear color, repaint). A stylesheet is installed only once it parses *and* every
+  color in it resolves, so a typo prints and changes nothing rather than putting a broken window on
+  screen.
 - **Icons:** `build.rs` still rasterizes the SVGs to A8 coverage masks; they are now packed into one
   RGBA8 **atlas strip** (white RGB, coverage in alpha) uploaded as a single D3D11 texture. ImGui's
   shader multiplies texel by vertex color, so `(1,1,1,a) * tint` gives any tint from one texture —
@@ -420,7 +422,7 @@ for, which the win shell applies.
   inherited it has invisible buttons and inputs whose edges you cannot see. So the settings window
   starts from ImGui's *factory geometry* (`render::imgui::FormStyle` snapshots the style at context
   creation, before `ui::theme` overwrites it — the only moment it exists) and `theme::form` paints
-  fire's own palette and the user's accent onto it. Same colours as the chrome, form shape. Two
+  the stylesheet's palette onto it. Same colours as the chrome, form shape. Two
   ImGui-default behaviours are corrected on the way: `WindowBg`/`PopupBg` are ~94 % opaque (right for a
   debug overlay on a 3D scene, wrong here — the viewport's empty-state hint ghosted through), and the
   tab bar fills the *unselected* tabs while leaving the selected one to blend into the page, which
@@ -447,11 +449,11 @@ for, which the win shell applies.
   contents), on the next image where re-fitting under the user would be (open-fit, tonemap, flipbook
   playback defaults), and on the next launch for `instance-mode`. *Not yet:* hot-reloading
   `config.toml` when it changes on disk (only the displayed image is watched — §10).
-- **Accent color:** the highlight throughout the **chrome** (pressed toolbar buttons, the latched
-  channel/backdrop keys) is the user's **system accent**, read via `GetSysColor(COLOR_HIGHLIGHT)` —
-  which Windows 10/11 set from the accent, so no undocumented API or registry read is needed. The
-  text drawn *on* it flips to black for a pale accent. Re-read on theme/accent change. The settings
-  window is outside this: it is stock ImGui, blue and all.
+- **Accent color:** the highlight throughout the UI (latched toolbar buttons, checkmarks, the selected
+  tab's rule) is the stylesheet's `accent` token — a color you set per mode in `ui/theme.toml`, not the
+  Windows accent. Anything drawn *on* it uses `contrast(accent)`, which picks black or white by
+  luminance, so a pale accent doesn't produce white-on-yellow. The settings window uses the same token,
+  which is what keeps the two windows recognizably one app.
 - **Future:** a third mode — compare two images side-by-side in one window, or tabs — is
   anticipated; it reuses the frame/child-view split (one view child per slot).
 

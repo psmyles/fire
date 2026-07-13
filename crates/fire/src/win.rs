@@ -69,7 +69,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
     WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DWMCOLORIZATIONCOLORCHANGED, WM_DPICHANGED, WM_DROPFILES, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_DPICHANGED, WM_DROPFILES, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
@@ -209,7 +209,7 @@ struct App {
     /// DPI-scaled chrome metrics (how tall the toolbar/status/transport are), which is what decides
     /// the image's sub-rect. Rebuilt on DPI change.
     metrics: Metrics,
-    /// Current theme. Re-read on `WM_SETTINGCHANGE` / `WM_DWMCOLORIZATIONCOLORCHANGED`.
+    /// Current theme (which of the stylesheet's two palettes). Re-read on `WM_SETTINGCHANGE`.
     dark: bool,
     dpi: u32,
     /// Event-driven render pump: frames still owed. ImGui needs a frame or two after an input to
@@ -1917,11 +1917,10 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.restyle();
             0
         }
-        // A light/dark switch arrives as WM_SETTINGCHANGE (along with much else); an accent-color
-        // change arrives as WM_DWMCOLORIZATIONCOLORCHANGED. Both mean "re-read the theme".
-        WM_SETTINGCHANGE | WM_DWMCOLORIZATIONCOLORCHANGED => {
-            // The accent can move without the light/dark mode changing, so restyle unconditionally
-            // rather than gating on `dark != app.dark` (that was a real bug in the GDI chrome).
+        // A light/dark switch arrives as WM_SETTINGCHANGE (along with much else), and it is the only
+        // theme input the app still takes from the system: every color, accent included, is the
+        // stylesheet's. So this re-reads the preference and re-picks the palette it selects.
+        WM_SETTINGCHANGE => {
             app.dark = chrome::system_uses_dark_mode();
             app.restyle();
             chrome::apply_dark_titlebar(hwnd, app.dark);

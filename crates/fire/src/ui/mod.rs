@@ -14,7 +14,7 @@
 pub mod settings;
 pub mod theme;
 
-use dear_imgui_rs::{Condition, StyleColor, TextureId, Ui, WindowFlags};
+use dear_imgui_rs::{Condition, StyleColor, StyleVar, TextureId, Ui, WindowFlags};
 
 use crate::chrome::{Action, ViewSnapshot};
 use crate::config::{Config, MenuEntry};
@@ -384,6 +384,76 @@ fn hint_chip(ui: &Ui, g: Grid, m: &Metrics, image: (f32, f32, f32, f32), out: &m
         });
 }
 
+/// A checkbox whose box is **exactly** `size` logical px on a side — the stylesheet's
+/// `checkbox_size` (`0` = leave it to the style's frame padding, i.e. ImGui's own sizing).
+///
+/// ImGui has no checkbox-size style var: the box is a square of `GetFrameHeight()`, i.e.
+/// `font size + 2 × frame_padding.y`. Frame padding can't go negative, so *while the label is part of
+/// the widget* the font size is a hard floor on the box — which is exactly the thing a checkbox
+/// doesn't need, because unlike a button or an input it has no text inside it to make room for.
+///
+/// So the two are separated here. The box is submitted with a hidden label, under a pushed **font
+/// size** of `size` and zero frame padding — which makes `GetFrameHeight()`, and therefore the
+/// square, exactly `size`, at any font. ImGui still draws it (frame, hover, active, and a check mark
+/// it scales to the box); we only decide how big it is. The label is then drawn as ordinary text, in
+/// the real font, centred against the box.
+///
+/// Wrapped in a group, so the caller's `is_item_hovered()` still covers the whole control — the box
+/// *and* its label — as it would for a plain `ui.checkbox`.
+pub(crate) fn checkbox(ui: &Ui, label: &str, v: &mut bool, size: f32) -> bool {
+    let style = ui.clone_style();
+    if size <= 0.0 {
+        return ui.checkbox(label, v);
+    }
+    // Logical → physical, and never so small it can't be hit.
+    let dpi = style.font_scale_dpi().max(0.01);
+    let px = (size * dpi).round().max(6.0);
+    // What to *push*. ImGui's live font size is `FontSizeBase × FontScaleMain × FontScaleDpi`
+    // (imgui.cpp: "GetFontSize() == style.FontSizeBase * …"), and `push_font_with_size` sets the
+    // **base** — so pushing the physical `px` would have it scaled by the DPI a second time, and on a
+    // 150% monitor a 16 px box comes out 36. Divide the scaling back out and the square lands on `px`.
+    let base = px / (dpi * style.font_scale_main().max(0.01));
+
+    // The row keeps the height ImGui's own checkbox would have given it — a frame — and the box and
+    // the label are both centred in it. That is what keeps a *small* box on the same centre line as
+    // the controls beside it (the transport's number fields) and leaves the settings rows exactly as
+    // tall as they were. A box *bigger* than a frame grows the row instead, like any other widget.
+    let line = ui.text_line_height();
+    let row_h = ui.frame_height().max(px);
+    let y0 = ui.cursor_pos_y();
+    let box_y = y0 + ((row_h - px) * 0.5).round();
+    let text_y = y0 + ((row_h - line) * 0.5).round();
+
+    ui.group(|| {
+        let x0 = ui.cursor_pos_x();
+        ui.set_cursor_pos([x0, box_y]);
+        let mut changed = {
+            let _font = ui.push_font_with_size(None, base);
+            let _pad = ui.push_style_var(StyleVar::FramePadding([0.0, 0.0]));
+            ui.checkbox(format!("##{label}"), v)
+        };
+
+        // The label is placed by **cursor, not `same_line`** — and that is load-bearing. ImGui renders
+        // text at `cursor.y + CurrLineTextBaseOffset`, and `SameLine` restores that offset from the
+        // line we are standing on: on the transport row it is the *number fields'* frame padding, so
+        // the label came out 8 px below the box. After an item the offset is zero, and setting the
+        // cursor leaves it there — so the y we compute is the y the text lands on.
+        let label_x = x0 + px + style.item_inner_spacing()[0];
+        ui.set_cursor_pos([label_x, text_y]);
+        ui.text(label);
+
+        // Clicking the label toggles, as it does on ImGui's own checkbox — it is half the control, not
+        // decoration. Laid *over* the text (which takes no input), never over the box, so the box keeps
+        // its own hover and active feedback.
+        ui.set_cursor_pos([label_x, text_y]);
+        if ui.invisible_button(format!("##{label}-hit"), [text_w(ui, label), line]) {
+            *v = !*v;
+            changed = true;
+        }
+        changed
+    })
+}
+
 /// Physical size of one toolbar button: the icon plus the frame padding the style gives it. Both
 /// come from the stylesheet via [`Metrics`], so the layout and ImGui cannot disagree about how wide
 /// a button is.
@@ -691,6 +761,13 @@ fn transport_band(
         .size([w, m.transport_h], Condition::Always)
         .flags(BAR)
         .build(|| {
+            // The band *is* a row of controls, so `[chrome.controls] input_height` is pushed over the
+            // whole of it — the fields, the slider, and the play button that lines up with them. The
+            // checkbox pushes its own size on top, below. Everything measured from here (`fh`, the
+            // field widths) is therefore measured at the size these will actually be drawn.
+            let controls = theme::current().chrome.controls;
+            let _p = theme::push_control(ui, controls.input_height, 0.0);
+
             let style = ui.clone_style();
             let spacing = style.item_spacing()[0];
             let inner = style.item_inner_spacing()[0];
@@ -762,7 +839,14 @@ fn transport_band(
             // Reserve the *widest* readout this clip can produce, or the slider would resize under
             // the cursor every time the frame number crossed a power of ten.
             let readout_w = text_w(ui, &format!("{total} / {total}"));
-            let blend_w = fh + inner + text_w(ui, "Blend");
+            // The box is a square of its own size (see `checkbox`), which is not the row's frame
+            // height — so the column is measured from that, not from `fh`.
+            let box_w = if controls.checkbox_size > 0.0 {
+                (controls.checkbox_size * m.scale).round()
+            } else {
+                fh
+            };
+            let blend_w = box_w + inner + text_w(ui, "Blend");
             let right_w =
                 readout_w + spacing + fps_w + inner + text_w(ui, "fps") + spacing * 2.0 + blend_w;
             let right_x = w - pad - right_w;
@@ -803,7 +887,7 @@ fn transport_band(
             ui.text("fps");
 
             ui.same_line_with_spacing(0.0, spacing * 2.0);
-            if ui.checkbox("Blend", &mut blend) {
+            if checkbox(ui, "Blend", &mut blend, controls.checkbox_size) {
                 out.edits.push(TransportEdit::ToggleBlend);
             }
             if ui.is_item_hovered() {

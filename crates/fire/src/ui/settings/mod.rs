@@ -27,7 +27,7 @@
 
 pub mod model;
 
-use dear_imgui_rs::{StyleColor, TabBarFlags, Ui};
+use dear_imgui_rs::{StyleColor, StyleStackToken, TabBarFlags, TabItemToken, Ui};
 
 use crate::config::Config;
 use crate::keybinds::{KeyAction, KeyChord, Keybinds, ALL_ACTIONS};
@@ -35,6 +35,7 @@ use crate::render::imgui::{center_next_window, size_next_window, FormStyle};
 
 use model::{BoolField, ChoiceField, NumField, TextField, {self as m}};
 
+use super::theme;
 use super::{text_w, Frame};
 
 /// The popup's ImGui id *and* its title bar.
@@ -169,7 +170,7 @@ pub fn build(
 ) {
     // Everything from here to the end of the function is drawn in the settings window's own style —
     // fire's colors on ImGui's *form* geometry, not the chrome's toolbar geometry.
-    super::theme::form(base.style_mut(), dark, scale);
+    theme::form(base.style_mut(), dark, scale);
     let _style = base.push();
 
     if !st.requested {
@@ -178,7 +179,7 @@ pub fn build(
     }
     // A proportion of the viewport, not a size: resizable from there, and no pixel width anywhere in
     // this module for a font or a DPI change to invalidate. (`[form] open_fraction` in theme.toml.)
-    let open = super::theme::current().form.open_fraction;
+    let open = theme::current().form.open_fraction;
     center_next_window(client);
     size_next_window((client.0 * open[0], client.1 * open[1]));
 
@@ -194,7 +195,13 @@ pub fn build(
         // that much, so OK/Cancel/Apply sit on the window's bottom edge at any size, and the
         // scrollbar covers the settings rather than the buttons.
         let style = ui.clone_style();
-        let footer = ui.frame_height() + style.item_spacing()[1] * 2.0 + style.separator_size();
+        // Measured *as a button* — `[form.controls] button_height` can make the footer row taller or
+        // shorter than a default frame, and the reserve has to be the height it will actually be.
+        let row_h = {
+            let _p = size_button(ui);
+            ui.frame_height()
+        };
+        let footer = row_h + style.item_spacing()[1] * 2.0 + style.separator_size();
         tabs(ui, st, footer, out);
 
         ui.separator();
@@ -209,32 +216,92 @@ pub fn build(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Control sizes (`[form.controls]`)
+// ---------------------------------------------------------------------------------------------
+//
+// ImGui sizes a tab, an input and a button the same way — `font size + 2 × frame_padding.y` — so the
+// style alone cannot make one of them tight and leave the others roomy. `theme::push_control` pushes
+// a frame padding around *one* widget to do that, and every widget below goes through one of these
+// scopes.
+//
+// The **checkbox is not one of them**: its box has no text inside it, so the font size has no
+// business being its floor, and it gets a size of its own — see [`super::checkbox`].
+
+/// The stylesheet's control sizes for this window. Cheap: an `Arc` read, and a frame is only drawn
+/// when something happened.
+fn controls() -> theme::FormControls {
+    theme::current().form.controls
+}
+
+fn size_input(ui: &Ui) -> Option<StyleStackToken<'_>> {
+    theme::push_control(ui, controls().input_height, 0.0)
+}
+
+fn size_button(ui: &Ui) -> Option<StyleStackToken<'_>> {
+    let c = controls();
+    theme::push_control(ui, c.button_height, c.button_padding_x)
+}
+
+fn size_tab(ui: &Ui) -> Option<StyleStackToken<'_>> {
+    let c = controls();
+    theme::push_control(ui, c.tab_height, c.tab_padding_x)
+}
+
+/// A button at the stylesheet's button size. `w = 0.0` sizes it to its label.
+fn button(ui: &Ui, label: impl AsRef<str>, w: f32) -> bool {
+    let _p = size_button(ui);
+    ui.button_with_size(label, [w, 0.0])
+}
+
+/// Width of a button that fits `label` — measured under the button's *own* padding, so a
+/// `button_padding_x` shows up in the width as well as the height.
+fn button_w(ui: &Ui, label: &str) -> f32 {
+    let _p = size_button(ui);
+    text_w(ui, label) + ui.clone_style().frame_padding()[0] * 2.0
+}
+
+/// One tab, submitted under the tab size — and *only* the tab: the guard drops before the caller
+/// draws the tab's contents, which are inputs and buttons with sizes of their own.
+fn tab<'ui>(ui: &'ui Ui, label: &str) -> Option<TabItemToken<'ui>> {
+    let _p = size_tab(ui);
+    ui.tab_item(label)
+}
+
 fn tabs(ui: &Ui, st: &mut State, footer: f32, out: &mut Frame) {
     // Full width, and everything down to the footer. Every tab is the same box, so the window doesn't
     // jump when you switch between them.
     let size = [0.0, -footer];
     // The accent rule along the selected tab's top edge is opt-in — `TabSelectedOverline` is a color
     // ImGui won't draw at all without this flag.
-    let Some(_bar) = ui.tab_bar_with_flags("##tabs", TabBarFlags::DRAW_SELECTED_OVERLINE) else {
+    //
+    // The bar's height is fixed at `BeginTabBar` (from the frame padding *then*), and each tab's is
+    // fixed at its own submission — so the tab size is pushed here and again in `tab`, and dropped
+    // before the tab's contents.
+    let bar = {
+        let _p = size_tab(ui);
+        ui.tab_bar_with_flags("##tabs", TabBarFlags::DRAW_SELECTED_OVERLINE)
+    };
+    let Some(_bar) = bar else {
         return;
     };
 
-    if let Some(_tab) = ui.tab_item("General") {
+    if let Some(_tab) = tab(ui, "General") {
         ui.child_window("##general")
             .size(size)
             .build(ui, || general(ui, st));
     }
-    if let Some(_tab) = ui.tab_item("Flipbook") {
+    if let Some(_tab) = tab(ui, "Flipbook") {
         ui.child_window("##flipbook")
             .size(size)
             .build(ui, || flipbook(ui, st));
     }
-    if let Some(_tab) = ui.tab_item("Keybinds") {
+    if let Some(_tab) = tab(ui, "Keybinds") {
         ui.child_window("##keybinds")
             .size(size)
             .build(ui, || keybinds(ui, st));
     }
-    if let Some(_tab) = ui.tab_item("Context menu") {
+    if let Some(_tab) = tab(ui, "Context menu") {
         ui.child_window("##context")
             .size(size)
             .build(ui, || context_menu(ui, st, out));
@@ -351,7 +418,7 @@ fn keybinds(ui: &Ui, st: &mut State) {
         .map(|a| text_w(ui, a.label()))
         .fold(0.0f32, f32::max)
         + spacing * 2.0;
-    let reset_w = text_w(ui, "Reset") + style.frame_padding()[0] * 2.0;
+    let reset_w = button_w(ui, "Reset");
 
     let mut group = "";
     for action in ALL_ACTIONS.iter().copied() {
@@ -359,6 +426,9 @@ fn keybinds(ui: &Ui, st: &mut State) {
             group = action.group();
             ui.separator_with_text(group);
         }
+
+        // The row *is* two buttons and a label aligned to them, so it is sized as one.
+        let _p = size_button(ui);
 
         // Everything read out of `st` up front: the buttons below take `&mut st`.
         let capturing = st.capture == Some(action);
@@ -403,7 +473,7 @@ fn keybinds(ui: &Ui, st: &mut State) {
 
     ui.spacing();
     ui.separator();
-    if ui.button("Restore all defaults") {
+    if button(ui, "Restore all defaults", 0.0) {
         st.keys = Keybinds::defaults();
         st.sync_keys();
         st.capture = None;
@@ -469,7 +539,7 @@ fn context_menu(ui: &Ui, st: &mut State, out: &mut Frame) {
     let sel = st.sel.clone();
     let has_sel = sel.is_some();
 
-    if ui.button("Add item") {
+    if button(ui, "Add item", 0.0) {
         st.sel = Some(m::insert_after(
             &mut st.draft.open_with,
             sel.as_deref(),
@@ -477,7 +547,7 @@ fn context_menu(ui: &Ui, st: &mut State, out: &mut Frame) {
         ));
     }
     ui.same_line();
-    if ui.button("Add submenu") {
+    if button(ui, "Add submenu", 0.0) {
         st.sel = Some(m::insert_after(
             &mut st.draft.open_with,
             sel.as_deref(),
@@ -487,7 +557,7 @@ fn context_menu(ui: &Ui, st: &mut State, out: &mut Frame) {
     ui.same_line();
 
     let _dis = (!has_sel).then(|| ui.begin_disabled());
-    if ui.button("Remove") {
+    if button(ui, "Remove", 0.0) {
         if let Some(p) = &sel {
             st.sel = m::remove_at(&mut st.draft.open_with, p);
         }
@@ -499,7 +569,7 @@ fn context_menu(ui: &Ui, st: &mut State, out: &mut Frame) {
         ("|\u{2190}", Move::Outdent),
     ] {
         ui.same_line();
-        if ui.button(label) {
+        if button(ui, label, 0.0) {
             if let Some(p) = &sel {
                 let moved = match op {
                     Move::Up => m::move_sibling(&mut st.draft.open_with, p, -1),
@@ -544,8 +614,11 @@ fn detail_form(ui: &Ui, st: &mut State, out: &mut Frame) {
 
     let labels: Vec<&str> = TEXT_FIELDS.iter().map(|f| f.label()).collect();
     let lw = label_col(ui, &labels);
+    let browse_w = button_w(ui, "Browse\u{2026}");
+
+    // This form is text boxes; the one button in it pushes its own size, on top of this.
+    let _p = size_input(ui);
     let style = ui.clone_style();
-    let browse_w = text_w(ui, "Browse\u{2026}") + style.frame_padding()[0] * 2.0;
 
     ui.spacing();
     let w = row(ui, TEXT_FIELDS[0].label(), lw);
@@ -571,7 +644,7 @@ fn detail_form(ui: &Ui, st: &mut State, out: &mut Frame) {
     }
     ui.same_line();
     // The file picker pumps its own modal loop, so the shell runs it once this paint has finished.
-    if ui.button_with_size("Browse\u{2026}", [browse_w, 0.0]) {
+    if button(ui, "Browse\u{2026}", browse_w) {
         out.settings_browse = true;
     }
 
@@ -594,6 +667,9 @@ fn write_field(st: &mut State, path: &[usize], i: usize) {
 /// OK / Cancel / Apply, right-aligned on the window's bottom edge. Apply is live exactly while there
 /// is something to apply.
 fn buttons(ui: &Ui, st: &mut State, out: &mut Frame) {
+    // One push for the whole row — so the three buttons, and the width measured for them, are all
+    // the size `[form.controls]` asks for.
+    let _p = size_button(ui);
     let style = ui.clone_style();
     let spacing = style.item_spacing()[0];
     // All three get the width of the widest, so they read as one set of choices rather than three
@@ -628,12 +704,17 @@ fn buttons(ui: &Ui, st: &mut State, out: &mut Frame) {
 
 fn check(ui: &Ui, st: &mut State, f: BoolField, label: &str) {
     let mut v = f.get(&st.draft);
-    if ui.checkbox(label, &mut v) {
+    // `super::checkbox`, not `ui.checkbox`: the box is sized on its own (`[form.controls]
+    // checkbox_size`), which ImGui's own checkbox cannot do — see the comment there.
+    if super::checkbox(ui, label, &mut v, controls().checkbox_size) {
         f.set(&mut st.draft, v);
     }
 }
 
 fn choice(ui: &Ui, st: &mut State, label_w: f32, f: ChoiceField, label: &str) {
+    // Pushed before `row`, so the label's `align_text_to_frame_padding` centres it on the control it
+    // labels rather than on a control of the default height.
+    let _p = size_input(ui);
     let w = row(ui, label, label_w);
     let mut i = f.get(&st.draft);
     ui.set_next_item_width(w);
@@ -648,6 +729,7 @@ fn choice(ui: &Ui, st: &mut State, label_w: f32, f: ChoiceField, label: &str) {
 /// checked against each other in `model`'s tests), so a value out of range can't be produced here in
 /// the first place. Ctrl+click still lets you type one.
 fn num(ui: &Ui, st: &mut State, label_w: f32, f: NumField, label: &str) {
+    let _p = size_input(ui);
     let w = row(ui, label, label_w);
     let (min, max, _, dp) = f.spec();
     let mut v = f.get(&st.draft);

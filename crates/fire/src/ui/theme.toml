@@ -1,7 +1,7 @@
 ####################################################################################################
 #  fire — the stylesheet.
 #
-#  Every colour, metric and spacing value the UI draws with is in this file. Nothing visual is
+#  Every color, metric and spacing value the UI draws with is in this file. Nothing visual is
 #  hard-coded in the Rust any more: `ui/theme.rs` loads this, resolves it, and hands it to ImGui.
 #
 #  HOT RELOAD (debug builds only)
@@ -16,18 +16,18 @@
 #    apply time — write what you want to see on a 100% display and HiDPI follows. Border *widths*
 #    are the exception: they stay 1 physical px, because a 1.5 px hairline is a blurry hairline.
 #
-#  COLOURS
-#    A colour is a string, and it is one of:
+#  COLORS
+#    A color is a string, and it is one of:
 #      "#rgb" / "#rrggbb" / "#rrggbbaa"   a literal (alpha defaults to ff)
 #      "none"                             fully transparent
-#      "accent"                           the user's Windows accent colour (see [accent])
 #      "<token>"                          a name from the [colors.dark] / [colors.light] block below
 #      "lift(X, 0.08)"                    X nudged one step brighter — or darker, if X is already
-#                                         bright. This is how a hover state is derived from a colour
-#                                         nobody knows at authoring time (the accent).
+#                                         bright. A hover state, without hand-picking a second shade
+#                                         for every token.
 #      "alpha(X, 0.45)"                   X at that opacity
-#      "contrast(X)"                      black or white, whichever stays readable *on* X. A user
-#                                         whose accent is pale yellow must not get white-on-yellow.
+#      "contrast(X)"                      black or white, whichever stays readable *on* X — so an
+#                                         accent-filled button's label follows the accent you set,
+#                                         and a pale accent doesn't get white-on-yellow.
 #    They nest: "lift(alpha(accent, 0.5), 0.1)" is legal, if unwise.
 #
 #  THE TWO STYLES, AND WHY THEY ARE TWO
@@ -43,35 +43,27 @@
 [font]
 # Base UI font size (Segoe UI). Everything else that measures text — the status bar's height, the
 # settings window's label column, the transport's number fields — follows from this.
-size = 14.0
+size = 16.0
 # Toolbar icon edge. The atlas is re-rastered from the source SVGs at this size × the DPI scale, so
 # changing it stays crisp (and, on hot reload, re-rasters immediately).
 icon_size = 16.0
-
-
-# ── The accent ────────────────────────────────────────────────────────────────────────────────────
-# "accent" in any colour below means the highlight colour the user chose in Windows Settings, read
-# from COLOR_HIGHLIGHT. To pin the app to a fixed accent instead, replace the "accent" uses below
-# with a literal — nothing else needs to change.
-[accent]
-# Used when the system highlight is unusable (see the luminance guards below).
-fallback = "#0078d7"
-# A near-black or near-white highlight would make accent-filled buttons unreadable against their own
-# text, so a system accent outside this band (0–255, Rec. 709 weights) falls back.
-min_luminance = 24.0
-max_luminance = 232.0
-# "contrast(X)" returns black above this relative luminance (0..1), white below it.
-contrast_threshold = 0.59
 
 
 # ── The palette ───────────────────────────────────────────────────────────────────────────────────
 # The semantic tokens, once per mode. Everything in [chrome.colors] and [form.colors] is written in
 # terms of these, so re-skinning the app is a matter of editing these two blocks — you can also add
 # your own tokens here and refer to them by name.
+[colors]
+# "contrast(X)" returns black above this relative luminance (0..1) and white below it. It is what
+# keeps a label legible on an accent-filled button whatever accent you pick; nudge it if a particular
+# accent lands on the wrong side of the line.
+contrast_threshold = 0.59
+
 [colors.dark]
-surface    = "#2b2b2b"   # the chrome's fill: toolbar, transport, popups, the settings window
+accent     = "#186ea0"   # the "this one is chosen" color: latched buttons, checkmarks, the tab rule
+surface    = "#1e1e1e"   # the chrome's fill: toolbar, transport, popups, the settings window
 sunken     = "#1e1e1e"   # one step back from the surface: the status bar, the settings title bar
-text       = "#e0e0e0"
+text       = "#ffffff"
 text_dim   = "#8c8c8c"   # disabled buttons, secondary readouts
 hover      = "#3c3c3c"   # the "pointer is on me" fill, and the settings window's button fill
 separator  = "#3c3c3c"   # toolbar group dividers, rules, scrollbar grabs
@@ -80,7 +72,8 @@ field      = "#1a1a1a"   # a text input is a *hole* in the surface, so it is dar
 view_clear = "#000000"   # the backdrop behind/around the image when nothing is loaded
 
 [colors.light]
-surface    = "#f0f0f0"
+accent     = "#0078d7"
+surface    = "#ffffff"
 sunken     = "#e6e6e6"
 text       = "#141414"
 text_dim   = "#6e6e6e"
@@ -100,21 +93,21 @@ toolbar_h   = 38.0
 status_h    = 24.0
 transport_h = 34.0
 # Gap between the window edge and the first/last toolbar button.
-edge_pad = 8.0
+edge_pad = 4.0
 # Gap between the window edge and the status bar's text.
 status_pad = 8.0
 # How far below the top of the image the flipbook hint chip floats.
 chip_offset_y = 12.0
 # The group divider between toolbar button groups: a 1 px rule spanning this fraction of the
 # toolbar's height (0.0 = top edge, 1.0 = bottom). Full height would look like a table.
-divider_top    = 0.28
-divider_bottom = 0.72
+divider_top    = 0.2
+divider_bottom = 0.8
 # Line spacing of the two-line "Drop an image here" hint, as a multiple of the line height.
 empty_hint_line_gap = 1.5
 
 [chrome.geom]
 # Padding *inside* a toolbar button — so a button is icon_size + 2×frame_padding on each axis.
-frame_padding = [7.0, 4.0]
+frame_padding = [6.0, 5.0]
 # Gap between adjacent buttons ([x, y]; only x shows on a one-row bar).
 item_spacing = [3.0, 4.0]
 # Gap between a widget and its own label/parts (the transport's "24" and its "fps").
@@ -141,6 +134,13 @@ frame_border  = 0.0
 popup_border  = 1.0
 image_border  = 0.0
 
+[chrome.controls]
+# See [form.controls] below for what these are and why they exist. The flipbook transport is the only
+# place in the chrome with real controls in it. These are *separate* from the form's: the two styles
+# are separate, so a checkbox is only the same size in both windows if you say so in both.
+checkbox_size = 16.0   # the "Blend" box — an exact square edge (unlike the rest, no font floor)
+input_height  = 0.0    # the cols/rows/count/fps fields, the scrub slider, the play button
+
 [chrome.colors]
 text          = "text"
 text_disabled = "text_dim"
@@ -166,12 +166,18 @@ header_hovered = "hover"
 header_active  = "accent"
 slider_grab        = "accent"
 slider_grab_active = "accent"
-check_mark         = "accent"
+# The transport's "Blend" box. A *checked* box is filled with checkbox_selected_bg and the tick is
+# drawn on top of it in check_mark — set both, or half the box is ImGui's default and it won't match
+# the settings window's. These are the same two values [form.colors] uses, on purpose: same control,
+# same look. (The corner radius is each style's own `frame_rounding`, so it still differs — the
+# chrome is square-ish, the form is rounder. Make them equal if you'd rather.)
+checkbox_selected_bg = "accent"
+check_mark           = "contrast(accent)"
 scrollbar_bg           = "none"
 scrollbar_grab         = "separator"
 scrollbar_grab_hovered = "hover"
 scrollbar_grab_active  = "accent"
-# Not ImGui style colours — fire's own two fills.
+# Not ImGui style colors — fire's own two fills.
 # The status bar sits on its own, slightly deeper, fill.
 status_bg = "sunken"
 # What the GPU clears the window to: the letterbox around the image, and the empty viewport.
@@ -193,15 +199,15 @@ frame_padding      = [8.0, 5.0]
 item_spacing       = [8.0, 6.0]
 item_inner_spacing = [6.0, 4.0]
 indent_spacing     = 16.0
-scrollbar_size     = 13.0
+scrollbar_size     = 12.0
 grab_min_size      = 12.0
 window_rounding    = 6.0
 child_rounding     = 4.0
 frame_rounding     = 4.0
 popup_rounding     = 4.0
 grab_rounding      = 4.0
-scrollbar_rounding = 4.0
-tab_rounding       = 4.0
+scrollbar_rounding = 2.0
+tab_rounding       = 0.0
 # Thickness of the accent rule along the selected tab's top edge.
 tab_bar_overline   = 2.0
 window_border = 1.0
@@ -209,6 +215,31 @@ child_border  = 1.0
 frame_border  = 0.0
 popup_border  = 1.0
 image_border  = 0.0
+
+[form.controls]
+# ── Control sizes ─────────────────────────────────────────────────────────────────────────────────
+# ImGui has no "tab height" and no "checkbox size". It derives *every* control's height the same way:
+#
+#       height = [font] size  +  2 × frame_padding.y
+#
+# …which is why raising frame_padding above to give the text boxes room also inflates the tab strip.
+# These knobs break that tie: each applies to one class of control and nothing else. Logical px.
+#
+#   0 = leave it to frame_padding (the default, and what the app looked like before these existed)
+#
+# For anything with text *inside* it — a tab, an input, a button — **the font size is the floor**:
+# ImGui gives it room for its own label, and padding cannot go negative. Ask for less than
+# [font] size and you simply get zero padding. To go below it, shrink the font.
+#
+# **checkbox_size is the exception, and is exact.** A checkbox has no text in its box, so nothing
+# floors it: the box is drawn separately from its label and comes out exactly this many px, at any
+# font. Write 14 and you get a 14 px box next to 16 px text.
+checkbox_size    = 16.0
+input_height     = 0.0   # text boxes, combos, sliders
+button_height    = 0.0
+button_padding_x = 0.0   # padding *inside* a button — also what makes OK/Cancel/Apply wide
+tab_height       = 24.0
+tab_padding_x    = 0.0
 
 [form.colors]
 text          = "text"
@@ -232,7 +263,7 @@ button         = "hover"
 button_hovered = "lift(hover, 0.08)"
 button_active  = "accent"
 # Everything that says "this one is chosen" wears the accent — the same one the toolbar latches
-# with, so the two windows are recognisably the same app.
+# with, so the two windows are recognizably the same app.
 check_mark           = "contrast(accent)"   # the tick drawn *on* the accent-filled box
 checkbox_selected_bg = "accent"
 slider_grab          = "accent"
