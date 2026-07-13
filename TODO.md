@@ -2,3 +2,8 @@
 - tracy integration
 - settings: custom background color (needs a `Params` cbuffer + shader extension)
 - settings: hot-reload `config.toml` on external edits (architecture.md §9 claims this)
+
+
+- overlay when settings window is open should be dark instead of bright
+- toolbar buttons need to be square instead of rectangles
+- 

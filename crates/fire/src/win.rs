@@ -136,42 +136,32 @@ const CARET_TIMER_ID: usize = 4;
 /// the phase changes look continuous.
 const CARET_BLINK_MS: u32 = 33;
 
-/// Timer tick used while crossfading (blend on): a fixed ~60 Hz so the fractional position (and its
-/// crossfade) advances smoothly. Blend off ticks at the frame rate instead (one texture step).
-const FLIPBOOK_BLEND_TICK_MS: u32 = 16;
+/// The flipbook playback timer's interval: a fixed ~60 Hz, whatever the sheet's frame rate and
+/// whether or not it is crossfading.
+///
+/// **This timer neither paces the animation nor, normally, the frames.** [`App::advance_flipbook`]
+/// derives the position from elapsed time, so the sheet plays at its own `fps` no matter when we
+/// sample it; and while the window is visible, each frame is asked for by the *previous* frame's
+/// present, which blocks until vblank and so paces playback at exactly the display's refresh rate
+/// (see [`App::render`]). What this timer does is **start** playback's pump and **carry** it when
+/// the present can't: an occluded window, where DXGI stops blocking.
+///
+/// It cannot be the pacer, and that is the point. `SetTimer` bottoms out near the system tick —
+/// ~15.6 ms — which is slower than a single refresh on a 120 Hz panel. Anything slower than the
+/// refresh leaves the pump unfed: the two frames [`App::redraw`] asks for land back to back, one
+/// refresh apart, and then nothing until the next tick, so the position gets sampled at uneven
+/// intervals. Uneven sampling of smooth motion is exactly what the eye reads as jitter in the
+/// transport bar — and it is why moving the mouse made playback look *better* rather than worse:
+/// mouse input feeds the pump at 125–1000 Hz, comfortably above any refresh rate.
+///
+/// Pinning the interval also removes a foot-gun. It used to be `1000/fps`, which at low frame rates
+/// grew *longer* than [`MAX_FLIPBOOK_STEP`] — so a normal tick was clamped like a stall and playback
+/// crawled. With the tick fixed that can't arise, and the cap means only what it says.
+const FLIPBOOK_TICK_MS: u32 = 16;
 
 /// Cap on the playback dt applied per tick, so a stall (modal loop, sleep) doesn't jump the
-/// animation far ahead when ticks resume — it just loses time, like the GIF path. A *floor* on the
-/// cap, not the cap itself: see [`flipbook_dt_cap`].
+/// animation far ahead when ticks resume — it just loses time, like the GIF path.
 const MAX_FLIPBOOK_STEP: f32 = 0.25;
-
-/// How often flipbook playback ticks for this state, in milliseconds: a fixed ~60 Hz while
-/// crossfading (the fractional position has to move smoothly between cells), otherwise once per
-/// frame at the sheet's own rate.
-///
-/// The single source of truth for the interval, deliberately: [`App::sync_flipbook_timer`] arms the
-/// timer with it and [`flipbook_dt_cap`] paces against it, and when those two disagreed, blend-off
-/// playback below 4 fps silently ran at a fraction of its speed.
-fn flipbook_tick_ms(s: &FlipbookState) -> u32 {
-    if s.blend {
-        FLIPBOOK_BLEND_TICK_MS
-    } else {
-        (1000.0 / s.fps).clamp(8.0, 60_000.0) as u32
-    }
-}
-
-/// The largest dt a single playback tick may credit.
-///
-/// [`MAX_FLIPBOOK_STEP`] alone is wrong whenever the timer's own interval is *longer* than it: at
-/// 1 fps with blend off the timer fires once a second, and capping that tick at 0.25 s would credit
-/// a quarter of a frame and then reset the clock — losing the other 0.75 s every tick, so playback
-/// crawls at `0.25 × fps²` instead of `fps` (at the 0.1 fps minimum, one frame every 40 s rather
-/// than every 10). So the cap is the interval, floored at [`MAX_FLIPBOOK_STEP`]: a normal tick is
-/// always credited in full, while a genuine stall — which is many intervals long — still clamps to
-/// a single step instead of jumping the animation ahead.
-fn flipbook_dt_cap(s: &FlipbookState) -> f32 {
-    MAX_FLIPBOOK_STEP.max(flipbook_tick_ms(s) as f32 / 1000.0)
-}
 
 /// Project a per-path [`FlipbookState`] to the surface's render parameters.
 fn surface_flipbook(s: FlipbookState) -> FlipbookParams {
@@ -580,6 +570,13 @@ impl App {
         e.enabled.then(|| e.state.clone()).flatten()
     }
 
+    /// Whether flipbook playback is actually running — i.e. whether a frame drawn now will differ
+    /// from the last one, and so whether [`App::render`] should ask for another after it.
+    fn flipbook_playing(&self) -> bool {
+        self.flipbook_state()
+            .is_some_and(|s| s.playing && s.frame_count > 1)
+    }
+
     /// Whether the transport band is shown (flipbook active, windowed).
     fn transport_visible(&self) -> bool {
         !self.fullscreen && self.flipbook_state().is_some()
@@ -632,7 +629,7 @@ impl App {
     fn sync_flipbook_timer(&mut self) {
         let tick = self
             .flipbook_state()
-            .and_then(|s| (s.playing && s.frame_count > 1).then(|| flipbook_tick_ms(&s)));
+            .and_then(|s| (s.playing && s.frame_count > 1).then_some(FLIPBOOK_TICK_MS));
         match tick {
             Some(t) => {
                 self.flipbook_last_tick = Some(Instant::now());
@@ -674,10 +671,9 @@ impl App {
             return false;
         }
         let now = Instant::now();
-        let cap = flipbook_dt_cap(s);
         let dt = self
             .flipbook_last_tick
-            .map(|t| (now - t).as_secs_f32().min(cap))
+            .map(|t| (now - t).as_secs_f32().min(MAX_FLIPBOOK_STEP))
             .unwrap_or(0.0);
         s.frame_pos = (s.frame_pos + dt * s.fps).rem_euclid(s.frame_count as f32);
         let pos = s.frame_pos;
@@ -1319,7 +1315,23 @@ impl App {
         self.settings = settings;
         self.menu = menu;
 
-        self.surface.present();
+        // **Playback is paced by the present, not by a timer.** `present` returned only once the
+        // display had taken the frame (sync interval 1 blocks until vblank), so asking for another
+        // one here paces the next exactly one refresh later — 120 Hz on a 120 Hz panel, whatever the
+        // sheet's fps — and `advance_flipbook` samples the position once per refresh, evenly. That
+        // even sampling is the whole point: the motion the eye follows is the transport bar's, and a
+        // Win32 timer cannot clock it (`SetTimer` bottoms out around 15.6 ms — slower than a single
+        // refresh at 120 Hz), which is why the timer alone still jittered. See [`FLIPBOOK_TICK_MS`].
+        //
+        // It terminates: at most one frame is owed at a time, and it is only asked for while
+        // something is actually playing — a paused flipbook or a still image is back to costing
+        // nothing. If the present *didn't* wait (occluded window: DXGI returns immediately), pacing
+        // on it would spin, so we don't, and the timer carries playback until the window is visible.
+        let presented = self.surface.present();
+        if presented && self.flipbook_playing() {
+            self.request_frames(1);
+        }
+
         self.sync_caret_timer();
         self.apply_ui(frame);
     }

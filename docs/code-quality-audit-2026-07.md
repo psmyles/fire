@@ -4,7 +4,7 @@ Whole-workspace review of `fire` v0.1.4 at commit `721015e` (clean tree, 2026-07
 File references are `path:line`, as of the original review.
 
 > **Status: acted on.** The findings below have since been fixed in the working tree — see
-> [§9 Resolution](#9-resolution) for what changed, what was deliberately *not* done, and the
+
 > three additional bugs that surfaced while fixing them (including an uninitialized-memory
 > read in the PSD C++ boundary). Line numbers in §3–§6 refer to the code *as found*, so they
 > no longer all resolve; the findings are kept verbatim as the record of what was wrong.
@@ -398,14 +398,26 @@ bombs, which it now refuses with a clean error instead of aborting.
   comments to satisfy a lint, which is how SAFETY comments become noise reviewers skip. The reason
   is recorded in `Cargo.toml` next to the commented-out lint.
 
-### Known gap, still open
+### The zune hot path — also closed
 
-**The zune hot path is still bounded only per-axis.** zune exposes no total-size option and
-`Image::read` decodes in one shot, so there is no point at which dimensions can be seen and refused
-— `check_dims` is unreachable from there. A crafted file under the cap on both axes but huge in
-product (a 65535×65535 JPEG ≈ 17 GiB) can still force an aborting allocation. Closing it means
-probing each zune format's header before decode; the constraint is documented at `decode_zune`.
-This is the one part of §3 that is *not* fixed, and it is the widest-used backend.
+Initially left open, since zune exposes no total-size option and `Image::read` parses the header and
+allocates the pixels in one shot, never handing back the dimensions in between. The way through is
+`DecoderTrait::read_headers()`, which every format routed to zune implements: `check_zune_dims`
+parses the header a *second* time on a throwaway decoder purely to have somewhere to refuse, then
+applies the same `check_dims` byte budget as every other backend.
+
+The second parse was measured rather than assumed, because decode speed is the project's primary
+metric: **13.6 µs against a 129 ms decode** on a 4928×3264 JPEG — **0.011%**. It reads marker bytes
+and no pixels, so it scales with header size, not image size (7.5 µs on a 4 MP file) and does not
+grow with the images it protects.
+
+Verified end-to-end: a 197 KB progressive JPEG patched to declare 65535×65535 (~17 GiB) is now
+refused by the shipped exe with `JPEG 65535x65535 needs more than the 4294967296-byte decode guard`,
+where it previously would have asked the allocator for 17 GiB and aborted. `zune_read_headers_is_not_vacuous`
+pins the probe against a future zune upgrade silently dropping a `read_headers` impl and turning the
+guard into a no-op.
+
+**Every decode backend is now bounded by the product, not just the axes.**
 
 ## 8. Suggested order of attack
 

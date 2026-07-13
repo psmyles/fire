@@ -660,6 +660,51 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     })
 }
 
+/// Refuse an oversized zune source *before* [`decode_zune`]'s `Image::read` allocates from its
+/// header.
+///
+/// The zune path decodes in one shot — `Image::read` parses the header and allocates the pixels
+/// without ever handing us the dimensions in between — so the header is parsed a *second* time
+/// here, on a throwaway decoder, purely to have somewhere to say no. zune's
+/// `set_max_width`/`set_max_height` bound each axis independently and nothing bounds the *product*,
+/// so a 65535×65535 JPEG sits under both caps while asking for ~17 GiB.
+///
+/// Decode speed is this project's primary metric, so the second parse was measured rather than
+/// assumed: **13.6 µs against a 129 ms decode** on a 4928×3264 JPEG — 0.011%, because it reads
+/// marker bytes and no pixels. It scales with header size, not image size (7.5 µs on a 4 MP file),
+/// so it does not grow with the images it protects.
+///
+/// Every format routed here implements `read_headers` (`zune_read_headers_is_not_vacuous` pins
+/// that); a decoder that did not would fall back to zune's per-axis caps alone.
+fn check_zune_dims(
+    bytes: &[u8],
+    fmt: zune_image::codecs::ImageFormat,
+    opts: zune_core::options::DecoderOptions,
+) -> Result<(), DecodeError> {
+    use zune_core::bit_depth::BitDepth;
+    use zune_core::bytestream::ZCursor;
+
+    let mut decoder = fmt
+        .decoder_with_options(ZCursor::new(bytes), opts)
+        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let headers = decoder
+        .read_headers()
+        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let Some(md) = headers else {
+        return Ok(());
+    };
+
+    let (width, height) = md.dimensions();
+    // `decode_zune` normalizes every colorspace to RGBA at the source's bit depth, so *that* is the
+    // buffer being sized — not the source's own channel count.
+    let bpp = match md.depth() {
+        BitDepth::Sixteen => 8,
+        BitDepth::Float32 => 16,
+        _ => 4,
+    };
+    check_dims(width, height, bpp, zune_format_name(fmt))
+}
+
 /// The hot path: zune for JPEG/BMP/QOI/PPM/WebP/farbfeld/JPEG-XL. Decoded with
 /// the speed-first options, normalized to interleaved RGBA in the source bit depth, and
 /// carrying the embedded ICC profile where the format exposes one.
@@ -678,16 +723,13 @@ fn decode_zune(
     // Speed is the project's top metric: enable platform intrinsics + unsafe fast paths.
     // Raise the dimension guard well past zune's 16384 default so large sources decode
     // (the downscale pass shrinks anything beyond the caller's max_dim afterwards).
-    //
-    // NOTE: unlike the other backends this is a *per-axis* cap only — zune offers no total-size
-    // option, and `Image::read` decodes in one shot, so there is no point at which we can see the
-    // dimensions and still refuse ([`check_dims`] is unreachable from here). A crafted file that
-    // stays under the cap on both axes but multiplies out huge (a 65535×65535 JPEG ≈ 17 GiB) can
-    // therefore still force an allocation that aborts the process. Closing it means probing each
-    // zune format's header before decoding; until then this cap is the only bound.
     let opts = DecoderOptions::new_fast()
         .set_max_width(MAX_DECODE_DIM)
         .set_max_height(MAX_DECODE_DIM);
+
+    // zune's options cap each *axis* but nothing caps the product, which is what actually gets
+    // allocated — so this is the guard that matters, and it has to happen before `Image::read`.
+    check_zune_dims(bytes, fmt, opts)?;
 
     let mut image =
         Image::read(ZCursor::new(bytes), opts).map_err(|e| DecodeError::Malformed(e.to_string()))?;
@@ -1595,6 +1637,83 @@ mod tests {
         // The budget divides the byte cap by the canvas size, and is clamped to the frame ceiling.
         let tiny_canvas_budget = (MAX_ANIMATION_BYTES / (4 * 4 * 4)).min(MAX_ANIMATION_FRAMES);
         assert_eq!(tiny_canvas_budget, MAX_ANIMATION_FRAMES);
+    }
+
+    /// The zune hot path is guarded by the *product*, not just each axis — the case its own
+    /// `set_max_width`/`set_max_height` options cannot express.
+    ///
+    /// A real 8×8 JPEG with its SOF dimensions overwritten to 65535×65535: a ~300-byte file that
+    /// declares 4.3 gigapixels, i.e. ~17 GiB of RGBA. Both axes are under the 131072 per-axis cap,
+    /// so zune would have accepted it and allocated — and an allocation that fails aborts the
+    /// process, which no `catch_unwind` can catch.
+    #[test]
+    fn zune_jpeg_decode_bomb_is_rejected_by_the_byte_budget() {
+        let mut jpg = encode(
+            &image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)),
+            image::ImageFormat::Jpeg,
+        );
+
+        // Find SOF0 (FF C0) and overwrite its 16-bit height and width fields.
+        // Segment layout: FF, C0, len(2), precision(1), height(2), width(2).
+        let sof = jpg
+            .windows(2)
+            .position(|w| w == [0xFF, 0xC0])
+            .expect("baseline JPEG has an SOF0");
+        jpg[sof + 5..sof + 7].copy_from_slice(&u16::MAX.to_be_bytes()); // height
+        jpg[sof + 7..sof + 9].copy_from_slice(&u16::MAX.to_be_bytes()); // width
+        assert!(jpg.len() < 1000, "the bomb is a tiny file: {} bytes", jpg.len());
+
+        let err = decode(&jpg, Some("jpg"), &DecodeOptions::default())
+            .expect_err("a 65535x65535 JPEG must be refused before zune allocates");
+        assert!(err.to_string().contains("decode guard"), "{err}");
+    }
+
+    /// Same shape, different container: BMP declares its dimensions as two `i32`s in the DIB
+    /// header, so the bomb is two field writes.
+    #[test]
+    fn zune_bmp_decode_bomb_is_rejected_by_the_byte_budget() {
+        let mut bmp = encode(
+            &image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4)),
+            image::ImageFormat::Bmp,
+        );
+        // BITMAPINFOHEADER: width at byte 18, height at byte 22 (little-endian i32).
+        bmp[18..22].copy_from_slice(&40_000i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&40_000i32.to_le_bytes());
+
+        let err = decode(&bmp, Some("bmp"), &DecodeOptions::default())
+            .expect_err("a 40000x40000 BMP (6.4 GiB of RGBA) must be refused");
+        assert!(err.to_string().contains("decode guard"), "{err}");
+    }
+
+    /// The zune guard reads its dimensions from `read_headers`, whose trait default is
+    /// `Ok(None)` — i.e. "no metadata", which [`check_zune_dims`] treats as "cannot check".
+    /// If a zune upgrade ever dropped that impl for a format we route, the guard would quietly
+    /// become a no-op and every test above would still pass. So assert the probe actually sees a
+    /// size for each format on the hot path.
+    #[test]
+    fn zune_read_headers_is_not_vacuous() {
+        use zune_core::bytestream::ZCursor;
+        use zune_core::options::DecoderOptions;
+        use zune_image::codecs::ImageFormat;
+
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(7, 5));
+        for (fmt, bytes) in [
+            (ImageFormat::JPEG, encode(&img, image::ImageFormat::Jpeg)),
+            (ImageFormat::BMP, encode(&img, image::ImageFormat::Bmp)),
+        ] {
+            let mut dec = fmt
+                .decoder_with_options(ZCursor::new(&bytes), DecoderOptions::new_fast())
+                .expect("decoder");
+            let md = dec
+                .read_headers()
+                .expect("headers parse")
+                .unwrap_or_else(|| panic!("{fmt:?} reports no metadata — the size guard is blind"));
+            assert_eq!(
+                md.dimensions(),
+                (7, 5),
+                "{fmt:?} header dimensions feed check_dims; they must be the real ones"
+            );
+        }
     }
 
     /// CRC-32 (IEEE) for building the PNG fixture above.

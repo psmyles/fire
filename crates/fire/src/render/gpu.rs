@@ -48,6 +48,9 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
     DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
+// Lives in Foundation, not Dxgi: it is an HRESULT, and a *success* one — `Present` returning it
+// means "the frame was accepted but nobody is looking", not that anything failed.
+use windows::Win32::Foundation::DXGI_STATUS_OCCLUDED;
 
 use windows_sys::Win32::Foundation::HWND as SysHwnd;
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
@@ -747,10 +750,18 @@ impl GpuSurface {
     }
 
     /// Present the completed frame, vsync-paced.
-    pub fn present(&mut self) {
+    ///
+    /// Returns whether the present actually **waited on the display**. Normally it does — sync
+    /// interval 1 blocks until vblank — and that wait is what the win shell paces continuous
+    /// playback on, in place of a Win32 timer it cannot clock fast enough (see
+    /// [`FLIPBOOK_TICK_MS`](crate::win::FLIPBOOK_TICK_MS)). But DXGI returns
+    /// `DXGI_STATUS_OCCLUDED` *immediately* when the window is hidden or fully covered, and a
+    /// caller pacing itself on a present that no longer blocks would spin as fast as it could
+    /// render. Saying so lets it fall back to the timer.
+    pub fn present(&mut self) -> bool {
         unsafe {
             // Sync interval 1 → vsync-paced (tear-free); event-driven, so no idle frames.
-            let _ = self.swapchain.Present(1, DXGI_PRESENT(0));
+            self.swapchain.Present(1, DXGI_PRESENT(0)) != DXGI_STATUS_OCCLUDED
         }
     }
 
