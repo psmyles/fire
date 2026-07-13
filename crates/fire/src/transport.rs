@@ -17,6 +17,10 @@ pub enum TransportEdit {
     SetFps(f32),
     ToggleBlend,
     TogglePlay,
+    /// Stop playback. **Idempotent, and that is the point** — it is emitted for as long as the user
+    /// holds the scrub bar (see [`crate::ui`]), which is every frame of a drag, so a `TogglePlay`
+    /// there would flicker between playing and paused instead of pausing.
+    Pause,
     /// Fractional playback position from the slider (snapped to an integer when blend is off).
     Scrub(f32),
 }

@@ -863,11 +863,26 @@ fn transport_band(
             ui.set_next_item_width(slider_w);
             // The number lives in the readout, so the track shows none: an empty format, not a
             // hidden label.
-            if ui
+            let scrubbed = ui
                 .slider_config("##pos", 0.0f32, last)
                 .display_format("")
-                .build(&mut pos)
-            {
+                .build(&mut pos);
+
+            // **Touching the bar takes playback off the clock, before anything else this frame.**
+            // `is_item_active` is the mouse being *held* on the slider — true from the press, so a
+            // click pauses even if it lands where the playhead already was and moves nothing.
+            // Without this, playback keeps advancing under the cursor and fights the drag: the shader
+            // takes its cell from `frame_pos`, and the timer would overwrite whatever was just
+            // scrubbed a few milliseconds later.
+            //
+            // It is `Pause`, not `TogglePlay`, because this is true on *every* frame of a drag — a
+            // toggle would flicker. And it is pushed **before** the scrub, so the two land in the
+            // right order; the `t.playing` guard means only the first frame of the drag emits it, so
+            // the rest of the drag stays on `Scrub`'s cheap path (no timer work, no param push).
+            if t.playing && ui.is_item_active() {
+                out.edits.push(TransportEdit::Pause);
+            }
+            if scrubbed {
                 // With crossfade off there is nothing between frames to land on.
                 out.edits
                     .push(TransportEdit::Scrub(if t.blend { pos } else { pos.floor() }));

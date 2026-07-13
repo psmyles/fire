@@ -749,6 +749,7 @@ impl App {
                 TransportEdit::SetFps(f) => s.fps = f,
                 TransportEdit::ToggleBlend => s.blend = !s.blend,
                 TransportEdit::TogglePlay => s.playing = !s.playing,
+                TransportEdit::Pause => s.playing = false,
                 TransportEdit::Scrub(pos) => s.frame_pos = pos,
             }
             s.clamp();
