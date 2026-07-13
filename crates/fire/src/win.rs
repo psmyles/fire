@@ -109,6 +109,12 @@ pub const WM_APP_FLIPBOOK_GUESS: u32 = WM_APP + 6;
 /// **only** thing in the app that needs this treatment — the popup menus and the settings window
 /// itself are ImGui, and pump nothing.
 pub const WM_APP_SETTINGS_BROWSE: u32 = WM_APP + 10;
+/// `ui/theme.toml` changed on disk and the new stylesheet is already live (see [`crate::hotstyle`],
+/// debug builds only). No payload — the UI thread re-derives everything the stylesheet feeds:
+/// metrics, both ImGui styles, the icon atlas, the clear color. Handled unconditionally so the
+/// reload path is the same code a release build would run; only the *watcher* that posts it is
+/// debug-gated.
+pub const WM_APP_THEME_RELOADED: u32 = WM_APP + 11;
 
 /// A completed sibling-image scan, delivered to the UI thread (boxed, via the message LPARAM).
 /// The win shell turns it into a [`Folder`] cursor once it confirms it's still current.
@@ -1252,6 +1258,21 @@ impl App {
         }
     }
 
+    /// Re-derive everything that comes out of the stylesheet, and repaint.
+    ///
+    /// The single path for "the app's *look* has to change": a DPI change (metrics and the icon
+    /// raster move), a light/dark or accent switch (colors move), and — in a debug build — an edit to
+    /// `ui/theme.toml` (any of it can move). Cheap: the icon atlas is only re-rastered if its
+    /// physical size actually changed, and everything else is a few dozen struct writes.
+    fn restyle(&mut self) {
+        self.metrics = Metrics::new(self.dpi);
+        crate::ui::theme::apply(self.imgui.style_mut(), self.dark, self.metrics.scale);
+        self.imgui.refresh_icons(self.surface.device());
+        self.surface
+            .set_clear(crate::ui::theme::view_clear_packed(self.dark));
+        self.redraw();
+    }
+
     /// Draw one frame: clear, the image into its sub-rect, then the whole UI over it, then present.
     ///
     /// This is the entire paint path — the `WM_PAINT` handler is a call to this. Note the ordering
@@ -1473,7 +1494,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             fh.max(1),
             cfg.fit_upscale,
         );
-        surface.set_clear(crate::chrome::Palette::for_mode(dark).view_clear_packed());
+        surface.set_clear(crate::ui::theme::view_clear_packed(dark));
         // The view-related config the surface owns (backdrop / open-fit / tonemap defaults). Same
         // path the settings dialog re-runs on Apply — see `App::apply_view_config`.
         apply_view_config(&mut surface, &cfg);
@@ -1486,6 +1507,11 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             dpi,
         );
         crate::ui::theme::apply(imgui.style_mut(), dark, metrics.scale);
+
+        // Debug only: watch `ui/theme.toml` in the source tree, so editing the stylesheet restyles
+        // this window without a rebuild. Posts WM_APP_THEME_RELOADED; compiled out of release.
+        #[cfg(debug_assertions)]
+        crate::hotstyle::spawn(frame as isize);
 
         // Workers and the pipe server post here (this window owns title/size/lifecycle).
         let pool = DecodePool::new(frame as isize);
@@ -1861,6 +1887,10 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.settings_browse();
             0
         }
+        WM_APP_THEME_RELOADED => {
+            app.restyle();
+            0
+        }
 
         // --- window / system -----------------------------------------------------------------
 
@@ -1883,26 +1913,18 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 );
             }
             app.dpi = new_dpi.max(96);
-            app.metrics = Metrics::new(app.dpi);
-            let (dark, scale) = (app.dark, app.metrics.scale);
-            app.imgui.set_dpi(app.surface.device(), app.dpi);
-            crate::ui::theme::apply(app.imgui.style_mut(), dark, scale);
-            app.redraw();
+            app.imgui.set_dpi(app.dpi);
+            app.restyle();
             0
         }
         // A light/dark switch arrives as WM_SETTINGCHANGE (along with much else); an accent-color
         // change arrives as WM_DWMCOLORIZATIONCOLORCHANGED. Both mean "re-read the theme".
         WM_SETTINGCHANGE | WM_DWMCOLORIZATIONCOLORCHANGED => {
-            let dark = chrome::system_uses_dark_mode();
             // The accent can move without the light/dark mode changing, so restyle unconditionally
             // rather than gating on `dark != app.dark` (that was a real bug in the GDI chrome).
-            app.dark = dark;
-            let scale = app.metrics.scale;
-            crate::ui::theme::apply(app.imgui.style_mut(), dark, scale);
-            app.surface
-                .set_clear(crate::chrome::Palette::for_mode(dark).view_clear_packed());
-            chrome::apply_dark_titlebar(hwnd, dark);
-            app.redraw();
+            app.dark = chrome::system_uses_dark_mode();
+            app.restyle();
+            chrome::apply_dark_titlebar(hwnd, app.dark);
             0
         }
         WM_CLOSE => {

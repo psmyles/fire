@@ -6,8 +6,9 @@
 //!
 //! * [`Action`] and [`ViewSnapshot`] — the command vocabulary and the read-only state the UI renders
 //!   from. Pure data; [`crate::ui`] reads them, the win shell applies them.
-//! * [`Palette`] — the light/dark color tokens, whose highlight is the user's **system accent**
-//!   ([`system_accent`], read from `COLOR_HIGHLIGHT`: documented, no registry poking).
+//! * [`system_highlight`] — the user's **system accent**, read from `COLOR_HIGHLIGHT` (documented,
+//!   no registry poking). The colors it feeds are in `ui/theme.toml`, not here: this module owns the
+//!   Win32 call, [`crate::ui::theme`] owns what the app does with it.
 //! * The dark title bar plumbing, which is a window-manager concern, not a paint one.
 //!
 //! Nothing here paints any more, and nothing here is GDI: the hand-painted Win32 settings dialog
@@ -221,97 +222,20 @@ impl ViewSnapshot {
     }
 }
 
-// --- palette ----------------------------------------------------------------
+// --- the system accent ------------------------------------------------------
 
-/// Light/dark color set for fire's **chrome** (the toolbar, status bar and transport). Values are GDI
-/// `COLORREF` (`0x00BBGGRR`); [`crate::ui::theme`] is the only consumer and converts them to ImGui's
-/// float RGBA. The settings window deliberately does *not* use this — it wears ImGui's stock style
-/// (see [`crate::ui::settings`]).
-#[derive(Clone, Copy)]
-pub(crate) struct Palette {
-    pub(crate) toolbar_bg: u32,
-    pub(crate) status_bg: u32,
-    pub(crate) text: u32,
-    pub(crate) text_dim: u32,
-    pub(crate) btn_hover: u32,
-    pub(crate) btn_active: u32,
-    pub(crate) separator: u32,
-    pub(crate) border: u32,
-    /// Letterbox / no-image backdrop.
-    view_clear: u32,
-}
-
-const fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
-}
-
-/// The blue we fall back to when the system highlight looks unusable (see [`system_accent`]).
-const DEFAULT_ACCENT: u32 = rgb(0, 120, 215);
-
-/// The user's accent color, as a GDI `COLORREF`.
+/// The user's accent color, raw, as a GDI `COLORREF` (`0x00BBGGRR`).
 ///
 /// `COLOR_HIGHLIGHT` is the *documented* way to read it: Windows 10/11 set the highlight (selection)
 /// color from the accent the user picks in Settings, so this tracks it with no undocumented API and
 /// no registry poking. It also does the right thing under a high-contrast theme, where the highlight
 /// is whatever that theme says it is.
 ///
-/// A near-black or near-white highlight would make our accent-filled buttons unreadable against
-/// their own text, so those degenerate values fall back to the shipped blue.
-pub fn system_accent() -> u32 {
-    let c = unsafe { GetSysColor(COLOR_HIGHLIGHT) };
-    let l = luminance(c);
-    if !(24.0..=232.0).contains(&l) {
-        return DEFAULT_ACCENT;
-    }
-    c
-}
-
-/// Perceptual-ish brightness of a `COLORREF`, 0..255. Rec. 709 weights on the raw sRGB bytes.
-fn luminance(c: u32) -> f32 {
-    let (r, g, b) = (
-        (c & 0xFF) as f32,
-        ((c >> 8) & 0xFF) as f32,
-        ((c >> 16) & 0xFF) as f32,
-    );
-    0.2126 * r + 0.7152 * g + 0.0722 * b
-}
-
-impl Palette {
-    pub(crate) fn for_mode(dark: bool) -> Self {
-        let accent = system_accent();
-        if dark {
-            Palette {
-                toolbar_bg: rgb(43, 43, 43),
-                status_bg: rgb(30, 30, 30),
-                text: rgb(224, 224, 224),
-                text_dim: rgb(140, 140, 140),
-                btn_hover: rgb(60, 60, 60),
-                btn_active: accent,
-                separator: rgb(60, 60, 60),
-                border: rgb(70, 70, 70),
-                view_clear: rgb(0, 0, 0),
-            }
-        } else {
-            Palette {
-                toolbar_bg: rgb(240, 240, 240),
-                status_bg: rgb(230, 230, 230),
-                text: rgb(20, 20, 20),
-                text_dim: rgb(110, 110, 110),
-                btn_hover: rgb(214, 214, 214),
-                btn_active: accent,
-                separator: rgb(200, 200, 200),
-                border: rgb(170, 170, 170),
-                view_clear: rgb(150, 150, 150),
-            }
-        }
-    }
-
-    /// The no-image backdrop as `0x00RRGGBB` packing (COLORREF is `0x00BBGGRR`), which is what the
-    /// GPU surface's clear color wants.
-    pub(crate) fn view_clear_packed(&self) -> u32 {
-        let c = self.view_clear;
-        ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF)
-    }
+/// Raw because the *policy* around it — the readability guard, and the blue it falls back to when the
+/// system highlight is so dark or so bright that nothing is legible on it — is a styling decision,
+/// and styling decisions live in `ui/theme.toml` (`[accent]`). This function is only the Win32 half.
+pub fn system_highlight() -> u32 {
+    unsafe { GetSysColor(COLOR_HIGHLIGHT) }
 }
 
 // --- dark mode / title bar --------------------------------------------------

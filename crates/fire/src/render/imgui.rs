@@ -49,9 +49,6 @@ unsafe extern "C" {
     fn dear_imgui_backend_dx11_shutdown();
 }
 
-/// Logical (96-dpi) icon edge. Scaled by DPI to get the physical raster size.
-const ICON_LOGICAL_PX: f32 = 16.0;
-
 pub struct Imgui {
     ctx: Context,
     /// The icon atlas. ImGui refers to it by raw SRV pointer, so both must outlive every frame that
@@ -59,6 +56,9 @@ pub struct Imgui {
     _icon_tex: Option<ID3D11Texture2D>,
     icon_srv: Option<ID3D11ShaderResourceView>,
     icon_id: TextureId,
+    /// Physical edge the atlas was last rastered at, so [`Imgui::refresh_icons`] can tell whether a
+    /// DPI or stylesheet change actually moved it.
+    icon_built_px: f32,
     dpi: u32,
     /// ImGui's factory style, captured at creation *before* [`crate::ui::theme`] overwrites it.
     /// The settings window is drawn with this — see [`StockStyle`].
@@ -201,10 +201,11 @@ impl Imgui {
             _icon_tex: None,
             icon_srv: None,
             icon_id: TextureId::new(0),
-            dpi: 0,
+            icon_built_px: 0.0,
+            dpi: dpi.max(96),
             stock,
         };
-        me.set_dpi(device, dpi);
+        me.refresh_icons(device);
         me
     }
 
@@ -236,31 +237,36 @@ impl Imgui {
         FormStyle(s)
     }
 
-    /// Physical icon edge for the current DPI.
+    /// Physical icon edge for the current DPI. The *logical* edge is a stylesheet value
+    /// (`[font] icon_size` in `ui/theme.toml`), so this moves on a hot reload as well as on a DPI
+    /// change — which is what [`Imgui::refresh_icons`] is for.
     pub fn icon_px(&self) -> f32 {
-        (ICON_LOGICAL_PX * self.dpi as f32 / 96.0).round()
+        (crate::ui::theme::current().font.icon_size * self.dpi as f32 / 96.0).round()
     }
-
 
     pub fn style_mut(&mut self) -> &mut dear_imgui_rs::Style {
         self.ctx.style_mut()
     }
 
-    /// Adopt a new DPI by re-rastering the icon atlas at the new physical size — the only real work,
-    /// since ImGui 1.92 re-bakes glyphs lazily. The *style* (including `font_scale_dpi`) is the
-    /// caller's job: it goes through [`crate::ui::theme::apply`], the one place metrics are decided.
-    /// No-op if the DPI hasn't moved.
-    pub fn set_dpi(&mut self, device: &ID3D11Device, dpi: u32) {
-        let dpi = dpi.max(96);
-        if dpi == self.dpi {
-            return;
+    /// Adopt a new DPI. ImGui 1.92 re-bakes *glyphs* lazily, so there is no font atlas to rebuild
+    /// and nothing else to do here; the icon atlas is a real raster and is the caller's next call
+    /// ([`Imgui::refresh_icons`]), and the style (including `font_scale_dpi`) goes through
+    /// [`crate::ui::theme::apply`] — the one place metrics are decided.
+    pub fn set_dpi(&mut self, dpi: u32) {
+        self.dpi = dpi.max(96);
+    }
+
+    /// Re-raster the icon atlas if the physical icon size has moved — a DPI change, or a stylesheet
+    /// edit. Cheap no-op when it hasn't, so the restyle path can call it unconditionally.
+    pub fn refresh_icons(&mut self, device: &ID3D11Device) {
+        if self.icon_px() != self.icon_built_px {
+            self.rebuild_icons(device);
         }
-        self.dpi = dpi;
-        self.rebuild_icons(device);
     }
 
     fn rebuild_icons(&mut self, device: &ID3D11Device) {
-        let n = self.icon_px() as usize;
+        let px = self.icon_px();
+        let n = px as usize;
         let (pixels, w) = icons::atlas(n);
 
         let desc = D3D11_TEXTURE2D_DESC {
@@ -311,6 +317,7 @@ impl Imgui {
         };
         self._icon_tex = tex;
         self.icon_srv = srv;
+        self.icon_built_px = px;
     }
 
     /// Feed a Win32 message to ImGui. `true` means ImGui consumed it and the shell should not.

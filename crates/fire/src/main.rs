@@ -19,6 +19,10 @@ mod flipbook;
 mod folder;
 mod foreground;
 mod forward;
+// Live-reload of `ui/theme.toml` into the running window. Debug only — a release build has no
+// source tree to watch and embeds the stylesheet instead.
+#[cfg(debug_assertions)]
+mod hotstyle;
 mod icons;
 mod ipc_server;
 mod keybinds;

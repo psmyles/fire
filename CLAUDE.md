@@ -79,9 +79,25 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   the only places that use the typed `windows` crate (typed COM); everything else uses `windows-sys`.
 - `render/view.rs` — pure pan/zoom/fit math + `Channel` (no Win32, unit-tested).
 - `ui/` — the whole UI, rebuilt every frame in immediate mode (`mod.rs` = toolbar / status bar /
-  transport band / hint chip / empty-state hint; `theme.rs` = style, colors, metrics; `settings/` =
-  the settings window). **Pure UI: no Win32, no COM, no GDI.** It reads a `ViewSnapshot` and returns a
-  `ui::Frame` of what the user asked for; the win shell applies it.
+  transport band / hint chip / empty-state hint; `theme.toml` + `theme.rs` = the stylesheet and its
+  loader; `settings/` = the settings window). **Pure UI: no Win32, no COM, no GDI.** It reads a
+  `ViewSnapshot` and returns a `ui::Frame` of what the user asked for; the win shell applies it.
+- `ui/theme.toml` — **the stylesheet: every color, metric and spacing value, in one commented file.**
+  Both palettes, both styles (chrome + settings form), the bar heights, paddings, roundings, the icon
+  and font size. Nothing visual is hardcoded in the Rust. Colors are a tiny grammar — `#hex`, `none`,
+  `accent` (the system accent), a token name from `[colors.dark]` / `[colors.light]`, and the derived
+  forms `lift(X, 0.08)` / `alpha(X, 0.45)` / `contrast(X)` — so a hover shade or a readable tick on an
+  accent nobody knows at authoring time stays *in the data*. `theme.rs` parses it, resolves it, and
+  maps a token to each ImGui `StyleColor`; that mapping is the only styling decision left in code.
+  **Tweak it and watch:** a debug build loads it from the source tree and `hotstyle.rs` watches it, so
+  saving the file restyles the running window (no rebuild). A release build embeds it with
+  `include_str!` and never reads the disk. A stylesheet is only installed once it parses *and* every
+  color resolves — a typo prints the offending key and leaves the last good one on screen — and the
+  `embedded_stylesheet_is_valid` test is why a broken one can't ship.
+- `hotstyle.rs` — the stylesheet watcher; **debug builds only** (`main.rs` doesn't declare the module
+  in release). Same discipline as `watcher.rs`: watch the directory (editors save by rename), debounce
+  the burst, and never touch the window from the thread — it posts `WM_APP_THEME_RELOADED` and the UI
+  thread runs `App::restyle` (metrics, both styles, the icon atlas, the clear color, repaint).
 - `ui/settings/` — the settings window, an ImGui `BeginPopupModal` (`mod.rs` = the modal + its four
   tabs; `model.rs` = pure field accessors + open-with tree edits, unit-tested). Two things it can't do
   itself are reported to the shell instead — "Browse…" (the file dialog pumps a modal loop) and keybind
@@ -96,12 +112,13 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
   is `content_region_avail − (the tab's longest label, measured in the live font)` — which both
   stretches the controls and aligns the labels into one column. Labels are drawn on the **left** with
   the widget given a hidden `##id`, because ImGui's native order is the reverse.
-- `chrome.rs` — despite the name, no longer paints anything, and is down to ~330 lines. What survives
-  is the shared *model* and *theme*: `Action` + `ViewSnapshot` (the command vocabulary and the state
-  the UI renders from), the light/dark `Palette` — whose highlight is the user's **system accent**
-  (`GetSysColor(COLOR_HIGHLIGHT)` tracks it: documented, no registry poking) — and `apply_dark_titlebar`
-  (documented DWM). **Every API it calls is documented**; the uxtheme ordinal hack went out with the
-  Win32 menus.
+- `chrome.rs` — despite the name, no longer paints anything, and no longer holds the palette either
+  (that moved to `ui/theme.toml`). What survives is the shared *model* and the Win32 half of the
+  theme: `Action` + `ViewSnapshot` (the command vocabulary and the state the UI renders from),
+  `system_highlight` — the user's **system accent**, `GetSysColor(COLOR_HIGHLIGHT)`: documented, no
+  registry poking (the *policy* around it, the fallback and the readability guard, is stylesheet
+  data) — and `apply_dark_titlebar` (documented DWM). **Every API it calls is documented**; the
+  uxtheme ordinal hack went out with the Win32 menus.
 - `decode_pool.rs` — off-thread worker pool (no async runtime).
 - `folder.rs` — sibling-image cursor behind ←/→ navigation + the status-bar count; pure scan/
   sort/cursor logic (no Win32, unit-tested), scanned off-thread and posted back to the frame.

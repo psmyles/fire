@@ -40,11 +40,6 @@ use super::{text_w, Frame};
 /// The popup's ImGui id *and* its title bar.
 const TITLE: &str = "Settings";
 
-/// The window's opening size as a fraction of the viewport. It is resizable from there, and ImGui
-/// clamps it to the screen — so this is a proportion, not a size, and there is no pixel width
-/// anywhere in this module for a font or a DPI to invalidate.
-const OPEN_FRACTION: (f32, f32) = (0.62, 0.78);
-
 /// Esc, read raw from the wndproc during a key capture (see [`State::capture_key`]).
 const VK_ESCAPE: u32 = 0x1B;
 
@@ -181,8 +176,11 @@ pub fn build(
         ui.open_popup(TITLE);
         st.requested = true;
     }
+    // A proportion of the viewport, not a size: resizable from there, and no pixel width anywhere in
+    // this module for a font or a DPI change to invalidate. (`[form] open_fraction` in theme.toml.)
+    let open = super::theme::current().form.open_fraction;
     center_next_window(client);
-    size_next_window((client.0 * OPEN_FRACTION.0, client.1 * OPEN_FRACTION.1));
+    size_next_window((client.0 * open[0], client.1 * open[1]));
 
     // `opened` gives the title bar its × — ImGui clears it and closes the popup in one go, so we
     // don't read it back; `is_popup_open` below is the single source of "ImGui closed it".

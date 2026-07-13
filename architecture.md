@@ -362,10 +362,23 @@ for, which the win shell applies.
   is scaled in `ui::theme::apply`, or the chrome stays 96-dpi-sized on a HiDPI monitor.
 - **Dark mode:** the system preference is read from the registry (`AppsUseLightTheme`); the title bar
   is darkened via `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)`; the ImGui style and the
-  letterbox backdrop come from `chrome::Palette`, whose highlight is the user's **system accent**
-  (`GetSysColor(COLOR_HIGHLIGHT)` — documented, no registry poking). `WM_SETTINGCHANGE` /
+  letterbox backdrop come from the light/dark token sets in the **stylesheet** (`ui/theme.toml`,
+  below), whose `accent` is the user's **system accent** (`GetSysColor(COLOR_HIGHLIGHT)` —
+  documented, no registry poking; `chrome::system_highlight`). `WM_SETTINGCHANGE` /
   `WM_DWMCOLORIZATIONCOLORCHANGED` re-skin live; the restyle is unconditional, because the accent can
   move without the light/dark mode changing.
+- **The stylesheet (`crates/fire/src/ui/theme.toml`):** every color, metric and spacing value the UI
+  draws with, in one commented file — the two styles (chrome and settings form), both palettes, the
+  bar heights, the paddings and roundings. Colors are a small grammar (`#hex`, `none`, `accent`, a
+  token name, `lift(X, a)`, `alpha(X, a)`, `contrast(X)`), so *derived* colors — a hover state, a
+  readable tick on an accent of unknown brightness — stay in the data rather than the code.
+  `ui::theme` parses it, resolves it against the mode's tokens and the live accent, and applies it;
+  the token → `StyleColor` mapping is the only styling decision left in Rust. **Release builds embed
+  it** (`include_str!`) and never touch the disk; **debug builds** load it from the source tree and
+  `hotstyle.rs` watches it — save the file and the running window restyles (`WM_APP_THEME_RELOADED` →
+  `App::restyle`: metrics, both styles, the icon atlas, the clear color, repaint). A stylesheet is
+  installed only once it parses *and* every color in it resolves, so a typo prints and changes
+  nothing rather than putting a broken window on screen.
 - **Icons:** `build.rs` still rasterizes the SVGs to A8 coverage masks; they are now packed into one
   RGBA8 **atlas strip** (white RGB, coverage in alpha) uploaded as a single D3D11 texture. ImGui's
   shader multiplies texel by vertex color, so `(1,1,1,a) * tint` gives any tint from one texture —

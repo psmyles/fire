@@ -218,7 +218,7 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
     // Empty state: no image and none loading. Purely decorative — OVERLAY takes no mouse input, so
     // the shell still sees the double-click that opens the file picker.
     if !snap.has_image && !snap.loading {
-        empty_hint(ui, image);
+        empty_hint(ui, m, image);
     }
 
     // The popups last, and outside any window — which is where ImGui expects them to live.
@@ -350,10 +350,7 @@ fn hint_chip(ui: &Ui, g: Grid, m: &Metrics, image: (f32, f32, f32, f32), out: &m
     let accent = ui.clone_style().color(StyleColor::ButtonActive);
 
     // Centered on the image, a little in from its top edge.
-    render::imgui::anchor_next_window(
-        (ix + iw * 0.5, iy + (12.0 * m.scale).round()),
-        (0.5, 0.0),
-    );
+    render::imgui::anchor_next_window((ix + iw * 0.5, iy + m.chip_offset_y), (0.5, 0.0));
 
     ui.window("##chip")
         .flags(BAR | WindowFlags::ALWAYS_AUTO_RESIZE)
@@ -387,11 +384,14 @@ fn hint_chip(ui: &Ui, g: Grid, m: &Metrics, image: (f32, f32, f32, f32), out: &m
         });
 }
 
-/// Physical size of one toolbar button.
+/// Physical size of one toolbar button: the icon plus the frame padding the style gives it. Both
+/// come from the stylesheet via [`Metrics`], so the layout and ImGui cannot disagree about how wide
+/// a button is.
 fn button_size(icon_px: f32, m: &Metrics) -> [f32; 2] {
-    let pad_x = (theme::FRAME_PAD_X * m.scale).round();
-    let pad_y = (theme::FRAME_PAD_Y * m.scale).round();
-    [icon_px + pad_x * 2.0, icon_px + pad_y * 2.0]
+    [
+        icon_px + m.button_pad[0] * 2.0,
+        icon_px + m.button_pad[1] * 2.0,
+    ]
 }
 
 fn toolbar(
@@ -404,7 +404,7 @@ fn toolbar(
     out: &mut Frame,
 ) {
     let bs = button_size(icon_px, m);
-    let spacing = (theme::ITEM_SPACING * m.scale).round();
+    let spacing = m.item_spacing;
     // A group divider: spacing, a 1px rule, spacing.
     let div_w = spacing * 2.0 + 1.0;
 
@@ -422,7 +422,7 @@ fn toolbar(
     // group collapses from its tail inward — same rule the GDI chrome used.
     let mut kept = candidates.clone();
     let mut dropped: Vec<Action> = Vec::new();
-    let edge = (8.0 * m.scale).round();
+    let edge = m.edge_pad;
     loop {
         let more_w = if dropped.is_empty() { 0.0 } else { bs[0] + spacing };
         let left_w = strip_width(
@@ -526,8 +526,8 @@ fn text_w(ui: &Ui, s: &str) -> f32 {
 fn divider(ui: &Ui, x: f32, m: &Metrics) {
     let c = ui.clone_style().color(StyleColor::Separator);
     let wp = ui.window_pos();
-    let top = wp[1] + (m.toolbar_h * 0.28).round();
-    let bot = wp[1] + (m.toolbar_h * 0.72).round();
+    let top = wp[1] + (m.toolbar_h * m.divider_top).round();
+    let bot = wp[1] + (m.toolbar_h * m.divider_bottom).round();
     ui.get_window_draw_list()
         .add_line([wp[0] + x, top], [wp[0] + x, bot], c)
         .build();
@@ -621,7 +621,7 @@ fn status_bar(ui: &Ui, snap: &ViewSnapshot, m: &Metrics, dark: bool, w: f32, h: 
         .size([w, m.status_h], Condition::Always)
         .flags(BAR)
         .build(|| {
-            let pad = (8.0 * m.scale).round();
+            let pad = m.status_pad;
             let y = ((m.status_h - ui.text_line_height()) * 0.5).round();
             ui.set_cursor_pos([pad, y]);
             ui.text(&snap.status_left);
@@ -634,7 +634,7 @@ fn status_bar(ui: &Ui, snap: &ViewSnapshot, m: &Metrics, dark: bool, w: f32, h: 
         });
 }
 
-fn empty_hint(ui: &Ui, image: (f32, f32, f32, f32)) {
+fn empty_hint(ui: &Ui, m: &Metrics, image: (f32, f32, f32, f32)) {
     let (x, y, w, h) = image;
     if w <= 0.0 || h <= 0.0 {
         return;
@@ -651,7 +651,8 @@ fn empty_hint(ui: &Ui, image: (f32, f32, f32, f32)) {
             let cy = (h * 0.5 - lh).round();
             for (i, s) in [LINE1, LINE2].iter().enumerate() {
                 let tw = text_w(ui, s);
-                ui.set_cursor_pos([((w - tw) * 0.5).round(), cy + i as f32 * lh * 1.5]);
+                let y = cy + i as f32 * lh * m.empty_hint_line_gap;
+                ui.set_cursor_pos([((w - tw) * 0.5).round(), y]);
                 if i == 0 {
                     ui.text(*s);
                 } else {
