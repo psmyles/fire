@@ -954,7 +954,14 @@ impl App {
         if self.settings.is_none() {
             self.settings = Some(crate::ui::settings::State::new(&self.cfg));
         }
-        self.redraw();
+        // Not `redraw()`: ImGui *fades* a modal's scrim in (`DimBgRatio += dt × 6` — 0.17 s of
+        // **drawn** time), and it advances only on the frames we actually draw. Two frames leave it
+        // at a tenth of its opacity and frozen there, until some unrelated input happens to pump
+        // another frame — which doesn't read as "the fade is stuck", it reads as "the dim is too
+        // weak". So ask for the fade's worth of frames. 0.17 s is ~11 frames at 60 Hz but ~24 here
+        // (an empty frame costs well under a vsync), hence the headroom; it still *terminates*, so
+        // the window is back to costing nothing the moment the scrim is up.
+        self.request_frames(32);
     }
 
     /// Whether a keybind row is armed and waiting for a key press.

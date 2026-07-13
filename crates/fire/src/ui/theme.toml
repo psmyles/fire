@@ -250,6 +250,14 @@ child_bg      = "none"
 border        = "border"
 border_shadow = "none"
 separator     = "separator"
+# The scrim over the rest of the window while this one is up. It is *this* style's color and not the
+# chrome's, even though the chrome is what gets dimmed: ImGui snapshots `ImGuiCol_ModalWindowDimBg`
+# into the window when the modal is **begun** (imgui.cpp, `Begin`) and paints the scrim from that
+# snapshot at end-frame — so the style in force is the one pushed around the settings window, i.e.
+# this one. Setting it on the chrome parses fine and does nothing at all.
+# Worth naming because ImGui's own default here is 80% **white** at 35% — a scrim that *brightens* a
+# dark app instead of dimming it.
+modal_dim_bg = "alpha(#000000, 0.45)"
 # The title bar reads as part of the window, not as a band across the top of it.
 title_bg           = "sunken"
 title_bg_active    = "sunken"

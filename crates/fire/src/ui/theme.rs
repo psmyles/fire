@@ -280,6 +280,11 @@ color_block!(FormColors {
     title_bg,
     title_bg_active,
     title_bg_collapsed,
+    // The scrim over the chrome while the settings window is up — and it is *this* style's color, not
+    // the chrome's, however backwards that reads. `Begin` copies `ImGuiCol_ModalWindowDimBg` into the
+    // modal window itself (`window->DC.ModalDimBgColor`), and end-frame paints the scrim from that
+    // copy — so what counts is the style pushed around this window, which is this one.
+    modal_dim_bg,
     frame_bg,
     frame_bg_hovered,
     frame_bg_active,
@@ -485,6 +490,10 @@ pub fn form(style: &mut Style, dark: bool, scale: f32) {
     style.set_color(StyleColor::TitleBg, cx.c(&c.title_bg));
     style.set_color(StyleColor::TitleBgActive, cx.c(&c.title_bg_active));
     style.set_color(StyleColor::TitleBgCollapsed, cx.c(&c.title_bg_collapsed));
+    // Read by `Begin`, not by the draw — see the field's comment. This style must be pushed *before*
+    // the settings window is begun (it is: `settings::build` pushes it first thing) or the scrim
+    // silently falls back to ImGui's white default.
+    style.set_color(StyleColor::ModalWindowDimBg, cx.c(&c.modal_dim_bg));
 
     style.set_color(StyleColor::FrameBg, cx.c(&c.frame_bg));
     style.set_color(StyleColor::FrameBgHovered, cx.c(&c.frame_bg_hovered));
