@@ -1,8 +1,10 @@
 //! GPU viewport: a Direct3D 11 renderer that presents the decoded image through a DXGI
-//! flip-model swapchain on the child "view" window. The image lives as a GPU texture (with a
-//! hardware mip chain), and pan/zoom/exposure/channel/tonemap are just constant-buffer
-//! values, so each frame is one textured fullscreen triangle: the per-frame CPU cost is ~an
-//! 80-byte upload + a draw call, and the GPU does the sampling and the whole color pipeline.
+//! flip-model swapchain covering the whole window's client area, drawing the image into a
+//! *sub-rect* of it (`App::image_rect`) with the ImGui chrome over the rest. The image lives as a
+//! GPU texture (with a hardware mip chain), and pan/zoom/exposure/channel/tonemap are just
+//! constant-buffer values, so each frame is one textured fullscreen triangle: the per-frame CPU
+//! cost is a 128-byte [`Params`] upload + a draw call, and the GPU does the sampling and the whole
+//! color pipeline.
 //!
 //! Panning changes a transform and the GPU re-samples the texture rather than re-running a
 //! per-pixel pipeline on the CPU. Presentation is vsync-paced through the flip-model swapchain
@@ -64,7 +66,7 @@ const ZOOM_DRAG_CLICK_SLOP: f32 = 5.0;
 
 /// Per-frame shader constants. Layout matches the HLSL `cbuffer` (16-byte float4 registers);
 /// keep the field order/padding in lockstep with the `Params` cbuffer in `render/shader.hlsl`.
-/// 112 bytes = 7 float4 registers.
+/// 128 bytes = 8 float4 registers — asserted below, so this comment cannot drift from the struct.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Params {
@@ -1163,7 +1165,7 @@ fn create_samplers(device: &ID3D11Device) -> (ID3D11SamplerState, ID3D11SamplerS
     }
 }
 
-/// Create the dynamic per-frame constant buffer ([`Params`], 80 bytes, 16-byte aligned).
+/// Create the dynamic per-frame constant buffer ([`Params`], 128 bytes, 16-byte aligned).
 fn create_const_buffer(device: &ID3D11Device) -> ID3D11Buffer {
     let desc = D3D11_BUFFER_DESC {
         ByteWidth: std::mem::size_of::<Params>() as u32,

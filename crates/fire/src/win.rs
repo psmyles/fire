@@ -113,9 +113,8 @@ pub const WM_APP_SETTINGS_BROWSE: u32 = WM_APP + 10;
 /// A completed sibling-image scan, delivered to the UI thread (boxed, via the message LPARAM).
 /// The win shell turns it into a [`Folder`] cursor once it confirms it's still current.
 struct FolderScan {
-    /// The issuing window's generation at scan time; used for stale-drop (same as decodes).
-    generation: u64,
-    /// The image whose folder was scanned; locates the cursor's starting index.
+    /// The image whose folder was scanned. Both the cursor's starting index *and* the staleness
+    /// check: see [`App::folder_scanned`] for why this, rather than a decode generation.
     path: PathBuf,
     /// Sorted sibling image paths in the folder.
     entries: Vec<PathBuf>,
@@ -142,8 +141,37 @@ const CARET_BLINK_MS: u32 = 33;
 const FLIPBOOK_BLEND_TICK_MS: u32 = 16;
 
 /// Cap on the playback dt applied per tick, so a stall (modal loop, sleep) doesn't jump the
-/// animation far ahead when ticks resume — it just loses time, like the GIF path.
+/// animation far ahead when ticks resume — it just loses time, like the GIF path. A *floor* on the
+/// cap, not the cap itself: see [`flipbook_dt_cap`].
 const MAX_FLIPBOOK_STEP: f32 = 0.25;
+
+/// How often flipbook playback ticks for this state, in milliseconds: a fixed ~60 Hz while
+/// crossfading (the fractional position has to move smoothly between cells), otherwise once per
+/// frame at the sheet's own rate.
+///
+/// The single source of truth for the interval, deliberately: [`App::sync_flipbook_timer`] arms the
+/// timer with it and [`flipbook_dt_cap`] paces against it, and when those two disagreed, blend-off
+/// playback below 4 fps silently ran at a fraction of its speed.
+fn flipbook_tick_ms(s: &FlipbookState) -> u32 {
+    if s.blend {
+        FLIPBOOK_BLEND_TICK_MS
+    } else {
+        (1000.0 / s.fps).clamp(8.0, 60_000.0) as u32
+    }
+}
+
+/// The largest dt a single playback tick may credit.
+///
+/// [`MAX_FLIPBOOK_STEP`] alone is wrong whenever the timer's own interval is *longer* than it: at
+/// 1 fps with blend off the timer fires once a second, and capping that tick at 0.25 s would credit
+/// a quarter of a frame and then reset the clock — losing the other 0.75 s every tick, so playback
+/// crawls at `0.25 × fps²` instead of `fps` (at the 0.1 fps minimum, one frame every 40 s rather
+/// than every 10). So the cap is the interval, floored at [`MAX_FLIPBOOK_STEP`]: a normal tick is
+/// always credited in full, while a genuine stall — which is many intervals long — still clamps to
+/// a single step instead of jumping the animation ahead.
+fn flipbook_dt_cap(s: &FlipbookState) -> f32 {
+    MAX_FLIPBOOK_STEP.max(flipbook_tick_ms(s) as f32 / 1000.0)
+}
 
 /// Project a per-path [`FlipbookState`] to the surface's render parameters.
 fn surface_flipbook(s: FlipbookState) -> FlipbookParams {
@@ -205,6 +233,17 @@ struct App {
     /// Full path of the image currently loaded (or loading) — the hot-reload target. `None`
     /// before the first open.
     current_path: Option<PathBuf>,
+    /// Full path of the image whose pixels are actually **on the surface**. Trails
+    /// [`Self::current_path`], which flips at *request* time: between the two, a decode is in
+    /// flight and the previous image is still the one being displayed.
+    ///
+    /// Everything the flipbook does keys off this rather than `current_path`, because the transport
+    /// band, its edits, and playback are all about the sheet the user is *looking at*. Keyed off
+    /// `current_path`, a slow decode (a big PSD/EXR is seconds) would show the incoming image's
+    /// transport over the outgoing image, apply the user's clicks to the incoming image's state,
+    /// and push the incoming image's playback position into the outgoing image's surface params —
+    /// visibly scrubbing a sheet the edits were never meant for. `None` when nothing is displayed.
+    shown_path: Option<PathBuf>,
     /// File-change watcher for hot-reload; `None` when disabled in config. Dropped with the
     /// `App`, which stops the watch thread.
     watcher: Option<FileWatcher>,
@@ -248,8 +287,8 @@ impl App {
         // Drop the old cursor immediately; the scan below rebuilds it (and the count fills in
         // after the image shows — lazy). Without this a stale "3 / 27" would linger until then.
         self.folder = None;
-        let generation = self.load(&req.path, req.flags.activate);
-        self.scan_folder(req.path, generation);
+        self.load(&req.path, req.flags.activate);
+        self.scan_folder(req.path);
     }
 
     /// Show the frame for `path`, raise it if `activate`, and enqueue the decode off-thread. The
@@ -333,17 +372,13 @@ impl App {
     /// Scan `path`'s folder for sibling images off the UI thread, posting the result back via
     /// `WM_APP_FOLDER_SCANNED`. Mirrors the decode pool's discipline: the worker never touches
     /// the window or renderer, only `PostMessage`s a boxed payload the wndproc reclaims.
-    fn scan_folder(&self, path: PathBuf, generation: u64) {
+    fn scan_folder(&self, path: PathBuf) {
         let frame = self.frame;
         let _ = std::thread::Builder::new()
             .name("fire-folder-scan".into())
             .spawn(move || {
                 let entries = folder::scan(&path);
-                let payload = Box::new(FolderScan {
-                    generation,
-                    path,
-                    entries,
-                });
+                let payload = Box::new(FolderScan { path, entries });
                 let lparam = Box::into_raw(payload) as isize;
                 // SAFETY: the box outlives the post; the UI thread reclaims it in the wndproc.
                 // If the window is gone the post fails — reclaim here so we don't leak.
@@ -355,11 +390,20 @@ impl App {
             });
     }
 
-    /// Adopt a finished folder scan as the navigation cursor, if it's still current (stale-drop
-    /// by generation, exactly like decodes). Refreshes the status bar so the count appears.
+    /// Adopt a finished folder scan as the navigation cursor, if it's still the image we're on.
+    /// Refreshes the status bar so the count appears.
+    ///
+    /// Stale-dropped by **path**, not by the decode generation the rest of the cross-thread posts
+    /// use. A folder cursor describes a *directory*, not a decode: a hot-reload re-decodes the same
+    /// file and bumps the generation, so a generation check would discard a scan that was still in
+    /// flight for the very image we are still showing — and discard it permanently, because `open`
+    /// already cleared the cursor and nothing but `open` starts a scan. ←/→ and the "n / m" count
+    /// would then stay dead for the rest of the session. The path is what actually identifies the
+    /// scan, and it still rejects the case the guard is for: a scan left over from a previous open
+    /// of a *different* image.
     fn folder_scanned(&mut self, scan: FolderScan) {
-        if scan.generation != self.surface.generation() {
-            return; // superseded by a newer open
+        if self.current_path.as_deref() != Some(scan.path.as_path()) {
+            return; // superseded by an open of a different image
         }
         self.folder = Folder::new(scan.entries, &scan.path);
         self.redraw();
@@ -399,6 +443,10 @@ impl App {
                     self.fail_load(&name, format!("failed: GPU upload ({e})"));
                     return;
                 }
+                // The surface now holds this image: from here the flipbook transport, its edits and
+                // its playback are about *this* path (see `shown_path`). Set before `apply_flipbook`
+                // below, which reads it.
+                self.shown_path = Some(outcome.path.clone());
                 set_title(self.frame, &format!("{}: {name}", crate::product::NAME));
                 self.surface.invalidate();
                 // A float source brings in the HDR group; an LDR one drops it — relayout either way.
@@ -443,6 +491,9 @@ impl App {
             self.frame,
             &format!("{}: {name} (failed)", crate::product::NAME),
         );
+        // Nothing is displayed any more, so nothing has a transport: `apply_flipbook` below reads
+        // this to clear the surface's flipbook params and kill the playback timer.
+        self.shown_path = None;
         self.surface.clear_image();
         self.surface.invalidate();
         self.redraw();
@@ -516,15 +567,16 @@ impl App {
 
     // --- flipbook (sprite-sheet) mode ------------------------------------------
 
-    /// The current image's per-path flipbook entry (created on demand).
+    /// The displayed image's per-path flipbook entry (created on demand). Keyed on
+    /// [`Self::shown_path`] — see that field for why not `current_path`.
     fn flipbook_entry(&mut self) -> Option<&mut PerPath> {
-        let path = self.current_path.clone()?;
+        let path = self.shown_path.clone()?;
         Some(self.flipbook.entry(path).or_default())
     }
 
-    /// A clone of the active flipbook state when the mode is enabled for the current image.
+    /// A clone of the active flipbook state when the mode is enabled for the displayed image.
     fn flipbook_state(&self) -> Option<FlipbookState> {
-        let e = self.flipbook.get(self.current_path.as_ref()?)?;
+        let e = self.flipbook.get(self.shown_path.as_ref()?)?;
         e.enabled.then(|| e.state.clone()).flatten()
     }
 
@@ -578,15 +630,9 @@ impl App {
 
     /// Arm/kill the flipbook playback timer to match the active state. Paused/off = no timer.
     fn sync_flipbook_timer(&mut self) {
-        let tick = self.flipbook_state().and_then(|s| {
-            (s.playing && s.frame_count > 1).then(|| {
-                if s.blend {
-                    FLIPBOOK_BLEND_TICK_MS
-                } else {
-                    (1000.0 / s.fps).clamp(8.0, 60_000.0) as u32
-                }
-            })
-        });
+        let tick = self
+            .flipbook_state()
+            .and_then(|s| (s.playing && s.frame_count > 1).then(|| flipbook_tick_ms(&s)));
         match tick {
             Some(t) => {
                 self.flipbook_last_tick = Some(Instant::now());
@@ -612,7 +658,7 @@ impl App {
     /// accumulate — and push the new position at the surface. Returns whether it advanced (i.e. the
     /// mode is on and playing); requests no frame of its own, so a paint can call it.
     fn advance_flipbook(&mut self) -> bool {
-        let Some(path) = self.current_path.clone() else {
+        let Some(path) = self.shown_path.clone() else {
             return false;
         };
         let Some(entry) = self.flipbook.get_mut(&path) else {
@@ -628,9 +674,10 @@ impl App {
             return false;
         }
         let now = Instant::now();
+        let cap = flipbook_dt_cap(s);
         let dt = self
             .flipbook_last_tick
-            .map(|t| (now - t).as_secs_f32().min(MAX_FLIPBOOK_STEP))
+            .map(|t| (now - t).as_secs_f32().min(cap))
             .unwrap_or(0.0);
         s.frame_pos = (s.frame_pos + dt * s.fps).rem_euclid(s.frame_count as f32);
         let pos = s.frame_pos;
@@ -644,7 +691,7 @@ impl App {
     /// it used to be its own layered popup window, with all the show/hide/reposition/minimize
     /// bookkeeping that implies. Now it is a function of state, evaluated per frame.
     fn chip_hint(&self) -> Option<Grid> {
-        let e = self.flipbook.get(self.current_path.as_ref()?)?;
+        let e = self.flipbook.get(self.shown_path.as_ref()?)?;
         if e.enabled || e.hint_dismissed {
             return None;
         }
@@ -668,7 +715,7 @@ impl App {
 
     /// Apply a transport edit to the active flipbook state, then sync the surface/timer/repaint.
     fn apply_transport_edit(&mut self, edit: TransportEdit) {
-        let Some(path) = self.current_path.clone() else {
+        let Some(path) = self.shown_path.clone() else {
             return;
         };
         let mut grid_changed = false;
@@ -707,17 +754,25 @@ impl App {
         if grid_changed {
             // A grid change refits to the new frame rect via set_flipbook.
             self.apply_flipbook();
-        } else if matches!(
-            edit,
-            TransportEdit::TogglePlay | TransportEdit::SetFps(_) | TransportEdit::ToggleBlend
-        ) {
-            // Play/fps/blend keep the grid but change playback (or the shader blend) and the timer.
+        } else if let TransportEdit::Scrub(_) = edit {
+            // Scrub is the only edit that moves nothing but the position — and it is the hot path
+            // (a slider drag), so it takes the cheap route: no re-fit, no timer work, no full
+            // param push, just the new position.
+            if let Some(s) = self.flipbook_state() {
+                self.surface.set_flipbook_pos(s.frame_pos);
+            }
+        } else {
+            // Everything else — count, play, fps, blend — changes what playback *resolves
+            // against*, not merely where it is. `frame_count` in particular is read by the shader
+            // to pick the cell (and the blend seam), and by `sync_flipbook_timer` to decide
+            // whether a timer should run at all: pushing only the position would leave the GPU
+            // resolving against the old count (playback stalling at the old last frame, or
+            // crossfading into a trimmed-off cell) and the timer armed for a state that no longer
+            // exists. `set_flipbook` re-fits only when the grid changes, so the user's pan/zoom
+            // survives this.
             let params = self.flipbook_state().map(surface_flipbook);
             self.surface.set_flipbook(params);
             self.sync_flipbook_timer();
-        } else if let Some(s) = self.flipbook_state() {
-            // Count/scrub: just move the position on the surface.
-            self.surface.set_flipbook_pos(s.frame_pos);
         }
         self.redraw();
     }
@@ -1013,13 +1068,20 @@ impl App {
         let zoom_pct = s.zoom_percent();
         let is_hdr = s.is_hdr();
 
-        let status_left = if !has_image && !self.loading {
-            "No image".to_string()
-        } else if self.loading {
+        let status_left = if self.loading {
             format!("{} — loading…", self.file_label)
         } else if self.meta.is_empty() {
-            self.file_label.clone()
+            // No image and nothing to say about one: the genuine empty state (fresh launch).
+            if has_image {
+                self.file_label.clone()
+            } else {
+                "No image".to_string()
+            }
         } else {
+            // `meta` is the only thing that distinguishes a *failed* load from an empty window:
+            // `fail_load` clears the surface and stores the decoder's reason here, so keying the
+            // empty state on `has_image` alone would swallow it and report "No image" for a file
+            // the user just watched fail. Show the reason whenever there is one.
             format!("{}   ·   {}", self.file_label, self.meta)
         };
         // Right side: the folder position/count (once the scan lands) followed by the zoom and,
@@ -1434,6 +1496,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             loading: false,
             folder: None,
             current_path: None,
+            shown_path: None,
             watcher,
             cfg,
             keybinds,
@@ -1872,22 +1935,16 @@ unsafe fn drop_first_path(hdrop: HDROP) -> Option<PathBuf> {
     Some(PathBuf::from(OsString::from_wide(&buf[..copied as usize])))
 }
 
-/// File extensions Fire can decode, driving the Open dialog's "Image files" filter. Mirrors the
-/// installer's Explorer associations (`installer/fire.iss`) and `fire-decode`'s routing; the raw
-/// list is `raw.rs`'s `EXTENSIONS`. A file the filter misses is still openable via "All files"
-/// (the decoder routes by magic bytes regardless of extension).
-const SUPPORTED_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "tif", "tiff", "webp", "ico", "tga",
-    "hdr", "exr", "psd", "psb", "heic", "heif", "avif", "cr2", "cr3", "nef", "nrw", "arw", "sr2",
-    "raf", "orf", "rw2", "pef", "srw", "dng", "3fr", "iiq", "erf", "mrw", "dcr", "kdc", "mef",
-    "mos", "raw",
-];
-
 /// Build the double-NUL-terminated `lpstrFilter` for [`open_file_dialog`]: an "Image files" entry
 /// listing every supported extension, then an "All files" catch-all. The filter is `label\0pattern\0`
 /// pairs ended by one extra NUL (the `GetOpenFileNameW` contract).
+///
+/// The extensions come from [`fire_decode::SUPPORTED_EXTENSIONS`] — the same list folder navigation
+/// uses. This function used to carry its own, 14 formats shorter, so the dialog hid `.qoi`, `.jxl`
+/// and the Netpbm family that the viewer opens perfectly well. (A file the filter misses is still
+/// openable via "All files": the decoder routes by magic bytes, not by name.)
 fn image_filter_wide() -> Vec<u16> {
-    let patterns: String = SUPPORTED_EXTS
+    let patterns: String = fire_decode::SUPPORTED_EXTENSIONS
         .iter()
         .map(|e| format!("*.{e}"))
         .collect::<Vec<_>>()
@@ -1990,39 +2047,55 @@ fn show_in_explorer(image: &Path) {
     }
 }
 
-/// Put UTF-16 `text` on the clipboard as `CF_UNICODETEXT` (the "Copy Path" / "Copy File Name"
-/// actions). Best-effort: on any failure we free our own allocation — clipboard ownership of the
-/// `HGLOBAL` only transfers once `SetClipboardData` succeeds — and bail without disturbing the
-/// existing clipboard contents beyond the `EmptyClipboard` we already issued.
-fn copy_text_to_clipboard(owner: HWND, text: &str) {
-    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes = utf16.len() * std::mem::size_of::<u16>();
-    unsafe {
-        if OpenClipboard(owner) == 0 {
-            return;
-        }
-        EmptyClipboard();
-        let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if !h.is_null() {
-            let dst = GlobalLock(h) as *mut u16;
-            if !dst.is_null() {
-                ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
-                GlobalUnlock(h);
-                if SetClipboardData(CF_UNICODETEXT, h).is_null() {
-                    GlobalFree(h); // ownership didn't transfer; release it
-                }
-            } else {
-                GlobalFree(h);
+/// Publish one clipboard format, `fill`ing a freshly allocated `HGLOBAL` of `bytes`.
+///
+/// The ownership rule is the whole reason this exists once rather than per format: the `HGLOBAL`
+/// belongs to *us* until `SetClipboardData` succeeds, and to the clipboard the instant it does — so
+/// every failure path before that point must free it, and none after may. Best-effort throughout: a
+/// failure leaves the clipboard no worse than the `EmptyClipboard` we already issued.
+///
+/// `fill` receives a pointer to `bytes` writable bytes and must initialize all of them.
+///
+/// # Safety
+/// `fill` must not write past `bytes` from the pointer it is given.
+unsafe fn set_clipboard(owner: HWND, format: u32, bytes: usize, fill: impl FnOnce(*mut u8)) {
+    if OpenClipboard(owner) == 0 {
+        return;
+    }
+    EmptyClipboard();
+    let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if !h.is_null() {
+        let base = GlobalLock(h) as *mut u8;
+        if base.is_null() {
+            GlobalFree(h);
+        } else {
+            fill(base);
+            GlobalUnlock(h);
+            if SetClipboardData(format, h).is_null() {
+                GlobalFree(h); // ownership didn't transfer; release it
             }
         }
-        CloseClipboard();
+    }
+    CloseClipboard();
+}
+
+/// Put UTF-16 `text` on the clipboard as `CF_UNICODETEXT` (the "Copy Path" / "Copy File Name"
+/// actions).
+fn copy_text_to_clipboard(owner: HWND, text: &str) {
+    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = std::mem::size_of_val(utf16.as_slice());
+    // SAFETY: the buffer is `utf16.len()` u16s long, exactly what we ask for and exactly what we
+    // write.
+    unsafe {
+        set_clipboard(owner, CF_UNICODETEXT, bytes, |base| {
+            ptr::copy_nonoverlapping(utf16.as_ptr(), base as *mut u16, utf16.len());
+        });
     }
 }
 
 /// Put `image` on the clipboard as `CF_HDROP` (the "Copy File" action), so it can be pasted into
 /// Explorer or another app as the file itself. Layout per the `DROPFILES` contract: the header,
-/// then the wide path (with its NUL), then one extra NUL ending the (single-entry) list. Same
-/// best-effort ownership rule as [`copy_text_to_clipboard`].
+/// then the wide path (with its NUL), then one extra NUL ending the (single-entry) list.
 fn copy_file_to_clipboard(owner: HWND, image: &Path) {
     let path: Vec<u16> = image
         .as_os_str()
@@ -2032,30 +2105,15 @@ fn copy_file_to_clipboard(owner: HWND, image: &Path) {
     let header = std::mem::size_of::<DROPFILES>();
     // header + the path (incl. its NUL) + one extra NUL ending the double-NUL-terminated list.
     let bytes = header + (path.len() + 1) * std::mem::size_of::<u16>();
+    // SAFETY: `bytes` covers the header, the path and its two NULs; the writes below stay inside it.
     unsafe {
-        if OpenClipboard(owner) == 0 {
-            return;
-        }
-        EmptyClipboard();
-        let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if !h.is_null() {
-            let base = GlobalLock(h) as *mut u8;
-            if !base.is_null() {
-                ptr::write_bytes(base, 0, bytes); // zero the header fields + the trailing NUL
-                let df = base as *mut DROPFILES;
-                (*df).pFiles = header as u32; // byte offset from the header to the path list
-                (*df).fWide = 1; // paths are UTF-16
-                let dst = base.add(header) as *mut u16;
-                ptr::copy_nonoverlapping(path.as_ptr(), dst, path.len());
-                GlobalUnlock(h);
-                if SetClipboardData(CF_HDROP, h).is_null() {
-                    GlobalFree(h);
-                }
-            } else {
-                GlobalFree(h);
-            }
-        }
-        CloseClipboard();
+        set_clipboard(owner, CF_HDROP, bytes, |base| {
+            ptr::write_bytes(base, 0, bytes); // zero the header fields + the trailing NUL
+            let df = base as *mut DROPFILES;
+            (*df).pFiles = header as u32; // byte offset from the header to the path list
+            (*df).fWide = 1; // paths are UTF-16
+            ptr::copy_nonoverlapping(path.as_ptr(), base.add(header) as *mut u16, path.len());
+        });
     }
 }
 

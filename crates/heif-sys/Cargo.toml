@@ -13,3 +13,6 @@ links = "heif"
 [build-dependencies]
 cc.workspace = true
 bindgen.workspace = true
+
+[lints]
+workspace = true

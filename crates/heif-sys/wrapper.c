@@ -48,7 +48,11 @@ int fire_heif_decode(const uint8_t* data, size_t len, fire_heif_image* out) {
     }
 
     int bits = heif_image_handle_get_luma_bits_per_pixel(handle);
+    // Clamped at *both* ends. libheif only reports 8/10/12, but the low clamp alone left the top
+    // open, and the 16-bit path below derives its shifts from this: bits > 16 makes `shift`
+    // negative, and a negative shift is undefined behaviour, not a large one.
     if (bits < 8) bits = 8;
+    if (bits > 16) bits = 16;
     int has_alpha = heif_image_handle_has_alpha_channel(handle);
 
     /* 8-bit sources decode straight to interleaved RGBA8; >8-bit (HDR HEIC/AVIF)
@@ -74,8 +78,22 @@ int fire_heif_decode(const uint8_t* data, size_t len, fire_heif_image* out) {
         return -7;
     }
 
+    /* Size the output with checked arithmetic, mirroring the Rust side's `checked_mul`. libheif's
+     * own security limits make an overflow here unreachable in practice (it would have had to
+     * allocate the source plane first), but an unchecked `w * bpp * h` that wrapped would hand
+     * `malloc` an undersized length and the row loop below would then run straight off the end of
+     * it. The bound is the same 4 GiB budget fire-decode applies to every other backend. */
     size_t bpp = use16 ? 8u : 4u; /* bytes per RGBA pixel */
+    const size_t MAX_OUT_BYTES = (size_t)4 << 30;
+    if ((size_t)w > MAX_OUT_BYTES / bpp) {
+        cleanup(img, handle, ctx);
+        return -8;
+    }
     size_t row_bytes = (size_t)w * bpp;
+    if ((size_t)h > MAX_OUT_BYTES / row_bytes) {
+        cleanup(img, handle, ctx);
+        return -8;
+    }
     size_t out_len = row_bytes * (size_t)h;
     uint8_t* pixels = (uint8_t*)malloc(out_len);
     if (!pixels) {

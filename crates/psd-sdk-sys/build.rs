@@ -21,6 +21,13 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor");
 
+    // Windows-only, like the rest of the workspace: psd_sdk and `wrapper.cpp` are compiled by MSVC
+    // (the vendored sources exclude the POSIX/Obj-C++ platform files). Short-circuit on any other
+    // host rather than failing deep inside bindgen or cl.exe with something unrecognisable.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
     // --- bindgen: C-ABI wrapper header -> Rust FFI declarations ------------------
     let bindings = bindgen::Builder::default()
         .header(wrapper_h.to_string_lossy())

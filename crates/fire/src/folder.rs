@@ -15,28 +15,15 @@ use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::str::Chars;
 
-/// Image file extensions fire can open. Kept in sync with the installer's per-format
-/// associations (`installer/fire.iss` `[Tasks]`): if a format is associated there, a folder
-/// of those files should navigate here. Lower-case; matching is case-insensitive.
-const IMAGE_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "tif", "tiff", "webp", "ico",
-    "tga", "qoi", "ppm", "pgm", "pbm", "pnm", "ff", "jxl", "hdr", "exr", "psd", "psb", "heic",
-    "heif", "avif",
-    // Camera raw (embedded-preview decode; kept in sync with fire-decode's EXT_LABELS).
-    "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "srw",
-    "dng", "x3f", "3fr", "fff", "iiq", "erf", "mrw", "dcr", "kdc", "mef", "mos", "rwl", "gpr",
-    "raw",
-];
-
 /// Whether `path`'s extension is one fire decodes (the folder-navigation membership test).
+///
+/// The list itself lives in [`fire_decode::SUPPORTED_EXTENSIONS`], next to the routing it
+/// describes. This module used to keep a copy, and it had drifted from the Open dialog's copy in
+/// `win.rs` — arrow-key navigation stepped through `.qoi`/`.jxl` files the dialog wouldn't show.
 pub fn is_supported_image(path: &Path) -> bool {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => {
-            let ext = ext.to_ascii_lowercase();
-            IMAGE_EXTS.contains(&ext.as_str())
-        }
-        None => false,
-    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(fire_decode::is_supported_extension)
 }
 
 /// Scan `file`'s directory for sibling image files, sorted in file-manager order. Returns the

@@ -612,16 +612,7 @@ fn button(
         && enabled
 }
 
-/// Black or white, whichever stays readable on the accent — a user with a pale yellow accent must not
-/// get white-on-yellow.
-fn on_accent(c: [f32; 4]) -> [f32; 4] {
-    let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-    if l > 0.59 {
-        [0.0, 0.0, 0.0, 1.0]
-    } else {
-        [1.0, 1.0, 1.0, 1.0]
-    }
-}
+use theme::on_accent;
 
 fn status_bar(ui: &Ui, snap: &ViewSnapshot, m: &Metrics, dark: bool, w: f32, h: f32) {
     let _bg = ui.push_style_color(StyleColor::WindowBg, theme::status_bg(dark));

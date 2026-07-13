@@ -13,3 +13,6 @@ build = "build.rs"
 # bindgen generates the Rust FFI declarations from the C-ABI wrapper.h.
 cc.workspace = true
 bindgen.workspace = true
+
+[lints]
+workspace = true

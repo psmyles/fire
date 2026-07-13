@@ -28,6 +28,13 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor");
 
+    // Windows-only, like the rest of the workspace: the vendored libs are MSVC static libs and
+    // `wrapper.c` is compiled by cl.exe. Short-circuit on any other host rather than failing deep
+    // inside bindgen or the linker with something unrecognisable.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
     if !inc.join("libheif").join("heif.h").exists() {
         panic!(
             "libheif headers missing at {} — vendor the static build (see vendor/VENDOR.txt)",

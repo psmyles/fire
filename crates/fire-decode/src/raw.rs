@@ -31,9 +31,10 @@
 use crate::{DecodedImage, PixelFormat};
 
 /// Map a lowercase raw file extension to a human-readable status-bar label. This is the
-/// authoritative set of extensions the decoder treats as camera raw; the installer's
-/// `assoc\raw` associations and `folder.rs`'s navigation list mirror the common subset.
-const EXT_LABELS: &[(&str, &str)] = &[
+/// authoritative set of extensions the decoder *routes* as camera raw; [`crate::SUPPORTED_EXTENSIONS`]
+/// must list every one of them (there is a test), and the installer's `assoc\raw` associations
+/// follow from that.
+pub(crate) const EXT_LABELS: &[(&str, &str)] = &[
     ("cr2", "Canon CR2"),
     ("cr3", "Canon CR3"),
     ("crw", "Canon CRW"),
@@ -122,9 +123,10 @@ pub fn find_preview(b: &[u8]) -> Option<Preview<'_>> {
     let mut best = None;
 
     if b.starts_with(b"II") || b.starts_with(b"MM") {
-        // TIFF-structured raw: walk the IFD tree for preview candidates + orientation.
+        // TIFF-structured raw: walk the IFD tree for preview candidates + orientation. A file with
+        // no Orientation tag at all displays as-is (1).
         let (cands, o) = collect_tiff(b);
-        orientation = o;
+        orientation = o.unwrap_or(1);
         best = pick_largest(b, &cands);
     } else if b.starts_with(b"FUJIFILMCCD-RAW") {
         if let Some(c) = raf_preview(b) {
@@ -229,6 +231,15 @@ fn jpeg_dimensions(b: &[u8]) -> Option<(u32, u32)> {
             continue;
         }
         let marker = b[i + 1];
+        // A marker may be padded with any number of leading 0xFF fill bytes (`FF FF … FF C0`), so
+        // 0xFF here is not the marker — it is more padding, and the real marker is one byte along.
+        // Treating it as a marker would read the *next* byte as the start of a length field and
+        // skip a garbage distance, usually straight past the SOF this function exists to find:
+        // the preview would then be discarded as undecodable despite being perfectly good.
+        if marker == 0xFF {
+            i += 1;
+            continue;
+        }
         // Standalone markers (no length field): SOI/EOI, restart markers, TEM.
         if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) || marker == 0x01 {
             i += 2;
@@ -288,13 +299,17 @@ fn raf_preview(b: &[u8]) -> Option<(usize, usize)> {
 // --- TIFF / EXIF IFD walk ----------------------------------------------------
 
 /// Walk a TIFF-structured raw's directory tree and collect every embedded-JPEG candidate
-/// range, returning them alongside the IFD0 `Orientation` (1 if absent). Traverses the IFD0
-/// chain, recurses into `SubIFDs` (0x014A) and the EXIF IFD (0x8769), and is bounded against
-/// malformed input by a visited-offset set and a hard IFD budget.
-fn collect_tiff(b: &[u8]) -> (Vec<(usize, usize)>, u16) {
+/// range, returning them alongside the first `Orientation` found (`None` if the file carries
+/// none). Traverses the IFD0 chain, recurses into `SubIFDs` (0x014A) and the EXIF IFD (0x8769),
+/// and is bounded against malformed input by a visited-offset set and a hard IFD budget.
+fn collect_tiff(b: &[u8]) -> (Vec<(usize, usize)>, Option<u16>) {
     let le = b.starts_with(b"II");
     let mut cands = Vec::new();
-    let mut orientation = 1u16;
+    // `None` = not seen yet, distinct from `Some(1)` = the file explicitly says "upright". Using 1
+    // as the sentinel would conflate the two, and a later IFD (the thumbnail chain, a SubIFD) whose
+    // Orientation disagreed would then override an IFD0 that had legitimately said 1 — rotating a
+    // correctly-oriented preview 90°.
+    let mut orientation: Option<u16> = None;
     let mut visited = std::collections::HashSet::new();
     let mut stack = Vec::new();
     if let Some(off0) = rd_u32(b, 4, le) {
@@ -343,10 +358,10 @@ fn collect_tiff(b: &[u8]) -> (Vec<(usize, usize)>, u16) {
 
             match tag {
                 0x0112 => {
-                    // Orientation — keep the first (IFD0's) value.
-                    if orientation == 1 {
+                    // Orientation — first one wins (IFD0's), including an explicit 1.
+                    if orientation.is_none() {
                         if let Some(v) = entry_scalar(b, eo, typ, le) {
-                            orientation = v as u16;
+                            orientation = Some(v as u16);
                         }
                     }
                 }
@@ -514,6 +529,38 @@ mod tests {
         assert_eq!(jpeg_dimensions(&data), Some((640, 480)));
     }
 
+    /// JPEG allows a marker to be padded with any number of leading `0xFF` fill bytes. Reading the
+    /// first `0xFF` *after* the initial one as if it were the marker makes the scanner take the
+    /// following byte as a segment length and skip a garbage distance — typically right over the
+    /// SOF, so the probe reports `None` and a perfectly good full-size preview gets thrown away in
+    /// favour of a thumbnail (or nothing at all).
+    #[test]
+    fn jpeg_dimensions_tolerates_ff_fill_bytes_before_markers() {
+        let data = jpeg(640, 480, [10, 20, 30]);
+        let (w, h) = jpeg_dimensions(&data).expect("baseline");
+
+        // Re-emit the stream with extra 0xFF padding in front of every marker after the SOI.
+        let mut padded = vec![0xFF, 0xD8];
+        let mut i = 2;
+        while i + 1 < data.len() {
+            if data[i] == 0xFF && data[i + 1] != 0xFF {
+                padded.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // three fill bytes
+                padded.push(data[i + 1]);
+                i += 2;
+            } else {
+                padded.push(data[i]);
+                i += 1;
+            }
+        }
+        padded.extend_from_slice(&data[i..]);
+
+        assert_eq!(
+            jpeg_dimensions(&padded),
+            Some((w, h)),
+            "0xFF fill bytes are padding, not a marker"
+        );
+    }
+
     #[test]
     fn marker_scan_finds_embedded_jpeg() {
         let preview = jpeg(800, 600, [200, 100, 50]);
@@ -580,6 +627,81 @@ mod tests {
         let p = find_preview(&tiff).expect("preview located");
         assert_eq!(p.orientation, 6);
         assert_eq!(jpeg_dimensions(p.jpeg), Some((512, 384)));
+    }
+
+    /// IFD0's Orientation wins even when it is *explicitly* 1 (upright).
+    ///
+    /// The walk used to track "not yet seen" with the sentinel value 1 — which is also a perfectly
+    /// legitimate stored orientation. A file whose IFD0 says "upright" and whose thumbnail IFD says
+    /// "rotate 90°" would then adopt the thumbnail's value and rotate a correctly-oriented preview
+    /// onto its side. First tag found wins; a second IFD does not get a vote.
+    #[test]
+    fn explicit_upright_orientation_is_not_overridden_by_a_later_ifd() {
+        let preview = jpeg(512, 384, [123, 45, 67]);
+
+        // Two chained IFDs: IFD0 says Orientation = 1, IFD1 (the thumbnail) says 6.
+        let entries: u16 = 3;
+        let ifd_len = 2 + entries as usize * 12 + 4;
+        let ifd0_off = 8usize;
+        let ifd1_off = ifd0_off + ifd_len;
+        let jpeg_off = ifd1_off + ifd_len;
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&(ifd0_off as u32).to_le_bytes());
+
+        let push_ifd = |t: &mut Vec<u8>, orientation: u32, next: u32| {
+            t.extend_from_slice(&entries.to_le_bytes());
+            for (tag, typ, n, val) in [
+                (0x0112u16, 3u16, 1u32, orientation),
+                (0x0201, 4, 1, jpeg_off as u32),
+                (0x0202, 4, 1, preview.len() as u32),
+            ] {
+                t.extend_from_slice(&tag.to_le_bytes());
+                t.extend_from_slice(&typ.to_le_bytes());
+                t.extend_from_slice(&n.to_le_bytes());
+                t.extend_from_slice(&val.to_le_bytes());
+            }
+            t.extend_from_slice(&next.to_le_bytes());
+        };
+        push_ifd(&mut tiff, 1, ifd1_off as u32); // IFD0: explicitly upright, chains to IFD1
+        push_ifd(&mut tiff, 6, 0); // IFD1: claims rotate-90
+
+        assert_eq!(tiff.len(), jpeg_off);
+        tiff.extend_from_slice(&preview);
+
+        let p = find_preview(&tiff).expect("preview located");
+        assert_eq!(p.orientation, 1, "IFD0's explicit 1 must not be overridden by IFD1's 6");
+    }
+
+    /// A TIFF with no Orientation tag anywhere displays as-is.
+    #[test]
+    fn missing_orientation_defaults_to_upright() {
+        let preview = jpeg(64, 48, [9, 9, 9]);
+        let entries: u16 = 2;
+        let ifd_off = 8u32;
+        let ifd_len = 2 + entries as usize * 12 + 4;
+        let jpeg_off = ifd_off as usize + ifd_len;
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&ifd_off.to_le_bytes());
+        tiff.extend_from_slice(&entries.to_le_bytes());
+        for (tag, typ, n, val) in [
+            (0x0201u16, 4u16, 1u32, jpeg_off as u32),
+            (0x0202, 4, 1, preview.len() as u32),
+        ] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&typ.to_le_bytes());
+            tiff.extend_from_slice(&n.to_le_bytes());
+            tiff.extend_from_slice(&val.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&preview);
+
+        assert_eq!(find_preview(&tiff).expect("preview").orientation, 1);
     }
 
     #[test]

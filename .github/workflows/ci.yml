@@ -1,0 +1,103 @@
+# CI for fire. Windows-only, because the app is: the crates don't compile anywhere else (the build
+# scripts short-circuit off-Windows) and there is nothing meaningful to check on another host.
+#
+# The one thing that makes this workflow non-obvious is the *vendored native artifacts*. `heif-sys`
+# links prebuilt static libs (heif/libde265/dav1d) and `psd-sdk-sys` compiles the psd_sdk C++ source,
+# and neither is in the Rust crate graph — they are fetched per `vendor/VENDOR.txt`. They are also
+# not in the repository. So the job is split:
+#
+#   * `check` always runs: it covers every crate that needs no vendored input — the whole shell
+#     (`fire`'s pure-logic modules), `fire-ipc`, and the pure-Rust half of the decode core.
+#   * `full` runs only when the vendor tree is present (a cached restore, or a self-hosted runner
+#     with it checked out). It builds the real `fire.exe` and runs the PSD/HEIF end-to-end tests.
+#
+# Without that split, a fork's first push would fail on a missing `heif.lib` and teach everyone to
+# ignore the badge.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a CI failure costs nothing and saves a round-trip.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: clippy + tests (no vendored deps)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `fire-ipc` is dependency-free and holds the named-pipe wire format — the one place that
+      # parses bytes from outside the process. It must always be checked.
+      - name: Clippy (fire-ipc)
+        run: cargo clippy -p fire-ipc --all-targets -- -D warnings
+
+      - name: Test (fire-ipc)
+        run: cargo test -p fire-ipc
+
+  full:
+    name: clippy + tests (full workspace)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM (libclang, for bindgen in psd-sdk-sys / heif-sys)
+        run: choco install llvm --no-progress -y
+
+      # The vendored artifacts are large and licence-encumbered, so they are not committed. Restore
+      # them from cache if a previous run populated it; otherwise this job reports that it skipped,
+      # rather than failing with a link error nobody can act on.
+      - name: Restore vendored native artifacts
+        id: vendor
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            crates/heif-sys/vendor
+            crates/psd-sdk-sys/vendor
+          key: vendor-${{ hashFiles('crates/*/vendor/VENDOR.txt') }}
+
+      - name: Check the vendor tree is present
+        id: have_vendor
+        shell: bash
+        run: |
+          if [ -f crates/heif-sys/vendor/lib/heif.lib ] && [ -d crates/psd-sdk-sys/vendor/Psd ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Vendored native artifacts absent — skipping the full build."
+            echo "::notice::Populate them per crates/*/vendor/VENDOR.txt to enable this job."
+          fi
+
+      - name: Clippy (workspace)
+        if: steps.have_vendor.outputs.present == 'true'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Includes the decode-bomb guards, the PSD C++ FFI fixtures, and the extension-table drift
+      # test that keeps installer/fire.iss honest.
+      - name: Test (workspace)
+        if: steps.have_vendor.outputs.present == 'true'
+        run: cargo test --workspace
+
+      - name: Build release exe
+        if: steps.have_vendor.outputs.present == 'true'
+        run: cargo build -p fire --release

@@ -14,3 +14,6 @@ lcms2.workspace = true
 psd-sdk-sys.workspace = true
 heif-sys.workspace = true
 bytemuck.workspace = true
+
+[lints]
+workspace = true

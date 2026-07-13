@@ -15,9 +15,10 @@ pub const MAX_ZOOM: f32 = 64.0;
 /// screen-space image outline (drawn just outside the boundary) on the constraining axis too.
 pub const FIT_GUTTER: f32 = 1.0;
 
-/// The drawable image surface — the child view window's client area, in physical px. The
-/// frame paints the toolbar/status chrome in separate windows, so the surface is exactly
-/// the image region; there are no chrome insets to carry.
+/// The drawable image surface — the image's sub-rect of the window (`App::image_rect`), in
+/// physical px, *not* the whole client area: the toolbar, status bar and transport band are drawn
+/// over the rest of the same swapchain. So this is exactly the image region and carries no chrome
+/// insets, and the pan/zoom/fit math below is written against it alone.
 #[derive(Clone, Copy, Debug)]
 pub struct Viewport {
     pub width: f32,

@@ -8,10 +8,12 @@
 //!   from. Pure data; [`crate::ui`] reads them, the win shell applies them.
 //! * [`Palette`] — the light/dark color tokens, whose highlight is the user's **system accent**
 //!   ([`system_accent`], read from `COLOR_HIGHLIGHT`: documented, no registry poking).
-//! * The dark title bar / dark menus plumbing, which is a window-manager concern, not a paint one.
+//! * The dark title bar plumbing, which is a window-manager concern, not a paint one.
 //!
-//! The GDI text helpers at the bottom are the last of it: they exist only for the settings dialog
-//! ([`crate::settings`]), which is still a hand-painted Win32 window. They go away with it.
+//! Nothing here paints any more, and nothing here is GDI: the hand-painted Win32 settings dialog
+//! that the last few text helpers existed for is now an ImGui window ([`crate::ui::settings`]), and
+//! they went with it. Every Win32 API this module still calls is documented — the `uxtheme` ordinal
+//! hack left with the `TrackPopupMenu` menus.
 
 use std::ffi::c_void;
 use std::ptr;

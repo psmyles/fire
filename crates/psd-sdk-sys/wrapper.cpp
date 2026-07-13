@@ -32,7 +32,13 @@ namespace {
 class MemoryFile : public psd::File {
 public:
     MemoryFile(psd::Allocator* allocator, const uint8_t* data, size_t size)
-        : psd::File(allocator), m_data(data), m_size(size) {}
+        : psd::File(allocator), m_data(data), m_size(size), m_shortRead(false) {}
+
+    // Whether any read ran past end-of-file, i.e. the document is truncated. psd_sdk has no way
+    // to tell us a parse went off the end (it does not check the ReadOperation we hand back, and
+    // its offsets come from the file's own headers), so the caller checks this after parsing and
+    // rejects the document. See DoRead.
+    bool HadShortRead(void) const { return m_shortRead; }
 
 private:
     bool DoOpenRead(const wchar_t*) PSD_OVERRIDE { return true; }
@@ -41,11 +47,22 @@ private:
 
     ReadOperation DoRead(void* buffer, uint32_t count, uint64_t position) PSD_OVERRIDE {
         if (position > m_size) {
+            m_shortRead = true;
+            std::memset(buffer, 0, count);
             return nullptr;
         }
         const uint64_t available = m_size - position;
         const uint32_t toCopy = (count <= available) ? count : static_cast<uint32_t>(available);
         std::memcpy(buffer, m_data + position, toCopy);
+        // A truncated file cannot be served in full. The buffer psd_sdk handed us is raw malloc'd
+        // memory, so the tail we did not fill would otherwise stay *uninitialized* — and psd_sdk,
+        // believing the read succeeded, would sample it straight into the composite, painting
+        // whatever the heap happened to hold into the image. Zero the remainder and record the
+        // truncation so fire_psd_open can refuse the document outright.
+        if (toCopy < count) {
+            std::memset(static_cast<uint8_t*>(buffer) + toCopy, 0, count - toCopy);
+            m_shortRead = true;
+        }
         // Non-null sentinel: the read already completed; WaitForRead just acknowledges it.
         return reinterpret_cast<ReadOperation>(1);
     }
@@ -58,7 +75,30 @@ private:
 
     const uint8_t* m_data;
     size_t m_size;
+    bool m_shortRead;
 };
+
+// Size guard, mirroring fire-decode's MAX_DECODE_DIM / MAX_DECODE_BYTES.
+//
+// It has to live here, not in Rust: ParseImageDataSection below allocates psd_sdk's planar
+// channel buffers straight from the dimensions in the file header, which is *before* Rust ever
+// sees a dimension it could validate. A 30-byte PSD claiming 60000x60000 would ask psd_sdk for
+// ~10 GB, and an allocation that fails aborts the process — nothing on the Rust side, not even
+// catch_unwind, can intervene. Refuse it at the point of allocation instead.
+const uint64_t MAX_PSD_DIM = 131072;              // per axis
+const uint64_t MAX_PSD_BYTES = 4ull << 30;        // 4 GiB of planar channel data
+
+bool psd_size_is_sane(const psd::Document* document) {
+    const uint64_t w = document->width;
+    const uint64_t h = document->height;
+    if (w == 0 || h == 0 || w > MAX_PSD_DIM || h > MAX_PSD_DIM) {
+        return false;
+    }
+    const uint64_t channels = document->channelCount ? document->channelCount : 1;
+    const uint64_t bytesPerSample = (document->bitsPerChannel + 7u) / 8u;
+    // w*h <= 2^34 and channels/bytesPerSample are small, so this cannot overflow 64 bits.
+    return w * h * channels * bytesPerSample <= MAX_PSD_BYTES;
+}
 
 // Everything parsed for one document, owned behind a single opaque handle.
 struct Doc {
@@ -118,6 +158,11 @@ fire_psd* fire_psd_open(const uint8_t* bytes, size_t len) {
             fire_psd_free(handle);
             return nullptr;
         }
+        // Checked before anything is sized from the header (see psd_size_is_sane).
+        if (!psd_size_is_sane(d.document)) {
+            fire_psd_free(handle);
+            return nullptr;
+        }
         // Merged image is only present when the PSD was saved with Maximize Compatibility.
         if (d.document->imageDataSection.length != 0) {
             d.imageData = psd::ParseImageDataSection(d.document, d.file, &d.allocator);
@@ -125,6 +170,13 @@ fire_psd* fire_psd_open(const uint8_t* bytes, size_t len) {
         // Image resources carry the embedded ICC profile (best-effort).
         if (d.document->imageResourcesSection.length != 0) {
             d.resources = psd::ParseImageResourcesSection(d.document, d.file, &d.allocator);
+        }
+        // A truncated document parses "successfully" — psd_sdk follows the header's own offsets
+        // and never learns it ran off the end — so the composite would be built from the zeros we
+        // substituted for the missing bytes. Refuse it rather than display a half-invented image.
+        if (d.file->HadShortRead()) {
+            fire_psd_free(handle);
+            return nullptr;
         }
         return handle;
     } catch (...) {

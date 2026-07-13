@@ -38,6 +38,93 @@ mod raw;
 /// still rejecting absurd (corrupt/decode-bomb) headers in the billions.
 const MAX_DECODE_DIM: usize = 1 << 17; // 131072
 
+/// Upper bound on the *total* pixel buffer an animated source may hold, across all frames.
+/// Every GIF frame is a full RGBA canvas ([`AnimationFrame`]), so memory is
+/// `frames × width × height × 4` — bounding the dimensions alone leaves the frame count free to
+/// multiply them. 1 GiB is far past any real animation (a 640×480 GIF gets ~870 frames) while
+/// keeping a crafted one from exhausting RAM.
+const MAX_ANIMATION_BYTES: usize = 1 << 30; // 1 GiB
+
+/// Hard ceiling on animation frames, independent of [`MAX_ANIMATION_BYTES`]: a tiny canvas
+/// makes the byte budget effectively unbounded, and every frame still costs a `Vec` and a
+/// timer tick.
+const MAX_ANIMATION_FRAMES: usize = 10_000;
+
+/// Upper bound on the pixel buffer a single decoded image may allocate, in bytes. Checked against
+/// `width × height × bytes_per_pixel`, because **the product is what gets allocated** — a per-axis
+/// cap alone bounds nothing useful: GIF's dimensions are `u16`, so a 65535×65535 GIF sits far under
+/// [`MAX_DECODE_DIM`] on both axes and still asks for 17 GiB.
+///
+/// 4 GiB clears the largest images this viewer is meant to open (the 216-MP scan cited in
+/// [`decode_png`] is ~1.7 GiB at 16-bit) while refusing the decode bombs.
+const MAX_DECODE_BYTES: usize = 4 << 30; // 4 GiB
+
+/// Reject a header whose declared size would allocate more than we are willing to — **before**
+/// anything is allocated from it. `bytes_per_pixel` is that of the buffer the caller is about to
+/// allocate (i.e. the *normalized RGBA* output: 4, 8, or 16), not the source's own layout.
+///
+/// This guard is not redundant with the `catch_unwind` that wraps every decode, and cannot be
+/// replaced by it: `catch_unwind` catches *panics*, and a `Vec` allocation that fails does not
+/// panic — it calls `handle_alloc_error`, which **aborts the process**. A crafted 20-byte header
+/// claiming billions of pixels has to be turned away here; nothing downstream can catch it.
+///
+/// Applied by every backend that sizes a buffer from parsed dimensions *and* can see those
+/// dimensions before allocating: PNG, GIF, Radiance HDR, OpenEXR. The zune hot path cannot —
+/// `zune_image::Image::read` decodes in one shot and only reports dimensions afterwards — so it
+/// relies on zune's own per-axis caps ([`MAX_DECODE_DIM`]) and remains bounded only by the product
+/// of those; see `decode_zune`.
+fn check_dims(
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+    what: &str,
+) -> Result<(), DecodeError> {
+    if width > MAX_DECODE_DIM || height > MAX_DECODE_DIM {
+        return Err(DecodeError::Malformed(format!(
+            "{what} dimensions {width}x{height} exceed the {MAX_DECODE_DIM} per-axis decode guard"
+        )));
+    }
+    let bytes = width
+        .checked_mul(height)
+        .and_then(|px| px.checked_mul(bytes_per_pixel));
+    match bytes {
+        Some(b) if b <= MAX_DECODE_BYTES => Ok(()),
+        _ => Err(DecodeError::Malformed(format!(
+            "{what} {width}x{height} needs more than the {MAX_DECODE_BYTES}-byte decode guard"
+        ))),
+    }
+}
+
+/// Every file extension fire can open, lower-case.
+///
+/// **The** list — the viewer's Open-dialog filter (`win.rs`) and its folder-navigation membership
+/// test (`folder.rs`) both read it from here rather than keeping their own. They used to keep their
+/// own, and the two had already drifted apart: a `.qoi` was reachable with the arrow keys but
+/// invisible in the Open dialog. The installer's per-format associations (`installer/fire.iss`) are
+/// a fourth consumer that *cannot* import this — it is an Inno Setup script — so a test below reads
+/// the `.iss` and asserts it registers exactly this set.
+///
+/// Note this is a convenience for *naming* files, not the routing decision: [`decode`] sniffs magic
+/// bytes and will happily open a supported image with the wrong extension (or none).
+pub const SUPPORTED_EXTENSIONS: &[&str] = &[
+    // Still formats, in the order the module doc lists the backends.
+    "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "tif", "tiff", "webp", "ico", "tga",
+    "qoi", "ppm", "pgm", "pbm", "pnm", "ff", "jxl", "hdr", "exr", "psd", "psb", "heic", "heif",
+    "avif", //
+    // Camera raw (embedded-preview decode). Mirrors `raw::EXT_LABELS`, which is what actually
+    // routes them — `raw_extensions_are_all_listed` keeps the two honest.
+    "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "srw",
+    "dng", "x3f", "3fr", "fff", "iiq", "erf", "mrw", "dcr", "kdc", "mef", "mos", "rwl", "gpr",
+    "raw",
+];
+
+/// Whether `ext` (with no leading dot, any case) is one fire can open. See
+/// [`SUPPORTED_EXTENSIONS`].
+pub fn is_supported_extension(ext: &str) -> bool {
+    let lower = ext.to_ascii_lowercase();
+    SUPPORTED_EXTENSIONS.contains(&lower.as_str())
+}
+
 /// Pixel layout of a decoded image. Drives the per-format CPU sampling path and whether the
 /// HDR exposure/tonemap path applies (float = HDR, linear working space).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,11 +228,14 @@ impl Default for DecodeOptions {
 }
 
 /// Decode failure modes.
+///
+/// There is deliberately no `UnknownFormat` variant: [`sniff`] always resolves to *some* backend
+/// (`Backend::Image` is the catch-all), so unrecognized input is not a routing failure — it is a
+/// backend rejecting bytes it cannot parse, and comes back as [`Malformed`](Self::Malformed). A
+/// variant that nothing can construct is a promise the type does not keep.
 #[derive(Debug)]
 pub enum DecodeError {
-    /// Could not determine the format from magic bytes or extension.
-    UnknownFormat,
-    /// The backend rejected the data as malformed.
+    /// The backend rejected the data as malformed — including input that is not an image at all.
     Malformed(String),
     /// An FFI backend (psd_sdk/lcms2) failed; surfaced so the viewer survives.
     Ffi(String),
@@ -156,7 +246,6 @@ pub enum DecodeError {
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DecodeError::UnknownFormat => write!(f, "unknown or unsupported image format"),
             DecodeError::Malformed(m) => write!(f, "malformed image: {m}"),
             DecodeError::Ffi(m) => write!(f, "decoder FFI error: {m}"),
             DecodeError::Other(m) => write!(f, "{m}"),
@@ -337,12 +426,25 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 }
 
 /// OpenEXR via the `exr` crate → 32-bit float RGBA (linear/HDR).
+///
+/// The headers are parsed on their own first, because the `rgba_channels` size closure below
+/// cannot fail: it allocates 16 bytes per declared pixel and hands the buffer back by value, so a
+/// crafted header would abort the process there ([`check_dims`]) with nothing able to intercept
+/// it. Reading the metadata separately is the only place a dimension check *can* refuse.
 fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     use exr::prelude::*;
 
     struct Buf {
         width: usize,
         pixels: Vec<[f32; 4]>,
+    }
+
+    let meta = exr::meta::MetaData::read_from_buffered(Cursor::new(bytes), false)
+        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    for header in &meta.headers {
+        let size = header.layer_size;
+        // 16 bytes/px: the closure's `[f32; 4]` buffer, and again for the `Vec<u8>` built from it.
+        check_dims(size.width(), size.height(), 16, "OpenEXR")?;
     }
 
     let image = read()
@@ -454,8 +556,16 @@ fn decode_raw(bytes: &[u8], label: &'static str) -> Result<DecodedImage, DecodeE
 /// files that the strict `#?RADIANCE` check would reject. Radiance carries no ICC profile;
 /// the data is linear RGB, so the HDR exposure/tonemap path applies downstream.
 fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    use image::ImageDecoder;
+
     let decoder = image::codecs::hdr::HdrDecoder::with_strictness(Cursor::new(bytes), false)
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    // Constructed directly (not via `ImageReader`), so the reader's default memory limits don't
+    // apply — the header guard is ours to make, exactly as in `decode_png`. `into_rgba32f` below
+    // allocates 16 bytes per declared pixel.
+    let (w, h) = decoder.dimensions();
+    check_dims(w as usize, h as usize, 16, "Radiance HDR")?;
+
     let dynimg = image::DynamicImage::from_decoder(decoder)
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
     let (width, height) = (dynimg.width(), dynimg.height());
@@ -497,11 +607,16 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     let mut decoder = image::codecs::png::PngDecoder::new(Cursor::new(bytes))
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
     let (width, height) = decoder.dimensions();
-    if width as usize > MAX_DECODE_DIM || height as usize > MAX_DECODE_DIM {
-        return Err(DecodeError::Malformed(format!(
-            "PNG dimensions {width}x{height} exceed the {MAX_DECODE_DIM} decode guard"
-        )));
-    }
+    // 16-bit sources are kept at 16 bits (8 bytes/px RGBA); everything else normalizes to RGBA8.
+    // Mirrors the `is_16bit` split below — the buffer this sizes is the one it allocates.
+    let out_bpp = match decoder.color_type() {
+        image::ColorType::L16
+        | image::ColorType::La16
+        | image::ColorType::Rgb16
+        | image::ColorType::Rgba16 => 8,
+        _ => 4,
+    };
+    check_dims(width as usize, height as usize, out_bpp, "PNG")?;
     // Source channel count (status bar / alpha-aware UI) and ICC must be read before
     // `from_decoder` consumes the decoder. Palette sources already report their expanded
     // RGB/RGBA color type, matching what zune reported.
@@ -563,6 +678,13 @@ fn decode_zune(
     // Speed is the project's top metric: enable platform intrinsics + unsafe fast paths.
     // Raise the dimension guard well past zune's 16384 default so large sources decode
     // (the downscale pass shrinks anything beyond the caller's max_dim afterwards).
+    //
+    // NOTE: unlike the other backends this is a *per-axis* cap only — zune offers no total-size
+    // option, and `Image::read` decodes in one shot, so there is no point at which we can see the
+    // dimensions and still refuse ([`check_dims`] is unreachable from here). A crafted file that
+    // stays under the cap on both axes but multiplies out huge (a 65535×65535 JPEG ≈ 17 GiB) can
+    // therefore still force an allocation that aborts the process. Closing it means probing each
+    // zune format's header before decoding; until then this cap is the only bound.
     let opts = DecoderOptions::new_fast()
         .set_max_width(MAX_DECODE_DIM)
         .set_max_height(MAX_DECODE_DIM);
@@ -649,14 +771,33 @@ fn zune_format_name(f: zune_image::codecs::ImageFormat) -> &'static str {
 /// (first paint, downscale, alpha scan) work unchanged.
 fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     use image::codecs::gif::GifDecoder;
-    use image::AnimationDecoder;
+    use image::{AnimationDecoder, ImageDecoder};
 
     let decoder =
         GifDecoder::new(Cursor::new(bytes)).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-    let frames = decoder
-        .into_frames()
-        .collect_frames()
-        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+
+    // Two guards, because this backend has two multiplicands. `GifDecoder` is constructed directly
+    // (no `ImageReader`, so no default memory limits) and every frame below is decoded to a *full*
+    // RGBA canvas: the cost is `frames × w × h × 4`. Bounding the dimensions alone would leave the
+    // frame count free to blow past RAM, and bounding the axes alone bounds nothing at all here —
+    // GIF's dimensions are `u16`, so even the maximum 65535×65535 is under every per-axis cap while
+    // asking for 17 GiB a frame. Hence: one byte-budget check on the canvas, one on the sequence.
+    let (w, h) = decoder.dimensions();
+    check_dims(w as usize, h as usize, 4, "GIF")?;
+    let frame_bytes = (w as usize).saturating_mul(h as usize).saturating_mul(4).max(1);
+    let max_frames = (MAX_ANIMATION_BYTES / frame_bytes).clamp(1, MAX_ANIMATION_FRAMES);
+
+    // Collected one at a time rather than through `collect_frames`, so the budget can stop the walk
+    // rather than discover it too late. Frames past the budget are dropped rather than raising an
+    // error — a truncated animation still shows, and no real encoder gets anywhere near the cap.
+    let mut frames = Vec::new();
+    for frame in decoder.into_frames() {
+        frames.push(frame.map_err(|e| DecodeError::Malformed(e.to_string()))?);
+        if frames.len() >= max_frames {
+            break;
+        }
+    }
+
     let first = frames
         .first()
         .ok_or_else(|| DecodeError::Malformed("GIF has no frames".into()))?;
@@ -1278,5 +1419,194 @@ mod tests {
         let bytes = b"\x89PNG\r\n\x1a\n garbage that is not a real png body";
         let r = decode(bytes, Some("png"), &DecodeOptions::default());
         assert!(r.is_err());
+    }
+
+    // --- The one extension table --------------------------------------------------------------
+
+    /// Every raw format the decoder *routes* (`raw::EXT_LABELS`) must also be a format the app
+    /// admits it can open. Miss one and the file decodes fine when opened directly but is
+    /// invisible to the Open dialog and skipped by folder navigation.
+    #[test]
+    fn raw_extensions_are_all_listed() {
+        for (ext, label) in raw::EXT_LABELS {
+            assert!(
+                SUPPORTED_EXTENSIONS.contains(ext),
+                "raw.rs routes .{ext} ({label}) but SUPPORTED_EXTENSIONS omits it"
+            );
+        }
+    }
+
+    /// The table is a set, not a bag — a duplicate would be harmless but signals an edit collision.
+    #[test]
+    fn extension_table_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for ext in SUPPORTED_EXTENSIONS {
+            assert!(seen.insert(*ext), ".{ext} is listed twice");
+            assert_eq!(*ext, ext.to_ascii_lowercase(), "extensions are stored lower-case");
+        }
+    }
+
+    /// The installer is the one copy of this list that cannot `use` it: `installer/fire.iss` is an
+    /// Inno Setup script, and its per-format `Capabilities\FileAssociations` entries are what put
+    /// fire in Explorer's "Open with" and Default Apps. If the two disagree, an installed fire
+    /// either claims a format it cannot decode or fails to offer one it can — so read the script
+    /// and compare the sets outright. Extensions live in lines of the form:
+    ///
+    /// ```text
+    /// ...Capabilities\FileAssociations"; ValueType: string; ValueName: ".png"; ValueData: "Fire.png"...
+    /// ```
+    #[test]
+    fn installer_associations_match_the_extension_table() {
+        const ISS: &str = include_str!("../../../installer/fire.iss");
+
+        let mut registered: Vec<String> = Vec::new();
+        for line in ISS.lines() {
+            if !line.contains(r"Capabilities\FileAssociations") {
+                continue;
+            }
+            // Pull the `ValueName: ".ext"` field out of the line.
+            let Some(rest) = line.split(r#"ValueName: "."#).nth(1) else {
+                continue;
+            };
+            let Some(ext) = rest.split('"').next() else {
+                continue;
+            };
+            registered.push(ext.to_ascii_lowercase());
+        }
+        assert!(
+            !registered.is_empty(),
+            "parsed no associations out of fire.iss — the script's format changed, and this test \
+             is now silently vacuous"
+        );
+
+        let installer: std::collections::BTreeSet<&str> =
+            registered.iter().map(|s| s.as_str()).collect();
+        let decoder: std::collections::BTreeSet<&str> =
+            SUPPORTED_EXTENSIONS.iter().copied().collect();
+
+        let missing: Vec<_> = decoder.difference(&installer).collect();
+        let extra: Vec<_> = installer.difference(&decoder).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "installer/fire.iss and SUPPORTED_EXTENSIONS disagree.\n  \
+             decodable but not associated: {missing:?}\n  \
+             associated but not decodable: {extra:?}"
+        );
+    }
+
+    // --- Decode-bomb guards -------------------------------------------------------------------
+    //
+    // Each of these is a *tiny* file whose header declares an enormous image. They must come back
+    // as a clean `Err` from the header check, never reaching an allocation: a `Vec` that fails to
+    // allocate aborts the process (`handle_alloc_error`), which no `catch_unwind` can intercept —
+    // so "the test passes" and "the test process is still alive" are the same assertion here.
+
+    /// The product, not the axes, is what gets allocated: both of these pass a per-axis cap of
+    /// 131072 and still ask for far more than [`MAX_DECODE_BYTES`].
+    #[test]
+    fn check_dims_bounds_the_product_not_just_each_axis() {
+        // Comfortably inside the per-axis cap; 65535² × 4 ≈ 17 GiB.
+        assert!(check_dims(65535, 65535, 4, "GIF").is_err());
+        // A single oversized axis is still refused.
+        assert!(check_dims(MAX_DECODE_DIM + 1, 1, 4, "PNG").is_err());
+        // Overflowing the multiply is a rejection, not a wrap.
+        assert!(check_dims(usize::MAX, usize::MAX, 16, "OpenEXR").is_err());
+        // A large-but-real image still decodes: a 216-MP 16-bit scan is ~1.7 GiB.
+        assert!(check_dims(18000, 12000, 8, "PNG").is_ok());
+    }
+
+    /// A 33-byte PNG whose IHDR claims 2³¹-ish pixels per side. The contract under test is
+    /// behavioral, not which layer enforces it: a decode bomb comes back as a clean `Err` and the
+    /// process survives. (Here the `png` crate's own memory limit happens to refuse it first;
+    /// [`check_dims`] is the backstop for the sizes that slip under that.)
+    #[test]
+    fn png_decode_bomb_header_is_rejected() {
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&0x7fff_ffffu32.to_be_bytes()); // width
+        ihdr.extend_from_slice(&0x7fff_ffffu32.to_be_bytes()); // height
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA, deflate, no filter/interlace
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes.extend_from_slice(&(ihdr.len() as u32 - 4).to_be_bytes());
+        bytes.extend_from_slice(&ihdr);
+        bytes.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+
+        assert!(
+            decode(&bytes, Some("png"), &DecodeOptions::default()).is_err(),
+            "a 2³¹×2³¹ IHDR must be refused, not allocated"
+        );
+    }
+
+    /// Radiance stores its dimensions as decimal text, so a 52-byte file can claim a gigapixel
+    /// canvas — 16 bytes/px once expanded to float RGBA, i.e. ~160 GiB.
+    #[test]
+    fn hdr_decode_bomb_header_is_rejected() {
+        let bytes = b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 99999 +X 99999\n";
+        let err = decode(bytes, Some("hdr"), &DecodeOptions::default())
+            .expect_err("a 99999² Radiance header must be refused");
+        assert!(err.to_string().contains("decode guard"), "{err}");
+    }
+
+    /// GIF is the case a per-axis cap *cannot* catch, and the reason [`check_dims`] takes a byte
+    /// budget: `u16` dimensions max out at 65535, comfortably under any sane axis guard, yet
+    /// 65535² × 4 bytes is ~17 GiB — per frame. A complete but tiny file (one 1×1 frame on a
+    /// 65535² logical screen) is all it takes; the canvas, not the frame, is what gets allocated.
+    #[test]
+    fn gif_max_u16_canvas_is_rejected_by_the_byte_budget() {
+        #[rustfmt::skip]
+        let bytes: Vec<u8> = [
+            b"GIF89a".as_slice(),
+            &[0xff, 0xff],              // logical screen width  = 65535
+            &[0xff, 0xff],              // logical screen height = 65535
+            &[0x80, 0x00, 0x00],        // global color table (2 entries), bg index, aspect
+            &[0x00, 0x00, 0x00],        // GCT[0] = black
+            &[0xff, 0xff, 0xff],        // GCT[1] = white
+            &[0x2c],                    // image separator
+            &[0x00, 0x00, 0x00, 0x00],  // frame left, top
+            &[0x01, 0x00, 0x01, 0x00],  // frame width = 1, height = 1
+            &[0x00],                    // no local color table
+            &[0x02],                    // LZW minimum code size
+            &[0x02, 0x44, 0x01],        // one sub-block: CLEAR, index 0, EOI
+            &[0x00],                    // block terminator
+            &[0x3b],                    // trailer
+        ]
+        .concat();
+
+        let err = decode(&bytes, Some("gif"), &DecodeOptions::default())
+            .expect_err("a 65535² GIF canvas must be refused");
+        assert!(err.to_string().contains("decode guard"), "{err}");
+    }
+
+    /// An animated GIF's cost is `frames × w × h × 4`, so the frame count is bounded too — a small
+    /// canvas must not let an unbounded sequence through. 100 frames of 4×4 is far under the cap
+    /// and decodes whole; the cap itself is exercised by [`MAX_ANIMATION_FRAMES`] arithmetic.
+    #[test]
+    fn animation_frame_budget_admits_real_sequences() {
+        let frames: Vec<_> = (0..100u32)
+            .map(|i| ([(i * 2) as u8, 40, 200, 255], 40u32))
+            .collect();
+        let bytes = encode_gif(4, 4, &frames);
+        let out = decode(&bytes, Some("gif"), &DecodeOptions::default()).unwrap();
+        let anim = out.animation.as_ref().expect("animated");
+        assert_eq!(anim.frames.len(), 100, "a 100-frame 4×4 GIF is nowhere near the budget");
+
+        // The budget divides the byte cap by the canvas size, and is clamped to the frame ceiling.
+        let tiny_canvas_budget = (MAX_ANIMATION_BYTES / (4 * 4 * 4)).min(MAX_ANIMATION_FRAMES);
+        assert_eq!(tiny_canvas_budget, MAX_ANIMATION_FRAMES);
+    }
+
+    /// CRC-32 (IEEE) for building the PNG fixture above.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
     }
 }

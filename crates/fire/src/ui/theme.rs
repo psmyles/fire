@@ -238,8 +238,9 @@ fn lift(c: [f32; 4], amount: f32) -> [f32; 4] {
     [f(c[0]), f(c[1]), f(c[2]), c[3]]
 }
 
-/// Black or white, whichever stays readable on `c`.
-fn on_accent(c: [f32; 4]) -> [f32; 4] {
+/// Black or white, whichever stays readable on `c` — a user whose system accent is a pale yellow
+/// must not get white-on-yellow.
+pub(crate) fn on_accent(c: [f32; 4]) -> [f32; 4] {
     if luminance(c) > 0.59 {
         [0.0, 0.0, 0.0, 1.0]
     } else {

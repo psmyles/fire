@@ -8,3 +8,6 @@ publish.workspace = true
 [dependencies]
 # Intentionally minimal — linked into fire.exe and exercised on the latency-sensitive
 # forward path, so it stays dependency-light (hand-rolled byte framing, no serde).
+
+[lints]
+workspace = true

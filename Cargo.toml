@@ -14,6 +14,29 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
 
+# Lints, workspace-wide. Members opt in with `[lints] workspace = true`.
+#
+# The tree is already clean under all of these — that is the point of writing them down. CI runs
+# clippy with `-D warnings`, so what is a warning here is a build failure there, and the invariants
+# below stop being things you have to remember.
+[workspace.lints.rust]
+# An unhandled Result at an FFI or Win32 boundary is how a "best-effort" call quietly becomes a
+# no-op. Deliberate discards stay legal by writing `let _ = ...`, which says so.
+unused_must_use = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+todo = "warn"
+unimplemented = "warn"
+# NOT enabled, deliberately, and worth writing down why: the tree has ~74 `unsafe` blocks without a
+# `// SAFETY:` tag. They are not undocumented — the cross-thread `PostMessage` hand-offs and the FFI
+# boundaries all carry real reasoning — but the bulk are one-line Win32 calls (`GetSysColor`,
+# `std::mem::zeroed()` on a POD struct) where a SAFETY tag would be ritual rather than information.
+# Turning this on today would mean 74 comments written to satisfy a lint, which is how SAFETY
+# comments become noise that reviewers learn to skip. Worth doing as its own pass, per module,
+# where each tag can say something true.
+#   undocumented_unsafe_blocks = "warn"
+
 # Centralized version lock — every member inherits these via `workspace = true`.
 # These are caret requirements; the first `cargo build` resolves exact patch
 # versions into Cargo.lock and proves the set is compatible.
@@ -29,7 +52,22 @@ bytemuck = { version = "1", features = ["derive"] }
 # zune is the hot-path decoder for the common formats.
 zune-image = "0.5"
 zune-core = "0.5"
-image = "0.25"
+# The `image` crate is the fallback decoder (TIFF/TGA/ICO), the multi-frame GIF path, and —
+# deliberately — the PNG and Radiance HDR paths, whose decoders measured faster than zune's; see
+# `decode_png` / `decode_hdr`. Only the formats we actually route to it are enabled: the default
+# feature set also pulls in `avif`, i.e. `ravif` -> `rav1e`, a complete AV1 *encoder* (one of the
+# heaviest builds in the ecosystem) that fire can never reach — AVIF is sniffed by magic bytes and
+# decoded by libheif/dav1d.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "gif",
+    "hdr",
+    "tiff",
+    "tga",
+    "ico",
+    "bmp",
+    "jpeg",
+] }
 exr = "1"
 lcms2 = { version = "6", features = ["static"] }
 
@@ -40,9 +78,6 @@ notify = "8"
 # Build-time only: fire's build.rs parses product.json (the single source of product
 # metadata: name/version/publisher/copyright/homepage). Not linked into the binary.
 serde_json = "1"
-
-# --- clipboard ---
-arboard = "3"
 
 # --- worker messaging ---
 crossbeam-channel = "0.5"
