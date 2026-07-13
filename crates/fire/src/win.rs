@@ -23,7 +23,7 @@ use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fire_decode::{DecodeOptions, DecodedImage};
 use fire_ipc::OpenRequest;
@@ -169,6 +169,12 @@ fn key_down(vk: i32) -> bool {
     (unsafe { GetKeyState(vk) } as u16 & 0x8000) != 0
 }
 
+/// When an animation frame displayed *now*, with the given delay (ms), falls due for replacement.
+/// The same clamp the timer gets, so the deadline and the timer agree.
+fn anim_deadline(delay_ms: u32) -> Instant {
+    Instant::now() + Duration::from_millis(delay_ms.max(1) as u64)
+}
+
 /// UI-thread state, stashed in both windows' `GWLP_USERDATA` (the frame owns the box).
 struct App {
     /// The one window: message loop, swapchain, chrome, title, size, lifecycle.
@@ -220,6 +226,10 @@ struct App {
     flipbook: HashMap<PathBuf, PerPath>,
     /// Wall-clock of the previous playback tick, for dt-based advance (robust to timer jitter).
     flipbook_last_tick: Option<Instant>,
+    /// When the displayed GIF frame falls due and must be replaced by the next one. `None` for a
+    /// still image. The deadline — not the timer firing — is what advances the animation; see
+    /// [`App::advance_playback`].
+    anim_due: Option<Instant>,
     /// The popup menu that is up, if any (actions or overflow). Like the settings window, an ImGui
     /// popup drawn inside our own frame: no `TrackPopupMenu`, no nested pump, no command-id table.
     menu: Option<crate::ui::MenuState>,
@@ -453,27 +463,55 @@ impl App {
     fn sync_animation(&mut self) {
         match self.surface.frame_delay_ms() {
             Some(delay) => unsafe {
+                self.anim_due = Some(anim_deadline(delay));
                 SetTimer(self.frame as HWND, ANIM_TIMER_ID, delay.max(1), None);
             },
             None => unsafe {
+                self.anim_due = None;
                 KillTimer(self.frame as HWND, ANIM_TIMER_ID);
             },
         }
     }
 
-    /// Advance the animated image one frame (on the playback timer): upload the next frame, repaint
-    /// the view, and reschedule the timer for that frame's delay. If the image is no longer animated
-    /// (e.g. it was cleared) the timer is stopped.
+    /// Advance the animated image one frame: upload the next frame, repaint the view, and reschedule
+    /// the timer (and the deadline) for that frame's delay. If the image is no longer animated (e.g.
+    /// it was cleared) the timer is stopped.
     fn tick_animation(&mut self) {
         match self.surface.advance_frame() {
             Some(delay) => {
+                self.anim_due = Some(anim_deadline(delay));
                 unsafe { SetTimer(self.frame as HWND, ANIM_TIMER_ID, delay.max(1), None) };
                 self.surface.invalidate();
             }
             None => unsafe {
+                self.anim_due = None;
                 KillTimer(self.frame as HWND, ANIM_TIMER_ID);
             },
         }
+    }
+
+    /// Bring both time-driven playbacks — the GIF's frame and the flipbook's cell — up to *now*,
+    /// asking for no frame of its own. Called at the top of `WM_PAINT`, so whatever caused the frame
+    /// we are about to draw, it shows the image that belongs to this instant.
+    ///
+    /// **Why a paint may not assume the playback timers have fired.** `WM_TIMER` is the
+    /// lowest-priority message there is: `GetMessage` synthesizes one only once the queue holds no
+    /// posted message, no input, *and* no pending `WM_PAINT`. Moving the mouse supplies the last two
+    /// at once — every `WM_MOUSEMOVE` asks ImGui for its settle frames, so the update region is never
+    /// empty for as long as the cursor keeps moving — and both playback timers are starved for the
+    /// whole gesture. Advancing only on the timer therefore froze playback the moment the mouse
+    /// moved, and unfroze it when the mouse stopped. Deriving the position from elapsed time instead
+    /// makes every frame correct no matter what asked for it, and leaves the timers doing what they
+    /// always did: asking for a frame when nothing else would.
+    ///
+    /// This is *not* the per-frame CPU work the GPU invariant forbids: both advances are a few
+    /// arithmetic ops against a deadline, and the GIF's texture upload happens exactly when its frame
+    /// falls due — never once per rendered frame.
+    fn advance_playback(&mut self) {
+        if self.anim_due.is_some_and(|due| Instant::now() >= due) {
+            self.tick_animation();
+        }
+        self.advance_flipbook();
     }
 
     // --- flipbook (sprite-sheet) mode ------------------------------------------
@@ -561,33 +599,44 @@ impl App {
         }
     }
 
-    /// Advance flipbook playback (on the timer): dt-based so jitter/stalls don't accumulate.
+    /// The flipbook timer fired: advance, and ask for the frame that shows it. On an idle window
+    /// this is what paces playback; the advance itself is [`App::advance_flipbook`], which every
+    /// paint also runs (see [`App::advance_playback`] for why it has to).
     fn tick_flipbook(&mut self) {
+        if self.advance_flipbook() {
+            self.redraw();
+        }
+    }
+
+    /// Advance flipbook playback to *now* — dt-based, so timer jitter and starved ticks don't
+    /// accumulate — and push the new position at the surface. Returns whether it advanced (i.e. the
+    /// mode is on and playing); requests no frame of its own, so a paint can call it.
+    fn advance_flipbook(&mut self) -> bool {
         let Some(path) = self.current_path.clone() else {
-            return;
+            return false;
         };
+        let Some(entry) = self.flipbook.get_mut(&path) else {
+            return false;
+        };
+        if !entry.enabled {
+            return false;
+        }
+        let Some(s) = &mut entry.state else {
+            return false;
+        };
+        if !s.playing || s.frame_count <= 1 {
+            return false;
+        }
         let now = Instant::now();
         let dt = self
             .flipbook_last_tick
             .map(|t| (now - t).as_secs_f32().min(MAX_FLIPBOOK_STEP))
             .unwrap_or(0.0);
-        self.flipbook_last_tick = Some(now);
-        let Some(entry) = self.flipbook.get_mut(&path) else {
-            return;
-        };
-        if !entry.enabled {
-            return;
-        }
-        let Some(s) = &mut entry.state else {
-            return;
-        };
-        if !s.playing || s.frame_count <= 1 {
-            return;
-        }
         s.frame_pos = (s.frame_pos + dt * s.fps).rem_euclid(s.frame_count as f32);
         let pos = s.frame_pos;
+        self.flipbook_last_tick = Some(now);
         self.surface.set_flipbook_pos(pos);
-        self.redraw();
+        true
     }
 
     /// The flipbook detection hint, when the chip should be offered: the current image has an
@@ -1392,6 +1441,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             windowed_placement: std::mem::zeroed(),
             flipbook: HashMap::new(),
             flipbook_last_tick: None,
+            anim_due: None,
             menu: None,
             settings: None,
             caret_timer: false,
@@ -1558,6 +1608,11 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
 
     match msg {
         WM_PAINT => {
+            // Bring playback up to *now* before drawing, so this frame shows the cell/GIF frame that
+            // belongs to this instant whatever asked for it — a hover, a resize, a drag. Deliberately
+            // *before* `BeginPaint`: the advance dirties the window, and this is the repaint that
+            // clears it, so it costs no extra frame. See `App::advance_playback`.
+            app.advance_playback();
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
             BeginPaint(hwnd, &mut ps);
             // The event-driven pump: draw the frame we were asked for, and stop when the debt is
