@@ -296,6 +296,11 @@ fn tabs(ui: &Ui, st: &mut State, footer: f32, out: &mut Frame) {
             .size(size)
             .build(ui, || flipbook(ui, st));
     }
+    if let Some(_tab) = tab(ui, "Octagon Overlay") {
+        ui.child_window("##overlay")
+            .size(size)
+            .build(ui, || overlay(ui, st));
+    }
     if let Some(_tab) = tab(ui, "Keybinds") {
         ui.child_window("##keybinds")
             .size(size)
@@ -401,6 +406,22 @@ fn flipbook(ui: &Ui, st: &mut State) {
     num(ui, st, lw, NumField::FlipbookFps, "Frame rate");
     check(ui, st, BoolField::FlipbookAutoplay, "Start playing immediately");
     check(ui, st, BoolField::FlipbookBlend, "Crossfade between frames");
+}
+
+fn overlay(ui: &Ui, st: &mut State) {
+    ui.separator_with_text("Octagon Overlay");
+    check(
+        ui,
+        st,
+        BoolField::OctagonRemember,
+        "Remember overlay settings across launches",
+    );
+    note(
+        ui,
+        "Saves the overlay's line color, crop factor and hide-outside values when Fire closes and \
+         restores them next launch. Off keeps them for the session only. Either way the overlay \
+         itself always starts switched off.",
+    );
 }
 
 /// The rebind editor: every action, its chord, and a per-row reset. Clicking the chord arms a

@@ -212,6 +212,56 @@ impl Default for ContextMenuCfg {
     }
 }
 
+/// `[octagon]` — the octagon overlay (Unity VFX Graph's octagon particle shape, drawn over the
+/// image). **Session-only by default**: with `remember = false` the overlay's options reset to the
+/// defaults every launch and nothing is written back. `remember = true` persists the options
+/// (color / crop factor / hide-outside) on exit and restores them next launch. The overlay's
+/// on/off toggle itself always starts off.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct OctagonCfg {
+    /// Persist the overlay options across launches (Settings ▸ Overlay).
+    pub remember: bool,
+    pub color: crate::octagon::LineColor,
+    /// 0..1 opacity of the octagon's lines (0 = invisible, 1 = solid).
+    #[serde(serialize_with = "serialize_f32")]
+    pub line_opacity: f32,
+    /// Octagon crop factor: 0 = the full quad, 0.5 = the diamond. Clamped by [`Config::sanitize`].
+    #[serde(serialize_with = "serialize_f32")]
+    pub crop: f32,
+    /// 0..1 fade of the image outside the octagon toward the backdrop.
+    #[serde(serialize_with = "serialize_f32")]
+    pub hide: f32,
+}
+
+impl Default for OctagonCfg {
+    fn default() -> Self {
+        Self {
+            remember: false,
+            color: crate::octagon::LineColor::default(),
+            line_opacity: 1.0,
+            crop: crate::octagon::CROP_DEFAULT,
+            hide: 0.0,
+        }
+    }
+}
+
+impl OctagonCfg {
+    /// The overlay state a launch starts with: the persisted options when `remember` is on, the
+    /// defaults otherwise — and always switched off.
+    pub fn initial_state(&self) -> crate::octagon::OctagonState {
+        let mut s = crate::octagon::OctagonState::default();
+        if self.remember {
+            s.color = self.color;
+            s.line_opacity = self.line_opacity;
+            s.crop = self.crop;
+            s.hide = self.hide;
+            s.clamp();
+        }
+        s
+    }
+}
+
 /// One `[keybinds]` value: a single chord (`fit = "F"`) or several aliases for one action
 /// (`zoom-in = ["=", "Num+"]`). Untagged, so TOML's own shape decides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +316,8 @@ pub struct Config {
     pub background: BackgroundCfg,
     pub flipbook: FlipbookCfg,
     pub context_menu: ContextMenuCfg,
+    /// The octagon overlay's persistence opt-in and (when opted in) its saved options.
+    pub octagon: OctagonCfg,
     /// Keyboard bindings the user has changed from the defaults. See [`KeybindsCfg`].
     pub keybinds: KeybindsCfg,
     /// User-defined entries for the toolbar's "Open in…" menu — external apps and/or nested
@@ -289,6 +341,7 @@ impl Default for Config {
             background: BackgroundCfg::default(),
             flipbook: FlipbookCfg::default(),
             context_menu: ContextMenuCfg::default(),
+            octagon: OctagonCfg::default(),
             keybinds: KeybindsCfg::new(),
             open_with: Vec::new(),
         }
@@ -319,6 +372,14 @@ impl Config {
             EXPOSURE_STEP_MAX,
         );
         self.flipbook.fps = clamp_finite(self.flipbook.fps, FPS_DEFAULT, FPS_MIN, FPS_MAX);
+        self.octagon.crop = clamp_finite(
+            self.octagon.crop,
+            crate::octagon::CROP_DEFAULT,
+            crate::octagon::CROP_MIN,
+            crate::octagon::CROP_MAX,
+        );
+        self.octagon.hide = clamp_finite(self.octagon.hide, 0.0, 0.0, 1.0);
+        self.octagon.line_opacity = clamp_finite(self.octagon.line_opacity, 1.0, 0.0, 1.0);
     }
 
     /// Best-effort save to `config.toml`. Written to a sibling temp file and renamed over the
@@ -507,6 +568,13 @@ mod tests {
                 copy_file: true,
                 copy_path: false,
                 copy_file_name: true,
+            },
+            octagon: OctagonCfg {
+                remember: true,
+                color: crate::octagon::LineColor::Blue,
+                line_opacity: 0.5,
+                crop: 0.3,
+                hide: 0.75,
             },
             keybinds: [
                 ("fit".to_string(), KeyValue::One("Ctrl+F".into())),

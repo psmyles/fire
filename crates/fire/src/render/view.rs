@@ -194,7 +194,6 @@ impl ViewState {
     }
 
     /// Map image pixel coordinates back to a surface-pixel position.
-    #[allow(dead_code)] // pair of screen_to_image; exercised by the round-trip test
     pub fn image_to_screen(&self, img: (f32, f32), image: (u32, u32), vp: &Viewport) -> (f32, f32) {
         let c = vp.center();
         let img_center = (c.0 + self.pan.0, c.1 + self.pan.1);

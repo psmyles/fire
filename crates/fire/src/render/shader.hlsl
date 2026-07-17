@@ -35,6 +35,8 @@ cbuffer Params : register(b0) {
     float  fb_blend;       // 0..1 crossfade toward frame B (0 = hard cut)
     float  fb_max_lod;     // mip clamp so minified samples can't bleed across cells
     float2 surf_origin;    // image sub-rect's top-left in RENDER-TARGET px (see ps_main)
+    float  oct_crop;       // octagon overlay crop factor (0 = quad, 0.5 = diamond)
+    float  oct_hide;       // 0..1 fade of the image outside the octagon (0 = overlay off)
 };
 
 struct VSOut { float4 pos : SV_Position; };
@@ -139,10 +141,26 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
         rgb *= exposure;
         rgb = (tonemap == 1) ? aces(rgb) : reinhard(rgb);
     }
-    if (channel == 1) return float4(rgb.rrr, 1.0);
-    if (channel == 2) return float4(rgb.ggg, 1.0);
-    if (channel == 3) return float4(rgb.bbb, 1.0);
-    if (channel == 4) { float v = srgb_to_linear(float3(a, a, a)).x; return float4(v, v, v, 1.0); }
-    if (a < 0.999) rgb = backdrop(sp) * (1.0 - a) + rgb * a;
-    return float4(rgb, 1.0);
+    float3 outc;
+    if (channel == 1) outc = rgb.rrr;
+    else if (channel == 2) outc = rgb.ggg;
+    else if (channel == 3) outc = rgb.bbb;
+    else if (channel == 4) outc = srgb_to_linear(float3(a, a, a)).xxx;
+    else {
+        outc = rgb;
+        if (a < 0.999) outc = backdrop(sp) * (1.0 - a) + rgb * a;
+    }
+    // Octagon overlay "hide outside": fade pixels outside the octagon inscribed in the frame rect
+    // toward the backdrop. Unity's octagon (see crate::octagon): midpoint vertices pinned at
+    // (±0.5, 0)/(0, ±0.5), corner vertices at (±a, ±a) with a = 0.5·(1−crop). Each side's
+    // half-plane reduces to q.x + k·q.y ≤ 0.5 (and its mirror) with q the |offset| from the frame
+    // center and k = crop/(1−crop): k=0 is the quad, k=1 the diamond. In flipbook mode
+    // `f`/`img_size` are already the frame rect, so the shape tracks the shown cell.
+    if (oct_hide > 0.0) {
+        float2 q = abs(f / img_size - 0.5);
+        float k = oct_crop / max(1.0 - oct_crop, 0.5);
+        if (max(q.x + k * q.y, q.y + k * q.x) > 0.5)
+            outc = lerp(outc, backdrop(sp), oct_hide);
+    }
+    return float4(outc, 1.0);
 }

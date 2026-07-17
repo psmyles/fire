@@ -115,6 +115,9 @@ pub struct Frame {
     /// The settings window's "Browse…": the shell runs the common file dialog, which pumps its own
     /// modal loop and so must not be entered from inside `WM_PAINT`.
     pub settings_browse: bool,
+    /// The octagon overlay's options window changed something: the new state, for the shell to
+    /// push into the surface.
+    pub octagon: Option<crate::octagon::OctagonState>,
 }
 
 /// Left-docked slots, in order, each with the overflow priority the GDI chrome used: navigation is
@@ -145,6 +148,7 @@ const LEFT: &[(Action, u8, u8)] = &[
 /// where the viewport's right-click menu puts it. One place to look, not two.
 const RIGHT: &[(Action, u8)] = &[
     (Action::ToggleOutline, 0),
+    (Action::ToggleOctagon, 0),
     (Action::Background(Bg::Black), 1),
     (Action::Background(Bg::White), 1),
     (Action::Background(Bg::Grey), 1),
@@ -212,6 +216,15 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
         status_bar(ui, snap, m, dark, w, h);
         if let Some(g) = chip {
             hint_chip(ui, g, m, image, &mut out);
+        }
+    }
+
+    // The octagon overlay: the lines always track the image (full-screen included); the options
+    // window is chrome, so it hides with the rest in full-screen.
+    if let Some(o) = &snap.octagon {
+        octagon_lines(ui, o, m, image);
+        if !fullscreen {
+            octagon_window(ui, o, m, image, &mut out);
         }
     }
 
@@ -382,6 +395,183 @@ fn hint_chip(ui: &Ui, g: Grid, m: &Metrics, image: (f32, f32, f32, f32), out: &m
                 ui.tooltip_text("Don't ask again for this image");
             }
         });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Octagon overlay
+// ---------------------------------------------------------------------------------------------
+
+use crate::chrome::OctagonSnapshot;
+use crate::octagon::{self, CROP_MAX, LINE_COLORS};
+
+/// The octagon's line render: a closed polyline over the displayed frame, on the *background* draw
+/// list — over the image (the D3D pass ran first) but under every ImGui window — clipped to the
+/// image's sub-rect so a zoomed-in frame never draws under the bars.
+fn octagon_lines(ui: &Ui, o: &OctagonSnapshot, m: &Metrics, image: (f32, f32, f32, f32)) {
+    let (ix, iy, iw, ih) = image;
+    if iw <= 0.0 || ih <= 0.0 {
+        return;
+    }
+    if o.state.line_opacity <= 0.0 {
+        return; // fully transparent lines — the shape still acts through the hide fade
+    }
+    let pts: Vec<[f32; 2]> = octagon::vertices(o.frame, o.state.crop).to_vec();
+    let dl = ui.get_background_draw_list();
+    dl.with_clip_rect([ix, iy], [ix + iw, iy + ih], || {
+        dl.add_polyline(pts, o.state.line_rgba())
+            .thickness(m.scale.max(1.0).round())
+            .closed(true)
+            .build();
+    });
+}
+
+/// The overlay's options window: a small movable (not resizable) panel over the viewport with the
+/// line color, the crop factor, and the hide-outside fade. Any edit reports the whole new state via
+/// [`Frame::octagon`]; the shell pushes it into the surface.
+fn octagon_window(
+    ui: &Ui,
+    o: &OctagonSnapshot,
+    m: &Metrics,
+    image: (f32, f32, f32, f32),
+    out: &mut Frame,
+) {
+    const FLAGS: WindowFlags = WindowFlags::from_bits_truncate(
+        WindowFlags::NO_RESIZE.bits()
+            | WindowFlags::NO_COLLAPSE.bits()
+            | WindowFlags::NO_SCROLLBAR.bits()
+            | WindowFlags::NO_SCROLL_WITH_MOUSE.bits()
+            | WindowFlags::NO_SAVED_SETTINGS.bits()
+            | WindowFlags::ALWAYS_AUTO_RESIZE.bits(),
+    );
+    let mut st = o.state;
+    let mut changed = false;
+    let (ix, iy, _, _) = image;
+
+    // The chrome style's window rounding is 0 (the bars are edge-to-edge panes); this is a
+    // floating panel, so it borrows the settings window's radius — one look for every floating
+    // window in the app.
+    let _round = ui.push_style_var(StyleVar::WindowRounding(theme::floating_window_rounding(
+        m.scale,
+    )));
+    ui.window("Octagon Overlay")
+        .flags(FLAGS)
+        // First use only: the user can drag it anywhere and it stays there for the session.
+        .position([ix + m.edge_pad * 2.0, iy + m.edge_pad * 2.0], Condition::FirstUseEver)
+        .build(|| {
+            // The same control height the transport row uses, so this panel matches the chrome.
+            let controls = theme::current().chrome.controls;
+            let _p = theme::push_control(ui, controls.input_height, 0.0);
+            let style = ui.clone_style();
+            let spacing = style.item_spacing()[0];
+
+            // One label column, sized to the longest label — same rule as the settings form. The
+            // gutter is a real gap, not the toolbar's tight item spacing: the widest label would
+            // otherwise touch its control.
+            let labels = ["Line Color", "Line Opacity", "Crop Factor", "Hide Outside"];
+            let label_w = labels.iter().map(|s| text_w(ui, s)).fold(0.0f32, f32::max)
+                + spacing.max((m.scale * 10.0).round());
+            // A slider plus its value box; the value box fits the widest value it can show.
+            let field_w = text_w(ui, "0.000") + style.frame_padding()[0] * 2.0;
+            let slider_w = (m.scale * 150.0).round();
+
+            let row = |label: &str| {
+                ui.align_text_to_frame_padding();
+                ui.text(label);
+                ui.same_line_with_pos(label_w);
+            };
+
+            // --- line color: one swatch per palette entry, the accent ring marking the pick ---
+            row(labels[0]);
+            let swatch = ui.frame_height();
+            let ring = style.color(StyleColor::ButtonActive);
+            for (i, c) in LINE_COLORS.iter().copied().enumerate() {
+                if i > 0 {
+                    ui.same_line();
+                }
+                if ui
+                    .color_button_config(format!("##oct-color-{i}"), c.rgba())
+                    .flags(dear_imgui_rs::ColorButtonFlags::NO_TOOLTIP)
+                    .size([swatch, swatch])
+                    .build()
+                    && st.color != c
+                {
+                    st.color = c;
+                    changed = true;
+                }
+                if ui.is_item_hovered() {
+                    ui.tooltip_text(c.label());
+                }
+                if o.state.color == c {
+                    let (min, max) = (ui.item_rect_min(), ui.item_rect_max());
+                    // Rounded like the swatch it wraps (the ring sits 1px outside, so its radius
+                    // grows by the same 1px) — a square ring around a rounded button reads as a
+                    // glitch.
+                    ui.get_window_draw_list()
+                        .add_rect([min[0] - 1.0, min[1] - 1.0], [max[0] + 1.0, max[1] + 1.0], ring)
+                        .rounding(style.frame_rounding() + 1.0)
+                        .thickness(2.0)
+                        .build();
+                }
+            }
+
+            // --- line opacity: fade the lines without losing the shape's hide fade ---
+            row(labels[1]);
+            changed |=
+                slider_with_field(ui, "##oct-alpha", &mut st.line_opacity, 1.0, slider_w, field_w);
+
+            // --- crop factor: the shape, 0 (quad) → 0.5 (diamond) ---
+            row(labels[2]);
+            changed |= slider_with_field(ui, "##oct-crop", &mut st.crop, CROP_MAX, slider_w, field_w);
+
+            // --- hide outside: fade the clipped region toward the backdrop ---
+            row(labels[3]);
+            changed |= slider_with_field(ui, "##oct-hide", &mut st.hide, 1.0, slider_w, field_w);
+        });
+
+    if changed {
+        st.clamp();
+        out.octagon = Some(st);
+    }
+}
+
+/// A slider over `0..=max` with a typed-entry value box beside it — the mockup's layout (the number
+/// lives in the box, so the track shows none). Returns whether either changed `v`.
+///
+/// The value is kept to **three decimals**: every change (drag or typed) is rounded, so the box
+/// never shows a `0.2741935` and the persisted config stays clean. The box itself takes only
+/// numeric characters (`CHARS_DECIMAL`) — letters don't even appear while typing; the surface
+/// still clamps the parsed value to range.
+fn slider_with_field(ui: &Ui, id: &str, v: &mut f32, max: f32, slider_w: f32, field_w: f32) -> bool {
+    let round3 = |v: &mut f32| *v = (*v * 1000.0).round() / 1000.0;
+    let mut changed = false;
+    ui.set_next_item_width(slider_w);
+    if ui
+        .slider_config(format!("{id}-slider"), 0.0f32, max)
+        .display_format("")
+        .build(v)
+    {
+        // Rounded *before* the value box is drawn, so a drag shows three decimals live — rounding
+        // at the end of the row would leave the box one frame behind, showing the raw drag value
+        // until the mouse is released.
+        round3(v);
+        changed = true;
+    }
+    ui.same_line();
+    ui.set_next_item_width(field_w);
+    // `%g` prints `0.25`, not `0.250000` — and never more than the three decimals the rounding
+    // leaves.
+    if ui
+        .input_float_config(format!("{id}-field"))
+        .step(0.0)
+        .step_fast(0.0)
+        .format("%g")
+        .flags(dear_imgui_rs::InputScalarFlags::CHARS_DECIMAL)
+        .build(v)
+    {
+        round3(v);
+        changed = true;
+    }
+    changed
 }
 
 /// A checkbox whose box is **exactly** `size` logical px on a side — the stylesheet's
@@ -957,6 +1147,7 @@ fn action_id(a: Action) -> u32 {
         Action::ExpReset => 22,
         Action::ExpDown => 23,
         Action::ToggleOutline => 30,
+        Action::ToggleOctagon => 31,
         Action::Background(Bg::Black) => 40,
         Action::Background(Bg::White) => 41,
         Action::Background(Bg::Grey) => 42,

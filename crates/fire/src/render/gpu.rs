@@ -117,9 +117,10 @@ struct Params {
     /// image opens exactly `toolbar_h` px too high, its top clipped away by the viewport.
     surf_origin_x: f32,
     surf_origin_y: f32,
-    /// Pad the struct out to a whole 16-byte register (HLSL allocates `b7` in full either way; this
-    /// keeps the `memcpy` from copying uninitialised bytes).
-    _pad: [f32; 2],
+    /// Octagon overlay: the crop factor (0 = quad, 0.5 = diamond) and how much the image outside
+    /// the octagon fades toward the backdrop (0 = overlay off / no hiding).
+    oct_crop: f32,
+    oct_hide: f32,
 }
 
 // The cbuffer layout is kept in lockstep with the HLSL `cbuffer Params` in `render/shader.hlsl`
@@ -187,6 +188,11 @@ pub struct GpuSurface {
     /// Draw a 1px outline around the image boundary (toolbar toggle). On by default for every
     /// image type; the pick persists across navigation, like the backdrop.
     outline: bool,
+
+    /// The octagon overlay (toolbar toggle + its options window). Session-global like the outline:
+    /// it persists across navigation. The line render is the UI's (an ImGui draw list); the shader
+    /// only consumes `crop`/`hide` for the hide-outside fade.
+    octagon: crate::octagon::OctagonState,
 
     /// Monotonic per-window decode generation; a `DecodeDone` older than this is stale.
     generation: u64,
@@ -269,6 +275,7 @@ impl GpuSurface {
             background: Background::Black,
             background_override: None,
             outline: true,
+            octagon: crate::octagon::OctagonState::default(),
             generation: 0,
             current_image: None,
             anim_frames: Vec::new(),
@@ -399,6 +406,35 @@ impl GpuSurface {
     pub fn toggle_outline(&mut self) {
         self.outline = !self.outline;
         self.refresh();
+    }
+
+    pub fn octagon(&self) -> crate::octagon::OctagonState {
+        self.octagon
+    }
+
+    /// Adopt the octagon overlay's state (the options window's edits, or the persisted config at
+    /// startup), clamped, and repaint.
+    pub fn set_octagon(&mut self, mut s: crate::octagon::OctagonState) {
+        s.clamp();
+        self.octagon = s;
+        self.refresh();
+    }
+
+    /// Toggle the octagon overlay (toolbar) and repaint. The options — color, crop, hide — survive
+    /// the off state, so re-enabling picks up where the user left off.
+    pub fn toggle_octagon(&mut self) {
+        self.octagon.enabled = !self.octagon.enabled;
+        self.refresh();
+    }
+
+    /// The displayed frame's rect in **image-region** coords (pan/zoom applied): the whole image,
+    /// or the current cell in flipbook mode. `None` with no image. This is what the octagon line
+    /// overlay is drawn against.
+    pub fn frame_screen_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let dims = self.view_dims()?;
+        let (x, y) = self.view.image_to_screen((0.0, 0.0), dims, &self.viewport);
+        let (w, h) = self.view.image_screen_size(dims);
+        Some((x, y, w, h))
     }
 
     fn image_dims(&self) -> Option<(u32, u32)> {
@@ -837,7 +873,12 @@ impl GpuSurface {
             fb_max_lod,
             surf_origin_x: self.origin.0,
             surf_origin_y: self.origin.1,
-            _pad: [0.0; 2],
+            oct_crop: self.octagon.crop,
+            oct_hide: if self.octagon.enabled {
+                self.octagon.hide
+            } else {
+                0.0
+            },
         };
 
         unsafe {

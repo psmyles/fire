@@ -18,8 +18,9 @@ decode**, not draw. A 2K PNG decodes in single-digit milliseconds; the headline 
 getting a process to `main()` and a window on screen. A cold launch of a small native exe is
 cheap enough that **no resident process is needed** to feel instant — so Fire keeps nothing
 warm and creates everything it needs on the launch path. Decode (≈392 ms for an 8192×4096
-PNG via zune) dominates time-to-first-pixel and is the project's primary metric; everything
-else is kept off the critical path to the first pixel.
+PNG) dominates time-to-first-pixel and is the project's primary metric; everything else is
+kept off the critical path to the first pixel. (PNG itself is decoded via the `image` crate,
+not zune's own PNG path — see §6.)
 
 Two consequences shape the whole design:
 
@@ -52,16 +53,15 @@ Explorer double-click
 │          NewWindow: open our own window                        │
 │          SingleInstance: own the mutex+pipe, or forward & exit │
 │                                                                │
-│  ┌── frame window (Win32) ─────────────────────────────────┐  │
-│  │  GDI toolbar (top) · GDI status bar (bottom)            │  │
+│  ┌── one window (Win32) ───────────────────────────────────┐  │
+│  │  D3D11 flip-model swapchain covers the whole client     │  │
+│  │  · image drawn into a sub-rect (one fullscreen triangle)│  │
+│  │  · Dear ImGui chrome drawn over the rest, same backbuf. │  │
 │  │  owns message loop, title, size, lifecycle, theme       │  │
-│  │  ┌── child "view" window ───────────────────────────┐   │  │
-│  │  │  D3D11 swapchain — the image region              │   │  │
-│  │  └──────────────────────────────────────────────────┘   │  │
 │  └─────────────────────────────────────────────────────────┘  │
 │                                                                │
 │  decode worker pool (off-thread)  ──PostMessage──▶ UI thread   │
-│  fire-decode core (zune / image / exr / psd_sdk / lcms2)       │
+│  fire-decode core (zune / image / exr / heif / psd_sdk / lcms2)│
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -455,7 +455,8 @@ for, which the win shell applies.
   luminance, so a pale accent doesn't produce white-on-yellow. The settings window uses the same token,
   which is what keeps the two windows recognizably one app.
 - **Future:** a third mode — compare two images side-by-side in one window, or tabs — is
-  anticipated; it reuses the frame/child-view split (one view child per slot).
+  anticipated. With the single-window collapse it would be built as extra image sub-rects (and
+  extra swapchain viewports) within the one window, not as child windows.
 
 ---
 
@@ -472,13 +473,24 @@ for, which the win shell applies.
   and stopped when a still image or a failed load takes over (`App::sync_animation`), so it follows
   ←/→ navigation and hot-reload and never outlives the animated image. Playback is pan/zoom/channel/
   exposure-agnostic (those still just change the constant buffer). Only GIF is animated for now.
-- Drag-and-drop open: both the frame and the view child register with `DragAcceptFiles`, and
-  each wndproc routes `WM_DROPFILES` through the same `App::open` path as a launch/forward
-  (registering both is required because `WS_CLIPCHILDREN` gives the view its own client rect, so
-  a drop over the image would otherwise miss the frame). The first dropped file is opened.
+- **Flipbook (sprite-sheet) playback:** a still image laid out as a `cols × rows` grid of frames
+  is played back as an animation without ever re-uploading the texture — the whole sheet stays one
+  texture and playback only moves the constant buffer's cell offsets + blend (`App::tick_flipbook`
+  on `FLIPBOOK_TIMER_ID`). The grid is **content-detected** off-thread on the decode worker
+  (`flipbook::detect`, YIN period detection over luma/alpha — *the pixels decide the grid*, since
+  filenames can be wrong or missing; a `_8x8` filename token is only a last-resort fallback), and
+  surfaced as a dismissible hint that never enters the mode on its own. Once in flipbook mode a
+  transport band (`crate::transport`, drawn in ImGui) exposes cols/rows/count, FPS, play/pause,
+  scrub and cross-frame blend; a scrub drag pauses playback for its duration. Defaults and per-path
+  overrides live in the Flipbook settings tab. Pure grid/frame math is in `flipbook.rs` (unit-tested,
+  no Win32/GPU).
+- Drag-and-drop open: the window registers with `DragAcceptFiles`, and the wndproc routes
+  `WM_DROPFILES` through the same `App::open` path as a launch/forward. With the single-window
+  collapse there is no child to also register — one client rect covers image and chrome alike. The
+  first dropped file is opened.
 - **Pixel inspector** (planned): eyedropper RGBA readout + a zoomed pixel grid at high
-  magnification, custom-painted into the view child with GDI `TextOut`/`DrawText` (system
-  font — no rasterizer dependency), reading `current_image` via `view.screen_to_image()`.
+  magnification, reading `current_image` via `view.screen_to_image()` and drawn in ImGui like the
+  rest of the chrome (no GDI, no child window).
 - Folder navigation: ←/→ walk the sibling images in the current file's directory (wrapping at
   both ends), in file-manager natural order (case-insensitive, digit-runs by value so `img2`
   precedes `img10`); the status bar shows the position/count (`3 / 27`).
@@ -492,8 +504,12 @@ for, which the win shell applies.
   (zoom/pan/channel/exposure) when the new image has the same dimensions, only re-fitting if the
   dimensions changed. The watch follows ←/→ navigation (it re-targets on every open/load) and is
   generation-tagged for stale-drop, exactly like decodes and folder scans.
-- Planned: clipboard (`arboard`); "open in configured editor"; configurable background and
-  alpha checkerboard.
+- **Open in configured editor:** the actions menu launches a user-configured external app on the
+  current file (`config` context-menu tree → `launch_external`); the tree is edited in the Context
+  menu settings tab.
+- Planned: pixel inspector (above); clipboard copy (not yet wired — no dependency pulled in); a
+  custom background-color picker (the settings ship four preset backdrops; a custom color needs a
+  `Params`/shader change).
 
 ---
 
@@ -522,10 +538,12 @@ fire/
 └─ Cargo.toml         # workspace
 ```
 
-Key dependencies: `windows` (typed COM for the D3D11 device + DXGI flip swapchain),
-`windows-sys` (Win32: window/message loop, GDI, DWM, DPI, pipe, mutex, registry),
-`zune-image`/`image`/`exr`/`lcms2`/`psd_sdk`/`libheif` (decode), `serde`/`toml`/`notify`
-(config), `arboard` (clipboard), `crossbeam-channel` (worker messaging).
+Key dependencies: `windows` (typed COM for the D3D11 device + DXGI flip swapchain, used only in
+`render/gpu.rs` and `render/imgui.rs`), `windows-sys` (the rest of Win32: window/message loop, DWM,
+DPI, pipe, mutex, registry), `dear-imgui-sys` (the ImGui context + upstream's own win32/dx11
+backends, §5.2), `zune-image`/`image`/`exr`/`lcms2`/`psd_sdk`/`libheif` (decode), `serde`/`toml`/
+`notify` (config + hot-reload), `crossbeam-channel` (worker messaging). (Clipboard is planned but no
+crate is pulled in yet.)
 
 ---
 
@@ -563,16 +581,17 @@ Key dependencies: `windows` (typed COM for the D3D11 device + DXGI flip swapchai
 **In v1:** single self-contained native Win32 exe; configurable NewWindow / SingleInstance
 lifecycle with **foreground activation on the forward path (§4.1)**; GPU (D3D11) shader
 render with channel/alpha/gamma/exposure/tonemap; async worker decode; zune + image + exr +
-psd_sdk + libheif decoders; camera-raw embedded-preview decode; ICC honoring via lcms2;
-tonemap-to-SDR HDR with exposure; downscale-to-fit RAM guard; **DPI-aware, dark-mode-aware
-ImGui toolbar + status bar + settings window**; open-in-editor + clipboard; association-only
-Explorer integration; unsigned installer.
+psd_sdk + libheif decoders; camera-raw embedded-preview decode; animated GIF playback; ICC honoring
+via lcms2; tonemap-to-SDR HDR with exposure; downscale-to-fit RAM guard; content-detected **flipbook
+(sprite-sheet) playback** with a transport band; folder ←/→ navigation; hot-reload of the displayed
+image; **DPI-aware, dark-mode-aware ImGui toolbar + status bar + settings window**; open-in-editor;
+association-only Explorer integration; unsigned installer.
 
-**In progress / deferred:** pixel inspector, background-color *picker* (the settings window ships
-the four preset backdrops; a custom color needs a `Params`/shader change), exposure trackbar;
-compare/tabs mode; Explorer `IThumbnailProvider`; **full raw development** (demosaic the sensor
-mosaic instead of showing the embedded preview — a separate opt-in mode, kept off the fast path);
-code signing.
+**In progress / deferred:** pixel inspector; clipboard copy (no crate wired in yet);
+background-color *picker* (the settings window ships the four preset backdrops; a custom color needs
+a `Params`/shader change), exposure trackbar; compare/tabs mode; Explorer `IThumbnailProvider`;
+**full raw development** (demosaic the sensor mosaic instead of showing the embedded preview — a
+separate opt-in mode, kept off the fast path); code signing.
 
 ---
 

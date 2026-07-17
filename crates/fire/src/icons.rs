@@ -50,10 +50,11 @@ pub enum Icon {
     Play,
     Pause,
     More,
+    Octagon,
 }
 
 /// The embedded A8 masters, indexed by `Icon as usize`. Same order as the enum / `build.rs`.
-const MASTERS: [&[u8]; 25] = [
+const MASTERS: [&[u8]; 26] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_left.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_right.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_zoom_out.a8")),
@@ -79,6 +80,7 @@ const MASTERS: [&[u8]; 25] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_play.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_pause.a8")),
     include_bytes!(concat!(env!("OUT_DIR"), "/icon_more.a8")),
+    include_bytes!(concat!(env!("OUT_DIR"), "/icon_octagon.a8")),
 ];
 
 /// Number of icons in the atlas strip.
@@ -86,9 +88,9 @@ pub const COUNT: usize = MASTERS.len();
 
 /// Compile-time guard that [`Icon`] and [`MASTERS`] stay the same length: [`Icon::uv`] and [`atlas`]
 /// index by `icon as usize`, so a variant added without a corresponding master (or vice-versa) must
-/// fail the build rather than panic at runtime. `More` must stay the last `Icon` variant for this
+/// fail the build rather than panic at runtime. `Octagon` must stay the last `Icon` variant for this
 /// check to hold.
-const _: () = assert!(Icon::More as usize + 1 == COUNT);
+const _: () = assert!(Icon::Octagon as usize + 1 == COUNT);
 
 impl Icon {
     /// This icon's UV rect within the atlas strip (icons are packed left-to-right, one row).
@@ -171,7 +173,7 @@ mod tests {
         assert_eq!(a0[0], 0.0);
         let (b0, _) = Icon::Right.uv();
         assert_eq!(a1[0], b0[0]); // adjacent cells share an edge
-        let (_, z1) = Icon::More.uv();
+        let (_, z1) = Icon::Octagon.uv();
         assert_eq!(z1[0], 1.0); // last cell ends exactly at the strip's right edge
     }
 }

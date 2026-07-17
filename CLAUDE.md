@@ -7,8 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Fire** (*Fast Image REview*) is a Windows-only native Win32 image viewer optimized for
 *time-to-first-pixel* when double-clicking a file in Explorer. It is a single self-contained
 `fire.exe`: image decoded off-thread, presented on the GPU through a Direct3D 11 device + DXGI
-flip-model swapchain created lazily when the window opens, with custom GDI-painted DPI/dark-mode
-chrome. There is no resident process — the thing Explorer launches *is* the whole app.
+flip-model swapchain created lazily when the window opens, with DPI/dark-mode chrome drawn by Dear
+ImGui into the same backbuffer. There is no resident process — the thing Explorer launches *is* the
+whole app.
 
 [architecture.md](architecture.md) is the authoritative design doc (process model, GPU pipeline,
 color management, IPC). Read it before any non-trivial change — the sections below are the

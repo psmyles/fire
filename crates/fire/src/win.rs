@@ -803,6 +803,7 @@ impl App {
             Action::ExpReset => self.surface.reset_exposure(),
             Action::ExpDown => self.surface.adjust_exposure(-self.cfg.exposure_step),
             Action::ToggleOutline => self.surface.toggle_outline(),
+            Action::ToggleOctagon => self.surface.toggle_octagon(),
             Action::Background(bg) => self.surface.set_background(bg),
             // Toggling full-screen resizes the window, which fires WM_SIZE; fall through to the
             // shared redraw below.
@@ -1064,11 +1065,40 @@ impl App {
         self.keybinds = Keybinds::from_config(&new.keybinds);
         apply_view_config(&mut self.surface, &new);
         self.cfg = new;
+        // Opting into octagon persistence captures the overlay options as they are *right now* —
+        // the settings draft only carries the checkbox; the live overlay is the authority.
+        if self.cfg.octagon.remember {
+            let s = self.surface.octagon();
+            self.cfg.octagon.color = s.color;
+            self.cfg.octagon.line_opacity = s.line_opacity;
+            self.cfg.octagon.crop = s.crop;
+            self.cfg.octagon.hide = s.hide;
+        }
         self.cfg.save();
 
         // The toolbar's tooltips carry the (possibly rebound) shortcuts, and the backdrop buttons
         // reflect the new default; the open-with menu is rebuilt per-show, so it needs nothing.
         self.redraw();
+    }
+
+    /// Persist the octagon overlay's options into `config.toml` on exit, when the user opted in
+    /// (Settings ▸ Overlay). The on/off toggle is never persisted — a launch always starts with
+    /// the overlay off.
+    fn persist_octagon(&mut self) {
+        if !self.cfg.octagon.remember {
+            return;
+        }
+        let s = self.surface.octagon();
+        let oc = &mut self.cfg.octagon;
+        if (oc.color, oc.line_opacity, oc.crop, oc.hide)
+            != (s.color, s.line_opacity, s.crop, s.hide)
+        {
+            oc.color = s.color;
+            oc.line_opacity = s.line_opacity;
+            oc.crop = s.crop;
+            oc.hide = s.hide;
+            self.cfg.save();
+        }
     }
 
     /// Build the snapshot the chrome renders from.
@@ -1112,6 +1142,20 @@ impl App {
             }
         }
 
+        // The octagon overlay's read model: only while it is on and something is displayed. The
+        // frame rect comes out in image-region coords; the UI draws in client coords, so the
+        // image origin is added here, once.
+        let octagon = (s.octagon().enabled && has_image)
+            .then(|| {
+                let (fx, fy, fw, fh) = s.frame_screen_rect()?;
+                let (ox, oy) = s.image_origin();
+                Some(chrome::OctagonSnapshot {
+                    state: s.octagon(),
+                    frame: (fx + ox, fy + oy, fw, fh),
+                })
+            })
+            .flatten();
+
         ViewSnapshot {
             channel: s.channel(),
             fit: s.is_fit(),
@@ -1122,6 +1166,7 @@ impl App {
             has_alpha: s.has_alpha(),
             background: s.background(),
             outline: s.outline(),
+            octagon,
             can_navigate: self.folder.as_ref().is_some_and(|f| f.len() > 1),
             fullscreen: self.fullscreen,
             flipbook: self.flipbook_state().is_some(),
@@ -1395,6 +1440,12 @@ impl App {
             self.open_menu(anchor.kind, anchor.pos);
         }
 
+        // The octagon overlay's options window edited something.
+        if let Some(s) = frame.octagon {
+            self.surface.set_octagon(s);
+            self.redraw();
+        }
+
         // The settings window. Apply *before* close, so OK (which does both) commits.
         if let Some(cfg) = frame.settings_apply {
             self.apply_settings(cfg);
@@ -1506,6 +1557,9 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
         // The view-related config the surface owns (backdrop / open-fit / tonemap defaults). Same
         // path the settings dialog re-runs on Apply — see `App::apply_view_config`.
         apply_view_config(&mut surface, &cfg);
+        // The octagon overlay's options — persisted ones if the user opted in, defaults otherwise;
+        // always starts switched off.
+        surface.set_octagon(cfg.octagon.initial_state());
 
         // ImGui needs the live D3D11 device/context, so it is built from the surface.
         let mut imgui = Imgui::new(
@@ -1941,6 +1995,7 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         WM_DESTROY => {
             // Remember where/how the window was before it goes away, to restore next launch.
             save_window_state(hwnd, app);
+            app.persist_octagon();
             PostQuitMessage(0);
             0
         }

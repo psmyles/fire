@@ -596,6 +596,14 @@ pub(crate) fn push_control(ui: &Ui, height: f32, pad_x: f32) -> Option<StyleStac
     Some(ui.push_style_var(StyleVar::FramePadding([x, y])))
 }
 
+/// The corner radius for a floating panel drawn under the *chrome* style (the octagon overlay's
+/// options window): the settings window's `[form] window_rounding`, scaled. The chrome style's own
+/// `window_rounding` is 0 — its windows are edge-to-edge bars — so a floating panel borrows the
+/// form's radius instead, and every floating window in the app shares one look.
+pub fn floating_window_rounding(scale: f32) -> f32 {
+    (current().form.geom.window_rounding * scale).round()
+}
+
 /// The status bar's fill — its own window, one step deeper than the toolbar's.
 pub fn status_bg(dark: bool) -> [f32; 4] {
     let t = current();

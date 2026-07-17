@@ -46,6 +46,9 @@ pub enum Action {
     ExpDown,
     /// Toggle the 1px image-boundary outline (right-side group).
     ToggleOutline,
+    /// Toggle the octagon overlay — Unity VFX Graph's octagon particle shape drawn over the image
+    /// (right-side group, next to the outline).
+    ToggleOctagon,
     /// Choose the viewport backdrop (right-side group).
     Background(Background),
     /// Enter/leave borderless full-screen (Esc or middle-click over the viewport also toggle it).
@@ -79,6 +82,10 @@ pub struct ViewSnapshot {
     pub background: Background,
     /// Image-boundary outline is on (drives the toggle button's highlight).
     pub outline: bool,
+    /// The octagon overlay, when it is active for the displayed image: its state (for the options
+    /// window) and the displayed frame's rect in client coords (for the line render). `None` when
+    /// the overlay is off or nothing is shown.
+    pub octagon: Option<OctagonSnapshot>,
     /// A folder cursor with more than one image exists (enables ←/→).
     pub can_navigate: bool,
     /// The window is currently in borderless full-screen (drives the toggle's highlight).
@@ -94,6 +101,15 @@ pub struct ViewSnapshot {
     pub status_right: String,
 }
 
+/// The octagon overlay's read model, built per frame like the rest of the snapshot.
+#[derive(Clone, Copy)]
+pub struct OctagonSnapshot {
+    pub state: crate::octagon::OctagonState,
+    /// The displayed frame's rect (the whole image, or the flipbook cell) in **client** coords,
+    /// pan/zoom applied — the box the octagon is inscribed in.
+    pub frame: (f32, f32, f32, f32),
+}
+
 impl ViewSnapshot {
     /// Whether a button is interactive in the current state (others are drawn dimmed).
     pub(crate) fn enabled(&self, a: Action) -> bool {
@@ -101,6 +117,7 @@ impl ViewSnapshot {
             Action::Prev | Action::Next => self.can_navigate,
             Action::ZoomOut | Action::ZoomIn | Action::ZoomToggle => self.has_image,
             Action::Channel(_) | Action::Background(_) | Action::ToggleOutline => self.has_image,
+            Action::ToggleOctagon => self.has_image,
             Action::ToggleTonemap | Action::ExpUp | Action::ExpReset | Action::ExpDown => {
                 self.is_hdr
             }
@@ -126,6 +143,7 @@ impl ViewSnapshot {
             Action::ToggleTonemap => self.tonemap == Tonemap::Aces,
             Action::Background(b) => self.background == b,
             Action::ToggleOutline => self.outline,
+            Action::ToggleOctagon => self.octagon.is_some(),
             Action::ToggleFullscreen => self.fullscreen,
             Action::ToggleFlipbook => self.flipbook,
             Action::Overflow => false,
@@ -166,6 +184,7 @@ impl ViewSnapshot {
             Action::ToggleOutline => {
                 format!("Image boundary outline{}", k(KeyAction::ToggleOutline))
             }
+            Action::ToggleOctagon => "Octagon overlay".into(),
             Action::Background(Background::Black) => "Black backdrop".into(),
             Action::Background(Background::White) => "White backdrop".into(),
             Action::Background(Background::Grey) => "Grey backdrop".into(),
@@ -208,6 +227,7 @@ impl ViewSnapshot {
             Action::ExpReset => Icon::EvReset,
             Action::ExpDown => Icon::EvDown,
             Action::ToggleOutline => Icon::Outline,
+            Action::ToggleOctagon => Icon::Octagon,
             Action::Background(Background::Black) => Icon::B,
             Action::Background(Background::White) => Icon::White,
             Action::Background(Background::Grey) => Icon::G,

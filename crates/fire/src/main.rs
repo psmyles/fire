@@ -26,6 +26,7 @@ mod hotstyle;
 mod icons;
 mod ipc_server;
 mod keybinds;
+mod octagon;
 mod product;
 mod render;
 mod transport;

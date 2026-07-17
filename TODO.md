@@ -1,3 +1,6 @@
 - tracy integration
 - settings: custom background color (needs a `Params` cbuffer + shader extension)
 - settings: hot-reload `config.toml` on external edits (architecture.md §9 claims this)
+- Tiled/virtual texturing deferred to v2
+- a third mode - compare two images side-by-side in one window, or tabs
+- pixel inspector

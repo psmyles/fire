@@ -118,6 +118,26 @@
 # copy-file-name = true
 
 # ----------------------------------------------------------------------------------------------
+# [octagon] — the octagon overlay (the octagon button on the toolbar): Unity VFX Graph's octagon
+#             particle shape drawn over the image, so you can see how a texture would be clipped.
+#             The overlay itself always starts switched OFF; these keys only govern its options.
+#
+#   remember      Persist the options below across launches (saved when Fire closes). Default
+#                 false: the options reset to the defaults every launch and nothing is written back.
+#   color         Line color: "red" (default), "green", "blue", "white" or "black".
+#   line-opacity  Opacity of the octagon's lines, 0.0 – 1.0. Default 1.0 (solid).
+#   crop          Crop factor, 0.0 – 0.5: 0 = the full quad, 0.5 = the diamond. Default 0.25.
+#   hide          How much the image outside the octagon fades toward the backdrop, 0.0 – 1.0.
+#                 Default 0.0 (fully visible).
+#
+# [octagon]
+# remember = false
+# color = "red"
+# line-opacity = 1.0
+# crop = 0.25
+# hide = 0.0
+
+# ----------------------------------------------------------------------------------------------
 # [keybinds] — keyboard shortcuts. Easiest edited in Settings ▸ Keybinds, but you can write them
 #              here too. Only the ones you CHANGE are listed: anything absent keeps its default (so
 #              you also pick up any new defaults a future version ships).

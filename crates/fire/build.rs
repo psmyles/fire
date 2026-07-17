@@ -69,6 +69,7 @@ const ICON_STEMS: &[&str] = &[
     "icon_play",
     "icon_pause",
     "icon_more",
+    "icon_octagon",
 ];
 
 /// Rasterize each toolbar SVG to a square A8 coverage mask in `OUT_DIR`. The SVGs are single-color
