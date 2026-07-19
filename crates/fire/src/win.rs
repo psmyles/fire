@@ -64,12 +64,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW,
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HWND_TOP, IDC_ARROW,
-    MINMAXINFO, MSG, SWP_FRAMECHANGED,
+    MINMAXINFO, MSG, SIZE_MAXIMIZED, SIZE_RESTORED, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SW_FORCEMINIMIZE,
     SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
     SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
     WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_DROPFILES, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_DPICHANGED, WM_DROPFILES, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
@@ -274,6 +274,12 @@ struct App {
     settings: Option<crate::ui::settings::State>,
     /// Whether the caret-blink timer is currently armed (see [`App::sync_caret_timer`]).
     caret_timer: bool,
+    /// True between `WM_ENTERSIZEMOVE` and `WM_EXITSIZEMOVE`, i.e. while the user is dragging the
+    /// frame's border or title bar. Used to *coalesce* the window-state save: we skip the flood of
+    /// intermediate `WM_SIZE`s during a drag and persist once at `WM_EXITSIZEMOVE` instead. See
+    /// [`save_window_state`] — persisting live (not just on close) is what lets the next
+    /// `NewWindow` launch reopen at the size/maximized state the user last left a window in.
+    in_size_move: bool,
 }
 
 impl App {
@@ -1608,6 +1614,7 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
             menu: None,
             settings: None,
             caret_timer: false,
+            in_size_move: false,
         });
 
         // Open the launch path immediately (decode is async; the image swaps in via
@@ -1796,6 +1803,30 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             // `render`, so there is nothing else to lay out.
             app.surface.resize(w, h);
             app.redraw();
+            // Persist the placement as it changes, not just on close, so the *next* NewWindow launch
+            // reopens at the size/maximized state the user last left a window in (rather than a stale
+            // one saved by some earlier window). We only act on the maximize-button/restore-button
+            // transitions here; a border drag floods `SIZE_RESTORED`, so that case saves once at
+            // `WM_EXITSIZEMOVE` instead (guarded by `in_size_move`). Full-screen resizes are skipped —
+            // saving there would persist the borderless monitor rect (`save_window_state` uses the
+            // stashed windowed placement only when quitting mid-full-screen).
+            let wp = wparam as u32;
+            if !app.fullscreen && !app.in_size_move && (wp == SIZE_MAXIMIZED || wp == SIZE_RESTORED) {
+                save_window_state(hwnd, app);
+            }
+            0
+        }
+        WM_ENTERSIZEMOVE => {
+            app.in_size_move = true;
+            0
+        }
+        WM_EXITSIZEMOVE => {
+            // A border drag or title-bar move just ended; persist the final rect once (the
+            // per-`WM_SIZE` save was suppressed while `in_size_move`).
+            app.in_size_move = false;
+            if !app.fullscreen {
+                save_window_state(hwnd, app);
+            }
             0
         }
         WM_GETMINMAXINFO => {
