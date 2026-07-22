@@ -65,6 +65,10 @@ SetupIconFile={#MyIconSource}
 ; Tell the shell to refresh icons/associations when our [Registry] entries change.
 ChangesAssociations=yes
 WizardStyle=modern
+
+; Fire's own MIT license, shown on the wizard's license page. Paths here are relative to this
+; .iss file, so ".." is the repo root.
+LicenseFile=..\LICENSE
 Compression=lzma2
 SolidCompression=yes
 OutputDir={#MyOutputDir}
@@ -75,6 +79,17 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "{#MyExeSource}"; DestDir: "{app}"; DestName: "{#MyAppExe}"; Flags: ignoreversion
+
+; --- license notices -----------------------------------------------------------------------
+; fire.exe is statically linked, so the binary installed above contains code from ~130 other
+; projects. Their licenses (MIT/BSD attribution, and LGPL-3.0 for libheif/libde265) require the
+; notices to travel with the binary, so a user who only ever runs Setup.exe still receives them.
+; Not optional and not behind a task: dropping these makes the installed copy non-compliant.
+; Paths are relative to this .iss file, so ".." is the repo root.
+Source: "..\LICENSE";                 DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "..\THIRD-PARTY-NOTICES.md";  DestDir: "{app}"; Flags: ignoreversion
+Source: "..\CREDITS.md";              DestDir: "{app}"; Flags: ignoreversion
+Source: "..\licenses\*.txt";          DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"

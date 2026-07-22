@@ -96,6 +96,19 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $ExePath)) { throw "Built exe not found at $ExePath (did the build run?)" }
 
+# --- 4b. verify the license notices are present ------------------------------
+# fire.iss installs these alongside the exe. A statically-linked fire.exe carries code from ~130
+# other projects whose licenses require their notices to travel with the binary, so shipping an
+# installer without them is a compliance bug, not a cosmetic one. Fail here with a clear message
+# rather than letting ISCC report a missing source file.
+Write-Step "Verifying license notices"
+$noticeFiles = 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'CREDITS.md'
+$absent = $noticeFiles | Where-Object { -not (Test-Path (Join-Path $RepoRoot $_)) }
+if ($absent) { throw "Missing license file(s) the installer must ship: $($absent -join ', ')" }
+$licenseTexts = @(Get-ChildItem -Path (Join-Path $RepoRoot 'licenses') -Filter '*.txt' -ErrorAction SilentlyContinue)
+if ($licenseTexts.Count -eq 0) { throw "No license texts found in $RepoRoot\licenses\ (installer expects licenses\*.txt)" }
+Write-Host "    $($noticeFiles.Count) notice files + $($licenseTexts.Count) license texts."
+
 # --- 5. write the generated ISPP include -------------------------------------
 Write-Step "Writing installer\product.generated.iss"
 # Escape double quotes for ISPP string literals (doubled), so values with quotes survive.

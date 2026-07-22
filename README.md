@@ -66,3 +66,18 @@ the `psd_sdk` C++ source (into `crates/psd-sdk-sys/vendor/`, for the PSD decoder
 prebuilt static `libheif` + `libde265` + `dav1d` libs (into `crates/heif-sys/vendor/`, for
 AVIF/HEIF/HEIC). See each crate's `vendor/VENDOR.txt` for the recipe.
 
+
+## License
+
+Fire is MIT licensed - see [LICENSE](LICENSE).
+
+`fire.exe` is statically linked, so it contains code from ~130 other projects.
+[CREDITS.md](CREDITS.md) says who wrote them; [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
+carries the formal per-package copyright notices, with full license texts in [licenses/](licenses/).
+The installer ships all of it alongside the exe.
+
+One dependency is copyleft: **libheif** and **libde265** are LGPL-3.0-only. Fire links them
+statically, so you are entitled to relink `fire.exe` against your own modified builds of those
+libraries - the exact `.lib` files are in `crates/heif-sys/vendor/lib/` and the recipe that
+produced them is in `crates/heif-sys/vendor/VENDOR.txt`. See the LGPL section of
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for details.
