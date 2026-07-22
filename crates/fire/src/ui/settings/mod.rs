@@ -33,7 +33,9 @@ use crate::config::Config;
 use crate::keybinds::{KeyAction, KeyChord, Keybinds, ALL_ACTIONS};
 use crate::render::imgui::{center_next_window, size_next_window, FormStyle};
 
-use model::{BoolField, ChoiceField, NumField, TextField, {self as m}};
+use model::{
+    BoolField, ChoiceField, NumField, TextField, {self as m},
+};
 
 use super::theme;
 use super::{text_w, Frame};
@@ -109,7 +111,12 @@ impl State {
             self.note.clear();
             return;
         }
-        let chord = KeyChord { vk, ctrl, alt, shift };
+        let chord = KeyChord {
+            vk,
+            ctrl,
+            alt,
+            shift,
+        };
         if chord.is_reserved() {
             return;
         }
@@ -361,7 +368,12 @@ fn general(ui: &Ui, st: &mut State) {
     ui.separator_with_text("Window");
     choice(ui, st, lw, ChoiceField::InstanceMode, "Opening an image");
     row_note(ui, lw, "Takes effect for images opened from now on.");
-    check(ui, st, BoolField::HotReload, "Reload the image when the file changes on disk");
+    check(
+        ui,
+        st,
+        BoolField::HotReload,
+        "Reload the image when the file changes on disk",
+    );
 
     ui.spacing();
     ui.separator_with_text("View");
@@ -393,7 +405,10 @@ fn flipbook(ui: &Ui, st: &mut State) {
         BoolField::FlipbookAutoDetect,
         "Offer flipbook mode when an image looks like a sprite sheet",
     );
-    note(ui, "Off skips the scan entirely; flipbook mode still works by hand.");
+    note(
+        ui,
+        "Off skips the scan entirely; flipbook mode still works by hand.",
+    );
 
     ui.spacing();
     ui.separator_with_text("Playback defaults");
@@ -404,7 +419,12 @@ fn flipbook(ui: &Ui, st: &mut State) {
     );
     ui.spacing();
     num(ui, st, lw, NumField::FlipbookFps, "Frame rate");
-    check(ui, st, BoolField::FlipbookAutoplay, "Start playing immediately");
+    check(
+        ui,
+        st,
+        BoolField::FlipbookAutoplay,
+        "Start playing immediately",
+    );
     check(ui, st, BoolField::FlipbookBlend, "Crossfade between frames");
 }
 
@@ -515,7 +535,10 @@ fn context_menu(ui: &Ui, st: &mut State, out: &mut Frame) {
 
     ui.spacing();
     ui.separator_with_text("\"Open in\u{2026}\" entries");
-    note(ui, "Programs to open the current image with. Nest entries to make submenus.");
+    note(
+        ui,
+        "Programs to open the current image with. Nest entries to make submenus.",
+    );
 
     // The tree, as a scrolling list of indented rows: full width, and six rows tall — measured in
     // rows, so it holds six of them whatever the font and the DPI happen to be.

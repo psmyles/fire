@@ -23,7 +23,10 @@ fn exr_2x2(px: [[f32; 4]; 4]) -> Vec<u8> {
     let image = Image::from_channels((2, 2), channels);
 
     let mut buf = Cursor::new(Vec::new());
-    image.write().to_buffered(&mut buf).expect("write exr fixture");
+    image
+        .write()
+        .to_buffered(&mut buf)
+        .expect("write exr fixture");
     buf.into_inner()
 }
 
@@ -47,7 +50,10 @@ fn exr_decodes_linear_float() {
 
     assert_eq!((out.width, out.height), (2, 2));
     assert_eq!(out.format, PixelFormat::Rgba32Float);
-    assert!(out.format.is_hdr(), "EXR is linear/HDR: exposure + tonemap apply");
+    assert!(
+        out.format.is_hdr(),
+        "EXR is linear/HDR: exposure + tonemap apply"
+    );
     assert_eq!(out.source_format, "OpenEXR");
     assert_eq!(pixel(&out, 0), [1.0, 0.0, 0.0, 1.0]);
     assert_eq!(pixel(&out, 1), [0.0, 0.5, 0.0, 1.0]);
@@ -63,7 +69,11 @@ fn exr_preserves_values_above_one() {
     let out = decode(&bytes, Some("exr"), &DecodeOptions::default()).expect("should decode");
 
     for i in 0..4 {
-        assert_eq!(pixel(&out, i), [8.0, 4.0, 2.0, 1.0], "HDR values must not clamp to 1.0");
+        assert_eq!(
+            pixel(&out, i),
+            [8.0, 4.0, 2.0, 1.0],
+            "HDR values must not clamp to 1.0"
+        );
     }
 }
 
@@ -80,7 +90,10 @@ fn exr_alpha_is_preserved_and_not_flagged_opaque() {
     let out = decode(&bytes, Some("exr"), &DecodeOptions::default()).expect("should decode");
 
     assert_eq!(pixel(&out, 1)[3], 0.25);
-    assert!(!out.alpha_opaque, "a transparent sample must clear the opaque-alpha flag");
+    assert!(
+        !out.alpha_opaque,
+        "a transparent sample must clear the opaque-alpha flag"
+    );
 }
 
 /// A fully opaque EXR is flagged, so the viewer skips the checker backdrop for it.

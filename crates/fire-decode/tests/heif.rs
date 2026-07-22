@@ -31,8 +31,8 @@ fn assert_top_left(out: &DecodedImage, expected: [u8; 4], tol: i32) {
 #[test]
 fn avif_solid_decodes() {
     let bytes = include_bytes!("fixtures/solid.avif");
-    let out = decode(bytes, Some("avif"), &DecodeOptions::default())
-        .expect("solid.avif should decode");
+    let out =
+        decode(bytes, Some("avif"), &DecodeOptions::default()).expect("solid.avif should decode");
 
     assert_eq!((out.width, out.height), (16, 16));
     assert_eq!(out.format, PixelFormat::Rgba8Unorm);
@@ -45,8 +45,8 @@ fn avif_solid_decodes() {
 #[test]
 fn avif_alpha_decodes() {
     let bytes = include_bytes!("fixtures/alpha.avif");
-    let out = decode(bytes, Some("avif"), &DecodeOptions::default())
-        .expect("alpha.avif should decode");
+    let out =
+        decode(bytes, Some("avif"), &DecodeOptions::default()).expect("alpha.avif should decode");
 
     assert_eq!((out.width, out.height), (16, 16));
     assert_eq!(out.format, PixelFormat::Rgba8Unorm);
@@ -70,8 +70,8 @@ fn avif_routes_by_magic_not_extension() {
 #[test]
 fn heic_solid_decodes() {
     let bytes = include_bytes!("fixtures/solid.heic");
-    let out = decode(bytes, Some("heic"), &DecodeOptions::default())
-        .expect("solid.heic should decode");
+    let out =
+        decode(bytes, Some("heic"), &DecodeOptions::default()).expect("solid.heic should decode");
 
     assert_eq!((out.width, out.height), (16, 16));
     assert_eq!(out.format, PixelFormat::Rgba8Unorm);
@@ -84,8 +84,8 @@ fn heic_solid_decodes() {
 #[test]
 fn heic_alpha_decodes() {
     let bytes = include_bytes!("fixtures/alpha.heic");
-    let out = decode(bytes, Some("heic"), &DecodeOptions::default())
-        .expect("alpha.heic should decode");
+    let out =
+        decode(bytes, Some("heic"), &DecodeOptions::default()).expect("alpha.heic should decode");
 
     assert_eq!((out.width, out.height), (16, 16));
     assert_eq!(out.source_format, "HEIC");

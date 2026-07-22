@@ -52,9 +52,9 @@ fn psd_rgba8_decodes_merged_composite() {
         COLOR_MODE_RGB,
         8,
         &[
-            vec![255, 0, 0, 10],    // R
-            vec![0, 255, 0, 20],    // G
-            vec![0, 0, 255, 30],    // B
+            vec![255, 0, 0, 10],     // R
+            vec![0, 255, 0, 20],     // G
+            vec![0, 0, 255, 30],     // B
             vec![255, 255, 128, 40], // A
         ],
     );
@@ -89,7 +89,10 @@ fn psd_rgb8_without_alpha_synthesizes_opaque_lane() {
     assert_eq!((out.width, out.height), (2, 1));
     assert_eq!(out.channels, 3, "a 3-channel PSD reports RGB, not RGBA");
     assert_eq!(out.pixels, vec![200, 30, 40, 255, 10, 220, 60, 255]);
-    assert!(!out.alpha_opaque, "no declared alpha channel -> flag stays false");
+    assert!(
+        !out.alpha_opaque,
+        "no declared alpha channel -> flag stays false"
+    );
 }
 
 /// The 16-bit branch of `sample_channel`: psd_sdk hands back native `uint16` samples and the
@@ -97,9 +100,8 @@ fn psd_rgb8_without_alpha_synthesizes_opaque_lane() {
 #[test]
 fn psd_rgb16_narrows_to_high_byte() {
     // Big-endian 16-bit samples: 0xABCD -> 0xAB, 0x1234 -> 0x12, 0xFF00 -> 0xFF.
-    let plane16 = |vals: [u16; 2]| -> Vec<u8> {
-        vals.iter().flat_map(|v| v.to_be_bytes()).collect()
-    };
+    let plane16 =
+        |vals: [u16; 2]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_be_bytes()).collect() };
     let bytes = psd(
         2,
         1,
@@ -114,7 +116,10 @@ fn psd_rgb16_narrows_to_high_byte() {
 
     let out = decode(&bytes, Some("psd"), &DecodeOptions::default()).expect("should decode");
     assert_eq!((out.width, out.height), (2, 1));
-    assert_eq!(out.pixels, vec![0xAB, 0xFF, 0x80, 255, 0x12, 0x00, 0xFF, 255]);
+    assert_eq!(
+        out.pixels,
+        vec![0xAB, 0xFF, 0x80, 255, 0x12, 0x00, 0xFF, 255]
+    );
 }
 
 /// The grayscale branch: a single plane is replicated across R, G and B rather than being read

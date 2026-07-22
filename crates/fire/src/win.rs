@@ -37,8 +37,8 @@ use crate::ui::theme::Metrics;
 
 use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -58,22 +58,18 @@ use windows_sys::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DROPFILES, HDROP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowPlacement,
-    KillTimer, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
-    SetWindowTextW, ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HWND_TOP, IDC_ARROW,
-    MINMAXINFO, MSG, SIZE_MAXIMIZED, SIZE_RESTORED, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SW_FORCEMINIMIZE,
-    SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
-    SW_SHOWMINNOACTIVE, SW_SHOWNORMAL,
-    WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
+    GetWindowLongPtrW, GetWindowPlacement, KillTimer, LoadCursorW, LoadIconW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+    SetWindowTextW, ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HWND_TOP, IDC_ARROW, MINMAXINFO, MSG, SIZE_MAXIMIZED,
+    SIZE_RESTORED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
+    SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
     WM_DPICHANGED, WM_DROPFILES, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
-    WPF_RESTORETOMAXIMIZED, WS_OVERLAPPEDWINDOW,
+    WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WPF_RESTORETOMAXIMIZED, WS_OVERLAPPEDWINDOW,
 };
 
 /// Clipboard format ids (stable Win32 values) not surfaced by windows-sys under the enabled
@@ -125,7 +121,6 @@ struct FolderScan {
     /// Sorted sibling image paths in the folder.
     entries: Vec<PathBuf>,
 }
-
 
 /// Timer id for animated-image (GIF) playback on the frame window; distinct from the tooltip
 /// timer. Rescheduled on each tick with the next frame's delay, since GIF frame delays vary.
@@ -1466,7 +1461,6 @@ impl App {
             unsafe { PostMessageW(self.frame as HWND, WM_APP_SETTINGS_BROWSE, 0, 0) };
         }
     }
-
 }
 
 /// Push the view-related settings into the renderer. The one place that maps `Config` onto
@@ -1811,7 +1805,8 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             // saving there would persist the borderless monitor rect (`save_window_state` uses the
             // stashed windowed placement only when quitting mid-full-screen).
             let wp = wparam as u32;
-            if !app.fullscreen && !app.in_size_move && (wp == SIZE_MAXIMIZED || wp == SIZE_RESTORED) {
+            if !app.fullscreen && !app.in_size_move && (wp == SIZE_MAXIMIZED || wp == SIZE_RESTORED)
+            {
                 save_window_state(hwnd, app);
             }
             0
@@ -1851,7 +1846,6 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         }
 
         // --- image input (only reached when ImGui didn't want the event) ---------------------
-
         WM_MOUSEMOVE => {
             let (x, y) = app.image_cursor(lparam);
             app.surface.on_cursor_moved((x, y));
@@ -1951,7 +1945,6 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         }
 
         // --- cross-thread wakeups ------------------------------------------------------------
-
         WM_APP_OPEN => {
             let req = Box::from_raw(lparam as *mut OpenRequest);
             app.open(*req);
@@ -1986,7 +1979,6 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
         }
 
         // --- window / system -----------------------------------------------------------------
-
         WM_DPICHANGED => {
             // Adopt the OS-suggested rect, then rescale the UI for the new DPI. ImGui 1.92 re-bakes
             // glyphs lazily, so this is a style rescale plus one icon-atlas re-raster — no font

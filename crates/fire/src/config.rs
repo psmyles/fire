@@ -449,7 +449,11 @@ pub fn ensure_default_config() {
         let _ = std::fs::create_dir_all(dir);
     }
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
         let _ = f.write_all(DEFAULT_CONFIG.as_bytes());
     }
 }
@@ -480,7 +484,10 @@ mod tests {
         let e = &cfg.open_with[0];
         assert!(!e.is_submenu());
         assert_eq!(e.path.as_deref(), Some(r"C:\ps.exe"));
-        assert_eq!(e.resolved_args(Path::new(r"D:\img.png")), vec![r"D:\img.png"]);
+        assert_eq!(
+            e.resolved_args(Path::new(r"D:\img.png")),
+            vec![r"D:\img.png"]
+        );
     }
 
     /// Nested `[[open-with.items]]` / `[[open-with.items.items]]` parses into the submenu tree, and
@@ -519,7 +526,10 @@ mod tests {
             vec![r"D:\a.tga", r"D:\a.tga.jpg"]
         );
         // A leaf with no `args` falls back to passing the image path alone.
-        assert_eq!(convert.items[1].resolved_args(Path::new(r"D:\a.tga")), vec![r"D:\a.tga"]);
+        assert_eq!(
+            convert.items[1].resolved_args(Path::new(r"D:\a.tga")),
+            vec![r"D:\a.tga"]
+        );
 
         // The actions menu names a clicked entry by its index path, and `entry_at` is what turns that
         // back into the app to launch — so a wrong answer here launches the wrong program.

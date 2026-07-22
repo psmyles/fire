@@ -69,7 +69,10 @@ pub struct OpenFlags {
 
 impl Default for OpenFlags {
     fn default() -> Self {
-        Self { window_mode: WindowMode::Default, activate: true }
+        Self {
+            window_mode: WindowMode::Default,
+            activate: true,
+        }
     }
 }
 
@@ -82,16 +85,16 @@ pub struct OpenRequest {
 
 impl OpenRequest {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), flags: OpenFlags::default() }
+        Self {
+            path: path.into(),
+            flags: OpenFlags::default(),
+        }
     }
 
     /// Serialize the payload (header + utf-8 path) into a fresh buffer. Does NOT
     /// include the length prefix; [`write_message`] adds that.
     fn encode_payload(&self) -> Result<Vec<u8>, ProtocolError> {
-        let path_str = self
-            .path
-            .to_str()
-            .ok_or(ProtocolError::NonUtf8Path)?;
+        let path_str = self.path.to_str().ok_or(ProtocolError::NonUtf8Path)?;
         let path_bytes = path_str.as_bytes();
         let total = HEADER_LEN + path_bytes.len();
         if total > MAX_MESSAGE_LEN as usize {
@@ -123,7 +126,10 @@ impl OpenRequest {
             std::str::from_utf8(&buf[HEADER_LEN..]).map_err(|_| ProtocolError::NonUtf8Path)?;
         Ok(OpenRequest {
             path: PathBuf::from(path_str),
-            flags: OpenFlags { window_mode, activate },
+            flags: OpenFlags {
+                window_mode,
+                activate,
+            },
         })
     }
 }
@@ -221,11 +227,18 @@ mod tests {
 
     #[test]
     fn roundtrip_all_flag_variants() {
-        for mode in [WindowMode::Default, WindowMode::NewWindow, WindowMode::NewTab] {
+        for mode in [
+            WindowMode::Default,
+            WindowMode::NewWindow,
+            WindowMode::NewTab,
+        ] {
             for activate in [true, false] {
                 let req = OpenRequest {
                     path: PathBuf::from(r"D:\a.exr"),
-                    flags: OpenFlags { window_mode: mode, activate },
+                    flags: OpenFlags {
+                        window_mode: mode,
+                        activate,
+                    },
                 };
                 assert_eq!(roundtrip(&req), req);
             }

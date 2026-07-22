@@ -162,7 +162,9 @@ mod tests {
         assert_eq!(w, 8 * COUNT);
         assert_eq!(px.len(), w * 8 * 4);
         // Every texel is white; only alpha carries the shape (that's what makes one texture tintable).
-        assert!(px.chunks_exact(4).all(|t| t[0] == 255 && t[1] == 255 && t[2] == 255));
+        assert!(px
+            .chunks_exact(4)
+            .all(|t| t[0] == 255 && t[1] == 255 && t[2] == 255));
         // ...and at least one texel is actually opaque, i.e. we packed real coverage, not a blank.
         assert!(px.chunks_exact(4).any(|t| t[3] > 0));
     }

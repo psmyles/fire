@@ -55,10 +55,9 @@ fn run(hwnd: isize) {
         )
     };
     if pipe == INVALID_HANDLE_VALUE {
-        eprintln!(
-            "fire: CreateNamedPipeW failed (err {})",
-            unsafe { GetLastError() }
-        );
+        eprintln!("fire: CreateNamedPipeW failed (err {})", unsafe {
+            GetLastError()
+        });
         return;
     }
 

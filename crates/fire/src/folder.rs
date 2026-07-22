@@ -30,8 +30,12 @@ pub fn is_supported_image(path: &Path) -> bool {
 /// full paths (including `file` itself if it is a supported image). Any I/O failure (no
 /// parent, unreadable dir) yields an empty list — the caller then simply gets no cursor.
 pub fn scan(file: &Path) -> Vec<PathBuf> {
-    let Some(dir) = file.parent() else { return Vec::new() };
-    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Some(dir) = file.parent() else {
+        return Vec::new();
+    };
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
 
     // Pair each path with its file name so the natural sort doesn't re-extract it per compare.
     let mut named: Vec<(String, PathBuf)> = read
@@ -61,8 +65,13 @@ impl Folder {
     /// meaningful to page through, so the caller shows no cursor.
     pub fn new(entries: Vec<PathBuf>, current: &Path) -> Option<Self> {
         let key = name_key(current)?;
-        let idx = entries.iter().position(|p| name_key(p).as_deref() == Some(key.as_str()))?;
-        Some(Folder { entries, current: idx })
+        let idx = entries
+            .iter()
+            .position(|p| name_key(p).as_deref() == Some(key.as_str()))?;
+        Some(Folder {
+            entries,
+            current: idx,
+        })
     }
 
     /// Number of sibling images in the folder.
@@ -162,7 +171,10 @@ mod tests {
     fn natural_sort_orders_numbers_by_value() {
         let mut names = vec!["img10.png", "img2.png", "img1.png", "img12.png"];
         names.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(names, vec!["img1.png", "img2.png", "img10.png", "img12.png"]);
+        assert_eq!(
+            names,
+            vec!["img1.png", "img2.png", "img10.png", "img12.png"]
+        );
     }
 
     #[test]

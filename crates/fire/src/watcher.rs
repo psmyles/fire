@@ -65,7 +65,10 @@ impl FileWatcher {
     /// Point the watcher at `path` (the image now on screen), tagging future reloads with
     /// `generation`. Cheap and non-blocking; the thread does the (re)watch.
     pub fn watch(&self, generation: u64, path: &Path) {
-        let _ = self.cmd_tx.send(WatchCmd { generation, path: path.to_path_buf() });
+        let _ = self.cmd_tx.send(WatchCmd {
+            generation,
+            path: path.to_path_buf(),
+        });
     }
 }
 
@@ -162,7 +165,12 @@ fn retarget(
         .unwrap_or_default();
     // Baseline at arm time so only changes *from now* fire (not the file's pre-existing state).
     let baseline = file_meta(&cmd.path);
-    *target = Some(TargetState { generation: cmd.generation, path: cmd.path, name_lc, baseline });
+    *target = Some(TargetState {
+        generation: cmd.generation,
+        path: cmd.path,
+        name_lc,
+        baseline,
+    });
 }
 
 /// Whether `event` is a create/modify touching the watched file name. Removes and access events
@@ -181,7 +189,9 @@ fn event_is_relevant(event: &Event, name_lc: &str) -> bool {
     );
     kind_ok
         && event.paths.iter().any(|p| {
-            p.file_name().map(|n| n.to_string_lossy().to_lowercase() == name_lc).unwrap_or(false)
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase() == name_lc)
+                .unwrap_or(false)
         })
 }
 
@@ -216,28 +226,47 @@ mod tests {
     use notify::event::{CreateKind, RemoveKind};
 
     fn ev(kind: EventKind, path: &str) -> Event {
-        Event { kind, paths: vec![PathBuf::from(path)], attrs: Default::default() }
+        Event {
+            kind,
+            paths: vec![PathBuf::from(path)],
+            attrs: Default::default(),
+        }
     }
 
     #[test]
     fn relevant_matches_target_name_case_insensitively() {
         let name = "photo.png".to_string(); // stored lowercased by retarget
-        assert!(event_is_relevant(&ev(EventKind::Modify(ModifyKind::Any), r"C:\d\PHOTO.PNG"), &name));
-        assert!(event_is_relevant(&ev(EventKind::Create(CreateKind::Any), r"C:\d\photo.png"), &name));
+        assert!(event_is_relevant(
+            &ev(EventKind::Modify(ModifyKind::Any), r"C:\d\PHOTO.PNG"),
+            &name
+        ));
+        assert!(event_is_relevant(
+            &ev(EventKind::Create(CreateKind::Any), r"C:\d\photo.png"),
+            &name
+        ));
     }
 
     #[test]
     fn irrelevant_for_other_files_and_for_removes() {
         let name = "photo.png".to_string();
         // A different file changing in the same watched directory must not reload us.
-        assert!(!event_is_relevant(&ev(EventKind::Modify(ModifyKind::Any), r"C:\d\other.png"), &name));
+        assert!(!event_is_relevant(
+            &ev(EventKind::Modify(ModifyKind::Any), r"C:\d\other.png"),
+            &name
+        ));
         // A delete of the target is ignored — we keep showing the last good image.
-        assert!(!event_is_relevant(&ev(EventKind::Remove(RemoveKind::Any), r"C:\d\photo.png"), &name));
+        assert!(!event_is_relevant(
+            &ev(EventKind::Remove(RemoveKind::Any), r"C:\d\photo.png"),
+            &name
+        ));
     }
 
     #[test]
     fn parent_dir_uses_cwd_for_a_bare_name() {
         assert_eq!(parent_dir(Path::new("img.png")), PathBuf::from("."));
-        assert_eq!(parent_dir(Path::new(r"C:\d\img.png")), PathBuf::from(r"C:\d"));
+        assert_eq!(
+            parent_dir(Path::new(r"C:\d\img.png")),
+            PathBuf::from(r"C:\d")
+        );
     }
 }

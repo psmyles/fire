@@ -58,8 +58,7 @@ pub fn current() -> Arc<Theme> {
 /// the caller to print; the window keeps showing the last stylesheet that worked.
 #[cfg(debug_assertions)]
 pub fn reload() -> Result<(), String> {
-    let src =
-        std::fs::read_to_string(SOURCE_PATH).map_err(|e| format!("{SOURCE_PATH}: {e}"))?;
+    let src = std::fs::read_to_string(SOURCE_PATH).map_err(|e| format!("{SOURCE_PATH}: {e}"))?;
     let theme = Theme::parse(&src)?;
     *THEME.write().expect("theme lock poisoned") = Arc::new(theme);
     Ok(())
@@ -456,13 +455,22 @@ pub fn apply(style: &mut Style, dark: bool, scale: f32) {
 
     style.set_color(StyleColor::SliderGrab, cx.c(&c.slider_grab));
     style.set_color(StyleColor::SliderGrabActive, cx.c(&c.slider_grab_active));
-    style.set_color(StyleColor::CheckboxSelectedBg, cx.c(&c.checkbox_selected_bg));
+    style.set_color(
+        StyleColor::CheckboxSelectedBg,
+        cx.c(&c.checkbox_selected_bg),
+    );
     style.set_color(StyleColor::CheckMark, cx.c(&c.check_mark));
 
     style.set_color(StyleColor::ScrollbarBg, cx.c(&c.scrollbar_bg));
     style.set_color(StyleColor::ScrollbarGrab, cx.c(&c.scrollbar_grab));
-    style.set_color(StyleColor::ScrollbarGrabHovered, cx.c(&c.scrollbar_grab_hovered));
-    style.set_color(StyleColor::ScrollbarGrabActive, cx.c(&c.scrollbar_grab_active));
+    style.set_color(
+        StyleColor::ScrollbarGrabHovered,
+        cx.c(&c.scrollbar_grab_hovered),
+    );
+    style.set_color(
+        StyleColor::ScrollbarGrabActive,
+        cx.c(&c.scrollbar_grab_active),
+    );
 }
 
 /// Apply the **settings window's** style.
@@ -504,7 +512,10 @@ pub fn form(style: &mut Style, dark: bool, scale: f32) {
     style.set_color(StyleColor::ButtonActive, cx.c(&c.button_active));
 
     style.set_color(StyleColor::CheckMark, cx.c(&c.check_mark));
-    style.set_color(StyleColor::CheckboxSelectedBg, cx.c(&c.checkbox_selected_bg));
+    style.set_color(
+        StyleColor::CheckboxSelectedBg,
+        cx.c(&c.checkbox_selected_bg),
+    );
     style.set_color(StyleColor::SliderGrab, cx.c(&c.slider_grab));
     style.set_color(StyleColor::SliderGrabActive, cx.c(&c.slider_grab_active));
     style.set_color(StyleColor::Header, cx.c(&c.header));
@@ -517,7 +528,10 @@ pub fn form(style: &mut Style, dark: bool, scale: f32) {
     style.set_color(StyleColor::Tab, cx.c(&c.tab));
     style.set_color(StyleColor::TabHovered, cx.c(&c.tab_hovered));
     style.set_color(StyleColor::TabSelected, cx.c(&c.tab_selected));
-    style.set_color(StyleColor::TabSelectedOverline, cx.c(&c.tab_selected_overline));
+    style.set_color(
+        StyleColor::TabSelectedOverline,
+        cx.c(&c.tab_selected_overline),
+    );
     style.set_color(StyleColor::TabDimmed, cx.c(&c.tab_dimmed));
     style.set_color(StyleColor::TabDimmedSelected, cx.c(&c.tab_dimmed_selected));
     style.set_color(
@@ -527,8 +541,14 @@ pub fn form(style: &mut Style, dark: bool, scale: f32) {
 
     style.set_color(StyleColor::ScrollbarBg, cx.c(&c.scrollbar_bg));
     style.set_color(StyleColor::ScrollbarGrab, cx.c(&c.scrollbar_grab));
-    style.set_color(StyleColor::ScrollbarGrabHovered, cx.c(&c.scrollbar_grab_hovered));
-    style.set_color(StyleColor::ScrollbarGrabActive, cx.c(&c.scrollbar_grab_active));
+    style.set_color(
+        StyleColor::ScrollbarGrabHovered,
+        cx.c(&c.scrollbar_grab_hovered),
+    );
+    style.set_color(
+        StyleColor::ScrollbarGrabActive,
+        cx.c(&c.scrollbar_grab_active),
+    );
 
     style.set_color(StyleColor::ResizeGrip, cx.c(&c.resize_grip));
     style.set_color(StyleColor::ResizeGripHovered, cx.c(&c.resize_grip_hovered));
@@ -589,7 +609,9 @@ pub(crate) fn push_control(ui: &Ui, height: f32, pad_x: f32) -> Option<StyleStac
     let y = if height > 0.0 {
         // ImGui: height = font size + 2 × pad.y. A negative padding is rejected outright (it would
         // assert), so the font size is the floor — see the note on `FormControls`.
-        ((s(height) - ui.current_font_size()) * 0.5).max(0.0).round()
+        ((s(height) - ui.current_font_size()) * 0.5)
+            .max(0.0)
+            .round()
     } else {
         base[1]
     };

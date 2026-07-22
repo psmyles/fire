@@ -142,7 +142,9 @@ impl KeyAction {
     /// The settings list's group heading for this action.
     pub fn group(self) -> &'static str {
         match self {
-            KeyAction::Fit | KeyAction::ActualSize | KeyAction::ZoomIn | KeyAction::ZoomOut => "View",
+            KeyAction::Fit | KeyAction::ActualSize | KeyAction::ZoomIn | KeyAction::ZoomOut => {
+                "View"
+            }
             KeyAction::ChannelRgb
             | KeyAction::ChannelR
             | KeyAction::ChannelG
@@ -245,12 +247,7 @@ impl KeyChord {
     /// Modifier *prefixes* are stripped one at a time rather than splitting on `+`, because the key
     /// name itself can be `+` or `Num+` ("Ctrl++" is a legitimate chord).
     pub fn parse(s: &str) -> Option<Self> {
-        const MODS: &[(&str, u8)] = &[
-            ("ctrl+", 0),
-            ("control+", 0),
-            ("alt+", 1),
-            ("shift+", 2),
-        ];
+        const MODS: &[(&str, u8)] = &[("ctrl+", 0), ("control+", 0), ("alt+", 1), ("shift+", 2)];
         let mut rest = s.trim();
         let mut chord = KeyChord::plain(0);
         'strip: loop {
@@ -355,10 +352,7 @@ fn vk_name(vk: u32) -> String {
 
 /// Inverse of [`vk_name`] (case-insensitive), including the `0x..` hex fallback.
 fn parse_vk(name: &str) -> Option<u32> {
-    if let Some((v, _)) = NAMED_VKS
-        .iter()
-        .find(|(_, n)| n.eq_ignore_ascii_case(name))
-    {
+    if let Some((v, _)) = NAMED_VKS.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)) {
         return Some(*v);
     }
     // "+" is how `Num+`-less layouts spell VK_OEM_PLUS; accept it as an alias for "=".
@@ -729,7 +723,10 @@ mod tests {
         assert_eq!(kb.lookup(KeyChord::plain(0x27), false), None);
 
         kb.reset(KeyAction::NextImage);
-        assert_eq!(kb.lookup(KeyChord::plain(0x27), false), Some(KeyAction::NextImage));
+        assert_eq!(
+            kb.lookup(KeyChord::plain(0x27), false),
+            Some(KeyAction::NextImage)
+        );
     }
 
     /// Stealing only one chord of a multi-chord action leaves its other chords alone.
@@ -740,7 +737,10 @@ mod tests {
         kb.rebind(KeyAction::ExposureReset, numplus);
         assert_eq!(kb.lookup(numplus, false), Some(KeyAction::ExposureReset));
         // `=` still zooms in.
-        assert_eq!(kb.lookup(KeyChord::plain(0xBB), false), Some(KeyAction::ZoomIn));
+        assert_eq!(
+            kb.lookup(KeyChord::plain(0xBB), false),
+            Some(KeyAction::ZoomIn)
+        );
     }
 
     /// Only rebound actions are written; an untouched table serializes to nothing.
@@ -754,7 +754,10 @@ mod tests {
         kb.unbind(KeyAction::ToggleTonemap);
         let cfg = kb.to_config();
         assert_eq!(cfg.get("fit"), Some(&KeyValue::One("Z".into())));
-        assert_eq!(cfg.get("toggle-tonemap"), Some(&KeyValue::One(String::new())));
+        assert_eq!(
+            cfg.get("toggle-tonemap"),
+            Some(&KeyValue::One(String::new()))
+        );
         assert_eq!(cfg.len(), 2);
 
         // …and reading it back reproduces the table exactly.

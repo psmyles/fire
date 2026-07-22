@@ -18,7 +18,10 @@ fn main() {
                 img.height,
                 img.channels,
                 img.bits_per_channel,
-                img.icc.as_ref().map(|v| format!("{} bytes", v.len())).unwrap_or("none".into())
+                img.icc
+                    .as_ref()
+                    .map(|v| format!("{} bytes", v.len()))
+                    .unwrap_or("none".into())
             );
             let n = img.rgba8.len().min(16);
             println!("first RGBA bytes: {:?}", &img.rgba8[..n]);

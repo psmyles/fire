@@ -770,8 +770,7 @@ impl GpuSurface {
         if w == 0 || h == 0 {
             // No image region (e.g. the window is collapsed to just chrome). Still a valid frame.
             unsafe {
-                self.context
-                    .OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
+                self.context.OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
             }
             return true;
         }
@@ -779,8 +778,7 @@ impl GpuSurface {
         self.draw_image(&rtv, w, h);
 
         unsafe {
-            self.context
-                .OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
+            self.context.OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
         }
         true
     }
@@ -803,7 +801,6 @@ impl GpuSurface {
 
     /// The image pass: the fullscreen triangle, scoped to the image sub-rect.
     fn draw_image(&mut self, rtv: &ID3D11RenderTargetView, w: u32, h: u32) {
-
         let is_hdr = self.is_hdr();
         // Flipbook mode maps the surface into a single frame rect: `img_w/img_h` become the
         // (fractional) cell size and the fb_* fields pick which cell(s) of the sheet to sample.

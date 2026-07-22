@@ -157,7 +157,11 @@ impl NumField {
     /// Clamped to the field's range on the way in.
     pub(crate) fn set(self, c: &mut Config, v: f32) {
         let (min, max, _, _) = self.spec();
-        let v = if v.is_finite() { v.clamp(min, max) } else { min };
+        let v = if v.is_finite() {
+            v.clamp(min, max)
+        } else {
+            min
+        };
         match self {
             NumField::ZoomStep => c.zoom_step = v,
             NumField::ExposureStep => c.exposure_step = v,
@@ -251,7 +255,10 @@ fn container<'a>(root: &'a mut Vec<MenuEntry>, path: &[usize]) -> Option<&'a mut
 }
 
 /// The entry at `path`.
-pub(crate) fn entry_at<'a>(root: &'a mut Vec<MenuEntry>, path: &[usize]) -> Option<&'a mut MenuEntry> {
+pub(crate) fn entry_at<'a>(
+    root: &'a mut Vec<MenuEntry>,
+    path: &[usize],
+) -> Option<&'a mut MenuEntry> {
     let last = *path.last()?;
     container(root, path)?.get_mut(last)
 }

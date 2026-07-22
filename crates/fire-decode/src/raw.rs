@@ -141,7 +141,10 @@ pub fn find_preview(b: &[u8]) -> Option<Preview<'_>> {
     }
 
     let (off, end) = best?;
-    Some(Preview { jpeg: &b[off..end], orientation })
+    Some(Preview {
+        jpeg: &b[off..end],
+        orientation,
+    })
 }
 
 /// Apply an EXIF `orientation` (2..=8) to a decoded image in place, rotating/flipping the
@@ -163,7 +166,11 @@ pub fn apply_orientation(img: &mut DecodedImage, orientation: u16) {
         return;
     }
     // Orientations 5..=8 are 90°/270° rotations (and the diagonal mirrors), which swap axes.
-    let (ow, oh) = if (5..=8).contains(&orientation) { (h, w) } else { (w, h) };
+    let (ow, oh) = if (5..=8).contains(&orientation) {
+        (h, w)
+    } else {
+        (w, h)
+    };
     let mut out = vec![0u8; ow * oh * bpp];
 
     for sy in 0..h {
@@ -188,7 +195,10 @@ pub fn apply_orientation(img: &mut DecodedImage, orientation: u16) {
     img.width = ow as u32;
     img.height = oh as u32;
     // Preview is always 8-bit RGBA at this point, but keep the invariant explicit.
-    debug_assert!(matches!(img.format, PixelFormat::Rgba8Unorm | PixelFormat::Rgba16Unorm));
+    debug_assert!(matches!(
+        img.format,
+        PixelFormat::Rgba8Unorm | PixelFormat::Rgba16Unorm
+    ));
 }
 
 // --- preview candidate selection ---------------------------------------------
@@ -418,9 +428,9 @@ fn collect_tiff(b: &[u8]) -> (Vec<(usize, usize)>, Option<u16>) {
 /// The value sits inline in the entry's 4-byte value field (all these types fit).
 fn entry_scalar(b: &[u8], eo: usize, typ: u16, le: bool) -> Option<u32> {
     match typ {
-        1 => rd_u8(b, eo + 8).map(|v| v as u32),  // BYTE
+        1 => rd_u8(b, eo + 8).map(|v| v as u32),      // BYTE
         3 => rd_u16(b, eo + 8, le).map(|v| v as u32), // SHORT
-        _ => rd_u32(b, eo + 8, le),                // LONG (4) and best-effort fallback
+        _ => rd_u32(b, eo + 8, le),                   // LONG (4) and best-effort fallback
     }
 }
 
@@ -476,7 +486,8 @@ mod tests {
 
     /// Encode a solid-color JPEG of the given size via the `image` crate (test fixtures).
     fn jpeg(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
-        let src = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(w, h, image::Rgb(rgb)));
+        let src =
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(w, h, image::Rgb(rgb)));
         let mut buf = std::io::Cursor::new(Vec::new());
         src.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
         buf.into_inner()
@@ -672,7 +683,10 @@ mod tests {
         tiff.extend_from_slice(&preview);
 
         let p = find_preview(&tiff).expect("preview located");
-        assert_eq!(p.orientation, 1, "IFD0's explicit 1 must not be overridden by IFD1's 6");
+        assert_eq!(
+            p.orientation, 1,
+            "IFD0's explicit 1 must not be overridden by IFD1's 6"
+        );
     }
 
     /// A TIFF with no Orientation tag anywhere displays as-is.

@@ -199,11 +199,15 @@ mod tests {
         // vertex, so on a square rect the octagon is equilateral at *any* crop factor.
         for crop in [0.0, 0.1, 0.25, 0.4, 0.5] {
             let v = vertices((0.0, 0.0, 100.0, 100.0), crop);
-            let len = |a: [f32; 2], b: [f32; 2]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+            let len =
+                |a: [f32; 2], b: [f32; 2]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
             let first = len(v[0], v[1]);
             for i in 0..8 {
                 let side = len(v[i], v[(i + 1) % 8]);
-                assert!((side - first).abs() < 1e-3, "crop {crop}, side {i}: {side} vs {first}");
+                assert!(
+                    (side - first).abs() < 1e-3,
+                    "crop {crop}, side {i}: {side} vs {first}"
+                );
             }
         }
     }

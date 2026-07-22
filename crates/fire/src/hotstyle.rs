@@ -51,7 +51,10 @@ fn run(frame: isize, path: PathBuf) {
     let Some(dir) = path.parent().map(Path::to_path_buf) else {
         return;
     };
-    let name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
 
     let (tx, rx) = unbounded::<notify::Result<Event>>();
     let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |res| {
@@ -67,7 +70,10 @@ fn run(frame: isize, path: PathBuf) {
         eprintln!("fire: cannot watch {}: {e}", dir.display());
         return;
     }
-    eprintln!("fire: watching {} — edit it and the window restyles", path.display());
+    eprintln!(
+        "fire: watching {} — edit it and the window restyles",
+        path.display()
+    );
 
     loop {
         // Block until something in the directory changes; ignore its siblings (theme.rs, mod.rs…).

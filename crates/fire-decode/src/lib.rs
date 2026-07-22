@@ -224,7 +224,10 @@ pub struct DecodeOptions {
 
 impl Default for DecodeOptions {
     fn default() -> Self {
-        Self { max_dim: 16384, honor_icc: true }
+        Self {
+            max_dim: 16384,
+            honor_icc: true,
+        }
     }
 }
 
@@ -385,14 +388,14 @@ fn alpha_is_opaque(img: &DecodedImage) -> bool {
         PixelFormat::Rgba16Unorm => px.chunks_exact(8).all(|p| p[6] == 0xff && p[7] == 0xff),
         // 16-bit half-float: opaque == 1.0 == 0x3c00. No decode path emits this today, but keep
         // the lane handling exhaustive over PixelFormat.
-        PixelFormat::Rgba16Float => {
-            px.chunks_exact(8).all(|p| u16::from_ne_bytes([p[6], p[7]]) == 0x3c00)
-        }
+        PixelFormat::Rgba16Float => px
+            .chunks_exact(8)
+            .all(|p| u16::from_ne_bytes([p[6], p[7]]) == 0x3c00),
         // 32-bit float (linear/HDR): 16 bytes/px, alpha is the 4th f32. Opaque == 1.0; values
         // above 1.0 count as opaque, NaN does not (keeping the alpha channel is the safe default).
-        PixelFormat::Rgba32Float => {
-            px.chunks_exact(16).all(|p| f32::from_ne_bytes([p[12], p[13], p[14], p[15]]) >= 1.0)
-        }
+        PixelFormat::Rgba32Float => px
+            .chunks_exact(16)
+            .all(|p| f32::from_ne_bytes([p[12], p[13], p[14], p[15]]) >= 1.0),
     }
 }
 
@@ -624,8 +627,8 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     let src_channels = decoder.color_type().channel_count();
     let icc = decoder.icc_profile().ok().flatten();
 
-    let dynimg = DynamicImage::from_decoder(decoder)
-        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let dynimg =
+        DynamicImage::from_decoder(decoder).map_err(|e| DecodeError::Malformed(e.to_string()))?;
 
     let is_16bit = matches!(
         dynimg,
@@ -732,8 +735,8 @@ fn decode_zune(
     // allocated — so this is the guard that matters, and it has to happen before `Image::read`.
     check_zune_dims(bytes, fmt, opts)?;
 
-    let mut image =
-        Image::read(ZCursor::new(bytes), opts).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let mut image = Image::read(ZCursor::new(bytes), opts)
+        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
 
     // Source characteristics for the status bar, captured before we normalize to RGBA.
     let src_channels = image.colorspace().num_components().min(255) as u8;
@@ -827,7 +830,10 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     // asking for 17 GiB a frame. Hence: one byte-budget check on the canvas, one on the sequence.
     let (w, h) = decoder.dimensions();
     check_dims(w as usize, h as usize, 4, "GIF")?;
-    let frame_bytes = (w as usize).saturating_mul(h as usize).saturating_mul(4).max(1);
+    let frame_bytes = (w as usize)
+        .saturating_mul(h as usize)
+        .saturating_mul(4)
+        .max(1);
     let max_frames = (MAX_ANIMATION_BYTES / frame_bytes).clamp(1, MAX_ANIMATION_FRAMES);
 
     // Collected one at a time rather than through `collect_frames`, so the budget can stop the walk
@@ -860,7 +866,10 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
                 // "as fast as possible", which renderers treat as 100 ms. Anything ≥ 20 ms is
                 // honored as authored.
                 let delay_ms = if raw_ms < 20 { 100 } else { raw_ms };
-                AnimationFrame { pixels: f.into_buffer().into_raw(), delay_ms }
+                AnimationFrame {
+                    pixels: f.into_buffer().into_raw(),
+                    delay_ms,
+                }
             })
             .collect(),
     });
@@ -913,8 +922,8 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         use image::ImageDecoder;
         decoder.icc_profile().ok().flatten()
     };
-    let dynimg = DynamicImage::from_decoder(decoder)
-        .map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let dynimg =
+        DynamicImage::from_decoder(decoder).map_err(|e| DecodeError::Malformed(e.to_string()))?;
     let width = dynimg.width();
     let height = dynimg.height();
     // Report the source channel count for the status bar and alpha-aware UI (RGBA icon,
@@ -997,11 +1006,19 @@ fn tiff_unspecified_extra_sample(bytes: &[u8]) -> Option<usize> {
     };
     let u16at = |o: usize| -> Option<u16> {
         let b = bytes.get(o..o.checked_add(2)?)?.try_into().ok()?;
-        Some(if little_endian { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+        Some(if little_endian {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        })
     };
     let u32at = |o: usize| -> Option<u32> {
         let b = bytes.get(o..o.checked_add(4)?)?.try_into().ok()?;
-        Some(if little_endian { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+        Some(if little_endian {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        })
     };
 
     let ifd = u32at(4)? as usize;
@@ -1069,7 +1086,9 @@ mod icc {
     fn transform_to_srgb(img: &mut DecodedImage, icc: &[u8]) {
         use lcms2::{ColorSpaceSignature, Flags, Intent, PixelFormat as Fmt, Profile, Transform};
 
-        let Ok(src) = Profile::new_icc(icc) else { return };
+        let Ok(src) = Profile::new_icc(icc) else {
+            return;
+        };
         // Only RGB(A) source profiles map cleanly onto our RGBA pixels.
         if src.color_space() != ColorSpaceSignature::RgbData {
             return;
@@ -1163,7 +1182,10 @@ mod icc {
                 );
             }
             // COPY_ALPHA: alpha bytes (every 4th) preserved exactly.
-            assert_eq!([img.pixels[3], img.pixels[7], img.pixels[11]], [40, 255, 77]);
+            assert_eq!(
+                [img.pixels[3], img.pixels[7], img.pixels[11]],
+                [40, 255, 77]
+            );
         }
 
         #[test]
@@ -1183,11 +1205,27 @@ mod icc {
         fn linear_rgb_profile_applies_tone_curve() {
             use lcms2::{CIExyY, CIExyYTRIPLE, Profile, ToneCurve};
 
-            let d65 = CIExyY { x: 0.3127, y: 0.3290, Y: 1.0 };
+            let d65 = CIExyY {
+                x: 0.3127,
+                y: 0.3290,
+                Y: 1.0,
+            };
             let primaries = CIExyYTRIPLE {
-                Red: CIExyY { x: 0.640, y: 0.330, Y: 1.0 },
-                Green: CIExyY { x: 0.300, y: 0.600, Y: 1.0 },
-                Blue: CIExyY { x: 0.150, y: 0.060, Y: 1.0 },
+                Red: CIExyY {
+                    x: 0.640,
+                    y: 0.330,
+                    Y: 1.0,
+                },
+                Green: CIExyY {
+                    x: 0.300,
+                    y: 0.600,
+                    Y: 1.0,
+                },
+                Blue: CIExyY {
+                    x: 0.150,
+                    y: 0.060,
+                    Y: 1.0,
+                },
             };
             let linear = ToneCurve::new(1.0);
             let profile = Profile::new_rgb(&d65, &primaries, &[&linear, &linear, &linear]).unwrap();
@@ -1230,7 +1268,10 @@ mod tests {
         src.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
         src.put_pixel(0, 1, image::Rgba([0, 0, 255, 128]));
         src.put_pixel(1, 1, image::Rgba([10, 20, 30, 40]));
-        let bytes = encode(&image::DynamicImage::ImageRgba8(src), image::ImageFormat::Png);
+        let bytes = encode(
+            &image::DynamicImage::ImageRgba8(src),
+            image::ImageFormat::Png,
+        );
 
         let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
         assert_eq!((out.width, out.height), (2, 2));
@@ -1252,11 +1293,20 @@ mod tests {
         let mut src = image::RgbaImage::new(2, 1);
         src.put_pixel(0, 0, image::Rgba([200, 30, 40, 255]));
         src.put_pixel(1, 0, image::Rgba([10, 220, 60, 255]));
-        let bytes = encode(&image::DynamicImage::ImageRgba8(src), image::ImageFormat::Png);
+        let bytes = encode(
+            &image::DynamicImage::ImageRgba8(src),
+            image::ImageFormat::Png,
+        );
 
         let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
-        assert_eq!(out.channels, 4, "an all-opaque RGBA PNG still reports its true RGBA format");
-        assert!(out.alpha_opaque, "all-opaque alpha => no transparency to composite");
+        assert_eq!(
+            out.channels, 4,
+            "an all-opaque RGBA PNG still reports its true RGBA format"
+        );
+        assert!(
+            out.alpha_opaque,
+            "all-opaque alpha => no transparency to composite"
+        );
         assert_eq!(out.format, PixelFormat::Rgba8Unorm);
         assert_eq!(&out.pixels[0..4], &[200, 30, 40, 255]);
 
@@ -1264,10 +1314,16 @@ mod tests {
         let mut src = image::RgbaImage::new(2, 1);
         src.put_pixel(0, 0, image::Rgba([200, 30, 40, 255]));
         src.put_pixel(1, 0, image::Rgba([10, 220, 60, 254]));
-        let bytes = encode(&image::DynamicImage::ImageRgba8(src), image::ImageFormat::Png);
+        let bytes = encode(
+            &image::DynamicImage::ImageRgba8(src),
+            image::ImageFormat::Png,
+        );
         let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
         assert_eq!(out.channels, 4);
-        assert!(!out.alpha_opaque, "a single non-opaque sample is real transparency");
+        assert!(
+            !out.alpha_opaque,
+            "a single non-opaque sample is real transparency"
+        );
     }
 
     /// The opaque-alpha flag also covers 16-bit RGBA (alpha at full `0xffff`).
@@ -1275,11 +1331,17 @@ mod tests {
     fn opaque_rgba16_png_flags_alpha_opaque() {
         let mut src = image::ImageBuffer::<image::Rgba<u16>, _>::new(1, 1);
         src.put_pixel(0, 0, image::Rgba([0xFFFF, 0x8000, 0x0001, 0xFFFF]));
-        let bytes = encode(&image::DynamicImage::ImageRgba16(src), image::ImageFormat::Png);
+        let bytes = encode(
+            &image::DynamicImage::ImageRgba16(src),
+            image::ImageFormat::Png,
+        );
 
         let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
         assert_eq!(out.format, PixelFormat::Rgba16Unorm);
-        assert_eq!(out.channels, 4, "an all-opaque 16-bit RGBA PNG still reports RGBA");
+        assert_eq!(
+            out.channels, 4,
+            "an all-opaque 16-bit RGBA PNG still reports RGBA"
+        );
         assert!(out.alpha_opaque, "all-opaque 16-bit alpha => flagged");
     }
 
@@ -1290,7 +1352,10 @@ mod tests {
         let mut src = image::GrayImage::new(2, 1);
         src.put_pixel(0, 0, image::Luma([40]));
         src.put_pixel(1, 0, image::Luma([200]));
-        let bytes = encode(&image::DynamicImage::ImageLuma8(src), image::ImageFormat::Png);
+        let bytes = encode(
+            &image::DynamicImage::ImageLuma8(src),
+            image::ImageFormat::Png,
+        );
 
         let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
         assert_eq!((out.width, out.height), (2, 1));
@@ -1304,7 +1369,10 @@ mod tests {
     fn png16_stays_16bit() {
         let mut src = image::ImageBuffer::<image::Rgba<u16>, _>::new(1, 1);
         src.put_pixel(0, 0, image::Rgba([0xFFFF, 0x8000, 0x0001, 0xFFFF]));
-        let bytes = encode(&image::DynamicImage::ImageRgba16(src), image::ImageFormat::Png);
+        let bytes = encode(
+            &image::DynamicImage::ImageRgba16(src),
+            image::ImageFormat::Png,
+        );
 
         let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
         assert_eq!(out.format, PixelFormat::Rgba16Unorm);
@@ -1327,15 +1395,23 @@ mod tests {
         let icc = lcms2::Profile::new_srgb().icc().unwrap();
         let mut buf = Vec::new();
         let mut enc = image::codecs::png::PngEncoder::new(&mut buf);
-        enc.set_icc_profile(icc.clone()).expect("png encoder supports ICC");
+        enc.set_icc_profile(icc.clone())
+            .expect("png encoder supports ICC");
         enc.write_image(&[200u8, 30, 40, 255], 1, 1, image::ExtendedColorType::Rgba8)
             .expect("encode fixture");
 
         // honor_icc=false so the raw profile bytes survive for the assertion.
-        let opts = DecodeOptions { honor_icc: false, ..Default::default() };
+        let opts = DecodeOptions {
+            honor_icc: false,
+            ..Default::default()
+        };
         let out = decode(&buf, Some("png"), &opts).unwrap();
         assert_eq!(out.source_format, "PNG");
-        assert_eq!(out.icc.as_deref(), Some(icc.as_slice()), "embedded ICC must be surfaced");
+        assert_eq!(
+            out.icc.as_deref(),
+            Some(icc.as_slice()),
+            "embedded ICC must be surfaced"
+        );
     }
 
     /// A solid-color JPEG decodes through zune to RGBA8 with the right dims (lossy, so we
@@ -1368,13 +1444,19 @@ mod tests {
         let mut src = image::RgbaImage::new(4, 4);
         src.put_pixel(0, 0, image::Rgba([200, 30, 40, 255]));
         src.put_pixel(3, 3, image::Rgba([10, 20, 30, 128]));
-        let bytes = encode(&image::DynamicImage::ImageRgba8(src), image::ImageFormat::Ico);
+        let bytes = encode(
+            &image::DynamicImage::ImageRgba8(src),
+            image::ImageFormat::Ico,
+        );
 
         let out = decode(&bytes, Some("ico"), &DecodeOptions::default()).unwrap();
         assert_eq!((out.width, out.height), (4, 4));
         assert_eq!(out.format, PixelFormat::Rgba8Unorm);
         assert_eq!(out.source_format, "ICO");
-        assert_eq!([out.pixels[0], out.pixels[1], out.pixels[2], out.pixels[3]], [200, 30, 40, 255]);
+        assert_eq!(
+            [out.pixels[0], out.pixels[1], out.pixels[2], out.pixels[3]],
+            [200, 30, 40, 255]
+        );
     }
 
     /// A camera-raw file routes to the preview extractor: a synthetic little-endian TIFF
@@ -1385,7 +1467,11 @@ mod tests {
     fn raw_decodes_embedded_preview_via_ext() {
         // Embedded preview: a 6(w)x2(h) JPEG. Orientation 8 swaps axes -> 2x6 displayed.
         let preview = encode(
-            &image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(6, 2, image::Rgb([200, 40, 60]))),
+            &image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                6,
+                2,
+                image::Rgb([200, 40, 60]),
+            )),
             image::ImageFormat::Jpeg,
         );
 
@@ -1477,13 +1563,19 @@ mod tests {
         let out = decode(&unspecified, Some("tif"), &DecodeOptions::default()).unwrap();
         assert_eq!(out.source_format, "TIFF");
         assert_eq!((out.width, out.height), (2, 1));
-        assert_eq!(out.channels, 4, "the extra sample must be presented as alpha");
+        assert_eq!(
+            out.channels, 4,
+            "the extra sample must be presented as alpha"
+        );
         assert_eq!(&out.pixels[0..8], &[255, 255, 255, 17, 255, 255, 255, 200]);
 
         // A file that already declares unassociated alpha needs no patch — the fixup must leave
         // those bytes borrowed — and decodes to exactly the same pixels.
         let declared = extra_sample_tiff(2);
-        assert!(matches!(tiff_extra_sample_as_alpha(&declared), Cow::Borrowed(_)));
+        assert!(matches!(
+            tiff_extra_sample_as_alpha(&declared),
+            Cow::Borrowed(_)
+        ));
         let out = decode(&declared, Some("tif"), &DecodeOptions::default()).unwrap();
         assert_eq!(&out.pixels[0..8], &[255, 255, 255, 17, 255, 255, 255, 200]);
     }
@@ -1497,8 +1589,12 @@ mod tests {
         let Cow::Owned(patched) = tiff_extra_sample_as_alpha(&original) else {
             panic!("expected a patched copy")
         };
-        let diffs: Vec<_> =
-            patched.iter().zip(&original).enumerate().filter(|(_, (a, b))| a != b).collect();
+        let diffs: Vec<_> = patched
+            .iter()
+            .zip(&original)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .collect();
         assert_eq!(diffs.len(), 1, "exactly one byte differs: {diffs:?}");
 
         let rgb = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 1));
@@ -1513,7 +1609,10 @@ mod tests {
             b"\x89PNG\r\n\x1a\n",        // not a TIFF at all
             b"",
         ] {
-            assert!(matches!(tiff_extra_sample_as_alpha(bytes), Cow::Borrowed(_)));
+            assert!(matches!(
+                tiff_extra_sample_as_alpha(bytes),
+                Cow::Borrowed(_)
+            ));
         }
 
         // ...and an ordinary RGB TIFF still reports three channels, not four.
@@ -1528,7 +1627,10 @@ mod tests {
         let mut src = image::RgbaImage::new(2, 1);
         src.put_pixel(0, 0, image::Rgba([200, 30, 40, 255]));
         src.put_pixel(1, 0, image::Rgba([10, 220, 60, 255]));
-        let bytes = encode(&image::DynamicImage::ImageRgba8(src), image::ImageFormat::Tga);
+        let bytes = encode(
+            &image::DynamicImage::ImageRgba8(src),
+            image::ImageFormat::Tga,
+        );
 
         // Without an extension hint the format is unidentifiable (the original bug).
         assert!(decode(&bytes, None, &DecodeOptions::default()).is_err());
@@ -1550,19 +1652,31 @@ mod tests {
         let mut src = image::RgbImage::new(2, 1);
         src.put_pixel(0, 0, image::Rgb([200, 30, 40]));
         src.put_pixel(1, 0, image::Rgb([10, 220, 60]));
-        let bytes = encode(&image::DynamicImage::ImageRgb8(src), image::ImageFormat::Tga);
+        let bytes = encode(
+            &image::DynamicImage::ImageRgb8(src),
+            image::ImageFormat::Tga,
+        );
 
         let out = decode(&bytes, Some("tga"), &DecodeOptions::default()).unwrap();
-        assert_eq!(out.channels, 3, "24-bit RGB TGA must not report an alpha channel");
+        assert_eq!(
+            out.channels, 3,
+            "24-bit RGB TGA must not report an alpha channel"
+        );
         // Still normalized to RGBA pixels with opaque alpha for the GPU upload.
         assert_eq!(&out.pixels[0..4], &[200, 30, 40, 255]);
 
         // A genuine 32-bit RGBA TGA still reports 4 channels.
         let mut rgba = image::RgbaImage::new(1, 1);
         rgba.put_pixel(0, 0, image::Rgba([1, 2, 3, 128]));
-        let bytes = encode(&image::DynamicImage::ImageRgba8(rgba), image::ImageFormat::Tga);
+        let bytes = encode(
+            &image::DynamicImage::ImageRgba8(rgba),
+            image::ImageFormat::Tga,
+        );
         let out = decode(&bytes, Some("tga"), &DecodeOptions::default()).unwrap();
-        assert_eq!(out.channels, 4, "32-bit RGBA TGA must report an alpha channel");
+        assert_eq!(
+            out.channels, 4,
+            "32-bit RGBA TGA must report an alpha channel"
+        );
     }
 
     /// Encode a GIF from a list of `(solid RGBA color, delay ms)` frames (test fixture). One frame
@@ -1594,7 +1708,10 @@ mod tests {
         assert_eq!(out.format, PixelFormat::Rgba8Unorm);
         assert_eq!(out.channels, 4);
 
-        let anim = out.animation.as_ref().expect("animated GIF carries an Animation");
+        let anim = out
+            .animation
+            .as_ref()
+            .expect("animated GIF carries an Animation");
         assert_eq!(anim.frames.len(), 2);
         // Delays round-trip (GIF stores centiseconds; both are multiples of 10 ms, ≥ 20 ms).
         assert_eq!(anim.frames[0].delay_ms, 100);
@@ -1603,9 +1720,21 @@ mod tests {
         assert_eq!(out.pixels, anim.frames[0].pixels);
         // Solid colors survive GIF palette quantization: frame 0 red-ish, frame 1 blue-ish.
         let f0 = &anim.frames[0].pixels;
-        assert!(f0[0] > 180 && f0[1] < 90 && f0[2] < 100, "frame0 {},{},{}", f0[0], f0[1], f0[2]);
+        assert!(
+            f0[0] > 180 && f0[1] < 90 && f0[2] < 100,
+            "frame0 {},{},{}",
+            f0[0],
+            f0[1],
+            f0[2]
+        );
         let f1 = &anim.frames[1].pixels;
-        assert!(f1[2] > 180 && f1[0] < 90, "frame1 {},{},{}", f1[0], f1[1], f1[2]);
+        assert!(
+            f1[2] > 180 && f1[0] < 90,
+            "frame1 {},{},{}",
+            f1[0],
+            f1[1],
+            f1[2]
+        );
     }
 
     /// GIF delays of 0 (and other sub-20 ms values) are clamped to 100 ms, matching how browsers
@@ -1615,7 +1744,10 @@ mod tests {
         let bytes = encode_gif(2, 2, &[([1, 2, 3, 255], 0), ([9, 8, 7, 255], 0)]);
         let out = decode(&bytes, Some("gif"), &DecodeOptions::default()).unwrap();
         let anim = out.animation.as_ref().expect("animated");
-        assert!(anim.frames.iter().all(|f| f.delay_ms == 100), "0-delay frames clamp to 100 ms");
+        assert!(
+            anim.frames.iter().all(|f| f.delay_ms == 100),
+            "0-delay frames clamp to 100 ms"
+        );
     }
 
     /// A single-frame GIF is an ordinary still image — no `Animation`, so no playback timer.
@@ -1625,7 +1757,10 @@ mod tests {
         let out = decode(&bytes, Some("gif"), &DecodeOptions::default()).unwrap();
         assert_eq!(out.source_format, "GIF");
         assert_eq!((out.width, out.height), (2, 2));
-        assert!(out.animation.is_none(), "a single-frame GIF is a still image");
+        assert!(
+            out.animation.is_none(),
+            "a single-frame GIF is a still image"
+        );
     }
 
     /// Corrupt input must surface an error, never panic (FFI-free path, but the viewer
@@ -1658,7 +1793,11 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for ext in SUPPORTED_EXTENSIONS {
             assert!(seen.insert(*ext), ".{ext} is listed twice");
-            assert_eq!(*ext, ext.to_ascii_lowercase(), "extensions are stored lower-case");
+            assert_eq!(
+                *ext,
+                ext.to_ascii_lowercase(),
+                "extensions are stored lower-case"
+            );
         }
     }
 
@@ -1806,7 +1945,11 @@ mod tests {
         let bytes = encode_gif(4, 4, &frames);
         let out = decode(&bytes, Some("gif"), &DecodeOptions::default()).unwrap();
         let anim = out.animation.as_ref().expect("animated");
-        assert_eq!(anim.frames.len(), 100, "a 100-frame 4×4 GIF is nowhere near the budget");
+        assert_eq!(
+            anim.frames.len(),
+            100,
+            "a 100-frame 4×4 GIF is nowhere near the budget"
+        );
 
         // The budget divides the byte cap by the canvas size, and is clamped to the frame ceiling.
         let tiny_canvas_budget = (MAX_ANIMATION_BYTES / (4 * 4 * 4)).min(MAX_ANIMATION_FRAMES);
@@ -1835,7 +1978,11 @@ mod tests {
             .expect("baseline JPEG has an SOF0");
         jpg[sof + 5..sof + 7].copy_from_slice(&u16::MAX.to_be_bytes()); // height
         jpg[sof + 7..sof + 9].copy_from_slice(&u16::MAX.to_be_bytes()); // width
-        assert!(jpg.len() < 1000, "the bomb is a tiny file: {} bytes", jpg.len());
+        assert!(
+            jpg.len() < 1000,
+            "the bomb is a tiny file: {} bytes",
+            jpg.len()
+        );
 
         let err = decode(&jpg, Some("jpg"), &DecodeOptions::default())
             .expect_err("a 65535x65535 JPEG must be refused before zune allocates");

@@ -26,7 +26,8 @@ use dear_imgui_sys as sys;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_IMMUTABLE,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_IMMUTABLE,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
 
@@ -158,7 +159,11 @@ pub fn center_next_window(client: (f32, f32)) {
 /// for anything else.
 pub fn position_next_window(pos: (f32, f32)) {
     let p = sys::ImVec2_c { x: pos.0, y: pos.1 };
-    place(p, sys::ImVec2_c { x: 0.0, y: 0.0 }, sys::ImGuiCond_Appearing);
+    place(
+        p,
+        sys::ImVec2_c { x: 0.0, y: 0.0 },
+        sys::ImGuiCond_Appearing,
+    );
 }
 
 /// Anchor the next window at `pos` with `pivot` (`0.0` = leading edge, `0.5` = centered, `1.0` =
@@ -192,7 +197,12 @@ pub fn size_next_window(size: (f32, f32)) {
 }
 
 impl Imgui {
-    pub fn new(hwnd: isize, device: &ID3D11Device, device_ctx: &ID3D11DeviceContext, dpi: u32) -> Self {
+    pub fn new(
+        hwnd: isize,
+        device: &ID3D11Device,
+        device_ctx: &ID3D11DeviceContext,
+        dpi: u32,
+    ) -> Self {
         let mut ctx = Context::create();
         // No imgui.ini: fire has no dockspaces or user-arranged windows to persist, and a settings
         // file that rewrites itself on a timer would break the "an idle window costs ~0" invariant.
@@ -211,10 +221,7 @@ impl Imgui {
 
         unsafe {
             dear_imgui_backend_win32_init(hwnd as *mut c_void);
-            dear_imgui_backend_dx11_init(
-                device.as_raw(),
-                device_ctx.as_raw(),
-            );
+            dear_imgui_backend_dx11_init(device.as_raw(), device_ctx.as_raw());
         }
 
         // Snapshot the factory style *now*, before `ui::theme::apply` runs over it — this is the

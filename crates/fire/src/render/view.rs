@@ -27,7 +27,10 @@ pub struct Viewport {
 
 impl Viewport {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width: width.max(1) as f32, height: height.max(1) as f32 }
+        Self {
+            width: width.max(1) as f32,
+            height: height.max(1) as f32,
+        }
     }
 
     /// Center of the surface in pixels (origin top-left, y down).
@@ -77,7 +80,11 @@ pub struct DisplayState {
 
 impl Default for DisplayState {
     fn default() -> Self {
-        Self { channel: Channel::Rgb, exposure: 0.0, tonemap: Tonemap::Reinhard }
+        Self {
+            channel: Channel::Rgb,
+            exposure: 0.0,
+            tonemap: Tonemap::Reinhard,
+        }
     }
 }
 
@@ -99,7 +106,12 @@ pub struct ViewState {
 
 impl Default for ViewState {
     fn default() -> Self {
-        Self { zoom: 1.0, pan: (0.0, 0.0), fit: true, fit_upscale: false }
+        Self {
+            zoom: 1.0,
+            pan: (0.0, 0.0),
+            fit: true,
+            fit_upscale: false,
+        }
     }
 }
 
@@ -110,7 +122,10 @@ impl ViewState {
     /// fit always means "fit to window" regardless of the image's size (the `fit-upscale` config key).
     pub fn fit_to_window(&mut self, image: (u32, u32), vp: &Viewport, upscale: bool) {
         // Fit into the surface minus a 1px gutter on every side so the outside outline always has room.
-        let (uw, uh) = ((vp.width - 2.0 * FIT_GUTTER).max(1.0), (vp.height - 2.0 * FIT_GUTTER).max(1.0));
+        let (uw, uh) = (
+            (vp.width - 2.0 * FIT_GUTTER).max(1.0),
+            (vp.height - 2.0 * FIT_GUTTER).max(1.0),
+        );
         let (iw, ih) = (image.0.max(1) as f32, image.1.max(1) as f32);
         let z = (uw / iw).min(uh / ih);
         // Without upscaling, never go past 1:1 (a small image already sits inside the surface).
@@ -130,7 +145,13 @@ impl ViewState {
 
     /// Multiply zoom by `factor` about `cursor` (surface px), keeping the image point
     /// currently under the cursor fixed on screen. Manual zoom leaves fit mode.
-    pub fn zoom_to_cursor(&mut self, factor: f32, cursor: (f32, f32), image: (u32, u32), vp: &Viewport) {
+    pub fn zoom_to_cursor(
+        &mut self,
+        factor: f32,
+        cursor: (f32, f32),
+        image: (u32, u32),
+        vp: &Viewport,
+    ) {
         let old = self.zoom;
         let new = (old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         if new == old {
@@ -177,13 +198,21 @@ impl ViewState {
         let (sw, sh) = self.image_screen_size(image);
         let lim_x = (sw + uw) * 0.5;
         let lim_y = (sh + uh) * 0.5;
-        self.pan = (self.pan.0.clamp(-lim_x, lim_x), self.pan.1.clamp(-lim_y, lim_y));
+        self.pan = (
+            self.pan.0.clamp(-lim_x, lim_x),
+            self.pan.1.clamp(-lim_y, lim_y),
+        );
     }
 
     /// Map a surface-pixel position to image pixel coordinates (origin top-left). Inverse
     /// of [`Self::image_to_screen`]; the eyedropper (Phase 4) reads pixels through this.
     #[allow(dead_code)] // wired to the pixel inspector in Phase 4; unit-tested now
-    pub fn screen_to_image(&self, screen: (f32, f32), image: (u32, u32), vp: &Viewport) -> (f32, f32) {
+    pub fn screen_to_image(
+        &self,
+        screen: (f32, f32),
+        image: (u32, u32),
+        vp: &Viewport,
+    ) -> (f32, f32) {
         let c = vp.center();
         let img_center = (c.0 + self.pan.0, c.1 + self.pan.1);
         let off = (screen.0 - img_center.0, screen.1 - img_center.1);
@@ -262,8 +291,18 @@ mod tests {
         s.zoom_to_cursor(2.5, cursor, image, &v);
         // ...must still be under the cursor after (within float tolerance, modulo clamp).
         let after = s.screen_to_image(cursor, image, &v);
-        assert!((before.0 - after.0).abs() < 0.5, "x: {} vs {}", before.0, after.0);
-        assert!((before.1 - after.1).abs() < 0.5, "y: {} vs {}", before.1, after.1);
+        assert!(
+            (before.0 - after.0).abs() < 0.5,
+            "x: {} vs {}",
+            before.0,
+            after.0
+        );
+        assert!(
+            (before.1 - after.1).abs() < 0.5,
+            "y: {} vs {}",
+            before.1,
+            after.1
+        );
         assert!(!s.fit);
     }
 
@@ -271,7 +310,12 @@ mod tests {
     fn screen_image_round_trip() {
         let v = vp();
         let image = (1234u32, 567u32);
-        let mut s = ViewState { zoom: 1.7, pan: (-30.0, 45.0), fit: false, fit_upscale: false };
+        let mut s = ViewState {
+            zoom: 1.7,
+            pan: (-30.0, 45.0),
+            fit: false,
+            fit_upscale: false,
+        };
         s.clamp_pan(image, &v);
         for &p in &[(0.0, 0.0), (640.0, 360.0), (999.0, 799.0)] {
             let img = s.screen_to_image(p, image, &v);
@@ -285,7 +329,12 @@ mod tests {
     fn pan_clamp_lets_you_push_image_just_out_of_view() {
         let v = vp();
         let image = (4000u32, 800u32); // wider than the 1000px viewport, same height
-        let mut s = ViewState { zoom: 1.0, pan: (0.0, 0.0), fit: false, fit_upscale: false };
+        let mut s = ViewState {
+            zoom: 1.0,
+            pan: (0.0, 0.0),
+            fit: false,
+            fit_upscale: false,
+        };
         // Pan far right; clamp pins it to (image_screen + surface)/2 — the image is then just
         // fully off the left edge and can't be pushed further.
         s.pan_by((100_000.0, 0.0), image, &v);

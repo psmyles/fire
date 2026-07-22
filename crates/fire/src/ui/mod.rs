@@ -18,8 +18,8 @@ use dear_imgui_rs::{Condition, StyleColor, StyleVar, TextureId, Ui, WindowFlags}
 
 use crate::chrome::{Action, ViewSnapshot};
 use crate::config::{Config, MenuEntry};
-use crate::icons::Icon;
 use crate::flipbook::{Grid, FPS_MAX};
+use crate::icons::Icon;
 use crate::render;
 use crate::render::imgui::FormStyle;
 use crate::transport::{TransportEdit, TransportSnapshot};
@@ -282,7 +282,11 @@ fn actions_menu(ui: &Ui, cfg: &Config, has_image: bool, out: &mut Frame) {
 
     if has_image {
         for (on, label, cmd) in [
-            (cm.show_in_explorer, "Show in Explorer", Command::ShowInExplorer),
+            (
+                cm.show_in_explorer,
+                "Show in Explorer",
+                Command::ShowInExplorer,
+            ),
             (cm.copy_file, "Copy File", Command::CopyFile),
             (cm.copy_path, "Copy Path", Command::CopyPath),
             (cm.copy_file_name, "Copy File Name", Command::CopyFileName),
@@ -456,7 +460,10 @@ fn octagon_window(
     ui.window("Octagon Overlay")
         .flags(FLAGS)
         // First use only: the user can drag it anywhere and it stays there for the session.
-        .position([ix + m.edge_pad * 2.0, iy + m.edge_pad * 2.0], Condition::FirstUseEver)
+        .position(
+            [ix + m.edge_pad * 2.0, iy + m.edge_pad * 2.0],
+            Condition::FirstUseEver,
+        )
         .build(|| {
             // The same control height the transport row uses, so this panel matches the chrome.
             let controls = theme::current().chrome.controls;
@@ -507,7 +514,11 @@ fn octagon_window(
                     // grows by the same 1px) — a square ring around a rounded button reads as a
                     // glitch.
                     ui.get_window_draw_list()
-                        .add_rect([min[0] - 1.0, min[1] - 1.0], [max[0] + 1.0, max[1] + 1.0], ring)
+                        .add_rect(
+                            [min[0] - 1.0, min[1] - 1.0],
+                            [max[0] + 1.0, max[1] + 1.0],
+                            ring,
+                        )
                         .rounding(style.frame_rounding() + 1.0)
                         .thickness(2.0)
                         .build();
@@ -516,12 +527,19 @@ fn octagon_window(
 
             // --- line opacity: fade the lines without losing the shape's hide fade ---
             row(labels[1]);
-            changed |=
-                slider_with_field(ui, "##oct-alpha", &mut st.line_opacity, 1.0, slider_w, field_w);
+            changed |= slider_with_field(
+                ui,
+                "##oct-alpha",
+                &mut st.line_opacity,
+                1.0,
+                slider_w,
+                field_w,
+            );
 
             // --- crop factor: the shape, 0 (quad) → 0.5 (diamond) ---
             row(labels[2]);
-            changed |= slider_with_field(ui, "##oct-crop", &mut st.crop, CROP_MAX, slider_w, field_w);
+            changed |=
+                slider_with_field(ui, "##oct-crop", &mut st.crop, CROP_MAX, slider_w, field_w);
 
             // --- hide outside: fade the clipped region toward the backdrop ---
             row(labels[3]);
@@ -541,7 +559,14 @@ fn octagon_window(
 /// never shows a `0.2741935` and the persisted config stays clean. The box itself takes only
 /// numeric characters (`CHARS_DECIMAL`) — letters don't even appear while typing; the surface
 /// still clamps the parsed value to range.
-fn slider_with_field(ui: &Ui, id: &str, v: &mut f32, max: f32, slider_w: f32, field_w: f32) -> bool {
+fn slider_with_field(
+    ui: &Ui,
+    id: &str,
+    v: &mut f32,
+    max: f32,
+    slider_w: f32,
+    field_w: f32,
+) -> bool {
     let round3 = |v: &mut f32| *v = (*v * 1000.0).round() / 1000.0;
     let mut changed = false;
     ui.set_next_item_width(slider_w);
@@ -676,7 +701,12 @@ fn toolbar(
         .collect();
 
     let right: Vec<(Action, u8)> = RIGHT.to_vec();
-    let right_w = strip_width(&right.iter().map(|(a, g)| (*a, *g)).collect::<Vec<_>>(), bs[0], spacing, div_w);
+    let right_w = strip_width(
+        &right.iter().map(|(a, g)| (*a, *g)).collect::<Vec<_>>(),
+        bs[0],
+        spacing,
+        div_w,
+    );
 
     // Drop the lowest-priority left slots until the strip fits. Ties break toward the *right*, so a
     // group collapses from its tail inward — same rule the GDI chrome used.
@@ -684,7 +714,11 @@ fn toolbar(
     let mut dropped: Vec<Action> = Vec::new();
     let edge = m.edge_pad;
     loop {
-        let more_w = if dropped.is_empty() { 0.0 } else { bs[0] + spacing };
+        let more_w = if dropped.is_empty() {
+            0.0
+        } else {
+            bs[0] + spacing
+        };
         let left_w = strip_width(
             &kept.iter().map(|(a, g, _)| (*a, *g)).collect::<Vec<_>>(),
             bs[0],
@@ -731,7 +765,18 @@ fn toolbar(
 
             // The overflow "»", immediately after the left strip.
             if !dropped.is_empty() {
-                if button(ui, tex, Icon::More, "##overflow", [x, y], bs, icon_px, true, false, m) {
+                if button(
+                    ui,
+                    tex,
+                    Icon::More,
+                    "##overflow",
+                    [x, y],
+                    bs,
+                    icon_px,
+                    true,
+                    false,
+                    m,
+                ) {
                     out.menu = Some(MenuAnchor {
                         kind: MenuKind::Overflow(dropped.clone()),
                         pos: (x, y + bs[1]),
@@ -856,9 +901,8 @@ fn button(
     };
 
     let _dis = (!enabled).then(|| ui.begin_disabled());
-    let _fill = active.then(|| {
-        ui.push_style_color(StyleColor::Button, style.color(StyleColor::ButtonActive))
-    });
+    let _fill = active
+        .then(|| ui.push_style_color(StyleColor::Button, style.color(StyleColor::ButtonActive)));
 
     let (uv0, uv1) = icon.uv();
     ui.image_button_config(id, tex, [icon_px, icon_px])
@@ -970,9 +1014,8 @@ fn transport_band(
             // Each field is as wide as the widest value it can actually hold, measured in the live
             // font — so it neither clips nor leaves a gutter, at any DPI, without a table of widths
             // to maintain.
-            let field = |digits: usize| {
-                text_w(ui, &"0".repeat(digits)) + style.frame_padding()[0] * 2.0
-            };
+            let field =
+                |digits: usize| text_w(ui, &"0".repeat(digits)) + style.frame_padding()[0] * 2.0;
             let digits = |n: u32| n.to_string().len();
             let grid_w = field(digits(t.grid_max));
             let count_w = field(digits((t.cols * t.rows).max(1)));
@@ -987,8 +1030,9 @@ fn transport_band(
             // --- left: the grid, the frame count, play/pause ---------------------------------
             ui.set_next_item_width(grid_w);
             if int_field(ui, "##cols", &mut cols) {
-                out.edits
-                    .push(TransportEdit::SetCols(cols.clamp(1, t.grid_max as i32) as u32));
+                out.edits.push(TransportEdit::SetCols(
+                    cols.clamp(1, t.grid_max as i32) as u32
+                ));
             }
             ui.same_line();
             ui.align_text_to_frame_padding();
@@ -996,15 +1040,17 @@ fn transport_band(
             ui.same_line();
             ui.set_next_item_width(grid_w);
             if int_field(ui, "##rows", &mut rows) {
-                out.edits
-                    .push(TransportEdit::SetRows(rows.clamp(1, t.grid_max as i32) as u32));
+                out.edits.push(TransportEdit::SetRows(
+                    rows.clamp(1, t.grid_max as i32) as u32
+                ));
             }
 
             ui.same_line_with_spacing(0.0, spacing * 3.0); // a group break, not a gap
             ui.set_next_item_width(count_w);
             if int_field(ui, "##count", &mut count) {
                 let max = (t.cols * t.rows).max(1) as i32;
-                out.edits.push(TransportEdit::SetCount(count.clamp(1, max) as u32));
+                out.edits
+                    .push(TransportEdit::SetCount(count.clamp(1, max) as u32));
             }
             if ui.is_item_hovered() {
                 ui.tooltip_text("Frames used from the sheet");
@@ -1074,8 +1120,11 @@ fn transport_band(
             }
             if scrubbed {
                 // With crossfade off there is nothing between frames to land on.
-                out.edits
-                    .push(TransportEdit::Scrub(if t.blend { pos } else { pos.floor() }));
+                out.edits.push(TransportEdit::Scrub(if t.blend {
+                    pos
+                } else {
+                    pos.floor()
+                }));
             }
 
             ui.same_line_with_pos(right_x);
