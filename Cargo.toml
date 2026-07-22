@@ -68,6 +68,11 @@ image = { version = "0.25", default-features = false, features = [
     "bmp",
     "jpeg",
 ] }
+# TIFF is decoded directly against this crate rather than through `image`, which collapses
+# everything the `tiff` crate does not hand it as a named colour type: it drops a 4th sample it
+# was not told is alpha, refuses grey+alpha outright, and narrows 16-bit to 8. Same crate
+# `image` uses underneath, so this adds no build weight — see `fire-decode`'s `tiff` module.
+tiff = "0.11"
 exr = "1"
 lcms2 = { version = "6", features = ["static"] }
 

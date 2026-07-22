@@ -246,10 +246,11 @@ also detected by magic so a no-extension open still routes correctly.
 | GIF | `image` crate - **all frames** (animated GIF plays; still GIF is a single frame) |
 | PNG | `image` crate → RGBA8/RGBA16 (+ICC). Deliberately **not** zune: the `png`+`fdeflate` stack measured ~1.8× faster than zune-png on large textures (the gap is in the core decode) |
 | Radiance HDR (`.hdr`/`.pic`) | `image` crate → 32-bit float RGBA. Deliberately **not** zune: zune-hdr ≤ 0.5.2 wraps RGBE exponents ≥ 32 stops from unity (dark pixels decode 2³² too bright), and the `image` decoder is ~2× faster besides |
-| TIFF, TGA, ICO | `image` crate (formats zune doesn't decode) |
+| TIFF | **`tiff` crate directly** → RGBA at the source depth (8/16/32f, +ICC). Going through `image` lost samples: it can only represent what `tiff`'s conservative `colortype()` names, so an unlabelled 4th sample (Photoshop's `ExtraSamples = 0`) was dropped, grey+alpha was refused outright, and 16-bit was narrowed to 8. Associated (premultiplied) alpha is straightened here. Palette/CMYK/YCbCr/Lab still fall back to `image` |
+| TGA, ICO | `image` crate (formats zune doesn't decode) |
 | AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
 | EXR | `exr` crate (pure Rust) → 32-bit float RGBA |
-| PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite |
+| PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite, at the document's own depth (8/16/32f). `wrapper.cpp` owns the colour-mode conversion: RGB/Grey/Duotone direct, Indexed through the palette, CMYK composited **through K** (PSD stores CMYK inverted), Lab via D50 XYZ. 16-bit samples are Photoshop's 15-bit+1 range (**0…32768**, not 0…65535); 1-bit Bitmap mode is refused, since psd_sdk sizes its planes `bits/8` = 0 |
 | Camera raw (CR2/CR3, NEF, ARW, RAF, ORF, RW2, DNG, …) | **`raw`** (pure Rust) → extract the embedded JPEG **preview**, decode via zune |
 | ICC transforms | **Little CMS** (`lcms2`) over FFI |
 

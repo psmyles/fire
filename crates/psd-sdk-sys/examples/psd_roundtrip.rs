@@ -23,8 +23,10 @@ fn main() {
                     .map(|v| format!("{} bytes", v.len()))
                     .unwrap_or("none".into())
             );
-            let n = img.rgba8.len().min(16);
-            println!("first RGBA bytes: {:?}", &img.rgba8[..n]);
+            // `rgba` is in the document's own depth — u8, native-endian u16, or f32 — so the
+            // raw bytes are what this smoke test can honestly print.
+            let n = img.rgba.len().min(16);
+            println!("first RGBA bytes: {:?}", &img.rgba[..n]);
         }
         Err(e) => {
             eprintln!("decode failed: {e}");

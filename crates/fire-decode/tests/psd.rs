@@ -3,13 +3,14 @@
 //!
 //! PSD is the project's only **C++** FFI boundary (psd_sdk, via `psd-sdk-sys`), and the widest
 //! one: `wrapper.cpp` re-samples psd_sdk's *planar* channels into interleaved RGBA itself,
-//! branching on bit depth (8/16/32) and colour mode (RGB/grayscale, with or without alpha). Each
-//! of those branches is a hand-written pointer walk, so each gets a fixture here.
+//! branching on bit depth (8/16/32) and on every colour mode Photoshop can save — RGB, greyscale,
+//! Indexed, CMYK, Lab — each with or without alpha. Every one of those branches is a hand-written
+//! pointer walk, so every one gets a fixture here.
 //!
 //! Fixtures are built in memory rather than committed as binaries: a minimal PSD is a header plus
 //! four length-prefixed sections, and writing it out in code documents the layout the C++ side
 //! relies on. Only the merged ("Maximize Compatibility") composite is in scope — the layer stack
-//! is a v2 concern and `fire_psd_read_merged_rgba8` returns error 2 without it.
+//! is a v2 concern and `fire_psd_read_merged` returns error 2 without it.
 
 use fire_decode::{decode, DecodeOptions, PixelFormat};
 
@@ -95,11 +96,15 @@ fn psd_rgb8_without_alpha_synthesizes_opaque_lane() {
     );
 }
 
-/// The 16-bit branch of `sample_channel`: psd_sdk hands back native `uint16` samples and the
-/// wrapper narrows them to 8-bit with `>> 8`, so the high byte is what survives.
+/// 16-bit PSDs keep 16 bits, and are scaled from Photoshop's range rather than Photoshop's
+/// *nominal* one.
+///
+/// Photoshop stores 16-bit samples as 15-bit+1 integers in the range **0…32768**, not 0…65535 —
+/// the vendored SDK says so itself in `PsdParseImageDataSection.cpp`. The wrapper used to narrow
+/// with `x >> 8`, which treats 32768 (white) as 128, i.e. rendered every 16-bit document at half
+/// brightness. It also flattened the buffer to 8 bits while `bit_depth` went on claiming 16.
 #[test]
-fn psd_rgb16_narrows_to_high_byte() {
-    // Big-endian 16-bit samples: 0xABCD -> 0xAB, 0x1234 -> 0x12, 0xFF00 -> 0xFF.
+fn psd_rgb16_scales_from_photoshops_32768_range() {
     let plane16 =
         |vals: [u16; 2]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_be_bytes()).collect() };
     let bytes = psd(
@@ -108,17 +113,202 @@ fn psd_rgb16_narrows_to_high_byte() {
         COLOR_MODE_RGB,
         16,
         &[
-            plane16([0xABCD, 0x1234]), // R
-            plane16([0xFF00, 0x0000]), // G
-            plane16([0x8080, 0xFFFF]), // B
+            plane16([32768, 0]),     // R: white, then black
+            plane16([16384, 32768]), // G: half, then white
+            plane16([0, 16384]),     // B: black, then half
         ],
     );
 
     let out = decode(&bytes, Some("psd"), &DecodeOptions::default()).expect("should decode");
     assert_eq!((out.width, out.height), (2, 1));
     assert_eq!(
+        out.format,
+        PixelFormat::Rgba16Unorm,
+        "16-bit source stays 16-bit"
+    );
+    assert_eq!(out.bit_depth, 16);
+    let s: Vec<u16> = out
+        .pixels
+        .chunks_exact(2)
+        .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+        .collect();
+    // 32768 is full white, not half. 16384 is the midpoint.
+    assert_eq!(s, vec![65535, 32768, 0, 65535, 0, 65535, 32768, 65535]);
+}
+
+/// 32-bit PSDs are linear/HDR and stay that way: values above 1.0 survive instead of being
+/// clamped into an 8-bit lane, so exposure and tonemapping apply as they do for EXR.
+#[test]
+fn psd_rgb32f_stays_linear_float() {
+    let plane32 = |v: f32| -> Vec<u8> { v.to_be_bytes().to_vec() };
+    let bytes = psd(
+        1,
+        1,
+        COLOR_MODE_RGB,
+        32,
+        &[plane32(4.0), plane32(0.5), plane32(0.0)],
+    );
+
+    let out = decode(&bytes, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(out.format, PixelFormat::Rgba32Float);
+    assert_eq!(out.bit_depth, 32);
+    let s: Vec<f32> = out
+        .pixels
+        .chunks_exact(4)
+        .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(
+        s,
+        vec![4.0, 0.5, 0.0, 1.0],
+        "HDR range preserved, alpha synthesized opaque"
+    );
+}
+
+/// A greyscale PSD's alpha channel must survive.
+///
+/// The wrapper's greyscale branch never read one: `hasAlpha` required colour mode RGB, so a
+/// Gray+Alpha document came back fully opaque while still *reporting* 2 channels — the viewer
+/// then computed `alpha_opaque` and showed a solid image. A greyscale document whose content
+/// lives entirely in alpha (a mask, a texture sheet) rendered as a blank square. Same failure
+/// as the TIFF `ExtraSamples` bug, one format over.
+#[test]
+fn psd_grayscale_alpha_is_not_dropped() {
+    let bytes = psd(
+        3,
+        1,
+        COLOR_MODE_GRAYSCALE,
+        8,
+        &[vec![200, 255, 0], vec![128, 0, 255]],
+    );
+
+    let out = decode(&bytes, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(out.channels, 2, "grey + alpha");
+    assert_eq!(
         out.pixels,
-        vec![0xAB, 0xFF, 0x80, 255, 0x12, 0x00, 0xFF, 255]
+        vec![200, 200, 200, 128, 255, 255, 255, 0, 0, 0, 0, 255],
+        "the alpha plane must reach the alpha lane"
+    );
+    assert!(!out.alpha_opaque);
+}
+
+/// Spot/extra channels must not be counted as image channels, and must not be mistaken for alpha.
+///
+/// `channels` came straight from the document header, which counts spot channels too — an RGB
+/// document with transparency plus one spot channel reported 5. The viewer keys its alpha UI
+/// (checker backdrop, alpha isolation, the status label) on 2 or 4, so a file that really did
+/// have transparency was presented as having none. Conversely `hasAlpha` was just "is there a
+/// 4th plane", so an RGB document with a spot channel and *no* transparency had that spot
+/// channel used as opacity.
+#[test]
+fn psd_spot_channels_do_not_break_the_alpha_report() {
+    let rgb = || vec![vec![255u8], vec![0], vec![0]];
+
+    // RGB + alpha + one spot channel: still RGBA, and the alpha is the 4th plane.
+    let mut planes = rgb();
+    planes.push(vec![128]); // alpha
+    planes.push(vec![64]); // spot
+    let out = decode(
+        &psd(1, 1, COLOR_MODE_RGB, 8, &planes),
+        Some("psd"),
+        &DecodeOptions::default(),
+    )
+    .expect("should decode");
+    assert_eq!(out.channels, 4, "spot channels are not image channels");
+    assert_eq!(out.pixels, vec![255, 0, 0, 128]);
+
+    // RGB with no alpha at all reports 3 and gets an opaque lane.
+    let out = decode(
+        &psd(1, 1, COLOR_MODE_RGB, 8, &rgb()),
+        Some("psd"),
+        &DecodeOptions::default(),
+    )
+    .expect("should decode");
+    assert_eq!(out.channels, 3);
+    assert_eq!(out.pixels, vec![255, 0, 0, 255]);
+}
+
+/// CMYK is stored **inverted** in a PSD (255 = no ink), and the K plane is not optional.
+///
+/// The wrapper mapped C->R, M->G, Y->B and dropped K entirely, which is wrong twice over: a
+/// no-ink (white) document rendered black, and pure cyan rendered red.
+#[test]
+fn psd_cmyk_composites_through_k() {
+    const CMYK: u16 = 4;
+    let ink = |v: u8| vec![v];
+
+    // No ink anywhere -> white.
+    let white = psd(1, 1, CMYK, 8, &[ink(255), ink(255), ink(255), ink(255)]);
+    let out = decode(&white, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(
+        out.pixels,
+        vec![255, 255, 255, 255],
+        "no ink is white, not black"
+    );
+
+    // Full black ink only -> black (this is the case K-dropping silently got right).
+    let black = psd(1, 1, CMYK, 8, &[ink(255), ink(255), ink(255), ink(0)]);
+    let out = decode(&black, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(out.pixels, vec![0, 0, 0, 255]);
+
+    // Full cyan ink, nothing else -> cyan.
+    let cyan = psd(1, 1, CMYK, 8, &[ink(0), ink(255), ink(255), ink(255)]);
+    let out = decode(&cyan, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(out.pixels, vec![0, 255, 255, 255], "pure cyan, not red");
+
+    // A CMYK document's alpha is its 5th plane, and it reports as colour+alpha.
+    let with_alpha = psd(
+        1,
+        1,
+        CMYK,
+        8,
+        &[ink(255), ink(255), ink(255), ink(255), ink(128)],
+    );
+    let out = decode(&with_alpha, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(out.channels, 4);
+    assert_eq!(out.pixels, vec![255, 255, 255, 128]);
+}
+
+/// Lab documents are converted through D50 XYZ rather than having L, a and b read as R, G and B.
+#[test]
+fn psd_lab_converts_to_srgb() {
+    const LAB: u16 = 9;
+    // L is 0..255 for L* 0..100; a and b are offset by 128, so 128 is neutral.
+    let white = psd(1, 1, LAB, 8, &[vec![255], vec![128], vec![128]]);
+    let out = decode(&white, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(
+        out.pixels,
+        vec![255, 255, 255, 255],
+        "L*=100 neutral is white"
+    );
+
+    let black = psd(1, 1, LAB, 8, &[vec![0], vec![128], vec![128]]);
+    let out = decode(&black, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(out.pixels, vec![0, 0, 0, 255], "L*=0 neutral is black");
+
+    // L* = 50 is perceptual middle grey, which is sRGB ~119 — NOT 128.
+    let mid = psd(1, 1, LAB, 8, &[vec![128], vec![128], vec![128]]);
+    let out = decode(&mid, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    let v = out.pixels[0];
+    assert!(
+        (117..=121).contains(&v),
+        "L*~50 should land near sRGB 119, got {v}"
+    );
+    assert_eq!(out.pixels[1], v, "neutral stays neutral");
+    assert_eq!(out.pixels[2], v);
+}
+
+/// A Bitmap-mode (1-bit) PSD is refused rather than sampled.
+///
+/// psd_sdk sizes its planes with `bitsPerChannel / 8`, which is **zero** at 1 bit, so every plane
+/// is a zero-byte allocation. The old sampler had no depth check and fell through to its 32-bit
+/// float branch, reading `4 * w * h` bytes off the end of it.
+#[test]
+fn psd_one_bit_bitmap_mode_is_refused() {
+    const BITMAP: u16 = 0;
+    let bytes = psd(8, 8, BITMAP, 1, &[vec![0xff; 8]]);
+    assert!(
+        decode(&bytes, Some("psd"), &DecodeOptions::default()).is_err(),
+        "1-bit documents have no readable planes and must be refused, not read past"
     );
 }
 

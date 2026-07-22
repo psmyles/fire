@@ -26,12 +26,12 @@
 //! applied by [`icc`]. Images larger than the caller's `max_dim` are CPU-downscaled to
 //! fit ([`downscale`]).
 
-use std::borrow::Cow;
 use std::io::Cursor;
 use std::path::Path;
 
 mod downscale;
 mod raw;
+mod tiff;
 
 /// Upper bound on a decoded source dimension. zune's default cap is 16384, which would
 /// reject any image larger than that on an axis before we ever get a chance to downscale
@@ -81,7 +81,7 @@ fn check_dims(
     what: &str,
 ) -> Result<(), DecodeError> {
     if width > MAX_DECODE_DIM || height > MAX_DECODE_DIM {
-        return Err(DecodeError::Malformed(format!(
+        return Err(DecodeError::TooLarge(format!(
             "{what} dimensions {width}x{height} exceed the {MAX_DECODE_DIM} per-axis decode guard"
         )));
     }
@@ -90,7 +90,7 @@ fn check_dims(
         .and_then(|px| px.checked_mul(bytes_per_pixel));
     match bytes {
         Some(b) if b <= MAX_DECODE_BYTES => Ok(()),
-        _ => Err(DecodeError::Malformed(format!(
+        _ => Err(DecodeError::TooLarge(format!(
             "{what} {width}x{height} needs more than the {MAX_DECODE_BYTES}-byte decode guard"
         ))),
     }
@@ -241,6 +241,15 @@ impl Default for DecodeOptions {
 pub enum DecodeError {
     /// The backend rejected the data as malformed — including input that is not an image at all.
     Malformed(String),
+    /// The image is past a decode guard ([`check_dims`]) — a decode bomb, or simply larger than
+    /// this build will allocate for.
+    ///
+    /// Kept distinct from [`Self::Malformed`] because *refusing* an image and *failing* to read
+    /// one call for opposite responses: a decoder that merely failed may be worth retrying with
+    /// a different one, and a guard that fired must never be. Conflating them let a 65535x65535
+    /// JPEG that zune correctly refused get handed to the `image` crate, which obligingly
+    /// allocated it.
+    TooLarge(String),
     /// An FFI backend (psd_sdk/lcms2) failed; surfaced so the viewer survives.
     Ffi(String),
     /// I/O or unexpected backend error.
@@ -251,6 +260,7 @@ impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DecodeError::Malformed(m) => write!(f, "malformed image: {m}"),
+            DecodeError::TooLarge(m) => write!(f, "image too large: {m}"),
             DecodeError::Ffi(m) => write!(f, "decoder FFI error: {m}"),
             DecodeError::Other(m) => write!(f, "{m}"),
         }
@@ -273,6 +283,9 @@ enum Backend {
     /// A GIF (still or animated); decoded frame-by-frame via the `image` crate so an animated
     /// GIF can play. Sniffed separately from [`Backend::Image`] to reach the multi-frame path.
     Gif,
+    /// A plain TIFF; decoded against the `tiff` crate directly ([`crate::tiff`]), falling back
+    /// to [`Backend::Image`] for the colour types that module does not own.
+    Tiff,
     /// Radiance HDR (`.hdr`/`.pic`); decoded by the `image` crate, *not* zune — see
     /// [`decode_hdr`] for why zune-hdr is avoided.
     Hdr,
@@ -319,6 +332,12 @@ fn sniff(bytes: &[u8], ext: Option<&str>) -> Backend {
         // before the zune/`image` fallback because TIFF-structured raws share TIFF's magic
         // and must not be handed to the `image` crate as ordinary TIFFs.
         Backend::Raw(label)
+    } else if bytes.starts_with(b"II\x2a\x00") || bytes.starts_with(b"MM\x00\x2a") {
+        // Plain TIFF, decoded against the `tiff` crate directly (see the `tiff` module for why
+        // the `image` path loses samples). Sniffed *after* `raw::label` so the many
+        // TIFF-structured camera raws, which share this magic, still route to the preview
+        // extractor — and it falls back to `image` for the colour types it does not own.
+        Backend::Tiff
     } else if bytes.starts_with(b"GIF8") {
         // GIF (b"GIF87a"/b"GIF89a"): route to the dedicated multi-frame decoder so an animated
         // GIF plays. zune has no GIF decoder anyway, so this only pre-empts the `image` fallback.
@@ -352,9 +371,31 @@ pub fn decode(
         Backend::Heif(label) => decode_heif(bytes, label)?,
         Backend::Raw(label) => decode_raw(bytes, label)?,
         Backend::Gif => decode_gif(bytes)?,
+        Backend::Tiff => {
+            // The `ExtraSamples` fixup has to happen before the decoder is constructed — either
+            // decoder — because both decide the sample layout at construction time.
+            let patched = tiff::extra_sample_as_alpha(bytes);
+            match tiff::decode(&patched) {
+                Some(result) => result?,
+                None => decode_image(&patched, ext_hint)?,
+            }
+        }
         Backend::Hdr => decode_hdr(bytes)?,
         Backend::Png => decode_png(bytes)?,
-        Backend::Zune(fmt) => decode_zune(bytes, fmt)?,
+        // zune is the hot path, not the only path. It has gaps the `image` crate does not —
+        // zune-bmp cannot read a 24-bit BMP narrower than 3 pixels, so a 1x1 colour swatch
+        // failed to open at all — and where the fast decoder simply says no, retrying with the
+        // slower one costs nothing (we are already on the error path) and turns "won't open"
+        // into "opens". A file both reject still reports zune's error, the more precise one.
+        //
+        // A guard rejection is emphatically NOT retried: `TooLarge` means we *decided* not to
+        // decode this, and handing it to a second decoder would be walking around our own
+        // decode-bomb defence.
+        Backend::Zune(fmt) => match decode_zune(bytes, fmt) {
+            Ok(img) => img,
+            Err(DecodeError::TooLarge(m)) => return Err(DecodeError::TooLarge(m)),
+            Err(zune_err) => decode_image(bytes, ext_hint).map_err(|_| zune_err)?,
+        },
         Backend::Image => decode_image(bytes, ext_hint)?,
     };
 
@@ -414,11 +455,19 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     let result = std::panic::catch_unwind(|| psd_sdk_sys::decode_psd(bytes))
         .map_err(|_| DecodeError::Ffi("psd_sdk panicked".into()))?;
     let psd = result.map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    // The wrapper hands back the document's own depth rather than always narrowing to 8-bit:
+    // a 16-bit PSD keeps its precision (and a 32-bit one its linear/HDR range) instead of
+    // being flattened on the way in, and `bit_depth` now describes the buffer it labels.
+    let format = match psd.bits_per_channel {
+        16 => PixelFormat::Rgba16Unorm,
+        32 => PixelFormat::Rgba32Float,
+        _ => PixelFormat::Rgba8Unorm,
+    };
     Ok(DecodedImage {
-        pixels: psd.rgba8,
+        pixels: psd.rgba,
         width: psd.width,
         height: psd.height,
-        format: PixelFormat::Rgba8Unorm,
+        format,
         bit_depth: psd.bits_per_channel.min(255) as u8,
         channels: psd.channels.min(255) as u8,
         icc: psd.icc,
@@ -440,6 +489,9 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 
     struct Buf {
         width: usize,
+        /// Whether the *file* declared an A channel. `rgba_channels` fills a missing one with
+        /// an opaque lane, so the buffer is 4 wide either way and the pixels can't be asked.
+        has_alpha: bool,
         pixels: Vec<[f32; 4]>,
     }
 
@@ -455,8 +507,9 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         .no_deep_data()
         .largest_resolution_level()
         .rgba_channels(
-            |size, _| Buf {
+            |size, channels: &RgbaChannels| Buf {
                 width: size.width(),
+                has_alpha: channels.3.is_some(),
                 pixels: vec![[0.0f32; 4]; size.width() * size.height()],
             },
             |buf: &mut Buf, pos, (r, g, b, a): (f32, f32, f32, f32)| {
@@ -483,7 +536,11 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         height: size.height() as u32,
         format: PixelFormat::Rgba32Float,
         bit_depth: 32,
-        channels: 4,
+        // Report what the file actually carries. An RGB-only EXR gets an opaque alpha lane
+        // synthesized by the reader, and claiming 4 channels for it offered the viewer's
+        // alpha UI over a channel the file never had — the same untruth a 24-bit TGA must not
+        // tell (see `decode_image`).
+        channels: if buf.has_alpha { 4 } else { 3 },
         icc: None,
         source_format: "OpenEXR",
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -902,9 +959,6 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, DecodeError> {
     use image::DynamicImage;
 
-    let patched = tiff_extra_sample_as_alpha(bytes);
-    let bytes: &[u8] = &patched;
-
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| DecodeError::Other(e.to_string()))?;
@@ -918,10 +972,23 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         .into_decoder()
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
     // ICC must be queried before the decoder is consumed by from_decoder.
-    let icc = {
+    let (icc, dims, color) = {
         use image::ImageDecoder;
-        decoder.icc_profile().ok().flatten()
+        (
+            decoder.icc_profile().ok().flatten(),
+            decoder.dimensions(),
+            decoder.color_type(),
+        )
     };
+    // The same byte budget every other backend applies, and the only one on this path: the
+    // reader is constructed directly, so the `image` crate's own default memory limits never
+    // engage, and `from_decoder` below allocates whatever the header claims.
+    check_dims(
+        dims.0 as usize,
+        dims.1 as usize,
+        4 * usize::from(color.bytes_per_pixel() / color.channel_count()).max(1),
+        format.map(format_name).unwrap_or("image"),
+    )?;
     let dynimg =
         DynamicImage::from_decoder(decoder).map_err(|e| DecodeError::Malformed(e.to_string()))?;
     let width = dynimg.width();
@@ -958,84 +1025,6 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         downscaled_from: None,
         animation: None,
     })
-}
-
-/// Rewrite a TIFF's lone *unspecified* `ExtraSamples` entry to *unassociated alpha*.
-///
-/// Photoshop stores the extra channel it names "Alpha 1" with `ExtraSamples = 0` (unspecified)
-/// rather than 2 (unassociated alpha). By the letter of TIFF 6.0 that sample then carries no
-/// defined meaning, and the `tiff` crate honors it literally: a 4-sample RGB image is reported
-/// as `RGB` and the fourth sample is dropped during readout. For the VFX texture sheets this
-/// shows up in — white RGB with the entire shape carried in alpha — that decodes to a blank
-/// white square, i.e. everything *but* the part of the file that has content in it.
-///
-/// Photoshop itself shows the channel, and every other viewer reads a single extra sample on an
-/// RGB image as alpha, so we do too, by patching the tag on the way in. Only IFD0 is walked, and
-/// only the single inline `SHORT` form Photoshop writes is touched; an extra channel that means
-/// something else declares itself with a different value and is left alone. When there is
-/// nothing to patch — the overwhelmingly common case, and every non-TIFF that reaches
-/// [`decode_image`] — the bytes are borrowed untouched and nothing is copied.
-fn tiff_extra_sample_as_alpha(bytes: &[u8]) -> Cow<'_, [u8]> {
-    const UNASSOCIATED_ALPHA: u16 = 2;
-
-    let Some(at) = tiff_unspecified_extra_sample(bytes) else {
-        return Cow::Borrowed(bytes);
-    };
-    let big_endian = bytes[0] == b'M';
-    let mut out = bytes.to_vec();
-    out[at..at + 2].copy_from_slice(&if big_endian {
-        UNASSOCIATED_ALPHA.to_be_bytes()
-    } else {
-        UNASSOCIATED_ALPHA.to_le_bytes()
-    });
-    Cow::Owned(out)
-}
-
-/// Byte offset of IFD0's `ExtraSamples` value, if the file is a classic TIFF whose sole extra
-/// sample is declared *unspecified*. Every read is bounds-checked, so a truncated or malformed
-/// header — or a BigTIFF, which the `image` crate cannot open anyway — yields `None` rather
-/// than reaching for a byte that isn't there.
-fn tiff_unspecified_extra_sample(bytes: &[u8]) -> Option<usize> {
-    const EXTRA_SAMPLES: u16 = 338;
-    const SHORT: u16 = 3;
-
-    let little_endian = match bytes.get(..4)? {
-        [b'I', b'I', 42, 0] => true,
-        [b'M', b'M', 0, 42] => false,
-        _ => return None,
-    };
-    let u16at = |o: usize| -> Option<u16> {
-        let b = bytes.get(o..o.checked_add(2)?)?.try_into().ok()?;
-        Some(if little_endian {
-            u16::from_le_bytes(b)
-        } else {
-            u16::from_be_bytes(b)
-        })
-    };
-    let u32at = |o: usize| -> Option<u32> {
-        let b = bytes.get(o..o.checked_add(4)?)?.try_into().ok()?;
-        Some(if little_endian {
-            u32::from_le_bytes(b)
-        } else {
-            u32::from_be_bytes(b)
-        })
-    };
-
-    let ifd = u32at(4)? as usize;
-    for i in 0..u16at(ifd)? as usize {
-        let entry = ifd.checked_add(2)?.checked_add(i.checked_mul(12)?)?;
-        if u16at(entry)? != EXTRA_SAMPLES {
-            continue;
-        }
-        // One SHORT fits the entry's 4-byte value field, so it is stored inline and
-        // left-justified there (in both byte orders). More than one extra channel, or any
-        // other type, is beyond what this fixup claims to understand.
-        if u16at(entry + 2)? != SHORT || u32at(entry + 4)? != 1 {
-            return None;
-        }
-        return (u16at(entry + 8)? == 0).then_some(entry + 8);
-    }
-    None
 }
 
 fn format_name(f: image::ImageFormat) -> &'static str {
@@ -1507,117 +1496,64 @@ mod tests {
         assert!(r > 180 && g < 90 && b < 100, "got {r},{g},{b}");
     }
 
-    /// A 2x1 uncompressed 4-sample RGB TIFF: both pixels white, the content carried entirely in
-    /// the fourth sample, which `extra_samples` declares (0 = unspecified, 2 = unassociated
-    /// alpha). Hand-rolled on purpose — the `image` crate's encoder can only write a TIFF that
-    /// labels its alpha properly, which is the one case that never needed fixing.
-    fn extra_sample_tiff(extra_samples: u32) -> Vec<u8> {
-        let entries: u16 = 10;
-        let ifd_off = 8usize;
-        // BitsPerSample is 4 SHORTs — 8 bytes, too wide for an entry's value field, so it lives
-        // out of line after the IFD, with the strip's pixels after that.
-        let bits_off = ifd_off + 2 + entries as usize * 12 + 4;
-        let data_off = bits_off + 8;
-
-        let mut t = Vec::new();
-        t.extend_from_slice(b"II");
-        t.extend_from_slice(&42u16.to_le_bytes());
-        t.extend_from_slice(&(ifd_off as u32).to_le_bytes());
-        t.extend_from_slice(&entries.to_le_bytes());
-        // Entries must be written in ascending tag order. A single SHORT fits the entry's 4-byte
-        // value field, so it sits there inline (left-justified, i.e. the low half here).
-        let mut entry = |tag: u16, typ: u16, n: u32, val: u32| {
-            t.extend_from_slice(&tag.to_le_bytes());
-            t.extend_from_slice(&typ.to_le_bytes());
-            t.extend_from_slice(&n.to_le_bytes());
-            t.extend_from_slice(&val.to_le_bytes());
-        };
-        entry(256, 3, 1, 2); // ImageWidth
-        entry(257, 3, 1, 1); // ImageLength
-        entry(258, 3, 4, bits_off as u32); // BitsPerSample [8,8,8,8]
-        entry(259, 3, 1, 1); // Compression = none
-        entry(262, 3, 1, 2); // PhotometricInterpretation = RGB
-        entry(273, 4, 1, data_off as u32); // StripOffsets
-        entry(277, 3, 1, 4); // SamplesPerPixel
-        entry(278, 3, 1, 1); // RowsPerStrip
-        entry(279, 4, 1, 8); // StripByteCounts
-        entry(338, 3, 1, extra_samples); // ExtraSamples
-        t.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
-
-        assert_eq!(t.len(), bits_off);
-        t.extend_from_slice(&[8u16, 8, 8, 8].map(u16::to_le_bytes).concat());
-        assert_eq!(t.len(), data_off);
-        t.extend_from_slice(&[255, 255, 255, 17, 255, 255, 255, 200]);
-        t
-    }
-
-    /// Photoshop writes the extra channel it calls "Alpha 1" as `ExtraSamples = 0` (unspecified)
-    /// rather than 2 (unassociated alpha), and the `tiff` crate honors that literally by dropping
-    /// the sample during readout. A VFX texture sheet — white RGB with the shape carried entirely
-    /// in alpha — then decoded to a blank white square. The fourth sample must survive, and the
-    /// image must report four channels so the viewer offers its alpha UI (checker backdrop,
-    /// alpha-channel isolation).
+    /// A format zune sniffs but then fails to decode falls through to the `image` crate.
+    ///
+    /// zune-bmp cannot read a 24-bit BMP narrower than 3 pixels — a 1x1 or 2x1 colour swatch
+    /// errored with "Not enough bytes" and the file would not open at all. zune stays the hot
+    /// path; this only runs once it has already said no.
     #[test]
-    fn tiff_unspecified_extra_sample_decodes_as_alpha() {
-        let unspecified = extra_sample_tiff(0);
-        let out = decode(&unspecified, Some("tif"), &DecodeOptions::default()).unwrap();
-        assert_eq!(out.source_format, "TIFF");
-        assert_eq!((out.width, out.height), (2, 1));
-        assert_eq!(
-            out.channels, 4,
-            "the extra sample must be presented as alpha"
-        );
-        assert_eq!(&out.pixels[0..8], &[255, 255, 255, 17, 255, 255, 255, 200]);
-
-        // A file that already declares unassociated alpha needs no patch — the fixup must leave
-        // those bytes borrowed — and decodes to exactly the same pixels.
-        let declared = extra_sample_tiff(2);
-        assert!(matches!(
-            tiff_extra_sample_as_alpha(&declared),
-            Cow::Borrowed(_)
-        ));
-        let out = decode(&declared, Some("tif"), &DecodeOptions::default()).unwrap();
-        assert_eq!(&out.pixels[0..8], &[255, 255, 255, 17, 255, 255, 255, 200]);
-    }
-
-    /// The fixup rewrites the two bytes of an unspecified `ExtraSamples` value and nothing else,
-    /// and only in a classic TIFF. Anything else — an ordinary 3-sample TIFF, a non-TIFF, a
-    /// header truncated mid-IFD — is borrowed through untouched rather than copied or panicked on.
-    #[test]
-    fn tiff_extra_sample_fixup_leaves_everything_else_alone() {
-        let original = extra_sample_tiff(0);
-        let Cow::Owned(patched) = tiff_extra_sample_as_alpha(&original) else {
-            panic!("expected a patched copy")
-        };
-        let diffs: Vec<_> = patched
-            .iter()
-            .zip(&original)
-            .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .collect();
-        assert_eq!(diffs.len(), 1, "exactly one byte differs: {diffs:?}");
-
-        let rgb = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 1));
-        let rgb = encode(&rgb, image::ImageFormat::Tiff);
-        let rgba = image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 1));
-        let rgba = encode(&rgba, image::ImageFormat::Tiff);
-        for bytes in [
-            &rgb[..],                    // a plain RGB TIFF: no ExtraSamples tag at all
-            &rgba[..],                   // already-proper alpha: ExtraSamples is not 0
-            &extra_sample_tiff(0)[..20], // truncated mid-IFD
-            b"II\x2a\x00",               // header only, no IFD
-            b"\x89PNG\r\n\x1a\n",        // not a TIFF at all
-            b"",
-        ] {
-            assert!(matches!(
-                tiff_extra_sample_as_alpha(bytes),
-                Cow::Borrowed(_)
+    fn zune_failure_falls_back_to_the_image_crate() {
+        for (w, h) in [(1u32, 1u32), (2, 1), (3, 1), (8, 8)] {
+            let src = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                w,
+                h,
+                image::Rgb([200, 30, 40]),
             ));
+            let bytes = encode(&src, image::ImageFormat::Bmp);
+            let out = decode(&bytes, Some("bmp"), &DecodeOptions::default())
+                .unwrap_or_else(|e| panic!("{w}x{h} BMP must open: {e}"));
+            assert_eq!((out.width, out.height), (w, h));
+            assert_eq!(&out.pixels[0..4], &[200, 30, 40, 255], "{w}x{h}");
+            assert_eq!(out.channels, 3);
         }
+    }
 
-        // ...and an ordinary RGB TIFF still reports three channels, not four.
-        let out = decode(&rgb, Some("tif"), &DecodeOptions::default()).unwrap();
-        assert_eq!(out.channels, 3);
+    /// A file neither decoder can read still reports zune's error, not the fallback's.
+    #[test]
+    fn zune_fallback_keeps_the_original_error() {
+        // A BMP header zune sniffs, followed by nothing either decoder can use.
+        let mut junk = b"BM".to_vec();
+        junk.extend_from_slice(&[0u8; 40]);
+        assert!(decode(&junk, Some("bmp"), &DecodeOptions::default()).is_err());
+    }
+
+    /// The fallback must never be a way around a decode guard.
+    ///
+    /// `check_dims` refusing an image and a decoder failing to read one look the same from the
+    /// outside, and when they did, the fallback happily handed a 65535x65535 JPEG that zune had
+    /// correctly refused to the `image` crate — which allocated it. A guard rejection is
+    /// [`DecodeError::TooLarge`] and stops there; only a real decode failure gets a second try.
+    #[test]
+    fn a_guard_rejection_is_never_retried_on_the_fallback() {
+        // A real 8x8 JPEG with its SOF0 dimensions overwritten to 65535x65535, exactly as
+        // `zune_jpeg_decode_bomb_is_rejected_by_the_byte_budget` builds it.
+        let mut jpg = encode(
+            &image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)),
+            image::ImageFormat::Jpeg,
+        );
+        let sof = jpg
+            .windows(2)
+            .position(|w| w == [0xFF, 0xC0])
+            .expect("baseline JPEG has an SOF0");
+        jpg[sof + 5..sof + 7].copy_from_slice(&u16::MAX.to_be_bytes()); // height
+        jpg[sof + 7..sof + 9].copy_from_slice(&u16::MAX.to_be_bytes()); // width
+
+        let err = decode(&jpg, Some("jpg"), &DecodeOptions::default())
+            .expect_err("a decode bomb must be refused");
+        assert!(
+            matches!(err, DecodeError::TooLarge(_)),
+            "a guard rejection must stay TooLarge so the fallback declines it, got {err:?}"
+        );
     }
 
     /// TGA has no start-of-file magic, so content sniffing can't identify it — the decoder

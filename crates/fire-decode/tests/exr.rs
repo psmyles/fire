@@ -104,6 +104,40 @@ fn exr_fully_opaque_alpha_is_flagged() {
     assert!(out.alpha_opaque);
 }
 
+/// An EXR with no A channel reports 3 channels, not 4.
+///
+/// `rgba_channels` fills a missing alpha with an opaque lane, so the decoded buffer is 4 wide
+/// whatever the file held — which meant an RGB-only EXR was reported as RGBA and offered the
+/// viewer's alpha UI (isolation, checker backdrop, the status label) over a channel that does
+/// not exist. The file's own channel list is the only place the truth survives. Same rule a
+/// 24-bit TGA already follows.
+#[test]
+fn exr_without_alpha_channel_reports_three() {
+    let rgb = SpecificChannels::rgb(|_p: Vec2<usize>| (0.5f32, 0.25f32, 0.125f32));
+    let mut buf = Cursor::new(Vec::new());
+    Image::from_channels((2, 2), rgb)
+        .write()
+        .to_buffered(&mut buf)
+        .expect("write rgb exr");
+
+    let out =
+        decode(&buf.into_inner(), Some("exr"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(
+        out.channels, 3,
+        "an RGB-only EXR has no alpha channel to report"
+    );
+    assert_eq!(
+        pixel(&out, 0),
+        [0.5, 0.25, 0.125, 1.0],
+        "alpha lane still synthesized opaque"
+    );
+
+    // ...and one that does carry alpha still reports 4.
+    let with_alpha = exr_2x2([[0.2, 0.4, 0.6, 0.5]; 4]);
+    let out = decode(&with_alpha, Some("exr"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(out.channels, 4);
+}
+
 /// EXR routing is by magic bytes (`0x76 2f 31 01`), not extension: a misnamed file still reaches
 /// the EXR backend, because the viewer sniffs bytes rather than trusting names.
 #[test]

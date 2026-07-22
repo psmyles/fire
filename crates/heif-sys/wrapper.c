@@ -123,6 +123,46 @@ int fire_heif_decode(const uint8_t* data, size_t len, fire_heif_image* out) {
         }
     }
 
+    /* Un-premultiply an associated-alpha image.
+     *
+     * Premultiplication in HEIF is a separate boolean on the handle/image, NOT part of the
+     * chroma: there is no "interleaved_RGBA_premultiplied", so asking for
+     * heif_chroma_interleaved_RGBA above does not ask libheif to straighten anything. It was
+     * never queried, so a HEIC/AVIF authored with premultiplied alpha was handed to a renderer
+     * that composites `backdrop*(1-a) + rgb*a` — i.e. assumes straight alpha — and its
+     * semi-transparent regions and edges came out too dark. */
+    if (has_alpha
+        && (heif_image_handle_is_premultiplied_alpha(handle)
+            || heif_image_is_premultiplied_alpha(img))) {
+        if (!use16) {
+            for (size_t i = 0; i < out_len; i += 4) {
+                unsigned a = pixels[i + 3];
+                if (a == 0) {
+                    pixels[i] = pixels[i + 1] = pixels[i + 2] = 0;
+                } else if (a < 255) {
+                    for (int c = 0; c < 3; ++c) {
+                        unsigned v = (pixels[i + c] * 255u + a / 2u) / a;
+                        pixels[i + c] = (uint8_t)(v > 255u ? 255u : v);
+                    }
+                }
+            }
+        } else {
+            uint16_t* p = (uint16_t*)pixels;
+            size_t n = out_len / 2u;
+            for (size_t i = 0; i < n; i += 4) {
+                uint32_t a = p[i + 3];
+                if (a == 0) {
+                    p[i] = p[i + 1] = p[i + 2] = 0;
+                } else if (a < 65535u) {
+                    for (int c = 0; c < 3; ++c) {
+                        uint32_t v = ((uint32_t)p[i + c] * 65535u + a / 2u) / a;
+                        p[i + c] = (uint16_t)(v > 65535u ? 65535u : v);
+                    }
+                }
+            }
+        }
+    }
+
     /* Embedded ICC (raw) profile, if any. A non-ICC (nclx) profile reports size 0. */
     uint8_t* icc = NULL;
     size_t icc_len = heif_image_handle_get_raw_color_profile_size(handle);

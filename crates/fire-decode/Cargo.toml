@@ -9,6 +9,7 @@ publish.workspace = true
 zune-image.workspace = true
 zune-core.workspace = true
 image.workspace = true
+tiff.workspace = true
 exr.workspace = true
 lcms2.workspace = true
 psd-sdk-sys.workspace = true

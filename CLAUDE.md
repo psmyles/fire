@@ -55,12 +55,22 @@ Five crates (`crates/`). The dependency flow is `fire` → `{fire-decode, fire-i
 
 - **`fire`** — the viewer exe. Win32 shell, D3D11 render, decode worker pool, optional named pipe.
 - **`fire-decode`** — uniform decode core. Single `decode`/`decode_path` entry point; routes by
-  magic bytes (and, for camera raw, file extension) to zune (hot path) / `image` / `exr` / libheif /
-  psd_sdk / `raw`, normalizes everything to interleaved RGBA in one of four `PixelFormat`s, extracts
-  ICC, applies lcms2 transforms, and CPU-downscales oversized images. Camera raw (CR2/CR3/NEF/ARW/…)
-  is handled by `raw.rs`, which extracts the largest embedded JPEG **preview** (TIFF-IFD walk / RAF
-  header / JPEG-marker scan) and decodes it via zune — full sensor development is out of scope.
-  **Decode speed is the project's primary metric.**
+  magic bytes (and, for camera raw, file extension) to zune (hot path) / `image` / `tiff` / `exr` /
+  libheif / psd_sdk / `raw`, normalizes everything to interleaved RGBA in one of four
+  `PixelFormat`s, extracts ICC, applies lcms2 transforms, and CPU-downscales oversized images.
+  Camera raw (CR2/CR3/NEF/ARW/…) is handled by `raw.rs`, which extracts the largest embedded JPEG
+  **preview** (TIFF-IFD walk / RAF header / JPEG-marker scan) and decodes it via zune — full sensor
+  development is out of scope. **Decode speed is the project's primary metric.**
+  - `tiff.rs` decodes TIFF against the `tiff` crate **directly**, because going through `image`
+    silently lost pixels: a 4th sample the file didn't *label* as alpha was dropped (Photoshop
+    writes `ExtraSamples = 0`, so a white-RGB/shape-in-alpha texture sheet decoded to a blank
+    square), grey+alpha wouldn't open at all, and 16-bit was narrowed to 8. It owns only the
+    *interpretation* of samples — compression, tiling, predictors and endianness stay in the crate
+    — and returns `None` for palette/CMYK/YCbCr/Lab so those fall back to the `image` path.
+  - **A guard rejection is `DecodeError::TooLarge`, not `Malformed`, and is never retried.** The
+    zune path falls back to `image` when the fast decoder simply fails (zune-bmp can't read a
+    24-bit BMP under 3px wide), and conflating "refused" with "failed" once let a 65535×65535
+    decode bomb walk around the byte budget into the `image` crate.
 - **`fire-ipc`** — dependency-light named-pipe wire format (length-prefixed `OpenRequest`) shared by
   the forward path and the server. Kept lean so the SingleInstance forward launch stays cheap.
 - **`psd-sdk-sys`** / **`heif-sys`** — `-sys` FFI crates (bindgen + `cc`) wrapping the vendored C/C++.

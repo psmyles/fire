@@ -28,8 +28,20 @@ typedef struct fire_psd fire_psd;
 typedef struct fire_psd_info {
     uint32_t width;
     uint32_t height;
+    /* Channels the COMPOSITE actually carries, after colour conversion: 1 (gray),
+     * 2 (gray+alpha), 3 (colour) or 4 (colour+alpha). Deliberately NOT the document's
+     * raw channelCount, which counts spot/extra channels too — an RGB document with one
+     * spot channel has channelCount 5, and reporting that made the viewer treat a file
+     * WITH transparency as having none (its alpha UI keys on 2 or 4). */
     uint16_t channels;
+    /* Source bits per channel: 8, 16 or 32. Also the layout of the buffer
+     * fire_psd_read_merged fills: uint8_t, uint16_t or float respectively. */
     uint16_t bits_per_channel;
+    /* PSD colour mode (psd::colorMode::Enum). Surfaced so Rust can tell whether the
+     * embedded ICC profile still describes the pixels: for CMYK/Lab/Multichannel we
+     * convert to RGB here, so the profile (a CMYK/Lab one) must NOT then be applied. */
+    uint16_t color_mode;
+    uint16_t reserved;
 } fire_psd_info;
 
 /* Open a PSD from an in-memory buffer. Returns NULL on failure. */
@@ -38,9 +50,10 @@ fire_psd* fire_psd_open(const uint8_t* bytes, size_t len);
 /* Populate *out_info. Returns 0 on success, non-zero on error. */
 int fire_psd_info_get(const fire_psd* doc, fire_psd_info* out_info);
 
-/* Read the merged/composited image as 8-bit RGBA into out_pixels
- * (must be width*height*4 bytes). Returns 0 on success. */
-int fire_psd_read_merged_rgba8(const fire_psd* doc, uint8_t* out_pixels, size_t out_len);
+/* Read the merged/composited image as interleaved RGBA at the document's bit depth:
+ * 8 -> uint8_t, 16 -> uint16_t, 32 -> float (linear/HDR). out_len is in BYTES and must
+ * be width*height*4*(bits_per_channel/8). Returns 0 on success. */
+int fire_psd_read_merged(const fire_psd* doc, void* out_pixels, size_t out_len);
 
 /* Length of the embedded ICC profile in bytes (0 if none). */
 size_t fire_psd_icc_len(const fire_psd* doc);

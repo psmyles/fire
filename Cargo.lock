@@ -362,6 +362,7 @@ dependencies = [
  "image",
  "lcms2",
  "psd-sdk-sys",
+ "tiff",
  "zune-core 0.5.1",
  "zune-image",
 ]
