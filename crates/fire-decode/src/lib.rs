@@ -26,6 +26,7 @@
 //! applied by [`icc`]. Images larger than the caller's `max_dim` are CPU-downscaled to
 //! fit ([`downscale`]).
 
+use std::borrow::Cow;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -892,6 +893,9 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, DecodeError> {
     use image::DynamicImage;
 
+    let patched = tiff_extra_sample_as_alpha(bytes);
+    let bytes: &[u8] = &patched;
+
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| DecodeError::Other(e.to_string()))?;
@@ -945,6 +949,76 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         downscaled_from: None,
         animation: None,
     })
+}
+
+/// Rewrite a TIFF's lone *unspecified* `ExtraSamples` entry to *unassociated alpha*.
+///
+/// Photoshop stores the extra channel it names "Alpha 1" with `ExtraSamples = 0` (unspecified)
+/// rather than 2 (unassociated alpha). By the letter of TIFF 6.0 that sample then carries no
+/// defined meaning, and the `tiff` crate honors it literally: a 4-sample RGB image is reported
+/// as `RGB` and the fourth sample is dropped during readout. For the VFX texture sheets this
+/// shows up in — white RGB with the entire shape carried in alpha — that decodes to a blank
+/// white square, i.e. everything *but* the part of the file that has content in it.
+///
+/// Photoshop itself shows the channel, and every other viewer reads a single extra sample on an
+/// RGB image as alpha, so we do too, by patching the tag on the way in. Only IFD0 is walked, and
+/// only the single inline `SHORT` form Photoshop writes is touched; an extra channel that means
+/// something else declares itself with a different value and is left alone. When there is
+/// nothing to patch — the overwhelmingly common case, and every non-TIFF that reaches
+/// [`decode_image`] — the bytes are borrowed untouched and nothing is copied.
+fn tiff_extra_sample_as_alpha(bytes: &[u8]) -> Cow<'_, [u8]> {
+    const UNASSOCIATED_ALPHA: u16 = 2;
+
+    let Some(at) = tiff_unspecified_extra_sample(bytes) else {
+        return Cow::Borrowed(bytes);
+    };
+    let big_endian = bytes[0] == b'M';
+    let mut out = bytes.to_vec();
+    out[at..at + 2].copy_from_slice(&if big_endian {
+        UNASSOCIATED_ALPHA.to_be_bytes()
+    } else {
+        UNASSOCIATED_ALPHA.to_le_bytes()
+    });
+    Cow::Owned(out)
+}
+
+/// Byte offset of IFD0's `ExtraSamples` value, if the file is a classic TIFF whose sole extra
+/// sample is declared *unspecified*. Every read is bounds-checked, so a truncated or malformed
+/// header — or a BigTIFF, which the `image` crate cannot open anyway — yields `None` rather
+/// than reaching for a byte that isn't there.
+fn tiff_unspecified_extra_sample(bytes: &[u8]) -> Option<usize> {
+    const EXTRA_SAMPLES: u16 = 338;
+    const SHORT: u16 = 3;
+
+    let little_endian = match bytes.get(..4)? {
+        [b'I', b'I', 42, 0] => true,
+        [b'M', b'M', 0, 42] => false,
+        _ => return None,
+    };
+    let u16at = |o: usize| -> Option<u16> {
+        let b = bytes.get(o..o.checked_add(2)?)?.try_into().ok()?;
+        Some(if little_endian { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+    };
+    let u32at = |o: usize| -> Option<u32> {
+        let b = bytes.get(o..o.checked_add(4)?)?.try_into().ok()?;
+        Some(if little_endian { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+    };
+
+    let ifd = u32at(4)? as usize;
+    for i in 0..u16at(ifd)? as usize {
+        let entry = ifd.checked_add(2)?.checked_add(i.checked_mul(12)?)?;
+        if u16at(entry)? != EXTRA_SAMPLES {
+            continue;
+        }
+        // One SHORT fits the entry's 4-byte value field, so it is stored inline and
+        // left-justified there (in both byte orders). More than one extra channel, or any
+        // other type, is beyond what this fixup claims to understand.
+        if u16at(entry + 2)? != SHORT || u32at(entry + 4)? != 1 {
+            return None;
+        }
+        return (u16at(entry + 8)? == 0).then_some(entry + 8);
+    }
+    None
 }
 
 fn format_name(f: image::ImageFormat) -> &'static str {
@@ -1345,6 +1419,106 @@ mod tests {
         // The camera's red is preserved through the JPEG round-trip.
         let [r, g, b] = [out.pixels[0], out.pixels[1], out.pixels[2]];
         assert!(r > 180 && g < 90 && b < 100, "got {r},{g},{b}");
+    }
+
+    /// A 2x1 uncompressed 4-sample RGB TIFF: both pixels white, the content carried entirely in
+    /// the fourth sample, which `extra_samples` declares (0 = unspecified, 2 = unassociated
+    /// alpha). Hand-rolled on purpose — the `image` crate's encoder can only write a TIFF that
+    /// labels its alpha properly, which is the one case that never needed fixing.
+    fn extra_sample_tiff(extra_samples: u32) -> Vec<u8> {
+        let entries: u16 = 10;
+        let ifd_off = 8usize;
+        // BitsPerSample is 4 SHORTs — 8 bytes, too wide for an entry's value field, so it lives
+        // out of line after the IFD, with the strip's pixels after that.
+        let bits_off = ifd_off + 2 + entries as usize * 12 + 4;
+        let data_off = bits_off + 8;
+
+        let mut t = Vec::new();
+        t.extend_from_slice(b"II");
+        t.extend_from_slice(&42u16.to_le_bytes());
+        t.extend_from_slice(&(ifd_off as u32).to_le_bytes());
+        t.extend_from_slice(&entries.to_le_bytes());
+        // Entries must be written in ascending tag order. A single SHORT fits the entry's 4-byte
+        // value field, so it sits there inline (left-justified, i.e. the low half here).
+        let mut entry = |tag: u16, typ: u16, n: u32, val: u32| {
+            t.extend_from_slice(&tag.to_le_bytes());
+            t.extend_from_slice(&typ.to_le_bytes());
+            t.extend_from_slice(&n.to_le_bytes());
+            t.extend_from_slice(&val.to_le_bytes());
+        };
+        entry(256, 3, 1, 2); // ImageWidth
+        entry(257, 3, 1, 1); // ImageLength
+        entry(258, 3, 4, bits_off as u32); // BitsPerSample [8,8,8,8]
+        entry(259, 3, 1, 1); // Compression = none
+        entry(262, 3, 1, 2); // PhotometricInterpretation = RGB
+        entry(273, 4, 1, data_off as u32); // StripOffsets
+        entry(277, 3, 1, 4); // SamplesPerPixel
+        entry(278, 3, 1, 1); // RowsPerStrip
+        entry(279, 4, 1, 8); // StripByteCounts
+        entry(338, 3, 1, extra_samples); // ExtraSamples
+        t.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+
+        assert_eq!(t.len(), bits_off);
+        t.extend_from_slice(&[8u16, 8, 8, 8].map(u16::to_le_bytes).concat());
+        assert_eq!(t.len(), data_off);
+        t.extend_from_slice(&[255, 255, 255, 17, 255, 255, 255, 200]);
+        t
+    }
+
+    /// Photoshop writes the extra channel it calls "Alpha 1" as `ExtraSamples = 0` (unspecified)
+    /// rather than 2 (unassociated alpha), and the `tiff` crate honors that literally by dropping
+    /// the sample during readout. A VFX texture sheet — white RGB with the shape carried entirely
+    /// in alpha — then decoded to a blank white square. The fourth sample must survive, and the
+    /// image must report four channels so the viewer offers its alpha UI (checker backdrop,
+    /// alpha-channel isolation).
+    #[test]
+    fn tiff_unspecified_extra_sample_decodes_as_alpha() {
+        let unspecified = extra_sample_tiff(0);
+        let out = decode(&unspecified, Some("tif"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.source_format, "TIFF");
+        assert_eq!((out.width, out.height), (2, 1));
+        assert_eq!(out.channels, 4, "the extra sample must be presented as alpha");
+        assert_eq!(&out.pixels[0..8], &[255, 255, 255, 17, 255, 255, 255, 200]);
+
+        // A file that already declares unassociated alpha needs no patch — the fixup must leave
+        // those bytes borrowed — and decodes to exactly the same pixels.
+        let declared = extra_sample_tiff(2);
+        assert!(matches!(tiff_extra_sample_as_alpha(&declared), Cow::Borrowed(_)));
+        let out = decode(&declared, Some("tif"), &DecodeOptions::default()).unwrap();
+        assert_eq!(&out.pixels[0..8], &[255, 255, 255, 17, 255, 255, 255, 200]);
+    }
+
+    /// The fixup rewrites the two bytes of an unspecified `ExtraSamples` value and nothing else,
+    /// and only in a classic TIFF. Anything else — an ordinary 3-sample TIFF, a non-TIFF, a
+    /// header truncated mid-IFD — is borrowed through untouched rather than copied or panicked on.
+    #[test]
+    fn tiff_extra_sample_fixup_leaves_everything_else_alone() {
+        let original = extra_sample_tiff(0);
+        let Cow::Owned(patched) = tiff_extra_sample_as_alpha(&original) else {
+            panic!("expected a patched copy")
+        };
+        let diffs: Vec<_> =
+            patched.iter().zip(&original).enumerate().filter(|(_, (a, b))| a != b).collect();
+        assert_eq!(diffs.len(), 1, "exactly one byte differs: {diffs:?}");
+
+        let rgb = image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 1));
+        let rgb = encode(&rgb, image::ImageFormat::Tiff);
+        let rgba = image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 1));
+        let rgba = encode(&rgba, image::ImageFormat::Tiff);
+        for bytes in [
+            &rgb[..],                    // a plain RGB TIFF: no ExtraSamples tag at all
+            &rgba[..],                   // already-proper alpha: ExtraSamples is not 0
+            &extra_sample_tiff(0)[..20], // truncated mid-IFD
+            b"II\x2a\x00",               // header only, no IFD
+            b"\x89PNG\r\n\x1a\n",        // not a TIFF at all
+            b"",
+        ] {
+            assert!(matches!(tiff_extra_sample_as_alpha(bytes), Cow::Borrowed(_)));
+        }
+
+        // ...and an ordinary RGB TIFF still reports three channels, not four.
+        let out = decode(&rgb, Some("tif"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.channels, 3);
     }
 
     /// TGA has no start-of-file magic, so content sniffing can't identify it — the decoder
