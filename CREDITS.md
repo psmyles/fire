@@ -99,6 +99,11 @@ Not linked into `fire.exe`, but Fire would not exist without them:
 * **The Rust project and its contributors** - the language, the compiler, the standard library,
   and Cargo.
 
+## Development
+
+* **[Claude Code](https://claude.com/claude-code)** - Anthropic. Used throughout Fire's
+  development as a coding assistant.
+
 ## Not third-party
 
 Fire's toolbar icons (`assets/icons/`) and its stylesheet (`crates/fire/src/ui/theme.toml`) are
