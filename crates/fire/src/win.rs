@@ -883,6 +883,10 @@ impl App {
     /// Perform a bound keyboard command.
     fn perform_key_action(&mut self, action: KeyAction) {
         match action {
+            // Both file commands run their own repaint (and the picker pumps a modal loop), so they
+            // return without the shared invalidate below.
+            KeyAction::OpenFile => return self.open_via_dialog(),
+            KeyAction::CloseImage => return self.close_image(),
             KeyAction::Fit => self.surface.fit(),
             KeyAction::ActualSize => self.surface.one_to_one(),
             KeyAction::ZoomIn => self.surface.zoom_centered(self.cfg.zoom_step),
@@ -897,16 +901,24 @@ impl App {
             KeyAction::ExposureDown => self.surface.adjust_exposure(-self.cfg.exposure_step),
             KeyAction::ExposureReset => self.surface.reset_exposure(),
             KeyAction::ToggleOutline => self.surface.toggle_outline(),
+            // Same call the toolbar's backdrop buttons make, so the pick sticks for the session
+            // exactly as clicking one does.
+            KeyAction::CycleBackdrop => {
+                let next = self.surface.background().next();
+                self.surface.set_background(next);
+            }
             // Navigation runs its own load + repaint (and relayout), so return without the shared
             // invalidate below.
             KeyAction::PrevImage => return self.navigate(-1),
             KeyAction::NextImage => return self.navigate(1),
             KeyAction::ToggleFullscreen => self.toggle_fullscreen(),
-            // Esc leaves full-screen if in it; otherwise it closes the window.
+            // Esc leaves full-screen if in it; otherwise it closes the window — unless
+            // `esc-closes-window` is off, which keeps the leave-full-screen half and drops the
+            // destructive one (see the config field).
             KeyAction::CloseOrExitFullscreen => {
                 if self.fullscreen {
                     self.set_fullscreen(false);
-                } else {
+                } else if self.cfg.esc_closes_window {
                     unsafe { DestroyWindow(self.frame as HWND) };
                 }
             }
@@ -1312,6 +1324,38 @@ impl App {
         }
     }
 
+    /// Close the displayed image (Ctrl+W) and go back to the empty state — the drop /
+    /// double-click hint — *without* closing the window. That is the split with
+    /// [`KeyAction::CloseOrExitFullscreen`]: Esc closes the window, this closes the picture.
+    ///
+    /// Bumping the generation is what makes it stick. A decode, a folder scan or a hot-reload
+    /// wakeup can still be in flight for the image being dropped, and each of those stale-drops on
+    /// something we clear here (`generation` for the decode and the reload, `current_path` for the
+    /// scan) — so none of them can swap the closed image back in a moment later.
+    fn close_image(&mut self) {
+        if self.current_path.is_none() && self.empty_view_active() {
+            return; // nothing open (and nothing on its way in)
+        }
+        self.surface.next_generation();
+        self.current_path = None;
+        // Nothing is displayed, so nothing has a transport: `apply_flipbook` below reads this to
+        // clear the surface's flipbook params and kill the playback timer. The per-path entries in
+        // `self.flipbook` stay — reopening the file restores its grid, exactly as navigating back to
+        // it does.
+        self.shown_path = None;
+        self.folder = None;
+        self.file_label.clear();
+        self.meta.clear();
+        self.loading = false;
+        set_title(self.frame, crate::product::NAME);
+        self.surface.clear_image();
+        self.surface.invalidate();
+        // No image → stop any GIF playback, clear the flipbook surface state and hide the chip.
+        self.sync_animation();
+        self.apply_flipbook();
+        self.redraw();
+    }
+
     /// Re-derive everything that comes out of the stylesheet, and repaint.
     ///
     /// The single path for "the app's *look* has to change": a DPI change (metrics and the icon
@@ -1465,7 +1509,8 @@ impl App {
 
 /// Push the view-related settings into the renderer. The one place that maps `Config` onto
 /// [`GpuSurface`], shared by startup and the settings dialog's Apply, so the two can't drift.
-/// Backdrop applies to the image already on screen; the fit/tonemap defaults seed the *next* adopt
+/// Backdrop and outline apply to the image already on screen — both are session-global toggles, so
+/// there is no "next image" for them to seed; the fit/tonemap defaults seed the *next* adopt
 /// (yanking the current image's zoom or tonemap out from under the user would be hostile).
 fn apply_view_config(surface: &mut GpuSurface, cfg: &Config) {
     surface.set_fit_upscale(cfg.fit_upscale);
@@ -1473,6 +1518,7 @@ fn apply_view_config(surface: &mut GpuSurface, cfg: &Config) {
     surface.set_open_actual_size(cfg.default_fit == crate::config::FitCfg::ActualSize);
     surface.set_default_tonemap(cfg.default_tonemap.to_render());
     surface.set_background_pref(cfg.background.override_for_render());
+    surface.set_outline(cfg.default_outline);
 }
 
 /// Create the frame + child view, wire up the decode pool, optionally serve the pipe

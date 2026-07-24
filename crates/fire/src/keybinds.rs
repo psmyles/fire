@@ -23,6 +23,9 @@ use crate::config::{KeyValue, KeybindsCfg};
 /// A rebindable keyboard command. The order here is the order the settings dialog lists them in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
+    // File
+    OpenFile,
+    CloseImage,
     // View
     Fit,
     ActualSize,
@@ -41,12 +44,15 @@ pub enum KeyAction {
     ExposureReset,
     // Appearance
     ToggleOutline,
+    /// Walk the four backdrops (black → white → grey → checker → black).
+    CycleBackdrop,
     // Navigation
     PrevImage,
     NextImage,
     // Window
     ToggleFullscreen,
-    /// Esc: leave full-screen if in it, otherwise close the window.
+    /// Esc: leave full-screen if in it, otherwise close the window — the closing half only when
+    /// the `esc-closes-window` config key is on (Settings ▸ General).
     CloseOrExitFullscreen,
     // Flipbook
     ToggleFlipbook,
@@ -57,6 +63,8 @@ pub enum KeyAction {
 
 /// Every action, in dialog/list order. The single source of truth for "what is bindable".
 pub const ALL_ACTIONS: &[KeyAction] = &[
+    KeyAction::OpenFile,
+    KeyAction::CloseImage,
     KeyAction::Fit,
     KeyAction::ActualSize,
     KeyAction::ZoomIn,
@@ -71,6 +79,7 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ExposureDown,
     KeyAction::ExposureReset,
     KeyAction::ToggleOutline,
+    KeyAction::CycleBackdrop,
     KeyAction::PrevImage,
     KeyAction::NextImage,
     KeyAction::ToggleFullscreen,
@@ -86,6 +95,8 @@ impl KeyAction {
     /// every user, so don't).
     pub fn name(self) -> &'static str {
         match self {
+            KeyAction::OpenFile => "open-file",
+            KeyAction::CloseImage => "close-image",
             KeyAction::Fit => "fit",
             KeyAction::ActualSize => "actual-size",
             KeyAction::ZoomIn => "zoom-in",
@@ -100,6 +111,7 @@ impl KeyAction {
             KeyAction::ExposureDown => "exposure-down",
             KeyAction::ExposureReset => "exposure-reset",
             KeyAction::ToggleOutline => "toggle-outline",
+            KeyAction::CycleBackdrop => "cycle-backdrop",
             KeyAction::PrevImage => "previous-image",
             KeyAction::NextImage => "next-image",
             KeyAction::ToggleFullscreen => "toggle-fullscreen",
@@ -114,6 +126,8 @@ impl KeyAction {
     /// Human label for the settings list.
     pub fn label(self) -> &'static str {
         match self {
+            KeyAction::OpenFile => "Open image\u{2026}",
+            KeyAction::CloseImage => "Close image",
             KeyAction::Fit => "Fit to window",
             KeyAction::ActualSize => "Actual size (1:1)",
             KeyAction::ZoomIn => "Zoom in",
@@ -128,6 +142,7 @@ impl KeyAction {
             KeyAction::ExposureDown => "Decrease exposure",
             KeyAction::ExposureReset => "Reset exposure",
             KeyAction::ToggleOutline => "Image boundary outline",
+            KeyAction::CycleBackdrop => "Next backdrop",
             KeyAction::PrevImage => "Previous image",
             KeyAction::NextImage => "Next image",
             KeyAction::ToggleFullscreen => "Full screen",
@@ -142,6 +157,7 @@ impl KeyAction {
     /// The settings list's group heading for this action.
     pub fn group(self) -> &'static str {
         match self {
+            KeyAction::OpenFile | KeyAction::CloseImage => "File",
             KeyAction::Fit | KeyAction::ActualSize | KeyAction::ZoomIn | KeyAction::ZoomOut => {
                 "View"
             }
@@ -154,7 +170,7 @@ impl KeyAction {
             | KeyAction::ExposureUp
             | KeyAction::ExposureDown
             | KeyAction::ExposureReset => "HDR",
-            KeyAction::ToggleOutline => "Appearance",
+            KeyAction::ToggleOutline | KeyAction::CycleBackdrop => "Appearance",
             KeyAction::PrevImage | KeyAction::NextImage => "Navigation",
             KeyAction::ToggleFullscreen | KeyAction::CloseOrExitFullscreen => "Window",
             KeyAction::ToggleFlipbook
@@ -402,6 +418,8 @@ impl Keybinds {
         let bind = |a: KeyAction, keys: &[&str]| (a, keys.iter().map(|s| c(s)).collect::<Vec<_>>());
         Self {
             bindings: vec![
+                bind(KeyAction::OpenFile, &["Ctrl+O"]),
+                bind(KeyAction::CloseImage, &["Ctrl+W"]),
                 bind(KeyAction::Fit, &["F"]),
                 bind(KeyAction::ActualSize, &["1"]),
                 bind(KeyAction::ZoomIn, &["=", "Shift+=", "Num+"]),
@@ -416,6 +434,7 @@ impl Keybinds {
                 bind(KeyAction::ExposureDown, &["["]),
                 bind(KeyAction::ExposureReset, &[]),
                 bind(KeyAction::ToggleOutline, &[]),
+                bind(KeyAction::CycleBackdrop, &["Z"]),
                 bind(KeyAction::PrevImage, &["Left"]),
                 bind(KeyAction::NextImage, &["Right"]),
                 bind(KeyAction::ToggleFullscreen, &["F11"]),
@@ -706,6 +725,37 @@ mod tests {
         // Two actions ship unbound.
         assert!(kb.chords(KeyAction::ExposureReset).is_empty());
         assert!(kb.chords(KeyAction::ToggleOutline).is_empty());
+        // Z walks the backdrops.
+        assert_eq!(
+            kb.lookup(KeyChord::plain(0x5A), false),
+            Some(KeyAction::CycleBackdrop)
+        );
+    }
+
+    /// The file commands ship on Ctrl chords, so a bare `O` / `W` stays free — and, being global,
+    /// they still fire inside flipbook mode.
+    #[test]
+    fn file_commands_are_ctrl_chords() {
+        let kb = Keybinds::defaults();
+        let ctrl = |vk| KeyChord {
+            vk,
+            ctrl: true,
+            alt: false,
+            shift: false,
+        };
+        for in_flipbook in [false, true] {
+            assert_eq!(
+                kb.lookup(ctrl(0x4F), in_flipbook),
+                Some(KeyAction::OpenFile)
+            );
+            assert_eq!(
+                kb.lookup(ctrl(0x57), in_flipbook),
+                Some(KeyAction::CloseImage)
+            );
+            // Chords match exactly, so the unmodified letters are untouched.
+            assert_eq!(kb.lookup(KeyChord::plain(0x4F), in_flipbook), None);
+            assert_eq!(kb.lookup(KeyChord::plain(0x57), in_flipbook), None);
+        }
     }
 
     /// A chord held by another action is *stolen*, leaving the table conflict-free.
@@ -750,10 +800,13 @@ mod tests {
         assert!(kb.to_config().is_empty());
 
         let mut kb = Keybinds::defaults();
-        kb.rebind(KeyAction::Fit, KeyChord::plain(0x5A)); // Z
+        // Q, a chord nothing ships bound to — so exactly two actions end up differing from the
+        // defaults. (Rebinding onto an *occupied* chord would unbind its owner and write a third
+        // entry; that's `rebind_steals_the_chord`'s job, not this test's.)
+        kb.rebind(KeyAction::Fit, KeyChord::plain(0x51));
         kb.unbind(KeyAction::ToggleTonemap);
         let cfg = kb.to_config();
-        assert_eq!(cfg.get("fit"), Some(&KeyValue::One("Z".into())));
+        assert_eq!(cfg.get("fit"), Some(&KeyValue::One("Q".into())));
         assert_eq!(
             cfg.get("toggle-tonemap"),
             Some(&KeyValue::One(String::new()))

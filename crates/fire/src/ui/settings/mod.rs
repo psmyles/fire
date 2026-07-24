@@ -378,6 +378,24 @@ fn general(ui: &Ui, st: &mut State) {
     ui.separator_with_text("Window");
     choice(ui, st, lw, ChoiceField::InstanceMode, "Opening an image");
     row_note(ui, lw, "Takes effect for images opened from now on.");
+    // Named after the *live* chord, not a literal "Esc": the Keybinds tab can move this binding, and
+    // a checkbox that keeps claiming "Esc" after you have would simply be lying.
+    let close_key = st
+        .keys
+        .chords(KeyAction::CloseOrExitFullscreen)
+        .first()
+        .map_or_else(|| "Esc".to_string(), |c| c.display());
+    check(
+        ui,
+        st,
+        BoolField::EscClosesWindow,
+        &format!("{close_key} closes the window"),
+    );
+    note(
+        ui,
+        "Off, it only leaves full screen — close with the title bar's X or Alt+F4. Which key this \
+         is lives on the Keybinds tab, under Window.",
+    );
     check(
         ui,
         st,
@@ -395,6 +413,17 @@ fn general(ui: &Ui, st: &mut State) {
         st,
         BoolField::FitUpscale,
         "\"Fit to window\" also enlarges small images",
+    );
+    check(
+        ui,
+        st,
+        BoolField::DefaultOutline,
+        "Outline the image boundary",
+    );
+    note(
+        ui,
+        "The starting state of the toolbar's outline button. Applies right away, to the image \
+         already on screen: the outline is one switch for the session rather than per-image state.",
     );
 
     ui.spacing();

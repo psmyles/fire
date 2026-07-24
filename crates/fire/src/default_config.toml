@@ -24,6 +24,20 @@
 # instance-mode = "new-window"
 
 # ----------------------------------------------------------------------------------------------
+# esc-closes-window — whether Esc closes the window. Esc does two jobs: in full screen it always
+#                     leaves full screen, and otherwise it closes the window. This key governs the
+#                     second one only.
+#
+#   true   (default) Esc closes the window.
+#   false  Esc only leaves full screen; close with the title bar's X or Alt+F4. Useful if you keep
+#          catching Esc when you meant Ctrl+W (close the image, keep the window).
+#
+# The key itself is rebindable — see close-or-exit-fullscreen under [keybinds] — and this setting
+# follows it there. Unbinding it instead would cost you the leave-full-screen half too.
+#
+# esc-closes-window = true
+
+# ----------------------------------------------------------------------------------------------
 # hot-reload — automatically re-decode the displayed image when its file changes on disk.
 #
 #   true   (default) Watch the open file and refresh the view when it is re-saved.
@@ -55,6 +69,19 @@
 #   "actual-size"  Always open at 100%, however large the image — pan to explore it.
 #
 # default-fit = "fit"
+
+# ----------------------------------------------------------------------------------------------
+# default-outline — whether the 1px outline around the image boundary starts switched on. Useful
+#                   for seeing where a mostly-transparent sprite actually ends; turn it off for a
+#                   clean look. The toolbar button (and its keybind) still toggles it at any time.
+#
+#   true   (default) Draw the boundary outline.
+#   false  No outline.
+#
+# Unlike default-fit / default-tonemap, this one is not a per-image starting state — the outline is
+# a single switch for the whole session — so changing it in Settings applies immediately.
+#
+# default-outline = true
 
 # ----------------------------------------------------------------------------------------------
 # background — the viewport backdrop: it fills the letterbox around the image and shows through
@@ -162,6 +189,7 @@
 # unbinds an action entirely. An unknown action name or an unreadable key is simply ignored.
 #
 # Action names and their defaults:
+#   open-file = "Ctrl+O"               close-image = "Ctrl+W"
 #   fit = "F"                          actual-size = "1"
 #   zoom-in = ["=", "Shift+=", "Num+"] zoom-out = ["-", "Num-"]
 #   all-channels = "C"                 red-channel = "R"
@@ -169,6 +197,7 @@
 #   alpha-channel = "A"                toggle-tonemap = "T"
 #   exposure-up = "]"                  exposure-down = "["
 #   exposure-reset = ""                toggle-outline = ""      (both unbound by default)
+#   cycle-backdrop = "Z"
 #   previous-image = "Left"            next-image = "Right"
 #   toggle-fullscreen = "F11"          close-or-exit-fullscreen = "Esc"
 #   toggle-flipbook = "K"

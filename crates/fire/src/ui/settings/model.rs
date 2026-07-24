@@ -20,8 +20,10 @@ use crate::flipbook::{FPS_MAX, FPS_MIN};
 /// A checkbox's target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BoolField {
+    EscClosesWindow,
     HotReload,
     FitUpscale,
+    DefaultOutline,
     FlipbookBlend,
     FlipbookAutoplay,
     FlipbookAutoDetect,
@@ -35,8 +37,10 @@ pub(crate) enum BoolField {
 impl BoolField {
     pub(crate) fn get(self, c: &Config) -> bool {
         match self {
+            BoolField::EscClosesWindow => c.esc_closes_window,
             BoolField::HotReload => c.hot_reload,
             BoolField::FitUpscale => c.fit_upscale,
+            BoolField::DefaultOutline => c.default_outline,
             BoolField::FlipbookBlend => c.flipbook.blend,
             BoolField::FlipbookAutoplay => c.flipbook.autoplay,
             BoolField::FlipbookAutoDetect => c.flipbook.auto_detect,
@@ -50,8 +54,10 @@ impl BoolField {
 
     pub(crate) fn set(self, c: &mut Config, v: bool) {
         match self {
+            BoolField::EscClosesWindow => c.esc_closes_window = v,
             BoolField::HotReload => c.hot_reload = v,
             BoolField::FitUpscale => c.fit_upscale = v,
+            BoolField::DefaultOutline => c.default_outline = v,
             BoolField::FlipbookBlend => c.flipbook.blend = v,
             BoolField::FlipbookAutoplay => c.flipbook.autoplay = v,
             BoolField::FlipbookAutoDetect => c.flipbook.auto_detect = v,

@@ -69,6 +69,21 @@ pub enum Background {
     Checker,
 }
 
+impl Background {
+    /// The next backdrop in the cycle (the `cycle-backdrop` keybind), wrapping at the end.
+    ///
+    /// The order is the declaration order, which is also the left→right order of the toolbar's
+    /// backdrop buttons — so the key walks the row you can see rather than some private sequence.
+    pub fn next(self) -> Self {
+        match self {
+            Background::Black => Background::White,
+            Background::White => Background::Grey,
+            Background::Grey => Background::Checker,
+            Background::Checker => Background::Black,
+        }
+    }
+}
+
 /// Non-geometric display state, reset to neutral for each new file (#17).
 #[derive(Clone, Copy, Debug)]
 pub struct DisplayState {
@@ -335,6 +350,32 @@ mod tests {
 
     fn vp() -> Viewport {
         Viewport::new(1000, 800)
+    }
+
+    /// The backdrop cycle visits all four and comes home — no mode is skipped or repeated, so the
+    /// key can't strand you on a backdrop you can only leave with the mouse.
+    #[test]
+    fn backdrop_cycle_covers_every_mode_once() {
+        let mut seen = vec![Background::Black];
+        let mut bg = Background::Black;
+        for _ in 0..3 {
+            bg = bg.next();
+            assert!(
+                !seen.contains(&bg),
+                "{bg:?} repeated before the cycle closed"
+            );
+            seen.push(bg);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Background::Black,
+                Background::White,
+                Background::Grey,
+                Background::Checker
+            ]
+        );
+        assert_eq!(bg.next(), Background::Black, "the cycle must wrap");
     }
 
     #[test]

@@ -187,8 +187,9 @@ pub struct GpuSurface {
     /// the user chooses, so each image still gets its natural default before the first override.
     background_override: Option<Background>,
 
-    /// Draw a 1px outline around the image boundary (toolbar toggle). On by default for every
-    /// image type; the pick persists across navigation, like the backdrop.
+    /// Draw a 1px outline around the image boundary (toolbar toggle). Starts on unless the
+    /// `default-outline` config key says otherwise; the pick then persists across navigation for
+    /// the rest of the session, like the backdrop.
     outline: bool,
 
     /// The octagon overlay (toolbar toggle + its options window). Session-global like the outline:
@@ -428,6 +429,14 @@ impl GpuSurface {
     /// Toggle the image-boundary outline and repaint.
     pub fn toggle_outline(&mut self) {
         self.outline = !self.outline;
+        self.refresh();
+    }
+
+    /// Apply the configured outline preference (settings dialog / startup). The outline is one
+    /// session-global flag, not per-image state, so — like [`Self::set_background_pref`] — this
+    /// reaches the image already on screen rather than seeding the next one.
+    pub fn set_outline(&mut self, on: bool) {
+        self.outline = on;
         self.refresh();
     }
 

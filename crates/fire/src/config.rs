@@ -308,6 +308,13 @@ pub type KeybindsCfg = std::collections::BTreeMap<String, KeyValue>;
 #[serde(default, rename_all = "kebab-case")]
 pub struct Config {
     pub instance_mode: InstanceMode,
+    /// Whether the `close-or-exit-fullscreen` binding (Esc, by default) closes the window. On by
+    /// default. Off keeps only the other half of that binding — leaving full screen — so Esc
+    /// pressed over a windowed viewer does nothing, and closing is the title bar's X / Alt+F4.
+    /// Guards a *destructive* key that sits one finger away from Ctrl+W, which is why it's a
+    /// setting rather than something you'd have to unbind (unbinding would cost you the
+    /// leave-full-screen half too).
+    pub esc_closes_window: bool,
     /// Reload the displayed image automatically when its file changes on disk. On by default;
     /// set `hot-reload = false` in `config.toml` to disable the file watch entirely.
     pub hot_reload: bool,
@@ -335,6 +342,11 @@ pub struct Config {
     pub default_tonemap: TonemapCfg,
     /// How an image is scaled when it opens.
     pub default_fit: FitCfg,
+    /// Whether the 1px image-boundary outline starts switched on. On by default. Like the backdrop
+    /// (and unlike `default-fit` / `default-tonemap`, which seed the *next* image), the outline is
+    /// one session-global toggle rather than per-image state, so this applies to the picture already
+    /// on screen the moment it is changed.
+    pub default_outline: bool,
     /// The viewport backdrop. `Auto` keeps the per-image default (checker for transparency).
     pub background: BackgroundCfg,
     pub flipbook: FlipbookCfg,
@@ -355,6 +367,7 @@ impl Default for Config {
         // open-with list empty.
         Self {
             instance_mode: InstanceMode::default(),
+            esc_closes_window: true,
             hot_reload: true,
             fit_upscale: true,
             zoom_step: 1.15,
@@ -363,6 +376,7 @@ impl Default for Config {
             zoom_snap_levels: ZOOM_SNAP_LEVELS.to_vec(),
             default_tonemap: TonemapCfg::default(),
             default_fit: FitCfg::default(),
+            default_outline: true,
             background: BackgroundCfg::default(),
             flipbook: FlipbookCfg::default(),
             context_menu: ContextMenuCfg::default(),
@@ -609,6 +623,7 @@ mod tests {
     fn save_round_trip() {
         let cfg = Config {
             instance_mode: InstanceMode::SingleInstance,
+            esc_closes_window: false,
             hot_reload: false,
             fit_upscale: false,
             zoom_step: 1.25,
@@ -617,6 +632,7 @@ mod tests {
             zoom_snap_levels: vec![50.0, 100.0, 12.5],
             default_tonemap: TonemapCfg::Aces,
             default_fit: FitCfg::ActualSize,
+            default_outline: false,
             background: BackgroundCfg::Grey,
             flipbook: FlipbookCfg {
                 fps: 12.0,
