@@ -4,15 +4,20 @@
 # The one thing that makes this workflow non-obvious is the *vendored native artifacts*. `heif-sys`
 # links prebuilt static libs (heif/libde265/dav1d) and `psd-sdk-sys` compiles the psd_sdk C++ source,
 # and neither is in the Rust crate graph — they are fetched per `vendor/VENDOR.txt`. They are also
-# not in the repository. So the job is split:
+# not in the repository. Those two crates are reached only through `fire-decode`'s `psd` / `heif`
+# features (default-on, so the shipped exe is unaffected), which is what lets the job split be:
 #
-#   * `check` always runs: it covers every crate that needs no vendored input — the whole shell
-#     (`fire`'s pure-logic modules), `fire-ipc`, and the pure-Rust half of the decode core.
+#   * `check` always runs, with `--no-default-features`: no psd_sdk, no libheif, and so no bindgen
+#     or LLVM either. That covers everything else — `fire-ipc`, the pure-Rust decode core, and the
+#     whole shell including `fire`'s pure-logic modules (view/config/keybinds/flipbook/ui).
 #   * `full` runs only when the vendor tree is present (a cached restore, or a self-hosted runner
-#     with it checked out). It builds the real `fire.exe` and runs the PSD/HEIF end-to-end tests.
+#     with it checked out). It adds the native decoders: the real `fire.exe` and the PSD/HEIF
+#     end-to-end tests.
 #
 # Without that split, a fork's first push would fail on a missing `heif.lib` and teach everyone to
-# ignore the badge.
+# ignore the badge. Without the features, `check` could only ever have covered `fire-ipc` — every
+# other crate pulls the vendored trees in transitively, so a cache miss meant a green badge over
+# code nothing had linted.
 
 name: CI
 
@@ -28,7 +33,7 @@ env:
 
 jobs:
   check:
-    name: clippy + tests (no vendored deps)
+    name: clippy + tests (no native decoders)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,13 +45,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # `fire-ipc` is dependency-free and holds the named-pipe wire format — the one place that
-      # parses bytes from outside the process. It must always be checked.
-      - name: Clippy (fire-ipc)
-        run: cargo clippy -p fire-ipc --all-targets -- -D warnings
+      # Everything except the two FFI decoders, so this needs no vendored input and no LLVM.
+      - name: Clippy (no native decoders)
+        run: cargo clippy -p fire-ipc -p fire-decode -p fire --no-default-features --all-targets -- -D warnings
 
+      # `fire-ipc` is dependency-free and holds the named-pipe wire format — the one place that
+      # parses bytes from outside the process. It must always be tested.
       - name: Test (fire-ipc)
         run: cargo test -p fire-ipc
+
+      # The pure-Rust decoders (PNG/JPEG/GIF/TIFF/EXR/HDR/raw), the decode-bomb guards, and the
+      # extension-table drift test that keeps installer/fire.iss honest.
+      - name: Test (fire-decode, no native decoders)
+        run: cargo test -p fire-decode --no-default-features
+
+      # The shell's pure-logic modules: view math, config round-trip, keybinds, flipbook
+      # detection, folder navigation, theme parsing, icon ordering.
+      - name: Test (fire, no native decoders)
+        run: cargo test -p fire --no-default-features
 
   full:
     name: clippy + tests (full workspace)
@@ -92,8 +108,7 @@ jobs:
         if: steps.have_vendor.outputs.present == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Includes the decode-bomb guards, the PSD C++ FFI fixtures, and the extension-table drift
-      # test that keeps installer/fire.iss honest.
+      # Adds what `check` cannot reach: the PSD C++ FFI fixtures and the HEIF/AVIF containers.
       - name: Test (workspace)
         if: steps.have_vendor.outputs.present == 'true'
         run: cargo test --workspace

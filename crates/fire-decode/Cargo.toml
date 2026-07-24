@@ -5,6 +5,15 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# On by default: the shipped fire.exe decodes PSD and HEIF/AVIF. They are features only so the
+# crate can be built and tested without the vendored native trees `psd-sdk-sys` / `heif-sys`
+# need — which is what lets CI lint and test the pure-Rust decode core on any runner. Turning
+# one off does not re-route those formats; it makes them a clear error (see `decode_psd`).
+default = ["psd", "heif"]
+psd = ["dep:psd-sdk-sys"]
+heif = ["dep:heif-sys"]
+
 [dependencies]
 zune-image.workspace = true
 zune-core.workspace = true
@@ -12,8 +21,8 @@ image.workspace = true
 tiff.workspace = true
 exr.workspace = true
 lcms2.workspace = true
-psd-sdk-sys.workspace = true
-heif-sys.workspace = true
+psd-sdk-sys = { workspace = true, optional = true }
+heif-sys = { workspace = true, optional = true }
 bytemuck.workspace = true
 
 [lints]

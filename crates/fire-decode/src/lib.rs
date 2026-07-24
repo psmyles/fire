@@ -25,6 +25,11 @@
 //! ICC profiles are extracted here; the lcms2 transform into the working space is
 //! applied by [`icc`]. Images larger than the caller's `max_dim` are CPU-downscaled to
 //! fit ([`downscale`]).
+//!
+//! The two FFI backends sit behind the **default-on** `psd` and `heif` features — the only
+//! parts of the workspace that need the vendored native trees. Building without them keeps the
+//! routing identical and returns a "built without" error for those formats, which is what lets
+//! CI lint and test everything here on a runner that has no vendored input at all.
 
 use std::io::Cursor;
 use std::path::Path;
@@ -451,6 +456,7 @@ pub fn decode_path(path: &Path, opts: &DecodeOptions) -> Result<DecodedImage, De
 
 /// PSD via psd_sdk (C++ FFI). Runs inside catch_unwind so a Rust-side panic in the
 /// thin wrapper cannot escape; the C++ side additionally guards against C++ exceptions.
+#[cfg(feature = "psd")]
 fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     let result = std::panic::catch_unwind(|| psd_sdk_sys::decode_psd(bytes))
         .map_err(|_| DecodeError::Ffi("psd_sdk panicked".into()))?;
@@ -476,6 +482,17 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         downscaled_from: None,
         animation: None,
     })
+}
+
+/// Stand-in for [`decode_psd`] when the crate is built without the vendored psd_sdk (CI's
+/// `--no-default-features` job; the shipped binary always has it). Routing deliberately does
+/// *not* change with the feature: the bytes really are a PSD, this build just cannot read one,
+/// and saying so is more honest than letting a fallback decoder mangle it.
+#[cfg(not(feature = "psd"))]
+fn decode_psd(_bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    Err(DecodeError::Other(
+        "this build has no PSD support (compiled without the \"psd\" feature)".into(),
+    ))
 }
 
 /// OpenEXR via the `exr` crate → 32-bit float RGBA (linear/HDR).
@@ -513,8 +530,12 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
                 pixels: vec![[0.0f32; 4]; size.width() * size.height()],
             },
             |buf: &mut Buf, pos, (r, g, b, a): (f32, f32, f32, f32)| {
+                // The position comes from the decoder, not from us: bounds-check it rather
+                // than index, so a crafted file cannot panic a decode worker.
                 let i = pos.y() * buf.width + pos.x();
-                buf.pixels[i] = [r, g, b, a];
+                if let Some(px) = buf.pixels.get_mut(i) {
+                    *px = [r, g, b, a];
+                }
             },
         )
         .first_valid_layer()
@@ -557,6 +578,7 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 /// scaled to full range. We treat the decoded values as display-encoded (SDR), so a
 /// true-HDR (PQ/HLG) HEIF will display without tonemapping — acceptable for v1, and most
 /// HEIC (phone photos) is 8-bit SDR, often Display-P3, whose ICC the [`icc`] pass honors.
+#[cfg(feature = "heif")]
 fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, DecodeError> {
     let result = std::panic::catch_unwind(|| heif_sys::decode_heif(bytes))
         .map_err(|_| DecodeError::Ffi("libheif panicked".into()))?;
@@ -581,6 +603,15 @@ fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, Decode
         downscaled_from: None,
         animation: None,
     })
+}
+
+/// Stand-in for [`decode_heif`] when the crate is built without the vendored libheif stack —
+/// see [`decode_psd`]'s counterpart for why this errors rather than rerouting.
+#[cfg(not(feature = "heif"))]
+fn decode_heif(_bytes: &[u8], label: &'static str) -> Result<DecodedImage, DecodeError> {
+    Err(DecodeError::Other(format!(
+        "this build has no {label} support (compiled without the \"heif\" feature)"
+    )))
 }
 
 /// Camera raw via embedded-preview extraction ([`raw`]). The raw container is not decoded;
@@ -1783,6 +1814,47 @@ mod tests {
              decodable but not associated: {missing:?}\n  \
              associated but not decodable: {extra:?}"
         );
+    }
+
+    /// Routing is a *measured* decision (§6): PNG and HDR are sniffed here but decoded by the
+    /// `image` crate, whose decoders beat zune's for both. Nothing else in this file can see
+    /// that — every other test asserts decoded pixels, and those come out identical whichever
+    /// backend produced them, so a format quietly demoted to the generic fallback would leave
+    /// the suite green and only show up as a slower decode.
+    ///
+    /// Worth pinning because the sniff is not ours: `sniff` asks zune's `guess_format`, whose
+    /// coverage moves with zune's own feature flags (its BMP and WebP probes are `#[cfg]`-gated;
+    /// its magic table currently is not). We enable only the formats we route to zune, so that
+    /// boundary is exactly where a dependency bump or a feature edit can shift routing without
+    /// touching a line of this crate. Assert the backend, not the pixels.
+    #[test]
+    fn png_and_hdr_route_to_their_own_backends_not_the_fallback() {
+        let png = encode(
+            &image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2)),
+            image::ImageFormat::Png,
+        );
+        assert!(
+            matches!(sniff(&png, None), Backend::Png),
+            "PNG must reach decode_png, not the `image` fallback"
+        );
+
+        // Both Radiance signatures, as whole little files: zune's sniffer peeks a fixed window,
+        // so a fixture trimmed to the bare magic would fail for reasons a real file never hits.
+        for magic in ["#?RADIANCE", "#?RGBE"] {
+            let mut hdr = format!("{magic}\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n").into_bytes();
+            hdr.extend_from_slice(&[128, 128, 128, 129]);
+            assert!(
+                matches!(sniff(&hdr, None), Backend::Hdr),
+                "Radiance HDR ({magic}) must reach decode_hdr, not the `image` fallback"
+            );
+        }
+
+        // And the formats zune *does* own still go to zune.
+        let jpg = encode(
+            &image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)),
+            image::ImageFormat::Jpeg,
+        );
+        assert!(matches!(sniff(&jpg, None), Backend::Zune(_)));
     }
 
     // --- Decode-bomb guards -------------------------------------------------------------------

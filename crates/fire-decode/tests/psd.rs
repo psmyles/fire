@@ -11,6 +11,10 @@
 //! four length-prefixed sections, and writing it out in code documents the layout the C++ side
 //! relies on. Only the merged ("Maximize Compatibility") composite is in scope — the layer stack
 //! is a v2 concern and `fire_psd_read_merged` returns error 2 without it.
+//!
+//! Compiled out without the `psd` feature: there is no psd_sdk to drive then, and the point of
+//! that configuration is to build and test on a machine with no vendored native trees at all.
+#![cfg(feature = "psd")]
 
 use fire_decode::{decode, DecodeOptions, PixelFormat};
 

@@ -8,6 +8,14 @@ publish.workspace = true
 # Builds `fire.exe` — the whole viewer (window, render, decode pool, optional pipe). The
 # default bin (package name + src/main.rs) needs no [[bin]] section.
 
+# Pass-throughs to `fire-decode`'s native decoders, on by default — the shipped exe reads PSD
+# and HEIF/AVIF. `--no-default-features` builds the viewer without the vendored native trees,
+# which is how CI checks the whole shell on a runner that has none.
+[features]
+default = ["psd", "heif"]
+psd = ["fire-decode/psd"]
+heif = ["fire-decode/heif"]
+
 # crossbeam-channel carries decode results from the worker pool; serde/toml read the
 # startup config.
 [dependencies]

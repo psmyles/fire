@@ -667,6 +667,64 @@ mod tests {
         assert_eq!(ctrl_right.display(), "Ctrl+\u{2192}");
     }
 
+    /// The two actions that ship deliberately unbound. Anything else missing from
+    /// [`Keybinds::defaults`] is an oversight, not a decision.
+    const INTENTIONALLY_UNBOUND: &[KeyAction] =
+        &[KeyAction::ExposureReset, KeyAction::ToggleOutline];
+
+    /// `defaults()` is a hand-written `vec!`, so — unlike `name`/`label`/`group`, which are
+    /// exhaustive matches the compiler polices — a newly added [`KeyAction`] compiles perfectly
+    /// while shipping unbound and absent from the settings list, which walks this table in
+    /// [`ALL_ACTIONS`] order. Pin both the coverage and the order.
+    #[test]
+    fn defaults_cover_every_action_in_order() {
+        let kb = Keybinds::defaults();
+        let listed: Vec<KeyAction> = kb.bindings.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            listed, ALL_ACTIONS,
+            "defaults() must list every action exactly once, in ALL_ACTIONS order"
+        );
+
+        for action in ALL_ACTIONS {
+            let bound = !kb.chords(*action).is_empty();
+            let expected = !INTENTIONALLY_UNBOUND.contains(action);
+            assert_eq!(
+                bound,
+                expected,
+                "`{}` is {} — update defaults() or INTENTIONALLY_UNBOUND",
+                action.name(),
+                if bound {
+                    "bound but listed as unbound"
+                } else {
+                    "unbound"
+                }
+            );
+        }
+    }
+
+    /// `is_flipbook_context` is a `matches!` that defaults to `false`, so a new flipbook action
+    /// forgotten there silently becomes a *global* binding — `Space` scrubbing a still image.
+    /// `group()` is an exhaustive match the compiler forces you to fill in, so tie the loose one
+    /// to it: everything filed under "Flipbook" is mode-scoped, except the toggle that enters the
+    /// mode (which must work from outside it).
+    #[test]
+    fn flipbook_context_agrees_with_the_settings_grouping() {
+        for action in ALL_ACTIONS {
+            let grouped = action.group() == "Flipbook";
+            let scoped = action.is_flipbook_context();
+            if *action == KeyAction::ToggleFlipbook {
+                assert!(grouped && !scoped, "the toggle must fire outside the mode");
+            } else {
+                assert_eq!(
+                    grouped,
+                    scoped,
+                    "`{}` is grouped under Flipbook but not context-scoped (or vice-versa)",
+                    action.name()
+                );
+            }
+        }
+    }
+
     /// The defaults reproduce the keyboard Fire shipped with (the table that used to live in
     /// `App::handle_key` as raw VK matches).
     #[test]

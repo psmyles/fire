@@ -14,6 +14,17 @@
 //! sources are already linear, 16-bit unorm is sRGB-decoded in the shader. The pixel shader
 //! outputs **linear** and the render-target view is `*_SRGB`, so the hardware sRGB-encodes on
 //! write. The whole pipeline is linear.
+//!
+//! [`GpuSurface`] is the window's whole render state, grouped by *lifetime* rather than by
+//! subsystem, because that is what makes it readable: [`DeviceObjects`] is built once at startup
+//! and never changes (bar the two lazily-recreated views); [`ImageContent`] and [`AnimState`] are
+//! replaced wholesale on every adopt; [`SessionPrefs`] deliberately outlives the image so a chosen
+//! backdrop survives folder navigation; [`GestureState`] lives only between a button-down and its
+//! up. The view core (`origin`/`viewport`/`view`/`display`/`flipbook`) stays flat on the surface —
+//! nearly every method touches it, and its math already lives in [`crate::render::view`].
+//!
+//! One rule for the sub-structs: `refresh`/`invalidate` never move onto them. Scheduling a repaint
+//! needs the `hwnd`, so mutate-then-refresh stays a [`GpuSurface`] method.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -141,12 +152,46 @@ pub struct FlipbookParams {
     pub blend: bool,
 }
 
-/// GPU render state for the view window: the D3D11 device/swapchain plus the same pan/zoom/fit
-/// and channel/exposure/tonemap state the CPU surface carried (so the window shell and chrome
-/// drive it through an identical API).
-pub struct GpuSurface {
-    hwnd: isize,
+/// Playback state of an animated image (animated GIF): every frame as a full RGBA canvas + delay,
+/// and which one is currently uploaded to the texture. Empty for a still image, which is the
+/// common case — a still costs one empty `Vec`. The playback timer lives in the win shell and
+/// advances this through [`GpuSurface::advance_frame`].
+#[derive(Default)]
+struct AnimState {
+    frames: Vec<AnimationFrame>,
+    index: usize,
+}
 
+impl AnimState {
+    /// Take `img`'s frames (if it has any) and rewind to frame 0. The image is shared with the
+    /// decode worker for flipbook detection, so frames are cloned rather than moved out; a still
+    /// image — the shared case — leaves the list empty and clones nothing.
+    fn adopt(&mut self, img: &DecodedImage) {
+        self.frames = img
+            .animation
+            .as_ref()
+            .map(|a| a.frames.clone())
+            .unwrap_or_default();
+        self.index = 0;
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.index = 0;
+    }
+
+    /// How long the current frame should be shown, or `None` if this isn't an animation. One
+    /// frame is a still: nothing to schedule.
+    fn delay_ms(&self) -> Option<u32> {
+        (self.frames.len() > 1).then(|| self.frames[self.index].delay_ms)
+    }
+}
+
+/// The D3D11 objects: the device and its swapchain, the two views over the backbuffer, and the
+/// pipeline state built once at startup. Everything here is created together in
+/// [`DeviceObjects::new`] and, apart from the two lazily-recreated views, never changes again —
+/// which is what separates it from the view/session state it renders.
+struct DeviceObjects {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     swapchain: IDXGISwapChain1,
@@ -154,539 +199,35 @@ pub struct GpuSurface {
     /// Recreated lazily after a resize (the backbuffer changes).
     rtv: Option<ID3D11RenderTargetView>,
     /// The UI pass's view of the *same* backbuffer: plain `UNORM`, because ImGui's colors are
-    /// already sRGB and must not be encoded a second time. See [`GpuSurface::ensure_rtv`].
+    /// already sRGB and must not be encoded a second time. See [`DeviceObjects::ensure_rtv`].
     rtv_ui: Option<ID3D11RenderTargetView>,
-    /// The image sub-rect's origin within the client (the chrome occupies the rest).
-    origin: (f32, f32),
-    /// What the non-image parts of the backbuffer are cleared to before the UI draws over them.
-    chrome_clear: [f32; 4],
 
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
     samp_aniso: ID3D11SamplerState,
     samp_point: ID3D11SamplerState,
     cbuffer: ID3D11Buffer,
-
-    /// Current image texture + its sampling view (None until the first image lands).
-    _tex: Option<ID3D11Texture2D>,
-    srv: Option<ID3D11ShaderResourceView>,
-    /// 1 if the texture samples already-linear (8-bit `*_SRGB` / float), 0 if the shader must
-    /// sRGB-decode (16-bit unorm).
-    linear_sample: i32,
-
-    /// No-image backdrop (empty window), packed sRGB and its linear form (for the `*_SRGB` RTV).
-    /// Once an image is loaded the [`Background`] mode owns the viewport instead.
-    clear: u32,
-    clear_lin: [f32; 4],
-
-    /// Viewport backdrop while an image is shown; defaults per-image (opaque → black, alpha →
-    /// checker) and is overridden by the toolbar's background buttons.
-    background: Background,
-    /// The user's explicit backdrop pick, if any. Once set via the toolbar it sticks for the rest
-    /// of the session (every later image adopts it instead of its per-type default); `None` until
-    /// the user chooses, so each image still gets its natural default before the first override.
-    background_override: Option<Background>,
-
-    /// Draw a 1px outline around the image boundary (toolbar toggle). Starts on unless the
-    /// `default-outline` config key says otherwise; the pick then persists across navigation for
-    /// the rest of the session, like the backdrop.
-    outline: bool,
-
-    /// The octagon overlay (toolbar toggle + its options window). Session-global like the outline:
-    /// it persists across navigation. The line render is the UI's (an ImGui draw list); the shader
-    /// only consumes `crop`/`hide` for the hide-outside fade.
-    octagon: crate::octagon::OctagonState,
-
-    /// Monotonic per-window decode generation; a `DecodeDone` older than this is stale.
-    generation: u64,
-    /// The displayed image — retained for the pixel inspector (#16) and for re-fit on resize.
-    /// For an animated source this holds frame 0 (dimensions/format/metadata are frame-invariant);
-    /// the frames themselves live in `anim_frames`. Held behind an `Arc` because the decode worker
-    /// keeps a clone alive to run flipbook detection *after* the image has been posted for display
-    /// (so detection never delays time-to-first-pixel); both sides only ever read it.
-    current_image: Option<Arc<DecodedImage>>,
-
-    /// Frames of an animated image (animated GIF), each a full RGBA canvas + delay. Empty for a
-    /// still image. `anim_index` is the frame currently uploaded to the texture; the playback
-    /// timer (owned by the win shell) advances it via [`Self::advance_frame`].
-    anim_frames: Vec<AnimationFrame>,
-    anim_index: usize,
-
-    viewport: Viewport,
-    view: ViewState,
-    /// Active flipbook render parameters, mirrored from the win shell's per-path state. `Some`
-    /// makes pan/zoom/fit operate on the frame rect and the shader sample a single cell. The
-    /// surface never persists this — it is (re)applied on every adopt via [`Self::set_flipbook`].
-    flipbook: Option<FlipbookParams>,
-    /// Whether the explicit "fit to window" command (`F` / toolbar) scales *small* images up to
-    /// fill the surface (the `fit-upscale` config key). False keeps the texture-viewer cap at 1:1.
-    /// This governs only the explicit command — how an image *opens* is `open_actual_size`.
-    fit_upscale: bool,
-    /// Whether a freshly adopted image opens at native 1:1 instead of fitted (the `default-fit`
-    /// config key). Fitted-on-open (the default) never upscales, so a small image shows at 100%
-    /// either way; this only changes what an *oversized* image does on open.
-    open_actual_size: bool,
-    /// The tonemap operator a freshly adopted image starts on (the `default-tonemap` config key).
-    /// Seeds [`DisplayState`] on each adopt; the `T` toggle still moves the live one.
-    default_tonemap: Tonemap,
-    display: DisplayState,
-    cursor: (f32, f32),
-    dragging: bool,
-    /// RMB scrubby-zoom: whether a zoom-drag is active, the pivot (the press point, surface px),
-    /// and the last cursor-y so each move applies an incremental zoom.
-    zoom_dragging: bool,
-    zoom_anchor: (f32, f32),
-    zoom_last_y: f32,
-    /// Whether the active RMB gesture has moved past [`ZOOM_DRAG_CLICK_SLOP`]; if not, the release
-    /// is treated as a right-click (opens the context menu) rather than the end of a zoom-drag.
-    zoom_dragged: bool,
-    /// Detent state for the active zoom-drag: the snap the zoom is currently resting on, if any.
-    zoom_detent: ZoomDetent,
-    /// The zoom levels the drag detents on, as zoom factors (the config stores percentages), and
-    /// how far past one the drag must travel to break out, in drag px. Both from the config
-    /// (`zoom-snap-levels` / `zoom-snap`) via [`Self::set_zoom_snapping`]; an empty ladder or a
-    /// zero distance is snapping switched off.
-    zoom_snaps: Vec<f32>,
-    zoom_snap_px: f32,
 }
 
-impl GpuSurface {
-    /// Build the D3D11 device + flip-model swapchain on the window. `width`/`height` are the whole
-    /// client: the swapchain covers it all, and the image is drawn into a sub-rect of it (see
-    /// [`Self::set_image_rect`]) with the chrome painted over the remainder. `_hinstance` is unused
-    /// (D3D needs only the HWND); kept for signature parity with the CPU surface.
-    pub fn new(hwnd: isize, _hinstance: isize, width: u32, height: u32, fit_upscale: bool) -> Self {
+impl DeviceObjects {
+    fn new(hwnd: HWND, width: u32, height: u32) -> Self {
         let (device, context) = create_device();
-        let win_hwnd = HWND(hwnd as *mut c_void);
-        let swapchain = create_swapchain(&device, win_hwnd, width.max(1), height.max(1));
-
+        let swapchain = create_swapchain(&device, hwnd, width, height);
         let (vs, ps) = create_shaders(&device);
         let (samp_aniso, samp_point) = create_samplers(&device);
         let cbuffer = create_const_buffer(&device);
-
         Self {
-            hwnd,
             device,
             context,
             swapchain,
             rtv: None,
             rtv_ui: None,
-            origin: (0.0, 0.0),
-            chrome_clear: [0.0, 0.0, 0.0, 1.0],
             vs,
             ps,
             samp_aniso,
             samp_point,
             cbuffer,
-            _tex: None,
-            srv: None,
-            linear_sample: 1,
-            clear: 0,
-            clear_lin: [0.0, 0.0, 0.0, 1.0],
-            background: Background::Black,
-            background_override: None,
-            outline: true,
-            octagon: crate::octagon::OctagonState::default(),
-            generation: 0,
-            current_image: None,
-            anim_frames: Vec::new(),
-            anim_index: 0,
-            viewport: Viewport::new(width, height),
-            view: ViewState::default(),
-            flipbook: None,
-            fit_upscale,
-            open_actual_size: false,
-            default_tonemap: Tonemap::Reinhard,
-            display: DisplayState::default(),
-            cursor: (0.0, 0.0),
-            dragging: false,
-            zoom_dragging: false,
-            zoom_anchor: (0.0, 0.0),
-            zoom_last_y: 0.0,
-            zoom_dragged: false,
-            zoom_detent: ZoomDetent::default(),
-            // Off until the shell pushes the config in — which it does immediately after
-            // construction, via `apply_view_config`.
-            zoom_snaps: Vec::new(),
-            zoom_snap_px: 0.0,
         }
-    }
-
-    /// Set the letterbox / no-image backdrop color (packed `0x00RRGGBB`); stored both packed and
-    /// as linear floats so the `*_SRGB` render target re-encodes it to the intended sRGB.
-    pub fn set_clear(&mut self, packed: u32) {
-        self.clear = packed;
-        let dec = |b: u32| srgb_to_linear((b & 0xff) as f32 / 255.0);
-        self.clear_lin = [dec(packed >> 16), dec(packed >> 8), dec(packed), 1.0];
-    }
-
-    pub fn next_generation(&mut self) -> u64 {
-        self.generation += 1;
-        self.generation
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub fn current_image(&self) -> Option<&DecodedImage> {
-        self.current_image.as_deref()
-    }
-
-    // --- read-only view of display state, for the chrome ---
-
-    pub fn zoom_percent(&self) -> u32 {
-        (self.view.zoom * 100.0).round().max(0.0) as u32
-    }
-
-    pub fn channel(&self) -> Channel {
-        self.display.channel
-    }
-
-    pub fn tonemap(&self) -> Tonemap {
-        self.display.tonemap
-    }
-
-    pub fn is_fit(&self) -> bool {
-        self.view.fit
-    }
-
-    pub fn exposure(&self) -> f32 {
-        self.display.exposure
-    }
-
-    pub fn is_hdr(&self) -> bool {
-        self.current_image
-            .as_ref()
-            .is_some_and(|i| i.format.is_hdr())
-    }
-
-    /// Whether the current image carries an alpha channel (gray+A or RGBA source) — drives the
-    /// RGB↔RGBA toolbar icon and keeps the alpha-channel isolation control available. This is true
-    /// even when the alpha is entirely opaque, so the user can always inspect it; whether that
-    /// alpha actually holds transparency (and thus defaults to the checker backdrop) is a separate
-    /// signal handled in [`Self::set_image`] via `DecodedImage::alpha_opaque`.
-    pub fn has_alpha(&self) -> bool {
-        self.current_image
-            .as_ref()
-            .is_some_and(|i| matches!(i.channels, 2 | 4))
-    }
-
-    pub fn background(&self) -> Background {
-        self.background
-    }
-
-    /// Set the viewport backdrop (toolbar override) and repaint. Records the pick so it persists
-    /// across image navigation for the rest of the session (see [`Self::background_override`]).
-    pub fn set_background(&mut self, bg: Background) {
-        self.background = bg;
-        self.background_override = Some(bg);
-        self.refresh();
-    }
-
-    /// Apply the configured backdrop preference (settings dialog / startup): `Some` pins that
-    /// backdrop for every image, `None` restores the per-image default (checker for real
-    /// transparency, black otherwise) — including for the image already on screen.
-    pub fn set_background_pref(&mut self, bg: Option<Background>) {
-        self.background_override = bg;
-        self.background = bg.unwrap_or_else(|| {
-            self.current_image
-                .as_ref()
-                .map_or(Background::Black, |img| default_background(img))
-        });
-        self.refresh();
-    }
-
-    /// Whether the explicit fit command upscales small images (the `fit-upscale` config key).
-    pub fn set_fit_upscale(&mut self, on: bool) {
-        self.fit_upscale = on;
-    }
-
-    /// The right-drag zoom's detents: the levels to snap to as *percentages* (`zoom-snap-levels`,
-    /// converted to zoom factors here) and how far past one the drag has to travel to break out, in
-    /// drag px (`zoom-snap`). Either empty levels or a zero distance switches snapping off.
-    pub fn set_zoom_snapping(&mut self, levels_pct: &[f32], strength_px: f32) {
-        self.zoom_snaps = levels_pct.iter().map(|p| p / 100.0).collect();
-        self.zoom_snap_px = strength_px;
-    }
-
-    /// Whether a newly opened image lands at native 1:1 rather than fitted (`default-fit`). Takes
-    /// effect on the next adopt — it never yanks the view of the image already on screen.
-    pub fn set_open_actual_size(&mut self, on: bool) {
-        self.open_actual_size = on;
-    }
-
-    /// The tonemap a newly adopted image starts on (`default-tonemap`). Like `set_open_actual_size`,
-    /// this seeds the *next* image: the current one keeps whatever the user toggled it to.
-    pub fn set_default_tonemap(&mut self, t: Tonemap) {
-        self.default_tonemap = t;
-    }
-
-    pub fn outline(&self) -> bool {
-        self.outline
-    }
-
-    /// Toggle the image-boundary outline and repaint.
-    pub fn toggle_outline(&mut self) {
-        self.outline = !self.outline;
-        self.refresh();
-    }
-
-    /// Apply the configured outline preference (settings dialog / startup). The outline is one
-    /// session-global flag, not per-image state, so — like [`Self::set_background_pref`] — this
-    /// reaches the image already on screen rather than seeding the next one.
-    pub fn set_outline(&mut self, on: bool) {
-        self.outline = on;
-        self.refresh();
-    }
-
-    pub fn octagon(&self) -> crate::octagon::OctagonState {
-        self.octagon
-    }
-
-    /// Adopt the octagon overlay's state (the options window's edits, or the persisted config at
-    /// startup), clamped, and repaint.
-    pub fn set_octagon(&mut self, mut s: crate::octagon::OctagonState) {
-        s.clamp();
-        self.octagon = s;
-        self.refresh();
-    }
-
-    /// Toggle the octagon overlay (toolbar) and repaint. The options — color, crop, hide — survive
-    /// the off state, so re-enabling picks up where the user left off.
-    pub fn toggle_octagon(&mut self) {
-        self.octagon.enabled = !self.octagon.enabled;
-        self.refresh();
-    }
-
-    /// The displayed frame's rect in **image-region** coords (pan/zoom applied): the whole image,
-    /// or the current cell in flipbook mode. `None` with no image. This is what the octagon line
-    /// overlay is drawn against.
-    pub fn frame_screen_rect(&self) -> Option<(f32, f32, f32, f32)> {
-        let dims = self.view_dims()?;
-        let (x, y) = self.view.image_to_screen((0.0, 0.0), dims, &self.viewport);
-        let (w, h) = self.view.image_screen_size(dims);
-        Some((x, y, w, h))
-    }
-
-    fn image_dims(&self) -> Option<(u32, u32)> {
-        self.current_image.as_ref().map(|i| (i.width, i.height))
-    }
-
-    /// Dimensions the pan/zoom/fit math operates on: the frame rect in flipbook mode, else the
-    /// whole image. All view-control call sites use this so entering the mode or changing the
-    /// grid re-fits and clamps against the frame.
-    fn view_dims(&self) -> Option<(u32, u32)> {
-        let (w, h) = self.image_dims()?;
-        Some(match self.flipbook {
-            Some(fb) => crate::flipbook::frame_dims(fb.grid, (w, h)),
-            None => (w, h),
-        })
-    }
-
-    /// Adopt (or clear) flipbook render parameters. Re-fits the view to the frame rect only when
-    /// entering/leaving the mode or when the grid changes (so playback/scrub position changes,
-    /// which call [`Self::set_flipbook_pos`], don't disturb the user's pan/zoom). Repaints.
-    pub fn set_flipbook(&mut self, fb: Option<FlipbookParams>) {
-        let old_grid = self.flipbook.map(|f| f.grid);
-        let new_grid = fb.map(|f| f.grid);
-        self.flipbook = fb;
-        if old_grid != new_grid {
-            // Entering/leaving the mode or a grid edit changes the fitted content size → re-fit
-            // without upscaling (same rule as opening an image), against the new view dims.
-            if let Some(dims) = self.view_dims() {
-                self.view.fit_to_window(dims, &self.viewport, false);
-            }
-        }
-        self.refresh();
-    }
-
-    /// Update only the fractional playback position (the hot path: playback tick / slider scrub).
-    /// No re-fit; just repaint.
-    pub fn set_flipbook_pos(&mut self, frame_pos: f32) {
-        if let Some(fb) = &mut self.flipbook {
-            fb.frame_pos = frame_pos;
-            self.refresh();
-        }
-    }
-
-    /// Drop the displayed image so the next paint shows the placeholder. Also drops any animation
-    /// frames so the win shell's next `frame_delay_ms()` returns `None` and the playback timer stops.
-    pub fn clear_image(&mut self) {
-        self.current_image = None;
-        self._tex = None;
-        self.srv = None;
-        self.anim_frames.clear();
-        self.anim_index = 0;
-        self.flipbook = None;
-    }
-
-    /// Adopt a decoded image: upload it as a GPU texture (hardware mip chain) and reset to fit +
-    /// neutral display state for the new file (#17). Returns the GPU error if the upload fails
-    /// (e.g. `E_OUTOFMEMORY` on a very large image) so the caller can report it instead of the
-    /// process aborting; on failure the prior display state is left untouched.
-    pub fn set_image(&mut self, img: Arc<DecodedImage>) -> windows::core::Result<()> {
-        let (w, h) = (img.width, img.height);
-        // Upload first: if the GPU rejects the texture we bail here, before mutating any state,
-        // so a failed adopt can't leave the surface half-updated.
-        self.upload_texture(&img)?;
-        // Adopt any animation frames for playback and start from frame 0 (already uploaded above).
-        // The image is shared with the decode worker (for flipbook detection), so frames are cloned
-        // rather than moved out; a still image (the shared case) leaves the list empty and clones
-        // nothing. The win shell arms the timer from `frame_delay_ms()` after this.
-        self.anim_frames = img
-            .animation
-            .as_ref()
-            .map(|a| a.frames.clone())
-            .unwrap_or_default();
-        self.anim_index = 0;
-        // Pick the viewport backdrop: an explicit pick (the toolbar's background buttons, or the
-        // `background` config key) sticks across every image; otherwise default to the image's
-        // nature — see `default_background`.
-        self.background = self
-            .background_override
-            .unwrap_or_else(|| default_background(&img));
-        self.current_image = Some(img);
-        // Neutral display state for the new file (#17), seeded with the configured tonemap.
-        self.display = DisplayState {
-            tonemap: self.default_tonemap,
-            ..DisplayState::default()
-        };
-        // A fresh image starts as a whole-image view; the win shell re-applies any per-path
-        // flipbook state (via `set_flipbook`) right after this adopt, which re-fits to the frame.
-        self.flipbook = None;
-        // Every newly opened image (including folder ←/→ navigation) fits *without* upscaling: a
-        // large image shrinks to fit, a small one shows at native 1:1. The explicit fit command
-        // (`F` / toolbar) can still fill the surface — see `fit_upscale` / `fit`. With
-        // `default-fit = "actual-size"` an image instead opens at 100% however large it is.
-        if self.open_actual_size {
-            self.view.one_to_one();
-        } else {
-            self.view.fit_to_window((w, h), &self.viewport, false);
-        }
-        Ok(())
-    }
-
-    /// Adopt a hot-reloaded image *without* resetting the view: upload the new pixels and keep the
-    /// current pan / zoom / channel / exposure / tonemap. Used when the file changed on disk and
-    /// the re-decode came back at the same dimensions (the "re-export same canvas" case), so the
-    /// user's zoomed-in detail and display state survive the update. The pan is re-clamped
-    /// defensively (a no-op while the dims are unchanged).
-    pub fn replace_image_keep_view(&mut self, img: Arc<DecodedImage>) -> windows::core::Result<()> {
-        self.upload_texture(&img)?;
-        // Refresh the animation frames from the re-decoded file and restart from frame 0 (the view
-        // is preserved, but the animation plays from the top). The win shell re-arms the timer.
-        self.anim_frames = img
-            .animation
-            .as_ref()
-            .map(|a| a.frames.clone())
-            .unwrap_or_default();
-        self.anim_index = 0;
-        self.current_image = Some(img);
-        // Hot reload keeps flipbook mode active (same path); clamp against the frame rect when in
-        // flipbook mode, else the whole image (a no-op while the dims are unchanged).
-        if !self.view.fit {
-            if let Some(vd) = self.view_dims() {
-                self.view.clamp_pan(vd, &self.viewport);
-            }
-        }
-        Ok(())
-    }
-
-    /// Delay (ms) the currently displayed animation frame should be shown before advancing, or
-    /// `None` for a still image. The win shell arms the playback timer from this after every adopt.
-    pub fn frame_delay_ms(&self) -> Option<u32> {
-        (self.anim_frames.len() > 1).then(|| self.anim_frames[self.anim_index].delay_ms)
-    }
-
-    /// Advance to the next animation frame (wrapping) and upload it as the texture, returning the
-    /// now-current frame's delay (ms) so the caller can reschedule the timer (GIF frame delays
-    /// vary). Returns `None` and does nothing for a still image. On a GPU upload error the visible
-    /// frame is left unchanged and the current frame's delay is returned, so a transient failure
-    /// paces the retry rather than wedging playback.
-    pub fn advance_frame(&mut self) -> Option<u32> {
-        let n = self.anim_frames.len();
-        if n <= 1 {
-            return None;
-        }
-        let (w, h) = self.image_dims()?;
-        let format = self.current_image.as_ref()?.format;
-        let next = (self.anim_index + 1) % n;
-        match create_image_texture(
-            &self.device,
-            &self.context,
-            &self.anim_frames[next].pixels,
-            w,
-            h,
-            format,
-        ) {
-            Ok((tex, srv, linear)) => {
-                self._tex = Some(tex);
-                self.srv = Some(srv);
-                self.linear_sample = linear;
-                self.anim_index = next;
-            }
-            Err(e) => eprintln!("fire: animation frame upload failed: {e}"),
-        }
-        Some(self.anim_frames[self.anim_index].delay_ms)
-    }
-
-    /// Upload `img`'s (frame-0) pixels as a `DEFAULT` texture with a full mip chain generated on the
-    /// GPU. Returns the GPU error rather than panicking if texture/SRV creation fails — this runs
-    /// synchronously from the wndproc (via `decode_done`), where a panic would unwind across the
-    /// Win32 boundary and abort the process.
-    fn upload_texture(&mut self, img: &DecodedImage) -> windows::core::Result<()> {
-        let (tex, srv, linear_sample) = create_image_texture(
-            &self.device,
-            &self.context,
-            &img.pixels,
-            img.width,
-            img.height,
-            img.format,
-        )?;
-        self._tex = Some(tex);
-        self.srv = Some(srv);
-        self.linear_sample = linear_sample;
-        Ok(())
-    }
-
-    /// Resize the swapchain to a new *client* size (physical px) and drop the stale views. The
-    /// image's sub-rect within it is a separate concern — the shell calls [`Self::set_image_rect`]
-    /// right after, because only it knows how tall the chrome is.
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        self.rtv = None;
-        self.rtv_ui = None;
-        unsafe {
-            if let Err(e) = self.swapchain.ResizeBuffers(
-                0,
-                width,
-                height,
-                DXGI_FORMAT_UNKNOWN,
-                DXGI_SWAP_CHAIN_FLAG(0),
-            ) {
-                // A failed resize leaves the backbuffer at its old size; log it (ensure_rtv will
-                // recreate the views from whatever the swapchain reports next paint).
-                eprintln!("fire: swapchain ResizeBuffers failed: {e}");
-            }
-        }
-        self.request_redraw();
-    }
-
-    /// Schedule a repaint (delivered as `WM_PAINT`).
-    pub fn invalidate(&self) {
-        // SAFETY: hwnd is a live window; null rect invalidates the whole client area.
-        unsafe { InvalidateRect(self.hwnd as SysHwnd, std::ptr::null(), 0) };
-    }
-
-    fn request_redraw(&self) {
-        self.invalidate();
-    }
-
-    fn refresh(&self) {
-        self.request_redraw();
     }
 
     /// (Re)create the two render-target views over the current backbuffer.
@@ -736,6 +277,569 @@ impl GpuSurface {
         }
     }
 
+    /// Drop the views and resize the backbuffer. The views come back on the next
+    /// [`Self::ensure_rtv`], sized from whatever the swapchain then reports.
+    fn resize(&mut self, width: u32, height: u32) {
+        self.rtv = None;
+        self.rtv_ui = None;
+        unsafe {
+            if let Err(e) = self.swapchain.ResizeBuffers(
+                0,
+                width,
+                height,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            ) {
+                // A failed resize leaves the backbuffer at its old size; log it (ensure_rtv will
+                // recreate the views from whatever the swapchain reports next paint).
+                eprintln!("fire: swapchain ResizeBuffers failed: {e}");
+            }
+        }
+    }
+}
+
+/// The flipbook cells one frame samples: the sheet size (texels), the two cell origins to blend
+/// between, the blend factor, and the mip-LOD clamp that stops a minified sample bleeding across
+/// a cell boundary. `None` outside flipbook mode.
+type FlipbookCells = Option<((u32, u32), (f32, f32), (f32, f32), f32, f32)>;
+
+/// What the GPU currently holds for the displayed image: the texture, how to sample it, and the
+/// decoded source it came from. All four are replaced together on every adopt and cleared
+/// together when the image goes away.
+#[derive(Default)]
+struct ImageContent {
+    /// Current image texture + its sampling view (None until the first image lands).
+    _tex: Option<ID3D11Texture2D>,
+    srv: Option<ID3D11ShaderResourceView>,
+    /// 1 if the texture samples already-linear (8-bit `*_SRGB` / float), 0 if the shader must
+    /// sRGB-decode (16-bit unorm).
+    linear_sample: i32,
+    /// The displayed image — retained for the pixel inspector (#16) and for re-fit on resize.
+    /// For an animated source this holds frame 0 (dimensions/format/metadata are frame-invariant);
+    /// the frames themselves live in [`AnimState`]. Held behind an `Arc` because the decode worker
+    /// keeps a clone alive to run flipbook detection *after* the image has been posted for display
+    /// (so detection never delays time-to-first-pixel); both sides only ever read it.
+    current: Option<Arc<DecodedImage>>,
+}
+
+/// Preferences and toggles that belong to the *session* rather than to any one image: they are
+/// seeded from the config, may be changed from the toolbar or the settings window, and
+/// deliberately survive navigating to the next image (which is the behaviour that makes flipping
+/// through a folder with a chosen backdrop and outline usable at all).
+struct SessionPrefs {
+    /// No-image backdrop (empty window), packed sRGB and its linear form (for the `*_SRGB` RTV).
+    /// Once an image is loaded the [`Background`] mode owns the viewport instead.
+    clear: u32,
+    clear_lin: [f32; 4],
+
+    /// Viewport backdrop while an image is shown; defaults per-image (opaque → black, alpha →
+    /// checker) and is overridden by the toolbar's background buttons.
+    background: Background,
+    /// The user's explicit backdrop pick, if any. Once set via the toolbar it sticks for the rest
+    /// of the session (every later image adopts it instead of its per-type default); `None` until
+    /// the user chooses, so each image still gets its natural default before the first override.
+    background_override: Option<Background>,
+
+    /// Draw a 1px outline around the image boundary (toolbar toggle). Starts on unless the
+    /// `default-outline` config key says otherwise; the pick then persists across navigation for
+    /// the rest of the session, like the backdrop.
+    outline: bool,
+
+    /// The octagon overlay (toolbar toggle + its options window). Session-global like the outline:
+    /// it persists across navigation. The line render is the UI's (an ImGui draw list); the shader
+    /// only consumes `crop`/`hide` for the hide-outside fade.
+    octagon: crate::octagon::OctagonState,
+
+    /// Whether the explicit "fit to window" command (`F` / toolbar) scales *small* images up to
+    /// fill the surface (the `fit-upscale` config key). False keeps the texture-viewer cap at 1:1.
+    /// This governs only the explicit command — how an image *opens* is `open_actual_size`.
+    fit_upscale: bool,
+    /// Whether a freshly adopted image opens at native 1:1 instead of fitted (the `default-fit`
+    /// config key). Fitted-on-open (the default) never upscales, so a small image shows at 100%
+    /// either way; this only changes what an *oversized* image does on open.
+    open_actual_size: bool,
+    /// The tonemap operator a freshly adopted image starts on (the `default-tonemap` config key).
+    /// Seeds [`DisplayState`] on each adopt; the `T` toggle still moves the live one.
+    default_tonemap: Tonemap,
+    /// The zoom levels the drag detents on, as zoom factors (the config stores percentages), and
+    /// how far past one the drag must travel to break out, in drag px. Both from the config
+    /// (`zoom-snap-levels` / `zoom-snap`) via [`GpuSurface::set_zoom_snapping`]; an empty ladder
+    /// or a zero distance is snapping switched off.
+    zoom_snaps: Vec<f32>,
+    zoom_snap_px: f32,
+}
+
+/// The in-flight mouse gesture: where the cursor is, and which drag (if either) owns it.
+///
+/// Grouped because these fields are only ever meaningful together and only between a button-down
+/// and its matching up — unlike the view state they act on, which outlives every gesture. Holds
+/// no config: the detent *ladder* is a session preference, and only the detent's position within
+/// a single drag lives here.
+#[derive(Default)]
+struct GestureState {
+    cursor: (f32, f32),
+    dragging: bool,
+    /// RMB scrubby-zoom: whether a zoom-drag is active, the pivot (the press point, surface px),
+    /// and the last cursor-y so each move applies an incremental zoom.
+    zoom_dragging: bool,
+    zoom_anchor: (f32, f32),
+    zoom_last_y: f32,
+    /// Whether the active RMB gesture has moved past [`ZOOM_DRAG_CLICK_SLOP`]; if not, the release
+    /// is treated as a right-click (opens the context menu) rather than the end of a zoom-drag.
+    zoom_dragged: bool,
+    /// Detent state for the active zoom-drag: the snap the zoom is currently resting on, if any.
+    zoom_detent: ZoomDetent,
+}
+
+impl GestureState {
+    /// Begin an RMB zoom-drag, pivoting on the current cursor (the press point).
+    fn begin_zoom_drag(&mut self) {
+        self.zoom_dragging = true;
+        self.zoom_anchor = self.cursor;
+        self.zoom_last_y = self.cursor.1;
+        self.zoom_dragged = false;
+        self.zoom_detent.reset();
+    }
+
+    /// End an RMB gesture. Returns `true` if it was an actual zoom-drag (the cursor moved past
+    /// [`ZOOM_DRAG_CLICK_SLOP`]); `false` if it was effectively a right-click.
+    fn end_zoom_drag(&mut self) -> bool {
+        self.zoom_dragging = false;
+        self.zoom_dragged
+    }
+
+    /// A pan or zoom drag is in progress, i.e. the image owns the mouse until the button comes up.
+    fn is_mouse_captured(&self) -> bool {
+        self.dragging || self.zoom_dragging
+    }
+}
+
+/// GPU render state for the view window: the D3D11 device/swapchain plus the same pan/zoom/fit
+/// and channel/exposure/tonemap state the CPU surface carried (so the window shell and chrome
+/// drive it through an identical API).
+pub struct GpuSurface {
+    hwnd: isize,
+
+    gfx: DeviceObjects,
+
+    /// The image sub-rect's origin within the client (the chrome occupies the rest).
+    origin: (f32, f32),
+    /// What the non-image parts of the backbuffer are cleared to before the UI draws over them.
+    chrome_clear: [f32; 4],
+
+    /// The displayed image's GPU residency.
+    tex: ImageContent,
+
+    /// Monotonic per-window decode generation; a `DecodeDone` older than this is stale.
+    generation: u64,
+
+    anim: AnimState,
+
+    /// Preferences and toggles that outlive the displayed image.
+    prefs: SessionPrefs,
+
+    viewport: Viewport,
+    view: ViewState,
+    /// Active flipbook render parameters, mirrored from the win shell's per-path state. `Some`
+    /// makes pan/zoom/fit operate on the frame rect and the shader sample a single cell. The
+    /// surface never persists this — it is (re)applied on every adopt via [`Self::set_flipbook`].
+    flipbook: Option<FlipbookParams>,
+    display: DisplayState,
+    gesture: GestureState,
+}
+
+impl GpuSurface {
+    /// Build the D3D11 device + flip-model swapchain on the window. `width`/`height` are the whole
+    /// client: the swapchain covers it all, and the image is drawn into a sub-rect of it (see
+    /// [`Self::set_image_rect`]) with the chrome painted over the remainder. `_hinstance` is unused
+    /// (D3D needs only the HWND); kept for signature parity with the CPU surface.
+    pub fn new(hwnd: isize, _hinstance: isize, width: u32, height: u32, fit_upscale: bool) -> Self {
+        let win_hwnd = HWND(hwnd as *mut c_void);
+        Self {
+            hwnd,
+            gfx: DeviceObjects::new(win_hwnd, width.max(1), height.max(1)),
+            origin: (0.0, 0.0),
+            chrome_clear: [0.0, 0.0, 0.0, 1.0],
+            tex: ImageContent {
+                linear_sample: 1,
+                ..ImageContent::default()
+            },
+            prefs: SessionPrefs {
+                clear: 0,
+                clear_lin: [0.0, 0.0, 0.0, 1.0],
+                background: Background::Black,
+                background_override: None,
+                outline: true,
+                octagon: crate::octagon::OctagonState::default(),
+                fit_upscale,
+                open_actual_size: false,
+                default_tonemap: Tonemap::Reinhard,
+                // Off until the shell pushes the config in — which it does immediately after
+                // construction, via `apply_view_config`.
+                zoom_snaps: Vec::new(),
+                zoom_snap_px: 0.0,
+            },
+            generation: 0,
+            anim: AnimState::default(),
+            viewport: Viewport::new(width, height),
+            view: ViewState::default(),
+            flipbook: None,
+            display: DisplayState::default(),
+            gesture: GestureState::default(),
+        }
+    }
+
+    /// Set the letterbox / no-image backdrop color (packed `0x00RRGGBB`); stored both packed and
+    /// as linear floats so the `*_SRGB` render target re-encodes it to the intended sRGB.
+    pub fn set_clear(&mut self, packed: u32) {
+        self.prefs.clear = packed;
+        let dec = |b: u32| srgb_to_linear((b & 0xff) as f32 / 255.0);
+        self.prefs.clear_lin = [dec(packed >> 16), dec(packed >> 8), dec(packed), 1.0];
+    }
+
+    pub fn next_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn current_image(&self) -> Option<&DecodedImage> {
+        self.tex.current.as_deref()
+    }
+
+    // --- read-only view of display state, for the chrome ---
+
+    pub fn zoom_percent(&self) -> u32 {
+        (self.view.zoom * 100.0).round().max(0.0) as u32
+    }
+
+    pub fn channel(&self) -> Channel {
+        self.display.channel
+    }
+
+    pub fn tonemap(&self) -> Tonemap {
+        self.display.tonemap
+    }
+
+    pub fn is_fit(&self) -> bool {
+        self.view.fit
+    }
+
+    pub fn exposure(&self) -> f32 {
+        self.display.exposure
+    }
+
+    pub fn is_hdr(&self) -> bool {
+        self.tex.current.as_ref().is_some_and(|i| i.format.is_hdr())
+    }
+
+    /// Whether the current image carries an alpha channel (gray+A or RGBA source) — drives the
+    /// RGB↔RGBA toolbar icon and keeps the alpha-channel isolation control available. This is true
+    /// even when the alpha is entirely opaque, so the user can always inspect it; whether that
+    /// alpha actually holds transparency (and thus defaults to the checker backdrop) is a separate
+    /// signal handled in [`Self::set_image`] via `DecodedImage::alpha_opaque`.
+    pub fn has_alpha(&self) -> bool {
+        self.tex
+            .current
+            .as_ref()
+            .is_some_and(|i| matches!(i.channels, 2 | 4))
+    }
+
+    pub fn background(&self) -> Background {
+        self.prefs.background
+    }
+
+    /// Set the viewport backdrop (toolbar override) and repaint. Records the pick so it persists
+    /// across image navigation for the rest of the session (see [`Self::background_override`]).
+    pub fn set_background(&mut self, bg: Background) {
+        self.prefs.background = bg;
+        self.prefs.background_override = Some(bg);
+        self.refresh();
+    }
+
+    /// Apply the configured backdrop preference (settings dialog / startup): `Some` pins that
+    /// backdrop for every image, `None` restores the per-image default (checker for real
+    /// transparency, black otherwise) — including for the image already on screen.
+    pub fn set_background_pref(&mut self, bg: Option<Background>) {
+        self.prefs.background_override = bg;
+        self.prefs.background = bg.unwrap_or_else(|| {
+            self.tex
+                .current
+                .as_ref()
+                .map_or(Background::Black, |img| default_background(img))
+        });
+        self.refresh();
+    }
+
+    /// Whether the explicit fit command upscales small images (the `fit-upscale` config key).
+    pub fn set_fit_upscale(&mut self, on: bool) {
+        self.prefs.fit_upscale = on;
+    }
+
+    /// The right-drag zoom's detents: the levels to snap to as *percentages* (`zoom-snap-levels`,
+    /// converted to zoom factors here) and how far past one the drag has to travel to break out, in
+    /// drag px (`zoom-snap`). Either empty levels or a zero distance switches snapping off.
+    pub fn set_zoom_snapping(&mut self, levels_pct: &[f32], strength_px: f32) {
+        self.prefs.zoom_snaps = levels_pct.iter().map(|p| p / 100.0).collect();
+        self.prefs.zoom_snap_px = strength_px;
+    }
+
+    /// Whether a newly opened image lands at native 1:1 rather than fitted (`default-fit`). Takes
+    /// effect on the next adopt — it never yanks the view of the image already on screen.
+    pub fn set_open_actual_size(&mut self, on: bool) {
+        self.prefs.open_actual_size = on;
+    }
+
+    /// The tonemap a newly adopted image starts on (`default-tonemap`). Like `set_open_actual_size`,
+    /// this seeds the *next* image: the current one keeps whatever the user toggled it to.
+    pub fn set_default_tonemap(&mut self, t: Tonemap) {
+        self.prefs.default_tonemap = t;
+    }
+
+    pub fn outline(&self) -> bool {
+        self.prefs.outline
+    }
+
+    /// Toggle the image-boundary outline and repaint.
+    pub fn toggle_outline(&mut self) {
+        self.prefs.outline = !self.prefs.outline;
+        self.refresh();
+    }
+
+    /// Apply the configured outline preference (settings dialog / startup). The outline is one
+    /// session-global flag, not per-image state, so — like [`Self::set_background_pref`] — this
+    /// reaches the image already on screen rather than seeding the next one.
+    pub fn set_outline(&mut self, on: bool) {
+        self.prefs.outline = on;
+        self.refresh();
+    }
+
+    pub fn octagon(&self) -> crate::octagon::OctagonState {
+        self.prefs.octagon
+    }
+
+    /// Adopt the octagon overlay's state (the options window's edits, or the persisted config at
+    /// startup), clamped, and repaint.
+    pub fn set_octagon(&mut self, mut s: crate::octagon::OctagonState) {
+        s.clamp();
+        self.prefs.octagon = s;
+        self.refresh();
+    }
+
+    /// Toggle the octagon overlay (toolbar) and repaint. The options — color, crop, hide — survive
+    /// the off state, so re-enabling picks up where the user left off.
+    pub fn toggle_octagon(&mut self) {
+        self.prefs.octagon.enabled = !self.prefs.octagon.enabled;
+        self.refresh();
+    }
+
+    /// The displayed frame's rect in **image-region** coords (pan/zoom applied): the whole image,
+    /// or the current cell in flipbook mode. `None` with no image. This is what the octagon line
+    /// overlay is drawn against.
+    pub fn frame_screen_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let dims = self.view_dims()?;
+        let (x, y) = self.view.image_to_screen((0.0, 0.0), dims, &self.viewport);
+        let (w, h) = self.view.image_screen_size(dims);
+        Some((x, y, w, h))
+    }
+
+    fn image_dims(&self) -> Option<(u32, u32)> {
+        self.tex.current.as_ref().map(|i| (i.width, i.height))
+    }
+
+    /// Dimensions the pan/zoom/fit math operates on: the frame rect in flipbook mode, else the
+    /// whole image. All view-control call sites use this so entering the mode or changing the
+    /// grid re-fits and clamps against the frame.
+    fn view_dims(&self) -> Option<(u32, u32)> {
+        let (w, h) = self.image_dims()?;
+        Some(match self.flipbook {
+            Some(fb) => crate::flipbook::frame_dims(fb.grid, (w, h)),
+            None => (w, h),
+        })
+    }
+
+    /// Adopt (or clear) flipbook render parameters. Re-fits the view to the frame rect only when
+    /// entering/leaving the mode or when the grid changes (so playback/scrub position changes,
+    /// which call [`Self::set_flipbook_pos`], don't disturb the user's pan/zoom). Repaints.
+    pub fn set_flipbook(&mut self, fb: Option<FlipbookParams>) {
+        let old_grid = self.flipbook.map(|f| f.grid);
+        let new_grid = fb.map(|f| f.grid);
+        self.flipbook = fb;
+        if old_grid != new_grid {
+            // Entering/leaving the mode or a grid edit changes the fitted content size → re-fit
+            // without upscaling (same rule as opening an image), against the new view dims.
+            if let Some(dims) = self.view_dims() {
+                self.view.fit_to_window(dims, &self.viewport, false);
+            }
+        }
+        self.refresh();
+    }
+
+    /// Update only the fractional playback position (the hot path: playback tick / slider scrub).
+    /// No re-fit; just repaint.
+    pub fn set_flipbook_pos(&mut self, frame_pos: f32) {
+        if let Some(fb) = &mut self.flipbook {
+            fb.frame_pos = frame_pos;
+            self.refresh();
+        }
+    }
+
+    /// Drop the displayed image so the next paint shows the placeholder. Also drops any animation
+    /// frames so the win shell's next `frame_delay_ms()` returns `None` and the playback timer stops.
+    pub fn clear_image(&mut self) {
+        self.tex.current = None;
+        self.tex._tex = None;
+        self.tex.srv = None;
+        self.anim.clear();
+        self.flipbook = None;
+    }
+
+    /// Adopt a decoded image: upload it as a GPU texture (hardware mip chain) and reset to fit +
+    /// neutral display state for the new file (#17). Returns the GPU error if the upload fails
+    /// (e.g. `E_OUTOFMEMORY` on a very large image) so the caller can report it instead of the
+    /// process aborting; on failure the prior display state is left untouched.
+    pub fn set_image(&mut self, img: Arc<DecodedImage>) -> windows::core::Result<()> {
+        let (w, h) = (img.width, img.height);
+        // Upload first: if the GPU rejects the texture we bail here, before mutating any state,
+        // so a failed adopt can't leave the surface half-updated.
+        self.upload_texture(&img)?;
+        // Adopt any animation frames for playback and start from frame 0 (already uploaded above).
+        // The win shell arms the timer from `frame_delay_ms()` after this.
+        self.anim.adopt(&img);
+        // Pick the viewport backdrop: an explicit pick (the toolbar's background buttons, or the
+        // `background` config key) sticks across every image; otherwise default to the image's
+        // nature — see `default_background`.
+        self.prefs.background = self
+            .prefs
+            .background_override
+            .unwrap_or_else(|| default_background(&img));
+        self.tex.current = Some(img);
+        // Neutral display state for the new file (#17), seeded with the configured tonemap.
+        self.display = DisplayState {
+            tonemap: self.prefs.default_tonemap,
+            ..DisplayState::default()
+        };
+        // A fresh image starts as a whole-image view; the win shell re-applies any per-path
+        // flipbook state (via `set_flipbook`) right after this adopt, which re-fits to the frame.
+        self.flipbook = None;
+        // Every newly opened image (including folder ←/→ navigation) fits *without* upscaling: a
+        // large image shrinks to fit, a small one shows at native 1:1. The explicit fit command
+        // (`F` / toolbar) can still fill the surface — see `fit_upscale` / `fit`. With
+        // `default-fit = "actual-size"` an image instead opens at 100% however large it is.
+        if self.prefs.open_actual_size {
+            self.view.one_to_one();
+        } else {
+            self.view.fit_to_window((w, h), &self.viewport, false);
+        }
+        Ok(())
+    }
+
+    /// Adopt a hot-reloaded image *without* resetting the view: upload the new pixels and keep the
+    /// current pan / zoom / channel / exposure / tonemap. Used when the file changed on disk and
+    /// the re-decode came back at the same dimensions (the "re-export same canvas" case), so the
+    /// user's zoomed-in detail and display state survive the update. The pan is re-clamped
+    /// defensively (a no-op while the dims are unchanged).
+    pub fn replace_image_keep_view(&mut self, img: Arc<DecodedImage>) -> windows::core::Result<()> {
+        self.upload_texture(&img)?;
+        // Refresh the animation frames from the re-decoded file and restart from frame 0 (the view
+        // is preserved, but the animation plays from the top). The win shell re-arms the timer.
+        self.anim.adopt(&img);
+        self.tex.current = Some(img);
+        // Hot reload keeps flipbook mode active (same path); clamp against the frame rect when in
+        // flipbook mode, else the whole image (a no-op while the dims are unchanged).
+        if !self.view.fit {
+            if let Some(vd) = self.view_dims() {
+                self.view.clamp_pan(vd, &self.viewport);
+            }
+        }
+        Ok(())
+    }
+
+    /// Delay (ms) the currently displayed animation frame should be shown before advancing, or
+    /// `None` for a still image. The win shell arms the playback timer from this after every adopt.
+    pub fn frame_delay_ms(&self) -> Option<u32> {
+        self.anim.delay_ms()
+    }
+
+    /// Advance to the next animation frame (wrapping) and upload it as the texture, returning the
+    /// now-current frame's delay (ms) so the caller can reschedule the timer (GIF frame delays
+    /// vary). Returns `None` and does nothing for a still image. On a GPU upload error the visible
+    /// frame is left unchanged and the current frame's delay is returned, so a transient failure
+    /// paces the retry rather than wedging playback.
+    pub fn advance_frame(&mut self) -> Option<u32> {
+        let n = self.anim.frames.len();
+        if n <= 1 {
+            return None;
+        }
+        let (w, h) = self.image_dims()?;
+        let format = self.tex.current.as_ref()?.format;
+        let next = (self.anim.index + 1) % n;
+        match create_image_texture(
+            &self.gfx.device,
+            &self.gfx.context,
+            &self.anim.frames[next].pixels,
+            w,
+            h,
+            format,
+        ) {
+            Ok((tex, srv, linear)) => {
+                self.tex._tex = Some(tex);
+                self.tex.srv = Some(srv);
+                self.tex.linear_sample = linear;
+                self.anim.index = next;
+            }
+            Err(e) => eprintln!("fire: animation frame upload failed: {e}"),
+        }
+        self.anim.delay_ms()
+    }
+
+    /// Upload `img`'s (frame-0) pixels as a `DEFAULT` texture with a full mip chain generated on the
+    /// GPU. Returns the GPU error rather than panicking if texture/SRV creation fails — this runs
+    /// synchronously from the wndproc (via `decode_done`), where a panic would unwind across the
+    /// Win32 boundary and abort the process.
+    fn upload_texture(&mut self, img: &DecodedImage) -> windows::core::Result<()> {
+        let (tex, srv, linear_sample) = create_image_texture(
+            &self.gfx.device,
+            &self.gfx.context,
+            &img.pixels,
+            img.width,
+            img.height,
+            img.format,
+        )?;
+        self.tex._tex = Some(tex);
+        self.tex.srv = Some(srv);
+        self.tex.linear_sample = linear_sample;
+        Ok(())
+    }
+
+    /// Resize the swapchain to a new *client* size (physical px) and drop the stale views. The
+    /// image's sub-rect within it is a separate concern — the shell calls [`Self::set_image_rect`]
+    /// right after, because only it knows how tall the chrome is.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.gfx.resize(width, height);
+        self.request_redraw();
+    }
+
+    /// Schedule a repaint (delivered as `WM_PAINT`).
+    pub fn invalidate(&self) {
+        // SAFETY: hwnd is a live window; null rect invalidates the whole client area.
+        unsafe { InvalidateRect(self.hwnd as SysHwnd, std::ptr::null(), 0) };
+    }
+
+    fn request_redraw(&self) {
+        self.invalidate();
+    }
+
+    fn refresh(&self) {
+        self.request_redraw();
+    }
+
     /// The image's sub-rect of the client, in physical px. The chrome owns the rest.
     pub fn set_image_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
         let (w, h) = (w.max(0.0), h.max(0.0));
@@ -761,11 +865,11 @@ impl GpuSurface {
     }
 
     pub fn device(&self) -> &ID3D11Device {
-        &self.device
+        &self.gfx.device
     }
 
     pub fn device_context(&self) -> &ID3D11DeviceContext {
-        &self.context
+        &self.gfx.context
     }
 
     /// The chrome fill: what the parts of the window the image doesn't cover get cleared to.
@@ -786,14 +890,15 @@ impl GpuSurface {
     /// image region and nothing else. No per-pixel CPU work, no extra draws.
     #[must_use]
     pub fn begin_frame(&mut self) -> bool {
-        self.ensure_rtv();
-        let (Some(rtv), Some(rtv_ui)) = (self.rtv.clone(), self.rtv_ui.clone()) else {
+        self.gfx.ensure_rtv();
+        let (Some(rtv), Some(rtv_ui)) = (self.gfx.rtv.clone(), self.gfx.rtv_ui.clone()) else {
             return false;
         };
 
         unsafe {
             // The chrome fill, through the UNORM view (the color is already sRGB).
-            self.context
+            self.gfx
+                .context
                 .ClearRenderTargetView(&rtv_ui, &self.chrome_clear);
         }
 
@@ -802,7 +907,9 @@ impl GpuSurface {
         if w == 0 || h == 0 {
             // No image region (e.g. the window is collapsed to just chrome). Still a valid frame.
             unsafe {
-                self.context.OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
+                self.gfx
+                    .context
+                    .OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
             }
             return true;
         }
@@ -810,7 +917,9 @@ impl GpuSurface {
         self.draw_image(&rtv, w, h);
 
         unsafe {
-            self.context.OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
+            self.gfx
+                .context
+                .OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
         }
         true
     }
@@ -827,18 +936,24 @@ impl GpuSurface {
     pub fn present(&mut self) -> bool {
         unsafe {
             // Sync interval 1 → vsync-paced (tear-free); event-driven, so no idle frames.
-            self.swapchain.Present(1, DXGI_PRESENT(0)) != DXGI_STATUS_OCCLUDED
+            self.gfx.swapchain.Present(1, DXGI_PRESENT(0)) != DXGI_STATUS_OCCLUDED
         }
     }
 
     /// The image pass: the fullscreen triangle, scoped to the image sub-rect.
-    fn draw_image(&mut self, rtv: &ID3D11RenderTargetView, w: u32, h: u32) {
-        let is_hdr = self.is_hdr();
-        // Flipbook mode maps the surface into a single frame rect: `img_w/img_h` become the
-        // (fractional) cell size and the fb_* fields pick which cell(s) of the sheet to sample.
-        // Off (still image / whole sheet), the fb fields are identity so the shader path below is
-        // untouched. Every field is set explicitly (no `..default()`), matching the checker note.
-        let (img_w, img_h, has_image, fbf) = match self.current_image.as_ref().zip(self.flipbook) {
+    fn draw_image(&self, rtv: &ID3D11RenderTargetView, w: u32, h: u32) {
+        let params = self.build_params();
+        self.submit_image_pass(rtv, &params, w, h);
+    }
+
+    /// Resolve what the shader should sample: the (possibly fractional) source rect, whether
+    /// there is an image at all, and — in flipbook mode — which cell(s) of the sheet to blend.
+    ///
+    /// Flipbook mode maps the surface into a single frame rect: `img_w/img_h` become the
+    /// (fractional) cell size and the fb_* fields pick which cell(s) of the sheet to sample. Off
+    /// (still image / whole sheet), the fb fields are identity so the shader path is untouched.
+    fn resolve_source_rect(&self) -> (f32, f32, i32, FlipbookCells) {
+        let (img_w, img_h, has_image, fbf) = match self.tex.current.as_ref().zip(self.flipbook) {
             Some((img, fbp)) => {
                 let sheet = (img.width, img.height);
                 let (fw, fh) = (
@@ -852,11 +967,19 @@ impl GpuSurface {
                 let lod = crate::flipbook::max_lod(fbp.grid, sheet);
                 (fw, fh, 1, Some((sheet, (ax, ay), (bx, by), blend, lod)))
             }
-            None => match &self.current_image {
+            None => match &self.tex.current {
                 Some(img) => (img.width as f32, img.height as f32, 1, None),
                 None => (1.0, 1.0, 0, None),
             },
         };
+        (img_w, img_h, has_image, fbf)
+    }
+
+    /// Build the frame's 128-byte constant buffer from the current view, display and session
+    /// state. Pure reads — everything the shader needs for one frame, and nothing else.
+    fn build_params(&self) -> Params {
+        let is_hdr = self.is_hdr();
+        let (img_w, img_h, has_image, fbf) = self.resolve_source_rect();
         // Identity flipbook fields when off (fb_on == 0 → shader ignores them, but keep them sane).
         let (sheet_w, sheet_h, ca, cb, fb_blend, fb_max_lod, fb_on) = match fbf {
             Some((sheet, ca, cb, blend, lod)) => {
@@ -864,7 +987,8 @@ impl GpuSurface {
             }
             None => (img_w, img_h, (0.0, 0.0), (0.0, 0.0), 0.0, f32::MAX, 0),
         };
-        let params = Params {
+        // Every field is set explicitly (no `..default()`), matching the checker note.
+        Params {
             img_w,
             img_h,
             surf_w: self.viewport.width,
@@ -884,13 +1008,13 @@ impl GpuSurface {
             },
             is_hdr: is_hdr as i32,
             has_image,
-            linear_sample: self.linear_sample,
-            background: background_code(self.background),
-            outline: self.outline as i32,
+            linear_sample: self.tex.linear_sample,
+            background: background_code(self.prefs.background),
+            outline: self.prefs.outline as i32,
             fb_on,
-            clear_r: self.clear_lin[0],
-            clear_g: self.clear_lin[1],
-            clear_b: self.clear_lin[2],
+            clear_r: self.prefs.clear_lin[0],
+            clear_g: self.prefs.clear_lin[1],
+            clear_b: self.prefs.clear_lin[2],
             clear_a: 1.0,
             sheet_w,
             sheet_h,
@@ -902,20 +1026,24 @@ impl GpuSurface {
             fb_max_lod,
             surf_origin_x: self.origin.0,
             surf_origin_y: self.origin.1,
-            oct_crop: self.octagon.crop,
-            oct_hide: if self.octagon.enabled {
-                self.octagon.hide
+            oct_crop: self.prefs.octagon.crop,
+            oct_hide: if self.prefs.octagon.enabled {
+                self.prefs.octagon.hide
             } else {
                 0.0
             },
-        };
+        }
+    }
 
+    /// Upload the constants and issue the one draw: viewport → bind → `Draw(3, 0)`.
+    fn submit_image_pass(&self, rtv: &ID3D11RenderTargetView, params: &Params, w: u32, h: u32) {
         unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             if self
+                .gfx
                 .context
                 .Map(
-                    &self.cbuffer,
+                    &self.gfx.cbuffer,
                     0,
                     D3D11_MAP_WRITE_DISCARD,
                     0,
@@ -924,11 +1052,11 @@ impl GpuSurface {
                 .is_ok()
             {
                 std::ptr::copy_nonoverlapping(
-                    &params as *const Params as *const u8,
+                    params as *const Params as *const u8,
                     mapped.pData as *mut u8,
                     std::mem::size_of::<Params>(),
                 );
-                self.context.Unmap(&self.cbuffer, 0);
+                self.gfx.context.Unmap(&self.gfx.cbuffer, 0);
             }
 
             // The viewport *is* the image's sub-rect: NDC maps onto it and clips to it, so the one
@@ -941,59 +1069,69 @@ impl GpuSurface {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             };
-            self.context.RSSetViewports(Some(&[vp]));
-            self.context
+            self.gfx.context.RSSetViewports(Some(&[vp]));
+            self.gfx
+                .context
                 .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-            self.context
+            self.gfx
+                .context
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            self.context.VSSetShader(&self.vs, None);
-            self.context.PSSetShader(&self.ps, None);
-            self.context
-                .PSSetConstantBuffers(0, Some(&[Some(self.cbuffer.clone())]));
-            self.context
-                .PSSetShaderResources(0, Some(std::slice::from_ref(&self.srv)));
-            self.context.PSSetSamplers(
+            self.gfx.context.VSSetShader(&self.gfx.vs, None);
+            self.gfx.context.PSSetShader(&self.gfx.ps, None);
+            self.gfx
+                .context
+                .PSSetConstantBuffers(0, Some(&[Some(self.gfx.cbuffer.clone())]));
+            self.gfx
+                .context
+                .PSSetShaderResources(0, Some(std::slice::from_ref(&self.tex.srv)));
+            self.gfx.context.PSSetSamplers(
                 0,
-                Some(&[Some(self.samp_aniso.clone()), Some(self.samp_point.clone())]),
+                Some(&[
+                    Some(self.gfx.samp_aniso.clone()),
+                    Some(self.gfx.samp_point.clone()),
+                ]),
             );
-            self.context.Draw(3, 0);
+            self.gfx.context.Draw(3, 0);
         }
     }
 
     // --- input-driven view controls (called from the win shell) ----------------
 
     pub fn on_cursor_moved(&mut self, pos: (f32, f32)) {
-        let delta = (pos.0 - self.cursor.0, pos.1 - self.cursor.1);
-        self.cursor = pos;
-        if self.dragging {
+        let delta = (pos.0 - self.gesture.cursor.0, pos.1 - self.gesture.cursor.1);
+        self.gesture.cursor = pos;
+        if self.gesture.dragging {
             if let Some(dims) = self.view_dims() {
                 self.view.pan_by(delta, dims, &self.viewport);
                 self.refresh();
             }
-        } else if self.zoom_dragging {
+        } else if self.gesture.zoom_dragging {
             // Past the click slop this is a real zoom-drag, so the release won't open the menu.
-            if !self.zoom_dragged {
-                let (ax, ay) = (pos.0 - self.zoom_anchor.0, pos.1 - self.zoom_anchor.1);
+            if !self.gesture.zoom_dragged {
+                let (ax, ay) = (
+                    pos.0 - self.gesture.zoom_anchor.0,
+                    pos.1 - self.gesture.zoom_anchor.1,
+                );
                 if (ax * ax + ay * ay).sqrt() > ZOOM_DRAG_CLICK_SLOP {
-                    self.zoom_dragged = true;
+                    self.gesture.zoom_dragged = true;
                 }
             }
             // Vertical drag = scrubby zoom about the fixed press anchor (down zooms in, up out),
             // detenting on the round zoom levels and on fit-to-window as it passes them.
-            let dy = pos.1 - self.zoom_last_y;
-            self.zoom_last_y = pos.1;
+            let dy = pos.1 - self.gesture.zoom_last_y;
+            self.gesture.zoom_last_y = pos.1;
             if dy != 0.0 {
                 if let Some(dims) = self.view_dims() {
                     // The break-out distance is configured in drag px; the detent works in the same
                     // log-zoom units the drag accumulates in, so it converts the same way dy does.
-                    let zoom = self.zoom_detent.step(
+                    let zoom = self.gesture.zoom_detent.step(
                         self.view.zoom,
                         dy * ZOOM_DRAG_SENSITIVITY,
-                        &self.zoom_snaps,
-                        self.zoom_snap_px * ZOOM_DRAG_SENSITIVITY,
+                        &self.prefs.zoom_snaps,
+                        self.prefs.zoom_snap_px * ZOOM_DRAG_SENSITIVITY,
                     );
                     self.view
-                        .zoom_to(zoom, self.zoom_anchor, dims, &self.viewport);
+                        .zoom_to(zoom, self.gesture.zoom_anchor, dims, &self.viewport);
                     self.refresh();
                 }
             }
@@ -1001,46 +1139,41 @@ impl GpuSurface {
     }
 
     pub fn begin_drag(&mut self) {
-        self.dragging = true;
+        self.gesture.dragging = true;
     }
 
     pub fn end_drag(&mut self) {
-        self.dragging = false;
+        self.gesture.dragging = false;
     }
 
     /// A pan or zoom drag is in progress, i.e. the image owns the mouse until the button comes up —
     /// even if the cursor has wandered over the toolbar. Without this the shell would hand the drag
     /// to ImGui mid-gesture the moment the pointer crossed the chrome, and the pan would stick.
     pub fn is_mouse_captured(&self) -> bool {
-        self.dragging || self.zoom_dragging
+        self.gesture.is_mouse_captured()
     }
 
     /// Begin an RMB zoom-drag, pivoting on the current cursor (the press point).
     pub fn begin_zoom_drag(&mut self) {
-        self.zoom_dragging = true;
-        self.zoom_anchor = self.cursor;
-        self.zoom_last_y = self.cursor.1;
-        self.zoom_dragged = false;
-        self.zoom_detent.reset();
+        self.gesture.begin_zoom_drag();
     }
 
     /// End an RMB gesture. Returns `true` if it was an actual zoom-drag (the cursor moved past
     /// [`ZOOM_DRAG_CLICK_SLOP`]); `false` if it was effectively a right-click, so the caller can
     /// open the context menu instead.
     pub fn end_zoom_drag(&mut self) -> bool {
-        self.zoom_dragging = false;
-        self.zoom_dragged
+        self.gesture.end_zoom_drag()
     }
 
     /// Whether an RMB zoom-drag is in progress (the shell repaints the zoom % while it is).
     pub fn is_zoom_dragging(&self) -> bool {
-        self.zoom_dragging
+        self.gesture.zoom_dragging
     }
 
     pub fn zoom_at_cursor(&mut self, factor: f32) {
         if let Some(dims) = self.view_dims() {
             self.view
-                .zoom_to_cursor(factor, self.cursor, dims, &self.viewport);
+                .zoom_to_cursor(factor, self.gesture.cursor, dims, &self.viewport);
             self.refresh();
         }
     }
@@ -1055,7 +1188,7 @@ impl GpuSurface {
     pub fn fit(&mut self) {
         if let Some(dims) = self.view_dims() {
             self.view
-                .fit_to_window(dims, &self.viewport, self.fit_upscale);
+                .fit_to_window(dims, &self.viewport, self.prefs.fit_upscale);
             self.refresh();
         }
     }
@@ -1278,7 +1411,7 @@ fn create_const_buffer(device: &ID3D11Device) -> ID3D11Buffer {
 /// the texture, its sampling view, and the `linear_sample` flag for `format` (1 if the sample is
 /// already linear — 8-bit `*_SRGB` / float — 0 if the shader must sRGB-decode 16-bit unorm). A free
 /// function (not a method) so the per-frame animation upload can borrow pixels straight out of
-/// `anim_frames` without aliasing the `&mut self` receiver. Returns the GPU error instead of
+/// [`AnimState`] without aliasing the `&mut self` receiver. Returns the GPU error instead of
 /// panicking (this runs synchronously in the wndproc, where a panic would abort the process).
 fn create_image_texture(
     device: &ID3D11Device,

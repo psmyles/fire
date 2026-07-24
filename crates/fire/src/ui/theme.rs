@@ -801,6 +801,11 @@ fn parse_amount(s: &str) -> Result<f32, String> {
 /// `rgb`, `rrggbb` or `rrggbbaa`, without the `#`.
 fn parse_hex(h: &str) -> Result<[f32; 4], String> {
     let bad = || format!("`#{h}` is not a #rgb, #rrggbb or #rrggbbaa color");
+    // The digits below are sliced by byte offset, so a multi-byte char would split a
+    // codepoint and panic. A hand-edited theme.toml must only ever be rejected.
+    if !h.is_ascii() {
+        return Err(bad());
+    }
     let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).map_err(|_| bad());
     let f = |v: u8| v as f32 / 255.0;
     match h.len() {
@@ -878,6 +883,15 @@ mod tests {
         assert!(parse_color("lift(#fff)").is_err());
         assert!(parse_color("lift(#fff, blue)").is_err());
         assert!(parse_color("hot pink").is_err());
+    }
+
+    /// The hex digits are sliced by byte offset, so a multi-byte char at the right total byte
+    /// length used to split a codepoint and panic. A hand-edited stylesheet only ever errors.
+    #[test]
+    fn a_non_ascii_color_is_rejected_not_a_panic() {
+        assert!(parse_color("#€€").is_err()); // 6 bytes, 2 chars
+        assert!(parse_color("#ff€€").is_err()); // 8 bytes
+        assert!(parse_color("#é½").is_err()); // 3 bytes, would slice mid-char
     }
 
     #[test]

@@ -408,7 +408,7 @@ for, which the win shell applies.
   an explicit Maximized/Minimized wins, otherwise the remembered maximized state is restored.
 - **Settings:** stored as **TOML** in `%APPDATA%\fire\config.toml`, editable directly *and* from the
   in-app settings window (`crate::ui::settings`) - a tabbed ImGui `BeginPopupModal` (General /
-  Flipbook / Keybinds / Context menu) with OK/Cancel/Apply.
+  Flipbook / Octagon Overlay / Keybinds / Context menu) with OK/Cancel/Apply.
 
   It is drawn **inside the frame we were already painting**, which is the whole difference from the
   2,150-line hand-painted Win32 dialog it replaced: no second HWND, no nested `GetMessageW` pump, and
@@ -446,9 +446,9 @@ for, which the win shell applies.
   **Esc/Enter are the shell's too** - ImGui does not close a modal on Escape, and a dialog you cannot
   escape is a trap.
 
-  Changes apply live where that isn't hostile (watcher, backdrop, zoom/exposure steps, keybinds, menu
-  contents), on the next image where re-fitting under the user would be (open-fit, tonemap, flipbook
-  playback defaults), and on the next launch for `instance-mode`. *Not yet:* hot-reloading
+  Changes apply live where that isn't hostile (watcher, backdrop, zoom/exposure steps, zoom-snap
+  levels, keybinds, menu contents), on the next image where re-fitting under the user would be
+  (open-fit, tonemap, flipbook playback defaults), and on the next launch for `instance-mode`. *Not yet:* hot-reloading
   `config.toml` when it changes on disk (only the displayed image is watched - §10).
 - **Accent color:** the highlight throughout the UI (latched toolbar buttons, checkmarks, the selected
   tab's rule) is the stylesheet's `accent` token - a color you set per mode in `ui/theme.toml`, not the
@@ -466,6 +466,14 @@ for, which the win shell applies.
 - Channel isolation (solo R/G/B/A, alpha-as-grayscale).
 - Pan / zoom / fit / 1:1; LMB drag-pan (the image can be pushed fully off any edge - Fit/1:1
   recenters it); mouse-wheel and RMB-vertical-drag zoom, both about the cursor.
+- **Zoom-snap detents** (`ZoomDetent`, `render/view.rs`): the RMB scrubby-zoom notches at the
+  configured zoom levels (`zoom-snap-levels`) instead of sliding past them, which is what makes
+  landing exactly on 100 % possible with a drag. Crossing a level pins the zoom there and absorbs
+  the next `zoom-snap` worth of travel; past that the zoom resumes *from the snap*, so breaking out
+  is continuous rather than a jump, and a held drag walks through snap after snap. A step that
+  clears a level by more than the release distance - a flick - passes straight through, so the
+  detents notch a deliberate drag without braking a fast one. All the math is in log-zoom units and
+  Win32-free (unit-tested); an empty ladder or a non-positive release is snapping switched off.
 - HDR exposure (stops) + tonemap operator (Reinhard / ACES).
 - **Animated GIF playback:** an animated GIF plays automatically at its authored per-frame delays.
   The decode delivers all frames (§6); the frame window runs a Win32 timer (`ANIM_TIMER_ID`),
