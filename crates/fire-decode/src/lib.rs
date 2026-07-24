@@ -1789,6 +1789,47 @@ mod tests {
         );
     }
 
+    /// Routing is a *measured* decision (§6): PNG and HDR are sniffed here but decoded by the
+    /// `image` crate, whose decoders beat zune's for both. Nothing else in this file can see
+    /// that — every other test asserts decoded pixels, and those come out identical whichever
+    /// backend produced them, so a format quietly demoted to the generic fallback would leave
+    /// the suite green and only show up as a slower decode.
+    ///
+    /// Worth pinning because the sniff is not ours: `sniff` asks zune's `guess_format`, whose
+    /// coverage moves with zune's own feature flags (its BMP and WebP probes are `#[cfg]`-gated;
+    /// its magic table currently is not). We enable only the formats we route to zune, so that
+    /// boundary is exactly where a dependency bump or a feature edit can shift routing without
+    /// touching a line of this crate. Assert the backend, not the pixels.
+    #[test]
+    fn png_and_hdr_route_to_their_own_backends_not_the_fallback() {
+        let png = encode(
+            &image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2)),
+            image::ImageFormat::Png,
+        );
+        assert!(
+            matches!(sniff(&png, None), Backend::Png),
+            "PNG must reach decode_png, not the `image` fallback"
+        );
+
+        // Both Radiance signatures, as whole little files: zune's sniffer peeks a fixed window,
+        // so a fixture trimmed to the bare magic would fail for reasons a real file never hits.
+        for magic in ["#?RADIANCE", "#?RGBE"] {
+            let mut hdr = format!("{magic}\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n").into_bytes();
+            hdr.extend_from_slice(&[128, 128, 128, 129]);
+            assert!(
+                matches!(sniff(&hdr, None), Backend::Hdr),
+                "Radiance HDR ({magic}) must reach decode_hdr, not the `image` fallback"
+            );
+        }
+
+        // And the formats zune *does* own still go to zune.
+        let jpg = encode(
+            &image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)),
+            image::ImageFormat::Jpeg,
+        );
+        assert!(matches!(sniff(&jpg, None), Backend::Zune(_)));
+    }
+
     // --- Decode-bomb guards -------------------------------------------------------------------
     //
     // Each of these is a *tiny* file whose header declares an enormous image. They must come back

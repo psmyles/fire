@@ -783,15 +783,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kamadak-exif"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1130d80c7374efad55a117d715a3af9368f0fa7a2c54573afc15a188cd984837"
-dependencies = [
- "mutate_once",
-]
-
-[[package]]
 name = "kqueue"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -946,12 +937,6 @@ dependencies = [
  "num-traits",
  "pxfm",
 ]
-
-[[package]]
-name = "mutate_once"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13d2233c9842d08cfe13f9eac96e207ca6a2ea10b80259ebe8ad0268be27d2af"
 
 [[package]]
 name = "nom"
@@ -1978,7 +1963,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9"
 dependencies = [
  "log",
- "serde",
 ]
 
 [[package]]
@@ -1986,15 +1970,6 @@ name = "zune-farbfeld"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46689bf6c90702cba18ef876cc0d29affa8cda58e82a1246fced3a820e0e4c3d"
-dependencies = [
- "zune-core 0.5.1",
-]
-
-[[package]]
-name = "zune-hdr"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34f7d50f1e3f3a95efa12c3c5048ad84e9d7fd8b1bc5faf01fd35b8df1f103e9"
 dependencies = [
  "zune-core 0.5.1",
 ]
@@ -2009,17 +1984,13 @@ dependencies = [
  "image-webp",
  "jpeg-encoder",
  "jxl-oxide",
- "kamadak-exif",
- "serde",
  "zune-bmp",
  "zune-core 0.5.1",
  "zune-farbfeld",
- "zune-hdr",
  "zune-jpeg 0.5.15",
  "zune-jpegxl",
  "zune-png",
  "zune-ppm",
- "zune-psd",
  "zune-qoi",
 ]
 
@@ -2074,15 +2045,6 @@ name = "zune-ppm"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6fa3b8ca5bfe13b58735c3c8e56442390946e8e0e0ff50e12b9215afd278d422"
-dependencies = [
- "zune-core 0.5.1",
-]
-
-[[package]]
-name = "zune-psd"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a518b7a7bee76246a6c783d795c56204cd9184ce0e2e4483717f1b9438c902c"
 dependencies = [
  "zune-core 0.5.1",
 ]

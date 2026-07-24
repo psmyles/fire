@@ -49,8 +49,24 @@ unimplemented = "warn"
 bytemuck = { version = "1", features = ["derive"] }
 
 # --- decode ---
-# zune is the hot-path decoder for the common formats.
-zune-image = "0.5"
+# zune is the hot-path decoder for the common formats. Its default feature is `all`, which is
+# wider than the routing in `sniff()` can ever reach: PSD goes to psd_sdk before zune sees it,
+# and PNG/HDR are deliberately routed to the `image` crate (measured faster - see `decode_png` /
+# `decode_hdr`), so zune-psd/zune-png/zune-hdr would be decoders nothing can call. `metadata`
+# (kamadak-exif) is likewise unused - the ICC accessor we do read is unconditional, and the only
+# EXIF Fire cares about is the orientation of a raw's embedded preview, which `raw.rs` reads
+# itself. Enable exactly the formats routed here, plus the two speed features.
+zune-image = { version = "0.5", default-features = false, features = [
+    "jpeg",
+    "bmp",
+    "qoi",
+    "ppm",
+    "farbfeld",
+    "webp",
+    "jpeg-xl",
+    "simd",
+    "threads",
+] }
 zune-core = "0.5"
 # The `image` crate is the fallback decoder (TIFF/TGA/ICO), the multi-frame GIF path, and —
 # deliberately — the PNG and Radiance HDR paths, whose decoders measured faster than zune's; see
