@@ -152,8 +152,16 @@ impl ViewState {
         image: (u32, u32),
         vp: &Viewport,
     ) {
+        self.zoom_to(self.zoom * factor, cursor, image, vp);
+    }
+
+    /// As [`Self::zoom_to_cursor`] but for an absolute target zoom — what the snapping scrubby-zoom
+    /// drag works in, since a detent names the zoom it wants rather than a step to take. A target
+    /// that doesn't move the zoom (already there, or clamped against a bound) is a no-op, so
+    /// holding a drag inside a detent can't drift the pan.
+    pub fn zoom_to(&mut self, zoom: f32, cursor: (f32, f32), image: (u32, u32), vp: &Viewport) {
         let old = self.zoom;
-        let new = (old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let new = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
         if new == old {
             return;
         }
@@ -232,6 +240,93 @@ impl ViewState {
         );
         (img_center.0 + off.0, img_center.1 + off.1)
     }
+}
+
+/// The detent state of one in-flight scrubby-zoom drag: which snap the zoom is pinned to, and how
+/// far the drag has pushed past it. Lives for the length of a gesture and starts fresh on the next.
+///
+/// Crossing a snap pins the zoom there and swallows the next `release` of drag; past that the zoom
+/// resumes *from the snap*, so the gesture stays continuous — no jump on the way out of a detent —
+/// and a drag held down keeps zooming on through snap after snap. A step that clears a snap by more
+/// than the release distance (a fast scrub) passes straight through: detents notch a deliberate
+/// drag without braking a flick.
+///
+/// The snap levels and the release distance both come from the config (`zoom-snap-levels` /
+/// `zoom-snap`), so this type holds no ladder of its own.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ZoomDetent {
+    held: Option<Held>,
+}
+
+/// A snap the drag is currently sitting in, both fields in natural-log zoom units: the snapped zoom
+/// and the signed travel accumulated since it engaged.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    snap: f32,
+    travel: f32,
+}
+
+impl ZoomDetent {
+    /// Advance a drag by `step` (natural-log zoom units — drag px × sensitivity) from the current
+    /// `zoom` and return the zoom to move to.
+    ///
+    /// `snaps` are the zoom levels to detent on (screen px per image px) and `release` is how far
+    /// past one the drag must travel to break out, in the same log units as `step`. An empty ladder
+    /// or a non-positive `release` is snapping switched off, and the drag runs free.
+    pub fn step(&mut self, zoom: f32, step: f32, snaps: &[f32], release: f32) -> f32 {
+        let from = zoom.max(MIN_ZOOM).ln();
+        if release <= 0.0 || snaps.is_empty() {
+            self.held = None;
+            return (from + step).exp();
+        }
+        if let Some(mut held) = self.held {
+            held.travel += step;
+            if held.travel.abs() <= release {
+                self.held = Some(held);
+                return held.snap.exp();
+            }
+            // Broken out: resume from the snap, minus the travel spent holding it there.
+            self.held = None;
+            return (held.snap + held.travel - release * held.travel.signum()).exp();
+        }
+        let to = from + step;
+        match crossed(from, to, snaps) {
+            Some(snap) if (to - snap).abs() <= release => {
+                self.held = Some(Held {
+                    snap,
+                    travel: to - snap,
+                });
+                snap.exp()
+            }
+            _ => to.exp(),
+        }
+    }
+
+    /// Forget any held snap. Call when a gesture begins, so a fresh drag can't inherit the detent
+    /// the last one was sitting in.
+    pub fn reset(&mut self) {
+        self.held = None;
+    }
+}
+
+/// The last snap (log units) crossed moving `from` → `to`, i.e. the one nearest where the step
+/// lands — so a big step that happens to end beside a snap still catches it, rather than being
+/// judged against the first rung it flew past.
+fn crossed(from: f32, to: f32, snaps: &[f32]) -> Option<f32> {
+    let up = to > from;
+    snaps
+        .iter()
+        .copied()
+        .filter(|z| *z > 0.0)
+        .map(f32::ln)
+        .filter(|s| {
+            if up {
+                *s > from && *s <= to
+            } else {
+                *s < from && *s >= to
+            }
+        })
+        .reduce(|a, b| if up { a.max(b) } else { a.min(b) })
 }
 
 #[cfg(test)]
@@ -345,6 +440,66 @@ mod tests {
         s.pan_by((0.0, 100_000.0), image, &v);
         let lim_y = (800.0 + 800.0) * 0.5;
         assert!((s.pan.1 - lim_y).abs() < 1e-6, "pan.y = {}", s.pan.1);
+    }
+
+    /// A ladder to detent against, independent of whatever the shipped config defaults to.
+    const SNAPS: &[f32] = &[0.5, 1.0, 1.5, 2.0, 3.0, 4.0];
+
+    /// ~2px of drag at the default scrubby-zoom sensitivity — a step small enough that the detent
+    /// engages rather than being flown past.
+    const NUDGE: f32 = 0.02;
+
+    /// The default break-out distance, in the log units `step` works in (~12px of drag).
+    const RELEASE: f32 = 0.12;
+
+    #[test]
+    fn scrubby_zoom_sticks_at_a_snap_then_carries_on() {
+        let mut d = ZoomDetent::default();
+        // Drag up from 90% until the detent catches 1:1.
+        let mut zoom = 0.9;
+        for _ in 0..6 {
+            zoom = d.step(zoom, NUDGE, SNAPS, RELEASE);
+        }
+        assert!((zoom - 1.0).abs() < 1e-6, "zoom = {zoom}");
+        // Keep dragging: it holds at 100% while the release distance is eaten...
+        for _ in 0..3 {
+            zoom = d.step(zoom, NUDGE, SNAPS, RELEASE);
+            assert!((zoom - 1.0).abs() < 1e-6, "zoom = {zoom}");
+        }
+        // ...then resumes *from* the snap, so the zoom neither jumps out of the detent nor stalls
+        // in it, and stops short of the next rung (150%).
+        for _ in 0..10 {
+            zoom = d.step(zoom, NUDGE, SNAPS, RELEASE);
+        }
+        assert!(zoom > 1.0 && zoom < 1.5, "zoom = {zoom}");
+    }
+
+    #[test]
+    fn a_fast_scrub_passes_between_snaps() {
+        let mut d = ZoomDetent::default();
+        // ~90px of drag in one move, from 100% to a zoom that lands clear of 200% and 300%: the
+        // snaps it flew over must not brake it.
+        let zoom = d.step(1.0, 0.9, SNAPS, RELEASE);
+        assert!((zoom - 0.9_f32.exp()).abs() < 1e-6, "zoom = {zoom}");
+        // But a fast scrub that happens to *land* on a snap still detents there.
+        let mut d = ZoomDetent::default();
+        let zoom = d.step(1.0, 2.0_f32.ln() + 0.01, SNAPS, RELEASE);
+        assert!((zoom - 2.0).abs() < 1e-6, "zoom = {zoom}");
+    }
+
+    /// Snapping switched off in the settings — no ladder, or no break-out distance — is a plain
+    /// exponential scrub, exactly as it was before detents existed.
+    #[test]
+    fn snapping_off_zooms_straight_through() {
+        for (snaps, release) in [(SNAPS, 0.0), (&[][..], RELEASE)] {
+            let mut d = ZoomDetent::default();
+            let mut zoom = 0.9;
+            for _ in 0..20 {
+                zoom = d.step(zoom, NUDGE, snaps, release);
+            }
+            let expect = 0.9 * (NUDGE * 20.0).exp();
+            assert!((zoom - expect).abs() < 1e-5, "zoom = {zoom}, want {expect}");
+        }
     }
 
     #[test]

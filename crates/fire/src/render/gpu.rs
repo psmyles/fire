@@ -55,7 +55,9 @@ use windows::Win32::Foundation::DXGI_STATUS_OCCLUDED;
 use windows_sys::Win32::Foundation::HWND as SysHwnd;
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
 
-use crate::render::view::{Background, Channel, DisplayState, Tonemap, ViewState, Viewport};
+use crate::render::view::{
+    Background, Channel, DisplayState, Tonemap, ViewState, Viewport, ZoomDetent,
+};
 
 /// Scrubby-zoom sensitivity: an RMB vertical drag multiplies zoom by `exp(dy * this)` per pixel
 /// (~2.7× per 100 px). Exponential-in-pixels so the gesture feels uniform across the zoom range;
@@ -237,6 +239,14 @@ pub struct GpuSurface {
     /// Whether the active RMB gesture has moved past [`ZOOM_DRAG_CLICK_SLOP`]; if not, the release
     /// is treated as a right-click (opens the context menu) rather than the end of a zoom-drag.
     zoom_dragged: bool,
+    /// Detent state for the active zoom-drag: the snap the zoom is currently resting on, if any.
+    zoom_detent: ZoomDetent,
+    /// The zoom levels the drag detents on, as zoom factors (the config stores percentages), and
+    /// how far past one the drag must travel to break out, in drag px. Both from the config
+    /// (`zoom-snap-levels` / `zoom-snap`) via [`Self::set_zoom_snapping`]; an empty ladder or a
+    /// zero distance is snapping switched off.
+    zoom_snaps: Vec<f32>,
+    zoom_snap_px: f32,
 }
 
 impl GpuSurface {
@@ -293,6 +303,11 @@ impl GpuSurface {
             zoom_anchor: (0.0, 0.0),
             zoom_last_y: 0.0,
             zoom_dragged: false,
+            zoom_detent: ZoomDetent::default(),
+            // Off until the shell pushes the config in — which it does immediately after
+            // construction, via `apply_view_config`.
+            zoom_snaps: Vec::new(),
+            zoom_snap_px: 0.0,
         }
     }
 
@@ -384,6 +399,14 @@ impl GpuSurface {
     /// Whether the explicit fit command upscales small images (the `fit-upscale` config key).
     pub fn set_fit_upscale(&mut self, on: bool) {
         self.fit_upscale = on;
+    }
+
+    /// The right-drag zoom's detents: the levels to snap to as *percentages* (`zoom-snap-levels`,
+    /// converted to zoom factors here) and how far past one the drag has to travel to break out, in
+    /// drag px (`zoom-snap`). Either empty levels or a zero distance switches snapping off.
+    pub fn set_zoom_snapping(&mut self, levels_pct: &[f32], strength_px: f32) {
+        self.zoom_snaps = levels_pct.iter().map(|p| p / 100.0).collect();
+        self.zoom_snap_px = strength_px;
     }
 
     /// Whether a newly opened image lands at native 1:1 rather than fitted (`default-fit`). Takes
@@ -946,14 +969,22 @@ impl GpuSurface {
                     self.zoom_dragged = true;
                 }
             }
-            // Vertical drag = scrubby zoom about the fixed press anchor (down zooms in, up out).
+            // Vertical drag = scrubby zoom about the fixed press anchor (down zooms in, up out),
+            // detenting on the round zoom levels and on fit-to-window as it passes them.
             let dy = pos.1 - self.zoom_last_y;
             self.zoom_last_y = pos.1;
             if dy != 0.0 {
                 if let Some(dims) = self.view_dims() {
-                    let factor = (dy * ZOOM_DRAG_SENSITIVITY).exp();
+                    // The break-out distance is configured in drag px; the detent works in the same
+                    // log-zoom units the drag accumulates in, so it converts the same way dy does.
+                    let zoom = self.zoom_detent.step(
+                        self.view.zoom,
+                        dy * ZOOM_DRAG_SENSITIVITY,
+                        &self.zoom_snaps,
+                        self.zoom_snap_px * ZOOM_DRAG_SENSITIVITY,
+                    );
                     self.view
-                        .zoom_to_cursor(factor, self.zoom_anchor, dims, &self.viewport);
+                        .zoom_to(zoom, self.zoom_anchor, dims, &self.viewport);
                     self.refresh();
                 }
             }
@@ -981,6 +1012,7 @@ impl GpuSurface {
         self.zoom_anchor = self.cursor;
         self.zoom_last_y = self.cursor.1;
         self.zoom_dragged = false;
+        self.zoom_detent.reset();
     }
 
     /// End an RMB gesture. Returns `true` if it was an actual zoom-drag (the cursor moved past

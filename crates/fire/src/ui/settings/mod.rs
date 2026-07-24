@@ -72,6 +72,10 @@ pub struct State {
     /// The detail form's text. Owned here rather than re-read from `draft` each frame, or the
     /// `InputText` would be rewritten under its own caret on every keystroke.
     fields: [String; 3],
+    /// The General tab's zoom-snap levels, as typed. Owned for the same reason as `fields` — and it
+    /// deliberately keeps what the user wrote (order, spacing, a half-typed number) until an Apply
+    /// tidies it, rather than being reformatted from `draft` mid-edit.
+    snap_levels: String,
     /// The selection [`Self::fields`] currently holds the text of.
     seeded: Option<Vec<usize>>,
     /// ImGui opens a popup by *event*, not by state, so this fires `open_popup` exactly once.
@@ -88,6 +92,7 @@ impl State {
             note: String::new(),
             sel: None,
             fields: Default::default(),
+            snap_levels: m::format_snap_levels(&cfg.zoom_snap_levels),
             seeded: None,
             requested: false,
         }
@@ -153,6 +158,9 @@ impl State {
     /// the shell to apply and persist. Also the Enter key's action (see `App::settings_key`).
     pub fn commit(&mut self) -> Config {
         self.draft.sanitize();
+        // Sanitize sorted, de-duplicated and range-filtered the snap levels; show what was actually
+        // kept, so an entry that was dropped doesn't sit in the box looking like it took.
+        self.snap_levels = m::format_snap_levels(&self.draft.zoom_snap_levels);
         self.applied = self.draft.clone();
         self.draft.clone()
     }
@@ -362,6 +370,8 @@ fn general(ui: &Ui, st: &mut State) {
             "HDR tone map",
             "Zoom step",
             "Exposure step",
+            "Zoom snapping",
+            "Snap to",
         ],
     );
 
@@ -393,6 +403,32 @@ fn general(ui: &Ui, st: &mut State) {
     row_note(ui, lw, "Zoom factor per wheel notch or key press.");
     num(ui, st, lw, NumField::ExposureStep, "Exposure step");
     row_note(ui, lw, "Stops per press of the exposure keys (HDR images).");
+    num(ui, st, lw, NumField::ZoomSnap, "Zoom snapping");
+    row_note(
+        ui,
+        lw,
+        "How far the right-drag zoom keeps going, in pixels, before it lets go of a snap level. \
+         0 turns snapping off.",
+    );
+    snap_levels(ui, st, lw);
+}
+
+/// The zoom levels the right-drag zoom snaps to, edited as one comma-separated list. A list rather
+/// than a row of steppers because it has no fixed length — the point is that you can drop the rungs
+/// you never want and add the ones you do.
+fn snap_levels(ui: &Ui, st: &mut State, label_w: f32) {
+    let _p = size_input(ui);
+    let w = row(ui, "Snap to", label_w);
+    ui.set_next_item_width(w);
+    if ui.input_text("##snap-levels", &mut st.snap_levels).build() {
+        st.draft.zoom_snap_levels = m::parse_snap_levels(&st.snap_levels);
+    }
+    row_note(
+        ui,
+        label_w,
+        "Zoom percentages, in any order. 100 is also the 1:1 snap; an empty list turns snapping \
+         off. Tidied up when you apply.",
+    );
 }
 
 fn flipbook(ui: &Ui, st: &mut State) {

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::flipbook::{FPS_DEFAULT, FPS_MAX, FPS_MIN};
-use crate::render::view::{Background, Tonemap};
+use crate::render::view::{Background, Tonemap, MAX_ZOOM, MIN_ZOOM};
 
 /// The commented template written verbatim to `config.toml` on first run (see
 /// [`Config::ensure_default_config`]). Kept as a repo file so the docs live in version control and a
@@ -31,6 +31,21 @@ const ZOOM_STEP_MAX: f32 = 4.0;
 /// Bounds on the exposure step, in stops.
 const EXPOSURE_STEP_MIN: f32 = 0.01;
 const EXPOSURE_STEP_MAX: f32 = 4.0;
+/// Bounds on the zoom-snap strength, in drag pixels. 0 is snapping switched off; past ~100px a
+/// detent would take half the screen to escape.
+const ZOOM_SNAP_MIN: f32 = 0.0;
+const ZOOM_SNAP_MAX: f32 = 100.0;
+const ZOOM_SNAP_DEFAULT: f32 = 12.0;
+
+/// The zoom levels (percent) a right-drag zoom snaps to out of the box.
+///
+/// Round halvings and doublings of 100%, which is also the 1:1 snap. They thin out towards the top
+/// deliberately: rungs closer together than the break-out distance would ratchet rather than zoom
+/// (at 1600%, a 25% increment is under 2px of drag). Editable in Settings → General.
+const ZOOM_SNAP_LEVELS: &[f32] = &[
+    50.0, 100.0, 150.0, 200.0, 300.0, 400.0, 600.0, 800.0, 1200.0, 1600.0, 2400.0, 3200.0, 4800.0,
+    6400.0,
+];
 
 /// How a launch relates to any already-running Fire window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -308,6 +323,14 @@ pub struct Config {
     /// Exposure step per `[` / `]` press (HDR sources), in stops. Clamped to `0.01..=4.0`.
     #[serde(serialize_with = "serialize_f32")]
     pub exposure_step: f32,
+    /// How far (drag px) a right-drag zoom must travel past one of `zoom_snap_levels` before the
+    /// zoom moves on — the strength of the detent. `0` switches snapping off. Clamped to `0..=100`.
+    #[serde(serialize_with = "serialize_f32")]
+    pub zoom_snap: f32,
+    /// The zoom levels (percent) the right-drag zoom snaps to. Out-of-range and duplicate entries
+    /// are dropped on load; an empty list is snapping off, same as `zoom_snap = 0`.
+    #[serde(serialize_with = "serialize_f32_list")]
+    pub zoom_snap_levels: Vec<f32>,
     /// The tonemap operator a freshly adopted HDR image starts on.
     pub default_tonemap: TonemapCfg,
     /// How an image is scaled when it opens.
@@ -336,6 +359,8 @@ impl Default for Config {
             fit_upscale: true,
             zoom_step: 1.15,
             exposure_step: 0.25,
+            zoom_snap: ZOOM_SNAP_DEFAULT,
+            zoom_snap_levels: ZOOM_SNAP_LEVELS.to_vec(),
             default_tonemap: TonemapCfg::default(),
             default_fit: FitCfg::default(),
             background: BackgroundCfg::default(),
@@ -371,6 +396,20 @@ impl Config {
             EXPOSURE_STEP_MIN,
             EXPOSURE_STEP_MAX,
         );
+        self.zoom_snap = clamp_finite(
+            self.zoom_snap,
+            ZOOM_SNAP_DEFAULT,
+            ZOOM_SNAP_MIN,
+            ZOOM_SNAP_MAX,
+        );
+        // A hand-edited (or typed-in) snap list is filtered rather than clamped: a level outside the
+        // zoom range is one the drag can never reach, and pinning it to a bound would invent a snap
+        // the user didn't ask for. Sorted and de-duplicated so the list reads back tidily.
+        self.zoom_snap_levels
+            .retain(|p| p.is_finite() && *p >= MIN_ZOOM * 100.0 && *p <= MAX_ZOOM * 100.0);
+        self.zoom_snap_levels
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.zoom_snap_levels.dedup();
         self.flipbook.fps = clamp_finite(self.flipbook.fps, FPS_DEFAULT, FPS_MIN, FPS_MAX);
         self.octagon.crop = clamp_finite(
             self.octagon.crop,
@@ -436,6 +475,16 @@ fn clamp_finite(v: f32, fallback: f32, lo: f32, hi: f32) -> f32 {
 /// and prints as the number the user actually chose.
 fn serialize_f32<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_f64((*v as f64 * 10_000.0).round() / 10_000.0)
+}
+
+/// [`serialize_f32`] over a list — same widening artifact, same fix, one element at a time.
+fn serialize_f32_list<S: serde::Serializer>(v: &[f32], s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = s.serialize_seq(Some(v.len()))?;
+    for f in v {
+        seq.serialize_element(&((*f as f64 * 10_000.0).round() / 10_000.0))?;
+    }
+    seq.end()
 }
 
 /// Write the commented [`DEFAULT_CONFIG`] template to `config.toml` *iff* it doesn't already exist,
@@ -564,6 +613,8 @@ mod tests {
             fit_upscale: false,
             zoom_step: 1.25,
             exposure_step: 0.5,
+            zoom_snap: 20.0,
+            zoom_snap_levels: vec![50.0, 100.0, 12.5],
             default_tonemap: TonemapCfg::Aces,
             default_fit: FitCfg::ActualSize,
             background: BackgroundCfg::Grey,
@@ -683,5 +734,28 @@ mod tests {
         nan.sanitize();
         assert_eq!(nan.zoom_step, 1.15);
         assert_eq!(nan.exposure_step, 0.25);
+    }
+
+    /// Snap levels are filtered, not clamped: an unreachable level is dropped rather than pinned to
+    /// a bound, which would invent a snap the user never asked for.
+    #[test]
+    fn sanitize_tidies_the_snap_levels() {
+        let mut cfg = Config {
+            zoom_snap: 500.0,
+            // Out of order, a duplicate, one below MIN_ZOOM, one above MAX_ZOOM, and a NaN.
+            zoom_snap_levels: vec![200.0, 50.0, 1.0, 200.0, 1e9, f32::NAN, 100.0],
+            ..Config::default()
+        };
+        cfg.sanitize();
+        assert_eq!(cfg.zoom_snap, ZOOM_SNAP_MAX);
+        assert_eq!(cfg.zoom_snap_levels, vec![50.0, 100.0, 200.0]);
+
+        // An empty list survives as empty — that is how snapping is switched off from the file.
+        let mut off = Config {
+            zoom_snap_levels: Vec::new(),
+            ..Config::default()
+        };
+        off.sanitize();
+        assert!(off.zoom_snap_levels.is_empty());
     }
 }

@@ -89,6 +89,21 @@
 # exposure-step = 0.25
 
 # ----------------------------------------------------------------------------------------------
+# zoom-snap / zoom-snap-levels — detents for the right-drag zoom (hold the right mouse button and
+#                                move the mouse up/down). As the zoom passes one of the levels it
+#                                sticks there; keep dragging and it carries on from that level.
+#
+#   zoom-snap         How far the drag keeps going past a level, in pixels, before it lets go.
+#                     Range 0 - 100; 0 turns snapping off. Larger is stickier.
+#   zoom-snap-levels  The zoom percentages to stick at. 100 is also the 1:1 snap. Levels outside
+#                     the 2% - 6400% zoom range are ignored, and an empty list [] is snapping off.
+#                     Levels closer together than zoom-snap makes the drag ratchet — there is
+#                     nowhere for it to run free between them.
+#
+# zoom-snap = 12
+# zoom-snap-levels = [50, 100, 150, 200, 300, 400, 600, 800, 1200, 1600, 2400, 3200, 4800, 6400]
+
+# ----------------------------------------------------------------------------------------------
 # [flipbook] — sprite-sheet playback mode (the K key / toolbar button). These are the DEFAULTS a
 #              newly enabled flipbook adopts; the transport band under the image edits the live
 #              one, and each image keeps its own settings for the session.

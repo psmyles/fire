@@ -132,6 +132,7 @@ impl ChoiceField {
 pub(crate) enum NumField {
     ZoomStep,
     ExposureStep,
+    ZoomSnap,
     FlipbookFps,
 }
 
@@ -142,6 +143,8 @@ impl NumField {
         match self {
             NumField::ZoomStep => (1.01, 4.0, 0.05, 2),
             NumField::ExposureStep => (0.01, 4.0, 0.05, 2),
+            // Whole drag pixels — a tenth of one is not a feel anybody can dial in.
+            NumField::ZoomSnap => (0.0, 100.0, 1.0, 0),
             NumField::FlipbookFps => (FPS_MIN, FPS_MAX, 1.0, 1),
         }
     }
@@ -150,6 +153,7 @@ impl NumField {
         match self {
             NumField::ZoomStep => c.zoom_step,
             NumField::ExposureStep => c.exposure_step,
+            NumField::ZoomSnap => c.zoom_snap,
             NumField::FlipbookFps => c.flipbook.fps,
         }
     }
@@ -165,6 +169,7 @@ impl NumField {
         match self {
             NumField::ZoomStep => c.zoom_step = v,
             NumField::ExposureStep => c.exposure_step = v,
+            NumField::ZoomSnap => c.zoom_snap = v,
             NumField::FlipbookFps => c.flipbook.fps = v,
         }
     }
@@ -424,6 +429,33 @@ pub(crate) fn split_args(s: &str) -> Vec<String> {
     out
 }
 
+/// Read a typed zoom-snap list ("50, 100, 150" — commas and/or spaces, a trailing `%` tolerated)
+/// into percentages. Junk tokens are dropped rather than rejected: the box is edited a keystroke at
+/// a time, so a half-typed entry must cost the user that entry and nothing else.
+///
+/// Range and ordering are [`Config::sanitize`]'s job, as they are for every other field here.
+pub(crate) fn parse_snap_levels(s: &str) -> Vec<f32> {
+    s.split([',', ';', ' ', '\t'])
+        .filter_map(|t| t.trim().trim_end_matches('%').parse::<f32>().ok())
+        .collect()
+}
+
+/// The inverse of [`parse_snap_levels`]. Whole percentages print without a decimal point — the
+/// levels are round numbers, and "50.0, 100.0" reads like a precision nobody asked for.
+pub(crate) fn format_snap_levels(levels: &[f32]) -> String {
+    levels
+        .iter()
+        .map(|p| {
+            if p.fract() == 0.0 {
+                format!("{p:.0}")
+            } else {
+                format!("{p}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The inverse of [`split_args`]: re-quote any element containing whitespace.
 pub(crate) fn join_args(args: &[String]) -> String {
     args.iter()
@@ -587,6 +619,23 @@ mod tests {
         assert!(split_args("   ").is_empty());
     }
 
+    /// The snap-level box is typed into a keystroke at a time, so parsing has to survive every
+    /// half-finished state — and round-trip whatever survives.
+    #[test]
+    fn snap_levels_round_trip_and_ignore_junk() {
+        assert_eq!(parse_snap_levels("50, 100, 150"), vec![50.0, 100.0, 150.0]);
+        // Separators are interchangeable, a trailing % is tolerated, and fractions survive.
+        assert_eq!(parse_snap_levels("50% 100;12.5"), vec![50.0, 100.0, 12.5]);
+        // A word, a lone separator or a bare "%" is dropped; the rest of the list still parses.
+        assert_eq!(parse_snap_levels("50, , x, %, 100"), vec![50.0, 100.0]);
+        assert!(parse_snap_levels("").is_empty());
+
+        let levels = vec![12.5, 50.0, 100.0, 6400.0];
+        let text = format_snap_levels(&levels);
+        assert_eq!(text, "12.5, 50, 100, 6400");
+        assert_eq!(parse_snap_levels(&text), levels);
+    }
+
     /// A numeric field's range **is** `Config::sanitize`'s clamp. The settings window's sliders are
     /// bounded by [`NumField::spec`], so if the two ever drift, a value the user set would be
     /// silently moved on the way to disk — the setting would just not take.
@@ -595,6 +644,7 @@ mod tests {
         for f in [
             NumField::ZoomStep,
             NumField::ExposureStep,
+            NumField::ZoomSnap,
             NumField::FlipbookFps,
         ] {
             let (min, max, _, _) = f.spec();

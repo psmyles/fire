@@ -1469,6 +1469,7 @@ impl App {
 /// (yanking the current image's zoom or tonemap out from under the user would be hostile).
 fn apply_view_config(surface: &mut GpuSurface, cfg: &Config) {
     surface.set_fit_upscale(cfg.fit_upscale);
+    surface.set_zoom_snapping(&cfg.zoom_snap_levels, cfg.zoom_snap);
     surface.set_open_actual_size(cfg.default_fit == crate::config::FitCfg::ActualSize);
     surface.set_default_tonemap(cfg.default_tonemap.to_render());
     surface.set_background_pref(cfg.background.override_for_render());
