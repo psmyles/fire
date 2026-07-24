@@ -371,7 +371,7 @@ impl App {
     /// the window or renderer, only `PostMessage`s a boxed payload the wndproc reclaims.
     fn scan_folder(&self, path: PathBuf) {
         let frame = self.frame;
-        let _ = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("fire-folder-scan".into())
             .spawn(move || {
                 let entries = folder::scan(&path);
@@ -385,6 +385,11 @@ impl App {
                     drop(unsafe { Box::from_raw(lparam as *mut FolderScan) });
                 }
             });
+        // Navigation is optional — losing it must not take the viewer down — but a thread the
+        // OS refused to start is worth saying out loud, or the "n / m" count just never appears.
+        if let Err(e) = spawned {
+            eprintln!("fire: could not start the folder scan thread: {e}");
+        }
     }
 
     /// Adopt a finished folder scan as the navigation cursor, if it's still the image we're on.

@@ -513,8 +513,12 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
                 pixels: vec![[0.0f32; 4]; size.width() * size.height()],
             },
             |buf: &mut Buf, pos, (r, g, b, a): (f32, f32, f32, f32)| {
+                // The position comes from the decoder, not from us: bounds-check it rather
+                // than index, so a crafted file cannot panic a decode worker.
                 let i = pos.y() * buf.width + pos.x();
-                buf.pixels[i] = [r, g, b, a];
+                if let Some(px) = buf.pixels.get_mut(i) {
+                    *px = [r, g, b, a];
+                }
             },
         )
         .first_valid_layer()

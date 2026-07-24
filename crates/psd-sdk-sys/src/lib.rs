@@ -142,7 +142,11 @@ pub fn decode_psd(bytes: &[u8]) -> Result<PsdImage, PsdError> {
         } else {
             0
         };
-        let icc = if icc_len > 0 {
+        // Cap the C++-reported ICC length before allocating against it, as the HEIF wrapper
+        // does. Real profiles are far smaller; a garbage length drops the profile instead of
+        // asking for an allocation that would abort the process.
+        const MAX_ICC_LEN: usize = 16 * 1024 * 1024;
+        let icc = if icc_len > 0 && icc_len <= MAX_ICC_LEN {
             let mut buf = vec![0u8; icc_len];
             if ffi::fire_psd_icc_get(handle, buf.as_mut_ptr(), buf.len()) == 0 {
                 Some(buf)
