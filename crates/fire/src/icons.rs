@@ -53,34 +53,49 @@ pub enum Icon {
     Octagon,
 }
 
-/// The embedded A8 masters, indexed by `Icon as usize`. Same order as the enum / `build.rs`.
-const MASTERS: [&[u8]; 26] = [
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_left.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_right.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_zoom_out.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_zoom_in.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_fit.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_1_1.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_RGB.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_rgba.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_R.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_G.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_B.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_A.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_aces.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_ev+.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_ev0.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_ev-.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_W.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_C.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_outline.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_open_with.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_fullscreen.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_flipbook.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_play.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_pause.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_more.a8")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/icon_octagon.a8")),
+/// Declare the icon order once: the embedded masters and their file stems are generated from the
+/// same list, so the `include_bytes!` paths cannot drift out of order against the names a test can
+/// check. Keeping them as two hand-written lists is what would let a reorder pass silently.
+macro_rules! icon_masters {
+    ($($stem:literal),+ $(,)?) => {
+        /// The embedded A8 masters, indexed by `Icon as usize`. Same order as the enum / `build.rs`.
+        const MASTERS: &[&[u8]] = &[
+            $(include_bytes!(concat!(env!("OUT_DIR"), "/", $stem, ".a8"))),+
+        ];
+        /// The same stems as names rather than bytes: what makes the order above checkable
+        /// against `build.rs`. Nothing at runtime needs them, only the order test.
+        #[cfg(test)]
+        const STEMS: &[&str] = &[$($stem),+];
+    };
+}
+
+icon_masters![
+    "icon_left",
+    "icon_right",
+    "icon_zoom_out",
+    "icon_zoom_in",
+    "icon_fit",
+    "icon_1_1",
+    "icon_RGB",
+    "icon_rgba",
+    "icon_R",
+    "icon_G",
+    "icon_B",
+    "icon_A",
+    "icon_aces",
+    "icon_ev+",
+    "icon_ev0",
+    "icon_ev-",
+    "icon_W",
+    "icon_C",
+    "icon_outline",
+    "icon_open_with",
+    "icon_fullscreen",
+    "icon_flipbook",
+    "icon_play",
+    "icon_pause",
+    "icon_more",
+    "icon_octagon",
 ];
 
 /// Number of icons in the atlas strip.
@@ -89,7 +104,8 @@ pub const COUNT: usize = MASTERS.len();
 /// Compile-time guard that [`Icon`] and [`MASTERS`] stay the same length: [`Icon::uv`] and [`atlas`]
 /// index by `icon as usize`, so a variant added without a corresponding master (or vice-versa) must
 /// fail the build rather than panic at runtime. `Octagon` must stay the last `Icon` variant for this
-/// check to hold.
+/// check to hold. Length is all this can prove — that the *order* also lines up is
+/// `icon_order_matches_the_build_script`'s job.
 const _: () = assert!(Icon::Octagon as usize + 1 == COUNT);
 
 impl Icon {
@@ -99,7 +115,73 @@ impl Icon {
         let n = COUNT as f32;
         ([i / n, 0.0], [(i + 1.0) / n, 1.0])
     }
+
+    /// The SVG file stem this variant is rasterized from. Exhaustive on purpose: a new variant
+    /// does not compile until it names its icon, and the test below proves the name it gives
+    /// lands at the same index as the master it will be drawn from.
+    #[cfg(test)]
+    fn stem(self) -> &'static str {
+        match self {
+            Icon::Left => "icon_left",
+            Icon::Right => "icon_right",
+            Icon::ZoomOut => "icon_zoom_out",
+            Icon::ZoomIn => "icon_zoom_in",
+            Icon::Fit => "icon_fit",
+            Icon::OneToOne => "icon_1_1",
+            Icon::Rgb => "icon_RGB",
+            Icon::Rgba => "icon_rgba",
+            Icon::R => "icon_R",
+            Icon::G => "icon_G",
+            Icon::B => "icon_B",
+            Icon::A => "icon_A",
+            Icon::Aces => "icon_aces",
+            Icon::EvUp => "icon_ev+",
+            Icon::EvReset => "icon_ev0",
+            Icon::EvDown => "icon_ev-",
+            Icon::White => "icon_W",
+            Icon::Checker => "icon_C",
+            Icon::Outline => "icon_outline",
+            Icon::OpenWith => "icon_open_with",
+            Icon::Fullscreen => "icon_fullscreen",
+            Icon::Flipbook => "icon_flipbook",
+            Icon::Play => "icon_play",
+            Icon::Pause => "icon_pause",
+            Icon::More => "icon_more",
+            Icon::Octagon => "icon_octagon",
+        }
+    }
 }
+
+/// Every [`Icon`] variant, in declaration order — the list the order test walks.
+#[cfg(test)]
+const ALL_ICONS: [Icon; COUNT] = [
+    Icon::Left,
+    Icon::Right,
+    Icon::ZoomOut,
+    Icon::ZoomIn,
+    Icon::Fit,
+    Icon::OneToOne,
+    Icon::Rgb,
+    Icon::Rgba,
+    Icon::R,
+    Icon::G,
+    Icon::B,
+    Icon::A,
+    Icon::Aces,
+    Icon::EvUp,
+    Icon::EvReset,
+    Icon::EvDown,
+    Icon::White,
+    Icon::Checker,
+    Icon::Outline,
+    Icon::OpenWith,
+    Icon::Fullscreen,
+    Icon::Flipbook,
+    Icon::Play,
+    Icon::Pause,
+    Icon::More,
+    Icon::Octagon,
+];
 
 /// Build the RGBA8 atlas strip for a physical icon edge of `icon_px`: `COUNT * icon_px` wide,
 /// `icon_px` tall, every texel white with the mask's coverage in alpha. Returns the pixels and the
@@ -167,6 +249,48 @@ mod tests {
             .all(|t| t[0] == 255 && t[1] == 255 && t[2] == 255));
         // ...and at least one texel is actually opaque, i.e. we packed real coverage, not a blank.
         assert!(px.chunks_exact(4).any(|t| t[3] > 0));
+    }
+
+    /// The one drift the compile-time length guard cannot catch: a *reorder*. `Icon as usize`
+    /// indexes both [`MASTERS`] and the atlas cell, so if the enum and the stem list disagree on
+    /// order, every button after the mismatch draws the wrong glyph — with no build failure and
+    /// nothing to see in a diff. Pin both halves against `build.rs`, which owns the rasterization
+    /// order, the same way `fire-decode` pins the extension table against the installer script.
+    #[test]
+    fn icon_order_matches_the_build_script() {
+        // `Icon as usize` must land on that variant's own stem.
+        for (i, icon) in ALL_ICONS.iter().enumerate() {
+            assert_eq!(*icon as usize, i, "ALL_ICONS is out of declaration order");
+            assert_eq!(
+                STEMS[i],
+                icon.stem(),
+                "Icon variant #{i} and the master at that index name different icons"
+            );
+        }
+
+        // ...and that order must be the one build.rs rasterizes in.
+        let build_rs = include_str!("../build.rs");
+        let list = build_rs
+            .split_once("const ICON_STEMS: &[&str] = &[")
+            .expect("build.rs still declares ICON_STEMS")
+            .1
+            .split_once("];")
+            .expect("ICON_STEMS is terminated")
+            .0;
+        let from_build: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_matches('"'))
+            .collect();
+        assert!(
+            !from_build.is_empty(),
+            "parsed nothing out of build.rs — the format changed and this guard went vacuous"
+        );
+        assert_eq!(
+            from_build, STEMS,
+            "build.rs rasterizes the icons in a different order than icons.rs embeds them"
+        );
     }
 
     #[test]
