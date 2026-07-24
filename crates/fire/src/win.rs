@@ -17,6 +17,16 @@
 //! Cross-thread wakeups (`WM_APP_OPEN` from the pipe server, `WM_APP_DECODE_DONE` from the worker
 //! pool, `WM_APP_FOLDER_SCANNED` from the folder-scan thread) are posted to this window, which
 //! reaches the shared [`App`] through its `GWLP_USERDATA` and owns the box.
+//!
+//! **The wndproc is three layers, and the order is the point.** [`frame_wndproc`] is the
+//! `catch_unwind` firewall — a panic must never unwind into the Win32 dispatcher. Inside it,
+//! [`route_event`] decides *who owns* each message (ImGui, an armed keybind row, the modal
+//! settings window, an open popup, or the viewer) before any handler runs; its sequence of gates
+//! is load-bearing, each one there because the gate before it would otherwise swallow the event.
+//! Only what survives routing reaches [`frame_wndproc_impl`]'s dispatch, which is a shallow match
+//! onto one handler per message family (`on_paint`, `on_layout`, `on_mouse`, `on_key`, `on_timer`,
+//! `on_app_message`, `on_system`). Messages nobody claims fall to `DefWindowProc` — including the
+//! key-ups and `WM_CHAR`, which routing gives settle frames but nothing dispatches.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -35,7 +45,9 @@ use crate::render::imgui::Imgui;
 use crate::transport::{TransportEdit, TransportSnapshot};
 use crate::ui::theme::Metrics;
 
-use windows_sys::Win32::Foundation::{GlobalFree, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    GlobalFree, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
@@ -486,6 +498,24 @@ impl App {
     /// status bar, mark the title failed, and drop any stale image. We don't clear in `load` (to
     /// avoid the navigation flash), so a broken file shouldn't keep showing the previously
     /// displayed one — that's why this repaints the backdrop here.
+    /// Drop whatever is on screen and go back to the empty state: no texture, no playback, no
+    /// transport, and a repaint that puts up the drop / double-click hint.
+    ///
+    /// Shared by the two ways an image stops being displayed — a failed load and an explicit close.
+    /// They differ only in what they do to the *title and labels* around this; the teardown itself
+    /// is identical. `shown_path` is cleared first because `apply_flipbook` reads it to decide there
+    /// is no transport to keep.
+    fn reset_to_empty(&mut self) {
+        self.shown_path = None;
+        self.surface.clear_image();
+        self.surface.invalidate();
+        // No image (or a still one) → stop any GIF playback that was running.
+        self.sync_animation();
+        // No image → clear any flipbook surface state, stop its timer, and hide the chip.
+        self.apply_flipbook();
+        self.redraw();
+    }
+
     fn fail_load(&mut self, name: &str, meta: String) {
         self.file_label = name.to_string();
         self.meta = meta;
@@ -493,19 +523,7 @@ impl App {
             self.frame,
             &format!("{}: {name} (failed)", crate::product::NAME),
         );
-        // Nothing is displayed any more, so nothing has a transport: `apply_flipbook` below reads
-        // this to clear the surface's flipbook params and kill the playback timer.
-        self.shown_path = None;
-        self.surface.clear_image();
-        self.surface.invalidate();
-        self.redraw();
-        self.redraw();
-        // Back to the empty state: hide the view and paint the drop / double-click hint.
-        self.redraw();
-        // No image (or a still one) → stop any GIF playback that was running.
-        self.sync_animation();
-        // No image → clear any flipbook surface state, stop its timer, and hide the chip.
-        self.apply_flipbook();
+        self.reset_to_empty();
     }
 
     /// (Re)start or stop GIF playback for the freshly adopted image. Arms the frame's animation
@@ -1343,22 +1361,14 @@ impl App {
         }
         self.surface.next_generation();
         self.current_path = None;
-        // Nothing is displayed, so nothing has a transport: `apply_flipbook` below reads this to
-        // clear the surface's flipbook params and kill the playback timer. The per-path entries in
-        // `self.flipbook` stay — reopening the file restores its grid, exactly as navigating back to
-        // it does.
-        self.shown_path = None;
+        // The per-path entries in `self.flipbook` stay — reopening the file restores its grid,
+        // exactly as navigating back to it does.
         self.folder = None;
         self.file_label.clear();
         self.meta.clear();
         self.loading = false;
         set_title(self.frame, crate::product::NAME);
-        self.surface.clear_image();
-        self.surface.invalidate();
-        // No image → stop any GIF playback, clear the flipbook surface state and hide the chip.
-        self.sync_animation();
-        self.apply_flipbook();
-        self.redraw();
+        self.reset_to_empty();
     }
 
     /// Re-derive everything that comes out of the stylesheet, and repaint.
@@ -1526,142 +1536,161 @@ fn apply_view_config(surface: &mut GpuSurface, cfg: &Config) {
     surface.set_outline(cfg.default_outline);
 }
 
+/// Register the window class and create the frame, sized from the remembered placement.
+///
+/// Returns the window, the placement it was restored from (the caller applies the exact position
+/// and show state once the `App` is attached — the OS picks the initial position here), and the
+/// system's dark-mode preference, which is read once and then owned by the `App`.
+///
+/// `None` if the window could not be created, which is terminal.
+unsafe fn create_frame(hinstance: HMODULE) -> Option<(HWND, Option<WindowState>, bool)> {
+    // The app icon embedded by build.rs (winresource id "1"); used for the frame title bar
+    // and taskbar so the window shows the flame instead of the generic Win32 default. The
+    // integer resource id is passed as a pseudo-pointer, the MAKEINTRESOURCE convention — not
+    // a real dangling pointer, so clippy's manual_dangling_ptr suggestion doesn't apply.
+    #[allow(clippy::manual_dangling_ptr)]
+    let app_icon = LoadIconW(hinstance, 1 as *const u16);
+
+    // Frame window class (owns chrome + message loop). WS_CLIPCHILDREN is set per-window.
+    // CS_DBLCLKS so the empty viewport (which the frame owns while the D3D view is hidden)
+    // receives WM_LBUTTONDBLCLK for double-click-to-open.
+    let frame_class = wide("FireFrameClass");
+    RegisterClassW(&WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+        lpfnWndProc: Some(frame_wndproc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: app_icon,
+        hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
+        hbrBackground: ptr::null_mut(),
+        lpszMenuName: ptr::null(),
+        lpszClassName: frame_class.as_ptr(),
+    });
+
+    let dark = chrome::system_uses_dark_mode();
+
+    // Restore the remembered size now, so the GPU viewport starts at the right size.
+    let saved = WindowState::load();
+    let (init_w, init_h) = match &saved {
+        Some(s) => (s.width.max(200), s.height.max(150)),
+        None => (1280, 800),
+    };
+
+    let title = wide(crate::product::NAME);
+    let frame = CreateWindowExW(
+        0,
+        frame_class.as_ptr(),
+        title.as_ptr(),
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        init_w,
+        init_h,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        hinstance,
+        ptr::null(),
+    );
+    if frame.is_null() {
+        eprintln!("fire: CreateWindowExW failed");
+        return None;
+    }
+    chrome::apply_dark_titlebar(frame, dark);
+    Some((frame, saved, dark))
+}
+
+/// Build the `App` for an already-created frame: the GPU surface, ImGui, the decode pool, the
+/// watcher and the keybind table.
+///
+/// **Construction order matters here.** The surface comes first because ImGui is built from its
+/// live D3D11 device and context; everything after is independent.
+unsafe fn build_app(frame: HWND, hinstance: HMODULE, dark: bool, cfg: Config) -> Box<App> {
+    let dpi = GetDpiForWindow(frame).max(96);
+    let metrics = Metrics::new(dpi);
+
+    // One window, so one drop target.
+    DragAcceptFiles(frame, 1);
+
+    // The swapchain covers the whole client; the image is drawn into a sub-rect of it, recomputed
+    // every frame (see `App::image_rect`).
+    let (fw, fh) = client_size(frame);
+    let mut surface = GpuSurface::new(
+        frame as isize,
+        hinstance as isize,
+        fw.max(1),
+        fh.max(1),
+        cfg.fit_upscale,
+    );
+    surface.set_clear(crate::ui::theme::view_clear_packed(dark));
+    // The view-related config the surface owns (backdrop / open-fit / tonemap defaults). Same
+    // path the settings dialog re-runs on Apply — see `App::apply_view_config`.
+    apply_view_config(&mut surface, &cfg);
+    // The octagon overlay's options — persisted ones if the user opted in, defaults otherwise;
+    // always starts switched off.
+    surface.set_octagon(cfg.octagon.initial_state());
+
+    // ImGui needs the live D3D11 device/context, so it is built from the surface.
+    let mut imgui = Imgui::new(
+        frame as isize,
+        surface.device(),
+        surface.device_context(),
+        dpi,
+    );
+    crate::ui::theme::apply(imgui.style_mut(), dark, metrics.scale);
+
+    // Debug only: watch `ui/theme.toml` in the source tree, so editing the stylesheet restyles
+    // this window without a rebuild. Posts WM_APP_THEME_RELOADED; compiled out of release.
+    #[cfg(debug_assertions)]
+    crate::hotstyle::spawn(frame as isize);
+
+    // Workers and the pipe server post here (this window owns title/size/lifecycle).
+    let pool = DecodePool::new(frame as isize);
+    // Hot-reload watcher (config-gated); posts WM_APP_FILE_CHANGED, same as the pool. None when
+    // disabled, so no watch thread is spawned.
+    let watcher = cfg.hot_reload.then(|| FileWatcher::spawn(frame as isize));
+    let keybinds = Keybinds::from_config(&cfg.keybinds);
+
+    Box::new(App {
+        frame: frame as isize,
+        surface,
+        imgui,
+        metrics,
+        dark,
+        dpi,
+        frames_wanted: 0,
+        pool,
+        file_label: String::new(),
+        meta: String::new(),
+        loading: false,
+        folder: None,
+        current_path: None,
+        shown_path: None,
+        watcher,
+        cfg,
+        keybinds,
+        fullscreen: false,
+        windowed_placement: std::mem::zeroed(),
+        flipbook: HashMap::new(),
+        flipbook_last_tick: None,
+        anim_due: None,
+        menu: None,
+        settings: None,
+        caret_timer: false,
+        in_size_move: false,
+    })
+}
+
 /// Create the frame + child view, wire up the decode pool, optionally serve the pipe
 /// (single-instance mode), open `initial` if given, and run the message loop until the window
 /// is closed (the process then exits — non-resident).
 pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
     unsafe {
         let hinstance = GetModuleHandleW(ptr::null());
-
-        // The app icon embedded by build.rs (winresource id "1"); used for the frame title bar
-        // and taskbar so the window shows the flame instead of the generic Win32 default. The
-        // integer resource id is passed as a pseudo-pointer, the MAKEINTRESOURCE convention — not
-        // a real dangling pointer, so clippy's manual_dangling_ptr suggestion doesn't apply.
-        #[allow(clippy::manual_dangling_ptr)]
-        let app_icon = LoadIconW(hinstance, 1 as *const u16);
-
-        // Frame window class (owns chrome + message loop). WS_CLIPCHILDREN is set per-window.
-        // CS_DBLCLKS so the empty viewport (which the frame owns while the D3D view is hidden)
-        // receives WM_LBUTTONDBLCLK for double-click-to-open.
-        let frame_class = wide("FireFrameClass");
-        RegisterClassW(&WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
-            lpfnWndProc: Some(frame_wndproc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinstance,
-            hIcon: app_icon,
-            hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
-            hbrBackground: ptr::null_mut(),
-            lpszMenuName: ptr::null(),
-            lpszClassName: frame_class.as_ptr(),
-        });
-
-        let dark = chrome::system_uses_dark_mode();
-
-        // Restore the remembered size now (so the GPU viewport starts at the right size); the
-        // exact position + maximized state is applied via SetWindowPlacement after the App is
-        // attached (the OS picks the initial position here).
-        let saved = WindowState::load();
-        let (init_w, init_h) = match &saved {
-            Some(s) => (s.width.max(200), s.height.max(150)),
-            None => (1280, 800),
-        };
-
-        let title = wide(crate::product::NAME);
-        let frame = CreateWindowExW(
-            0,
-            frame_class.as_ptr(),
-            title.as_ptr(),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            init_w,
-            init_h,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            hinstance,
-            ptr::null(),
-        );
-        if frame.is_null() {
-            eprintln!("fire: CreateWindowExW failed");
+        let Some((frame, saved, dark)) = create_frame(hinstance) else {
             return;
-        }
-        chrome::apply_dark_titlebar(frame, dark);
-
-        let dpi = GetDpiForWindow(frame).max(96);
-        let metrics = Metrics::new(dpi);
-
-        // One window, so one drop target.
-        DragAcceptFiles(frame, 1);
-
-        // The swapchain covers the whole client; the image is drawn into a sub-rect of it, recomputed
-        // every frame (see `App::image_rect`).
-        let (fw, fh) = client_size(frame);
-        let mut surface = GpuSurface::new(
-            frame as isize,
-            hinstance as isize,
-            fw.max(1),
-            fh.max(1),
-            cfg.fit_upscale,
-        );
-        surface.set_clear(crate::ui::theme::view_clear_packed(dark));
-        // The view-related config the surface owns (backdrop / open-fit / tonemap defaults). Same
-        // path the settings dialog re-runs on Apply — see `App::apply_view_config`.
-        apply_view_config(&mut surface, &cfg);
-        // The octagon overlay's options — persisted ones if the user opted in, defaults otherwise;
-        // always starts switched off.
-        surface.set_octagon(cfg.octagon.initial_state());
-
-        // ImGui needs the live D3D11 device/context, so it is built from the surface.
-        let mut imgui = Imgui::new(
-            frame as isize,
-            surface.device(),
-            surface.device_context(),
-            dpi,
-        );
-        crate::ui::theme::apply(imgui.style_mut(), dark, metrics.scale);
-
-        // Debug only: watch `ui/theme.toml` in the source tree, so editing the stylesheet restyles
-        // this window without a rebuild. Posts WM_APP_THEME_RELOADED; compiled out of release.
-        #[cfg(debug_assertions)]
-        crate::hotstyle::spawn(frame as isize);
-
-        // Workers and the pipe server post here (this window owns title/size/lifecycle).
-        let pool = DecodePool::new(frame as isize);
-        // Hot-reload watcher (config-gated); posts WM_APP_FILE_CHANGED, same as the pool. None when
-        // disabled, so no watch thread is spawned.
-        let watcher = cfg.hot_reload.then(|| FileWatcher::spawn(frame as isize));
-        let keybinds = Keybinds::from_config(&cfg.keybinds);
-
-        let mut app = Box::new(App {
-            frame: frame as isize,
-            surface,
-            imgui,
-            metrics,
-            dark,
-            dpi,
-            frames_wanted: 0,
-            pool,
-            file_label: String::new(),
-            meta: String::new(),
-            loading: false,
-            folder: None,
-            current_path: None,
-            shown_path: None,
-            watcher,
-            cfg,
-            keybinds,
-            fullscreen: false,
-            windowed_placement: std::mem::zeroed(),
-            flipbook: HashMap::new(),
-            flipbook_last_tick: None,
-            anim_due: None,
-            menu: None,
-            settings: None,
-            caret_timer: false,
-            in_size_move: false,
-        });
+        };
+        let mut app = build_app(frame, hinstance, dark, cfg);
 
         // Open the launch path immediately (decode is async; the image swaps in via
         // WM_APP_DECODE_DONE once the loop runs).
@@ -1724,6 +1753,113 @@ unsafe extern "system" fn frame_wndproc(
     }
 }
 
+/// Who owns an incoming message, as decided by [`route_event`].
+enum Routed {
+    /// Handled by ImGui or a modal layer; the wndproc returns 0 without dispatching.
+    Consumed,
+    /// The viewer's — fall through to the per-family dispatch.
+    ToApp,
+}
+
+/// Decide who owns a message before the viewer's own dispatch sees it.
+///
+/// ImGui sees every message first (except WM_PAINT, which is ours) so it can update its input
+/// state. Then two booleans decide who owns the event — replacing the entire hand-rolled
+/// hover/capture/hit-test/focus layer the GDI chrome needed:
+///
+///   * `want_capture_mouse`    — the pointer is over a widget (toolbar, transport, popup).
+///   * `want_capture_keyboard` — a text field has focus, so keys are typing, not commands.
+///
+/// Note this is *not* the wnd-proc handler's return value: upstream returns true only for the
+/// handful of messages it fully consumes (WM_SETCURSOR and friends), never for "that click was
+/// mine". Gating on the return value instead would let a click on a toolbar button *also* pan the
+/// image underneath it.
+///
+/// **The order below is load-bearing** — each gate exists because the one before it would
+/// otherwise take the event. Every path that returns [`Routed::Consumed`] is one the old inline
+/// preamble answered with a bare `0`, never `DefWindowProc`, which is why two variants suffice.
+unsafe fn route_event(
+    app: &mut App,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Routed {
+    let key_msg = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+
+    // A keybind row on the settings tab is armed: this press *is* the binding. Take it before
+    // ImGui sees it — Esc has to reach the capture (where it cancels), and ImGui would read it
+    // as "close the modal" instead.
+    if key_msg && app.settings_capturing() {
+        app.settings_capture(wparam as u32);
+        app.request_frames(2);
+        return Routed::Consumed;
+    }
+
+    if app.imgui.wnd_proc(hwnd as isize, msg, wparam, lparam) {
+        return Routed::Consumed;
+    }
+
+    let mouse_msg = matches!(
+        msg,
+        WM_MOUSEMOVE
+            | WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_LBUTTONDBLCLK
+            | WM_RBUTTONDOWN
+            | WM_RBUTTONUP
+            | WM_MBUTTONDOWN
+            | WM_MOUSEWHEEL
+    );
+    // WM_CHAR and the key-ups matter for the settle frames even though nothing below dispatches
+    // them: without WM_CHAR, typing into a text field wouldn't repaint it.
+    let input_msg = key_msg || matches!(msg, WM_CHAR | WM_KEYUP | WM_SYSKEYUP);
+
+    // Any input can change a hover or an active state, so give ImGui its settle frames. This runs
+    // *before* the ownership gates below, so a message they swallow still gets its frames.
+    if mouse_msg || input_msg {
+        app.request_frames(2);
+    }
+
+    // A pan/zoom drag already in flight owns the mouse to the end of the gesture, even if the
+    // cursor strays over the chrome — otherwise the drag would stick the moment it crossed the
+    // toolbar.
+    if mouse_msg && !app.surface.is_mouse_captured() && app.imgui.wants_mouse() {
+        return Routed::Consumed;
+    }
+    // The settings window is modal: while it is up, keys belong to it, not to the viewer — a
+    // stray `F` must not re-fit the image behind it.
+    //
+    // Esc and Enter we handle ourselves. ImGui's nav deliberately does *not* close a modal on
+    // Escape, and a dialog you can't escape is a trap. But while a **text field** is being
+    // edited those two keys are the field's (Esc reverts it, Enter commits it) — ImGui has
+    // already seen them via `wnd_proc` above — so we stay out of the way, and a second press,
+    // once the field has let go, reaches us.
+    if key_msg && app.settings.is_some() {
+        if !app.imgui.wants_text_input() {
+            app.settings_key(wparam as u32);
+        }
+        return Routed::Consumed;
+    }
+    // A popup menu is up. It isn't modal, so — unlike the settings window — ImGui leaves
+    // `want_capture_keyboard` false and every key would fall straight through to the viewer: Esc
+    // would *close the window* out from under the open menu. So the menu takes the keys, and Esc
+    // dismisses it (which ImGui also does itself; doing it here as well is harmless and is the
+    // part that doesn't depend on a default we don't own).
+    if key_msg && app.menu.is_some() {
+        const VK_ESCAPE: u32 = 0x1B;
+        if wparam as u32 == VK_ESCAPE {
+            app.menu = None;
+            app.redraw();
+        }
+        return Routed::Consumed;
+    }
+    if key_msg && app.imgui.wants_keyboard() {
+        return Routed::Consumed;
+    }
+    Routed::ToApp
+}
+
 /// Frame window handling: chrome paint, toolbar input, lifecycle, and the cross-thread wakeups.
 /// Wrapped by [`frame_wndproc`]'s panic firewall.
 unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1737,111 +1873,90 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
     }
     let app = &mut *app_ptr;
 
-    // ImGui sees every message first (except WM_PAINT, which is ours) so it can update its input
-    // state. Then two booleans decide who owns the event — replacing the entire hand-rolled
-    // hover/capture/hit-test/focus layer the GDI chrome needed:
-    //
-    //   * `want_capture_mouse`    — the pointer is over a widget (toolbar, transport, popup).
-    //   * `want_capture_keyboard` — a text field has focus, so keys are typing, not commands.
-    //
-    // Note this is *not* the wnd-proc handler's return value: upstream returns true only for the
-    // handful of messages it fully consumes (WM_SETCURSOR and friends), never for "that click was
-    // mine". Gating on the return value instead would let a click on a toolbar button *also* pan the
-    // image underneath it.
+    // WM_PAINT is ours alone and skips routing entirely; everything else is offered to ImGui and
+    // the modal layers first.
     if msg != WM_PAINT {
-        let key_msg = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
-
-        // A keybind row on the settings tab is armed: this press *is* the binding. Take it before
-        // ImGui sees it — Esc has to reach the capture (where it cancels), and ImGui would read it
-        // as "close the modal" instead.
-        if key_msg && app.settings_capturing() {
-            app.settings_capture(wparam as u32);
-            app.request_frames(2);
-            return 0;
-        }
-
-        if app.imgui.wnd_proc(hwnd as isize, msg, wparam, lparam) {
-            return 0;
-        }
-
-        let mouse_msg = matches!(
-            msg,
-            WM_MOUSEMOVE
-                | WM_LBUTTONDOWN
-                | WM_LBUTTONUP
-                | WM_LBUTTONDBLCLK
-                | WM_RBUTTONDOWN
-                | WM_RBUTTONUP
-                | WM_MBUTTONDOWN
-                | WM_MOUSEWHEEL
-        );
-        // WM_CHAR and the key-ups matter for the settle frames even though nothing below dispatches
-        // them: without WM_CHAR, typing into a text field wouldn't repaint it.
-        let input_msg = key_msg || matches!(msg, WM_CHAR | WM_KEYUP | WM_SYSKEYUP);
-
-        // Any input can change a hover or an active state, so give ImGui its settle frames.
-        if mouse_msg || input_msg {
-            app.request_frames(2);
-        }
-
-        // A pan/zoom drag already in flight owns the mouse to the end of the gesture, even if the
-        // cursor strays over the chrome — otherwise the drag would stick the moment it crossed the
-        // toolbar.
-        if mouse_msg && !app.surface.is_mouse_captured() && app.imgui.wants_mouse() {
-            return 0;
-        }
-        // The settings window is modal: while it is up, keys belong to it, not to the viewer — a
-        // stray `F` must not re-fit the image behind it.
-        //
-        // Esc and Enter we handle ourselves. ImGui's nav deliberately does *not* close a modal on
-        // Escape, and a dialog you can't escape is a trap. But while a **text field** is being
-        // edited those two keys are the field's (Esc reverts it, Enter commits it) — ImGui has
-        // already seen them via `wnd_proc` above — so we stay out of the way, and a second press,
-        // once the field has let go, reaches us.
-        if key_msg && app.settings.is_some() {
-            if !app.imgui.wants_text_input() {
-                app.settings_key(wparam as u32);
-            }
-            return 0;
-        }
-        // A popup menu is up. It isn't modal, so — unlike the settings window — ImGui leaves
-        // `want_capture_keyboard` false and every key would fall straight through to the viewer: Esc
-        // would *close the window* out from under the open menu. So the menu takes the keys, and Esc
-        // dismisses it (which ImGui also does itself; doing it here as well is harmless and is the
-        // part that doesn't depend on a default we don't own).
-        if key_msg && app.menu.is_some() {
-            const VK_ESCAPE: u32 = 0x1B;
-            if wparam as u32 == VK_ESCAPE {
-                app.menu = None;
-                app.redraw();
-            }
-            return 0;
-        }
-        if key_msg && app.imgui.wants_keyboard() {
+        if let Routed::Consumed = route_event(app, hwnd, msg, wparam, lparam) {
             return 0;
         }
     }
 
     match msg {
-        WM_PAINT => {
-            // Bring playback up to *now* before drawing, so this frame shows the cell/GIF frame that
-            // belongs to this instant whatever asked for it — a hover, a resize, a drag. Deliberately
-            // *before* `BeginPaint`: the advance dirties the window, and this is the repaint that
-            // clears it, so it costs no extra frame. See `App::advance_playback`.
-            app.advance_playback();
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            BeginPaint(hwnd, &mut ps);
-            // The event-driven pump: draw the frame we were asked for, and stop when the debt is
-            // paid. If `frames_wanted` is still positive afterwards, dirty the window so exactly one
-            // more WM_PAINT arrives — never a self-sustaining loop.
-            app.frames_wanted = app.frames_wanted.saturating_sub(1);
-            app.render();
-            if app.frames_wanted > 0 {
-                InvalidateRect(hwnd, ptr::null(), 0);
-            }
-            EndPaint(hwnd, &ps);
+        WM_PAINT => on_paint(app, hwnd),
+
+        WM_SIZE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE | WM_GETMINMAXINFO => {
+            on_layout(app, hwnd, msg, wparam, lparam)
+        }
+
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN
+        | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MOUSEWHEEL => on_mouse(app, hwnd, msg, wparam, lparam),
+
+        WM_KEYDOWN | WM_SYSKEYDOWN => on_key(app, hwnd, msg, wparam, lparam),
+
+        WM_TIMER => on_timer(app, wparam),
+
+        WM_DROPFILES => {
+            handle_drop(app, wparam as HDROP);
             0
         }
+
+        // Cross-thread wakeups. Listed one by one rather than as a `WM_APP..=` range: the id space
+        // has retired gaps, and a range would silently adopt whatever is added next.
+        WM_APP_OPEN
+        | WM_APP_DECODE_DONE
+        | WM_APP_FLIPBOOK_GUESS
+        | WM_APP_FOLDER_SCANNED
+        | WM_APP_FILE_CHANGED
+        | WM_APP_SETTINGS_BROWSE
+        | WM_APP_THEME_RELOADED => on_app_message(app, msg, wparam, lparam),
+
+        WM_DPICHANGED | WM_SETTINGCHANGE => on_system(app, hwnd, msg, wparam, lparam),
+
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            // Remember where/how the window was before it goes away, to restore next launch.
+            save_window_state(hwnd, app);
+            app.persist_octagon();
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Draw one frame and settle the repaint debt.
+unsafe fn on_paint(app: &mut App, hwnd: HWND) -> LRESULT {
+    // Bring playback up to *now* before drawing, so this frame shows the cell/GIF frame that
+    // belongs to this instant whatever asked for it — a hover, a resize, a drag. Deliberately
+    // *before* `BeginPaint`: the advance dirties the window, and this is the repaint that
+    // clears it, so it costs no extra frame. See `App::advance_playback`.
+    app.advance_playback();
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    BeginPaint(hwnd, &mut ps);
+    // The event-driven pump: draw the frame we were asked for, and stop when the debt is
+    // paid. If `frames_wanted` is still positive afterwards, dirty the window so exactly one
+    // more WM_PAINT arrives — never a self-sustaining loop.
+    app.frames_wanted = app.frames_wanted.saturating_sub(1);
+    app.render();
+    if app.frames_wanted > 0 {
+        InvalidateRect(hwnd, ptr::null(), 0);
+    }
+    EndPaint(hwnd, &ps);
+    0
+}
+
+/// Window geometry: resize, the size/move modal loop, and the minimum tracking size.
+unsafe fn on_layout(
+    app: &mut App,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
         WM_SIZE => {
             let w = (lparam & 0xffff) as u32;
             let h = ((lparam >> 16) & 0xffff) as u32;
@@ -1896,8 +2011,14 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             mmi.ptMinTrackSize.y = r.bottom - r.top;
             0
         }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
 
-        // --- image input (only reached when ImGui didn't want the event) ---------------------
+/// Image input. Only reached when [`route_event`] decided ImGui didn't want the event, so
+/// everything here acts on the image itself.
+unsafe fn on_mouse(app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
         WM_MOUSEMOVE => {
             let (x, y) = app.image_cursor(lparam);
             app.surface.on_cursor_moved((x, y));
@@ -1968,12 +2089,19 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             }
             0
         }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Keyboard commands. `WM_SYSKEYDOWN`'s fallthrough is load-bearing: only chords actually bound
+/// are consumed, so Alt+F4 and the Alt-menu still reach `DefWindowProc`.
+unsafe fn on_key(app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
         WM_KEYDOWN => {
             app.handle_key(wparam as u32);
             0
         }
-        // Alt chords arrive here, not as WM_KEYDOWN. Consume only the ones actually bound, so
-        // Alt+F4 and the Alt-menu still reach DefWindowProc.
+        // Alt chords arrive here, not as WM_KEYDOWN.
         WM_SYSKEYDOWN => {
             if app.handle_key(wparam as u32) {
                 0
@@ -1981,22 +2109,27 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
         }
-        WM_TIMER => {
-            match wparam {
-                ANIM_TIMER_ID => app.tick_animation(),
-                FLIPBOOK_TIMER_ID => app.tick_flipbook(),
-                // The caret is drawn by ImGui, so blinking it is just another frame.
-                CARET_TIMER_ID => app.request_frames(1),
-                _ => {}
-            }
-            0
-        }
-        WM_DROPFILES => {
-            handle_drop(app, wparam as HDROP);
-            0
-        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
 
-        // --- cross-thread wakeups ------------------------------------------------------------
+/// The three Win32 timers: GIF playback, flipbook playback, and the text caret blink.
+unsafe fn on_timer(app: &mut App, wparam: WPARAM) -> LRESULT {
+    match wparam {
+        ANIM_TIMER_ID => app.tick_animation(),
+        FLIPBOOK_TIMER_ID => app.tick_flipbook(),
+        // The caret is drawn by ImGui, so blinking it is just another frame.
+        CARET_TIMER_ID => app.request_frames(1),
+        _ => {}
+    }
+    0
+}
+
+/// Cross-thread wakeups posted by the decode pool, the folder scan, the watcher, the pipe server
+/// and the theme hot-reloader. Each carrying a payload reclaims its `Box` here — keeping every
+/// `from_raw` in one function is what makes that discipline checkable at a glance.
+unsafe fn on_app_message(app: &mut App, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
         WM_APP_OPEN => {
             let req = Box::from_raw(lparam as *mut OpenRequest);
             app.open(*req);
@@ -2029,8 +2162,22 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.restyle();
             0
         }
+        // Unreachable: the dispatch above lists exactly the ids handled here. Not `DefWindowProc`
+        // — a WM_APP_* message carries a raw pointer we own, and handing it to the default proc
+        // would leak the payload rather than report the mistake.
+        _ => unreachable!("on_app_message reached with msg {msg:#06x}"),
+    }
+}
 
-        // --- window / system -----------------------------------------------------------------
+/// DPI and system-theme changes: both re-style the whole UI.
+unsafe fn on_system(
+    app: &mut App,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
         WM_DPICHANGED => {
             // Adopt the OS-suggested rect, then rescale the UI for the new DPI. ImGui 1.92 re-bakes
             // glyphs lazily, so this is a style rescale plus one icon-atlas re-raster — no font
@@ -2061,17 +2208,6 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             app.dark = chrome::system_uses_dark_mode();
             app.restyle();
             chrome::apply_dark_titlebar(hwnd, app.dark);
-            0
-        }
-        WM_CLOSE => {
-            DestroyWindow(hwnd);
-            0
-        }
-        WM_DESTROY => {
-            // Remember where/how the window was before it goes away, to restore next launch.
-            save_window_state(hwnd, app);
-            app.persist_octagon();
-            PostQuitMessage(0);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -2133,28 +2269,31 @@ fn image_filter_wide() -> Vec<u16> {
     buf
 }
 
-/// Run the common Open dialog (owned by the frame) filtered to supported image formats, returning
-/// the chosen path or `None` on cancel. `GetOpenFileNameW` pumps its own modal loop on the UI
-/// thread, like the actions popup menu; no COM init is needed for the classic picker.
-fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
-    let filter = image_filter_wide();
-    let mut file_buf = vec![0u16; 4096];
+/// Run the common Open dialog owned by the frame, with `filter` as a double-NUL-terminated
+/// label/pattern list, returning the chosen path or `None` on cancel.
+///
+/// `GetOpenFileNameW` pumps its own modal loop on the UI thread, like the actions popup menu; no
+/// COM init is needed for the classic picker.
+fn run_open_dialog(owner: HWND, filter: &[u16]) -> Option<PathBuf> {
+    let mut buf = vec![0u16; 4096];
     let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
     ofn.hwndOwner = owner;
     ofn.lpstrFilter = filter.as_ptr();
     ofn.nFilterIndex = 1;
-    ofn.lpstrFile = file_buf.as_mut_ptr();
-    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.lpstrFile = buf.as_mut_ptr();
+    ofn.nMaxFile = buf.len() as u32;
     ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
     if unsafe { GetOpenFileNameW(&mut ofn) } == 0 {
         return None; // cancelled or dismissed
     }
-    let end = file_buf
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(file_buf.len());
-    Some(PathBuf::from(OsString::from_wide(&file_buf[..end])))
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(PathBuf::from(OsString::from_wide(&buf[..end])))
+}
+
+/// The Open dialog filtered to supported image formats.
+fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
+    run_open_dialog(owner, &image_filter_wide())
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -2170,21 +2309,7 @@ fn browse_for_program(owner: HWND) -> Option<PathBuf> {
         filter.push(0);
     }
     filter.push(0);
-
-    let mut buf = vec![0u16; 4096];
-    let mut ofn: OPENFILENAMEW = unsafe { std::mem::zeroed() };
-    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-    ofn.hwndOwner = owner;
-    ofn.lpstrFilter = filter.as_ptr();
-    ofn.nFilterIndex = 1;
-    ofn.lpstrFile = buf.as_mut_ptr();
-    ofn.nMaxFile = buf.len() as u32;
-    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-    if unsafe { GetOpenFileNameW(&mut ofn) } == 0 {
-        return None;
-    }
-    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    Some(PathBuf::from(String::from_utf16_lossy(&buf[..end])))
+    run_open_dialog(owner, &filter)
 }
 
 /// Launch a configured external app on `image` (the "Open in…" menu action). Best-effort: the child
