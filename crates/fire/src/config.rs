@@ -235,7 +235,7 @@ impl Default for ContextMenuCfg {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct OctagonCfg {
-    /// Persist the overlay options across launches (Settings ▸ Overlay).
+    /// Persist the overlay options across launches (Settings ▸ Octagon Overlay).
     pub remember: bool,
     pub color: crate::octagon::LineColor,
     /// 0..1 opacity of the octagon's lines (0 = invisible, 1 = solid).
