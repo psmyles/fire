@@ -109,7 +109,10 @@ windows-sys = "0.60"
 
 # --- internal crates ---
 fire-ipc = { path = "crates/fire-ipc" }
-fire-decode = { path = "crates/fire-decode" }
+# `default-features = false` here is load-bearing, not tidiness: without it cargo ignores a
+# member's own `default-features = false` (with only a warning) and the psd/heif gate silently
+# does nothing. `fire` turns both back on through its own default feature.
+fire-decode = { path = "crates/fire-decode", default-features = false }
 psd-sdk-sys = { path = "crates/psd-sdk-sys" }
 heif-sys = { path = "crates/heif-sys" }
 

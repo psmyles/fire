@@ -12,6 +12,10 @@
 //! through a RGB->YUV->RGB matrix conversion that rounds a channel by a unit or two, so
 //! bit-exact assertions would be brittle. Alpha is a separate (non-YUV) plane and stays
 //! effectively exact.
+//!
+//! Compiled out without the `heif` feature: there is no libheif to drive then, and the point of
+//! that configuration is to build and test on a machine with no vendored native trees at all.
+#![cfg(feature = "heif")]
 
 use fire_decode::{decode, DecodeOptions, DecodedImage, PixelFormat};
 

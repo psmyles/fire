@@ -25,6 +25,11 @@
 //! ICC profiles are extracted here; the lcms2 transform into the working space is
 //! applied by [`icc`]. Images larger than the caller's `max_dim` are CPU-downscaled to
 //! fit ([`downscale`]).
+//!
+//! The two FFI backends sit behind the **default-on** `psd` and `heif` features — the only
+//! parts of the workspace that need the vendored native trees. Building without them keeps the
+//! routing identical and returns a "built without" error for those formats, which is what lets
+//! CI lint and test everything here on a runner that has no vendored input at all.
 
 use std::io::Cursor;
 use std::path::Path;
@@ -451,6 +456,7 @@ pub fn decode_path(path: &Path, opts: &DecodeOptions) -> Result<DecodedImage, De
 
 /// PSD via psd_sdk (C++ FFI). Runs inside catch_unwind so a Rust-side panic in the
 /// thin wrapper cannot escape; the C++ side additionally guards against C++ exceptions.
+#[cfg(feature = "psd")]
 fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     let result = std::panic::catch_unwind(|| psd_sdk_sys::decode_psd(bytes))
         .map_err(|_| DecodeError::Ffi("psd_sdk panicked".into()))?;
@@ -476,6 +482,17 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         downscaled_from: None,
         animation: None,
     })
+}
+
+/// Stand-in for [`decode_psd`] when the crate is built without the vendored psd_sdk (CI's
+/// `--no-default-features` job; the shipped binary always has it). Routing deliberately does
+/// *not* change with the feature: the bytes really are a PSD, this build just cannot read one,
+/// and saying so is more honest than letting a fallback decoder mangle it.
+#[cfg(not(feature = "psd"))]
+fn decode_psd(_bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    Err(DecodeError::Other(
+        "this build has no PSD support (compiled without the \"psd\" feature)".into(),
+    ))
 }
 
 /// OpenEXR via the `exr` crate → 32-bit float RGBA (linear/HDR).
@@ -561,6 +578,7 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 /// scaled to full range. We treat the decoded values as display-encoded (SDR), so a
 /// true-HDR (PQ/HLG) HEIF will display without tonemapping — acceptable for v1, and most
 /// HEIC (phone photos) is 8-bit SDR, often Display-P3, whose ICC the [`icc`] pass honors.
+#[cfg(feature = "heif")]
 fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, DecodeError> {
     let result = std::panic::catch_unwind(|| heif_sys::decode_heif(bytes))
         .map_err(|_| DecodeError::Ffi("libheif panicked".into()))?;
@@ -585,6 +603,15 @@ fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, Decode
         downscaled_from: None,
         animation: None,
     })
+}
+
+/// Stand-in for [`decode_heif`] when the crate is built without the vendored libheif stack —
+/// see [`decode_psd`]'s counterpart for why this errors rather than rerouting.
+#[cfg(not(feature = "heif"))]
+fn decode_heif(_bytes: &[u8], label: &'static str) -> Result<DecodedImage, DecodeError> {
+    Err(DecodeError::Other(format!(
+        "this build has no {label} support (compiled without the \"heif\" feature)"
+    )))
 }
 
 /// Camera raw via embedded-preview extraction ([`raw`]). The raw container is not decoded;
