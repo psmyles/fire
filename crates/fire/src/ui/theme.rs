@@ -30,6 +30,8 @@ use std::sync::{Arc, LazyLock, RwLock};
 use dear_imgui_rs::{Style, StyleColor, StyleStackToken, StyleVar, Ui};
 use serde::Deserialize;
 
+use crate::icons::{self, Icon};
+
 /// The stylesheet, compiled into the exe. This is what a release build always uses.
 const EMBEDDED: &str = include_str!("theme.toml");
 
@@ -89,6 +91,12 @@ fn load() -> Theme {
 #[serde(deny_unknown_fields)]
 pub struct Theme {
     pub font: Font,
+    /// Per-icon shrink factors, keyed by [`Icon::name`]. Sparse on purpose — an icon that isn't
+    /// listed is `1.0` — and validated by [`Theme::parse`], so a misspelled icon fails the load
+    /// rather than being a line in the file that quietly does nothing. Read via
+    /// [`Theme::icon_scale`].
+    #[serde(default)]
+    icon_scale: BTreeMap<String, f32>,
     pub colors: Modes,
     pub chrome: Chrome,
     pub form: Form,
@@ -317,11 +325,27 @@ color_block!(FormColors {
 });
 
 impl Theme {
-    /// Parse a stylesheet **and prove it**: every color in it is resolved, in both modes. So `reload`
-    /// either installs a stylesheet that will draw correctly or reports exactly which key is wrong —
-    /// an unknown token name never reaches a widget.
+    /// Parse a stylesheet **and prove it**: every color in it is resolved, in both modes, and every
+    /// `[icon_scale]` entry names a real icon and asks for a real size. So `reload` either installs a
+    /// stylesheet that will draw correctly or reports exactly which key is wrong — an unknown token
+    /// name never reaches a widget.
     fn parse(src: &str) -> Result<Theme, String> {
         let theme: Theme = toml::from_str(src).map_err(|e| format!("theme.toml: {e}"))?;
+        // `deny_unknown_fields` cannot reach inside a map, so the icon names are checked by hand —
+        // otherwise `[icon_scale] octogon = 0.8` is a typo that looks like it took effect.
+        for (key, &v) in &theme.icon_scale {
+            if !icons::ALL.iter().any(|i| i.name() == key) {
+                return Err(format!(
+                    "theme.toml: icon_scale.{key}: no icon by that name"
+                ));
+            }
+            if !(v.is_finite() && v > 0.0 && v <= 1.0) {
+                return Err(format!(
+                    "theme.toml: icon_scale.{key} = {v}: must be greater than 0 and at most 1 \
+                     (1.0 is the full [font] icon_size — raise that to make an icon bigger)"
+                ));
+            }
+        }
         for dark in [true, false] {
             let mode = if dark { "colors.dark" } else { "colors.light" };
             let cx = theme.cx(dark);
@@ -337,6 +361,12 @@ impl Theme {
             }
         }
         Ok(theme)
+    }
+
+    /// How much of its cell this icon draws at, `1.0` (the default) being all of it. Baked into the
+    /// atlas by [`crate::icons::atlas`], not applied at draw time, so it never moves a button.
+    pub fn icon_scale(&self, icon: Icon) -> f32 {
+        self.icon_scale.get(icon.name()).copied().unwrap_or(1.0)
     }
 
     fn tokens(&self, dark: bool) -> &Tokens {
@@ -909,6 +939,55 @@ mod tests {
         tokens.insert("a".into(), parse_color("b").unwrap());
         tokens.insert("b".into(), parse_color("a").unwrap());
         assert!(cx(&tokens).resolve(&parse_color("a").unwrap(), 0).is_err());
+    }
+
+    /// Swap `[icon_scale]` in the embedded stylesheet for `body`, so these exercise the real file
+    /// rather than a hand-rolled minimal one.
+    fn with_icon_scale(body: &str) -> Result<Theme, String> {
+        let (head, rest) = EMBEDDED
+            .split_once("[icon_scale]")
+            .expect("theme.toml declares [icon_scale]");
+        let tail = rest.split_once("\n[").expect("a table follows it").1;
+        Theme::parse(&format!("{head}[icon_scale]\n{body}\n[{tail}"))
+    }
+
+    /// The shipped table lists every icon, which is what makes it the vocabulary a reader looks up
+    /// a name in — `Theme::parse` only rejects names that *aren't* icons, so a variant added without
+    /// its line would otherwise just be missing from the file with nothing to say so.
+    #[test]
+    fn the_stylesheet_lists_every_icon() {
+        let t = Theme::parse(EMBEDDED).expect("theme.toml");
+        for icon in icons::ALL {
+            assert!(
+                t.icon_scale.contains_key(icon.name()),
+                "[icon_scale] is missing {}",
+                icon.name()
+            );
+        }
+    }
+
+    #[test]
+    fn an_icon_scale_applies_only_to_the_icon_named() {
+        let t = with_icon_scale("octagon = 0.5").expect("a valid scale");
+        assert_eq!(t.icon_scale(Icon::Octagon), 0.5);
+        // Everything else keeps the full cell — the table is sparse, not a full list.
+        assert_eq!(t.icon_scale(Icon::Play), 1.0);
+    }
+
+    /// The stylesheet's contract is that a bad edit is a *load error*, not a value that silently
+    /// does nothing: `deny_unknown_fields` can't see inside the map, so `Theme::parse` checks it.
+    #[test]
+    fn a_bad_icon_scale_is_a_load_error() {
+        let e = with_icon_scale("octogon = 0.5").unwrap_err();
+        assert!(e.contains("octogon"), "{e}");
+        // Above 1.0 there is no room in the cell, and 0 would raster to nothing.
+        assert!(with_icon_scale("octagon = 1.5").is_err());
+        assert!(with_icon_scale("octagon = 0.0").is_err());
+        assert!(with_icon_scale("octagon = -1.0").is_err());
+        assert!(with_icon_scale("octagon = nan").is_err());
+        // ...but the boundary itself is fine, and so is an empty table.
+        assert!(with_icon_scale("octagon = 1.0").is_ok());
+        assert!(with_icon_scale("").is_ok());
     }
 
     #[test]

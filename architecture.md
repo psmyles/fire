@@ -385,7 +385,14 @@ for, which the win shell applies.
 - **Icons:** `build.rs` still rasterizes the SVGs to A8 coverage masks; they are now packed into one
   RGBA8 **atlas strip** (white RGB, coverage in alpha) uploaded as a single D3D11 texture. ImGui's
   shader multiplies texel by vertex color, so `(1,1,1,a) * tint` gives any tint from one texture -
-  no per-tint CPU work, which is what the old GDI path did on every repaint.
+  no per-tint CPU work, which is what the old GDI path did on every repaint. The stylesheet's
+  `[icon_scale]` (a per-icon shrink, for artwork that doesn't fill its box like the rest) is **baked
+  into the atlas**, not applied at the draw call: the master is rastered into a smaller box *centred
+  in a full-size cell*, so the cell - and therefore the UV grid, the draw size and ImGui's derived
+  button size - stays a fixed `icon_px`, and the shrunk icon is a true downsample rather than a
+  re-scaled cell. `Imgui::refresh_icons` watches the scales as well as the size, since a hot reload
+  can move one without the other. An `Icon` is a *cell*, not a drawing: two variants may name the
+  same SVG (`B` and `BackdropBlack`) so that two buttons sharing artwork can still be sized apart.
 
 ---
 

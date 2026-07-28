@@ -6,6 +6,14 @@
 //! physical icon size for the current DPI and packs them side by side into a single RGBA8 strip —
 //! **white RGB, coverage in alpha** — which [`crate::render::imgui`] uploads as one D3D11 texture.
 //!
+//! **Per-icon scale is baked in here, not applied at draw time.** The source SVGs don't fill their
+//! box equally — a solid octagon reads heavier than a letterform at the same edge — so the
+//! stylesheet's `[icon_scale]` may shrink an individual icon. [`atlas`] honours it by rendering that
+//! master into a smaller box *centred in a full-size cell*: every cell stays `icon_px` square, so the
+//! UV grid, the draw size and hence ImGui's derived button size are all untouched, and the shrunk
+//! icon is a true box-downsample of the master rather than a bilinear re-scale of a finished cell.
+//! Scaling at the `image_button_config` call instead would have done both the other way round.
+//!
 //! White-with-alpha is what lets a single texture serve every tint: ImGui's pixel shader multiplies
 //! the sampled texel by the vertex color, so `(1,1,1,a) * tint` yields the tint at the mask's
 //! coverage. One texture, any color, no per-tint CPU work — which is why the old GDI path (tint into
@@ -18,10 +26,14 @@
 /// each `.a8` master is exactly `MASTER * MASTER` bytes.
 const MASTER: usize = 64;
 
+/// Floor on a per-icon scale, so a fat-fingered stylesheet value can't raster an icon to nothing.
+/// The ceiling is 1.0 by construction: the cell *is* the icon size, there is no room above it.
+const MIN_SCALE: f32 = 0.1;
+
 /// A toolbar icon. The order matches `build.rs`'s `ICON_STEMS` (and [`MASTERS`]) so `icon as usize`
-/// indexes both the embedded master and the icon's cell in the atlas strip. Several buttons share an
-/// icon (e.g. the blue-channel and black-background buttons both use [`Icon::B`]); the UI maps each
-/// action to one of these.
+/// indexes both the embedded master and the icon's cell in the atlas strip. The UI maps each action
+/// to one of these; a variant is a *cell*, not a drawing, so two of them may come from the same SVG
+/// ([`Icon::B`] and [`Icon::BackdropBlack`]) precisely so the stylesheet can size them apart.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
@@ -41,7 +53,9 @@ pub enum Icon {
     EvUp,
     EvReset,
     EvDown,
+    BackdropBlack,
     White,
+    BackdropGrey,
     Checker,
     Outline,
     OpenWith,
@@ -86,7 +100,9 @@ icon_masters![
     "icon_ev+",
     "icon_ev0",
     "icon_ev-",
+    "icon_B",
     "icon_W",
+    "icon_G",
     "icon_C",
     "icon_outline",
     "icon_open_with",
@@ -116,6 +132,43 @@ impl Icon {
         ([i / n, 0.0], [(i + 1.0) / n, 1.0])
     }
 
+    /// This icon's name in the stylesheet — the key `[icon_scale]` in `ui/theme.toml` addresses it
+    /// by. Deliberately *not* derived from [`Icon::stem`]: the file stems include `icon_ev+` and
+    /// `icon_RGB`, which make poor TOML keys, so these are the variant names in snake_case and every
+    /// one of them is a bare key. Exhaustive, so a new variant must name itself before it compiles.
+    pub fn name(self) -> &'static str {
+        match self {
+            Icon::Left => "left",
+            Icon::Right => "right",
+            Icon::ZoomOut => "zoom_out",
+            Icon::ZoomIn => "zoom_in",
+            Icon::Fit => "fit",
+            Icon::OneToOne => "one_to_one",
+            Icon::Rgb => "rgb",
+            Icon::Rgba => "rgba",
+            Icon::R => "r",
+            Icon::G => "g",
+            Icon::B => "b",
+            Icon::A => "a",
+            Icon::Aces => "aces",
+            Icon::EvUp => "ev_up",
+            Icon::EvReset => "ev_reset",
+            Icon::EvDown => "ev_down",
+            Icon::BackdropBlack => "backdrop_black",
+            Icon::White => "white",
+            Icon::BackdropGrey => "backdrop_grey",
+            Icon::Checker => "checker",
+            Icon::Outline => "outline",
+            Icon::OpenWith => "open_with",
+            Icon::Fullscreen => "fullscreen",
+            Icon::Flipbook => "flipbook",
+            Icon::Play => "play",
+            Icon::Pause => "pause",
+            Icon::More => "more",
+            Icon::Octagon => "octagon",
+        }
+    }
+
     /// The SVG file stem this variant is rasterized from. Exhaustive on purpose: a new variant
     /// does not compile until it names its icon, and the test below proves the name it gives
     /// lands at the same index as the master it will be drawn from.
@@ -138,7 +191,9 @@ impl Icon {
             Icon::EvUp => "icon_ev+",
             Icon::EvReset => "icon_ev0",
             Icon::EvDown => "icon_ev-",
+            Icon::BackdropBlack => "icon_B",
             Icon::White => "icon_W",
+            Icon::BackdropGrey => "icon_G",
             Icon::Checker => "icon_C",
             Icon::Outline => "icon_outline",
             Icon::OpenWith => "icon_open_with",
@@ -152,9 +207,9 @@ impl Icon {
     }
 }
 
-/// Every [`Icon`] variant, in declaration order — the list the order test walks.
-#[cfg(test)]
-const ALL_ICONS: [Icon; COUNT] = [
+/// Every [`Icon`] variant, in declaration order — so `ALL[i] as usize == i`, which is what lets a
+/// caller build a per-icon table (the stylesheet's scales) indexed the same way [`atlas`] reads it.
+pub const ALL: [Icon; COUNT] = [
     Icon::Left,
     Icon::Right,
     Icon::ZoomOut,
@@ -171,7 +226,9 @@ const ALL_ICONS: [Icon; COUNT] = [
     Icon::EvUp,
     Icon::EvReset,
     Icon::EvDown,
+    Icon::BackdropBlack,
     Icon::White,
+    Icon::BackdropGrey,
     Icon::Checker,
     Icon::Outline,
     Icon::OpenWith,
@@ -186,12 +243,20 @@ const ALL_ICONS: [Icon; COUNT] = [
 /// Build the RGBA8 atlas strip for a physical icon edge of `icon_px`: `COUNT * icon_px` wide,
 /// `icon_px` tall, every texel white with the mask's coverage in alpha. Returns the pixels and the
 /// strip's width in px (height is `icon_px`).
-pub fn atlas(icon_px: usize) -> (Vec<u8>, usize) {
+///
+/// `scales` is the stylesheet's per-icon shrink, indexed by `Icon as usize` (see [`ALL`]); `1.0`
+/// fills the cell and is the maximum. Anything less rasters that master into a smaller box centred
+/// in its cell — the *cell* is always `icon_px`, so nothing downstream of the atlas moves.
+pub fn atlas(icon_px: usize, scales: &[f32; COUNT]) -> (Vec<u8>, usize) {
     let n = icon_px.max(1);
     let w = n * COUNT;
     let mut px = vec![0u8; w * n * 4];
     for (i, master) in MASTERS.iter().enumerate() {
-        let mask = downsample(master, n);
+        // The drawn box, and where it sits in the cell. An odd leftover biases the icon a physical
+        // pixel up and left, which is the cheap price of not landing the raster on a half pixel.
+        let inner = ((n as f32 * scales[i].clamp(MIN_SCALE, 1.0)).round() as usize).clamp(1, n);
+        let off = (n - inner) / 2;
+        let mask = downsample(master, inner);
         let x0 = i * n;
         for y in 0..n {
             for x in 0..n {
@@ -199,7 +264,11 @@ pub fn atlas(icon_px: usize) -> (Vec<u8>, usize) {
                 px[o] = 255;
                 px[o + 1] = 255;
                 px[o + 2] = 255;
-                px[o + 3] = mask[y * n + x];
+                // Outside the drawn box the cell is white-transparent — a margin, not a border.
+                px[o + 3] = match (y.checked_sub(off), x.checked_sub(off)) {
+                    (Some(my), Some(mx)) if my < inner && mx < inner => mask[my * inner + mx],
+                    _ => 0,
+                };
             }
         }
     }
@@ -207,7 +276,9 @@ pub fn atlas(icon_px: usize) -> (Vec<u8>, usize) {
 }
 
 /// Box-downsample a `MASTER²` coverage mask to `dst²` by averaging each destination pixel's source
-/// footprint — effectively supersampled antialiasing of the master raster down to the icon size.
+/// footprint — effectively supersampled antialiasing of the master raster down to the drawn size.
+/// `dst` is the icon's *drawn* box, which is the cell edge only at scale `1.0`; a shrunk icon simply
+/// comes further down the same master, so it is as clean as an unscaled one.
 /// (If `dst > MASTER` the footprints collapse to single texels, i.e. nearest-neighbor upsample;
 /// only the very highest DPIs reach that, and the master is sized so it rarely happens.)
 fn downsample(master: &[u8], dst: usize) -> Vec<u8> {
@@ -238,9 +309,15 @@ fn downsample(master: &[u8], dst: usize) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// Alpha of the texel at `(x, y)` of icon `i`'s cell in a strip of `n`-px cells.
+    fn cell_alpha(px: &[u8], n: usize, i: usize, x: usize, y: usize) -> u8 {
+        let w = n * COUNT;
+        px[(y * w + i * n + x) * 4 + 3]
+    }
+
     #[test]
     fn atlas_is_a_strip_of_square_cells() {
-        let (px, w) = atlas(8);
+        let (px, w) = atlas(8, &[1.0; COUNT]);
         assert_eq!(w, 8 * COUNT);
         assert_eq!(px.len(), w * 8 * 4);
         // Every texel is white; only alpha carries the shape (that's what makes one texture tintable).
@@ -259,8 +336,8 @@ mod tests {
     #[test]
     fn icon_order_matches_the_build_script() {
         // `Icon as usize` must land on that variant's own stem.
-        for (i, icon) in ALL_ICONS.iter().enumerate() {
-            assert_eq!(*icon as usize, i, "ALL_ICONS is out of declaration order");
+        for (i, icon) in ALL.iter().enumerate() {
+            assert_eq!(*icon as usize, i, "ALL is out of declaration order");
             assert_eq!(
                 STEMS[i],
                 icon.stem(),
@@ -291,6 +368,60 @@ mod tests {
             from_build, STEMS,
             "build.rs rasterizes the icons in a different order than icons.rs embeds them"
         );
+    }
+
+    /// A scaled icon must shrink *within* its own cell: the cell edge is what the UV grid and the
+    /// button size are built on, so a scale that leaked into the cell size (or into a neighbour)
+    /// would have every icon after it sampling the wrong slice of the strip.
+    #[test]
+    fn a_scale_insets_one_icon_and_leaves_the_rest_alone() {
+        const N: usize = 24;
+        let scaled = Icon::Octagon as usize;
+        let mut scales = [1.0; COUNT];
+        scales[scaled] = 0.5;
+        let (plain, w) = atlas(N, &[1.0; COUNT]);
+        let (px, w2) = atlas(N, &scales);
+        // The cell grid is untouched by the scale.
+        assert_eq!((w, px.len()), (w2, plain.len()));
+        assert_eq!(w, N * COUNT);
+
+        // Only the scaled icon's cell changed.
+        for i in 0..COUNT {
+            let differs = (0..N).any(|y| {
+                (0..N).any(|x| cell_alpha(&px, N, i, x, y) != cell_alpha(&plain, N, i, x, y))
+            });
+            assert_eq!(differs, i == scaled, "cell {i} changed unexpectedly");
+        }
+
+        // The margin around the inset box is empty all the way round...
+        let inner = N / 2;
+        let off = (N - inner) / 2;
+        let box_ = off..off + inner;
+        let inset = |x: usize, y: usize| box_.contains(&x) && box_.contains(&y);
+        for y in 0..N {
+            for x in 0..N {
+                if !inset(x, y) {
+                    assert_eq!(
+                        cell_alpha(&px, N, scaled, x, y),
+                        0,
+                        "scaled icon spilled outside its inset box at ({x}, {y})"
+                    );
+                }
+            }
+        }
+        // ...and the coverage moved into it rather than vanishing.
+        assert!((0..N).any(|y| (0..N).any(|x| inset(x, y) && cell_alpha(&px, N, scaled, x, y) > 0)));
+    }
+
+    /// The stylesheet addresses icons by [`Icon::name`], so two variants sharing a name would make
+    /// one of them unreachable from `[icon_scale]` — silently, and only for whichever lost.
+    #[test]
+    fn icon_names_are_unique() {
+        let mut names: Vec<&str> = ALL.iter().map(|i| i.name()).collect();
+        names.sort_unstable();
+        let n = names.len();
+        names.dedup();
+        assert_eq!(names.len(), n, "two Icon variants share a stylesheet name");
     }
 
     #[test]

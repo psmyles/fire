@@ -60,6 +60,9 @@ pub struct Imgui {
     /// Physical edge the atlas was last rastered at, so [`Imgui::refresh_icons`] can tell whether a
     /// DPI or stylesheet change actually moved it.
     icon_built_px: f32,
+    /// ...and the per-icon scales it was rastered with, which a hot reload can move on their own.
+    /// Zeroes until the first build, and zero is never a legal scale, so the first check builds.
+    icon_built_scales: [f32; icons::COUNT],
     dpi: u32,
     /// ImGui's factory style, captured at creation *before* [`crate::ui::theme`] overwrites it.
     /// The settings window is drawn with this — see [`StockStyle`].
@@ -234,6 +237,7 @@ impl Imgui {
             icon_srv: None,
             icon_id: TextureId::new(0),
             icon_built_px: 0.0,
+            icon_built_scales: [0.0; icons::COUNT],
             dpi: dpi.max(96),
             stock,
         };
@@ -276,6 +280,14 @@ impl Imgui {
         (crate::ui::theme::current().font.icon_size * self.dpi as f32 / 96.0).round()
     }
 
+    /// The stylesheet's per-icon shrink factors, in the order [`icons::atlas`] indexes them. Also a
+    /// hot-reloadable value, and one that moves *without* [`Imgui::icon_px`] moving — which is why
+    /// [`Imgui::refresh_icons`] compares it too.
+    fn icon_scales(&self) -> [f32; icons::COUNT] {
+        let theme = crate::ui::theme::current();
+        std::array::from_fn(|i| theme.icon_scale(icons::ALL[i]))
+    }
+
     pub fn style_mut(&mut self) -> &mut dear_imgui_rs::Style {
         self.ctx.style_mut()
     }
@@ -288,10 +300,12 @@ impl Imgui {
         self.dpi = dpi.max(96);
     }
 
-    /// Re-raster the icon atlas if the physical icon size has moved — a DPI change, or a stylesheet
-    /// edit. Cheap no-op when it hasn't, so the restyle path can call it unconditionally.
+    /// Re-raster the icon atlas if anything it was baked from has moved — the physical icon size (a
+    /// DPI change or a stylesheet edit) or the per-icon scales (a stylesheet edit alone, which
+    /// leaves the size untouched). Cheap no-op when nothing has, so the restyle path can call it
+    /// unconditionally.
     pub fn refresh_icons(&mut self, device: &ID3D11Device) {
-        if self.icon_px() != self.icon_built_px {
+        if self.icon_px() != self.icon_built_px || self.icon_scales() != self.icon_built_scales {
             self.rebuild_icons(device);
         }
     }
@@ -299,7 +313,8 @@ impl Imgui {
     fn rebuild_icons(&mut self, device: &ID3D11Device) {
         let px = self.icon_px();
         let n = px as usize;
-        let (pixels, w) = icons::atlas(n);
+        let scales = self.icon_scales();
+        let (pixels, w) = icons::atlas(n, &scales);
 
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w as u32,
@@ -350,6 +365,7 @@ impl Imgui {
         self._icon_tex = tex;
         self.icon_srv = srv;
         self.icon_built_px = px;
+        self.icon_built_scales = scales;
     }
 
     /// Feed a Win32 message to ImGui. `true` means ImGui consumed it and the shell should not.

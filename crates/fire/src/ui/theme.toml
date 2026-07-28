@@ -49,6 +49,64 @@ size = 16.0
 icon_size = 16.0
 
 
+# ── Per-icon size trim ────────────────────────────────────────────────────────────────────────────
+# The source SVGs share a box but not a weight: a solid octagon reads heavier than a letterform drawn
+# to the same edge. Nudge an individual icon down here rather than compromising `icon_size` for all
+# of them.
+#
+#   1.0        the icon fills its cell, i.e. exactly `icon_size` above. This is the default *and the
+#              maximum*: the cell is the icon size, so there is no room above it. To make one icon
+#              bigger, raise `icon_size` and trim the others.
+#   0 < s < 1  the icon is rastered that fraction of the cell and centred, with a transparent margin.
+#              It is re-rastered from the SVG at the smaller size, so it stays as crisp as any other,
+#              and the *button* does not change size — only the glyph inside it does.
+#
+# Every icon is listed, so this table is also the vocabulary: an entry may be deleted (it defaults to
+# 1.0) but a *name* that isn't one of these is a load error, like a bad color token, rather than a
+# line that quietly does nothing.
+#
+# `backdrop_black` / `backdrop_grey` are drawn from the same two SVGs as the `b` / `g` channel
+# buttons. They are separate entries precisely so a backdrop letter can be sized apart from a channel
+# letter; set them to the same number to keep the pair identical.
+[icon_scale]
+# Previous / next image.
+left           = 0.85
+right          = 0.85
+# Zoom out / in, and the fit ↔ 1:1 toggle (whichever state it is showing).
+zoom_out       = 0.9
+zoom_in        = 0.9
+fit            = 1.0
+one_to_one     = 1.0
+# Channel view: all channels (the second is shown when the image has alpha), then the isolated ones.
+rgb            = 1.0
+rgba           = 1.0
+r              = 0.8
+g              = 0.8
+b              = 0.8
+a              = 0.8
+# Tone map, and the exposure trio.
+aces           = 1.0
+ev_up          = 1.0
+ev_reset       = 1.0
+ev_down        = 1.0
+# Backdrop: black, white, grey, checkerboard — and the alpha outline.
+backdrop_black = 0.8
+white          = 0.8
+backdrop_grey  = 0.8
+checker        = 0.8
+outline        = 0.9
+# Open with…, fullscreen, and the flipbook toggle.
+open_with      = 1.0
+fullscreen     = 1.0
+flipbook       = 0.9
+# The transport band's play/pause button (sized off the text line, not `icon_size`).
+play           = 1.0
+pause          = 1.0
+# The » overflow button, and the octagon crop.
+more           = 1.0
+octagon        = 1.0
+
+
 # ── The palette ───────────────────────────────────────────────────────────────────────────────────
 # The semantic tokens, once per mode. Everything in [chrome.colors] and [form.colors] is written in
 # terms of these, so re-skinning the app is a matter of editing these two blocks — you can also add

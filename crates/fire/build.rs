@@ -43,6 +43,10 @@ const ICON_MASTER: u32 = 64;
 /// `<stem>.a8` file in `OUT_DIR` (a row-major `ICON_MASTER`²-byte coverage mask) that the icon
 /// module embeds via `include_bytes!`. The list is the source of truth for the `icons::Icon` enum;
 /// a missing SVG is a build error (the metadata is mandatory, like the shaders).
+///
+/// This is a list of *positions*, not a set: a stem may appear twice, which is how two `Icon`
+/// variants drawn from one SVG (the blue channel and the black backdrop) get a cell each and so a
+/// `[icon_scale]` entry each. Rasterizing that stem twice writes the same bytes to the same file.
 const ICON_STEMS: &[&str] = &[
     "icon_left",
     "icon_right",
@@ -60,7 +64,9 @@ const ICON_STEMS: &[&str] = &[
     "icon_ev+",
     "icon_ev0",
     "icon_ev-",
+    "icon_B",
     "icon_W",
+    "icon_G",
     "icon_C",
     "icon_outline",
     "icon_open_with",

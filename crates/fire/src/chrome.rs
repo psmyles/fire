@@ -228,9 +228,11 @@ impl ViewSnapshot {
             Action::ExpDown => Icon::EvDown,
             Action::ToggleOutline => Icon::Outline,
             Action::ToggleOctagon => Icon::Octagon,
-            Action::Background(Background::Black) => Icon::B,
+            // Drawn from the same SVGs as the blue/green channel buttons, but their own icons, so
+            // the stylesheet can size a backdrop letter differently from a channel letter.
+            Action::Background(Background::Black) => Icon::BackdropBlack,
             Action::Background(Background::White) => Icon::White,
-            Action::Background(Background::Grey) => Icon::G,
+            Action::Background(Background::Grey) => Icon::BackdropGrey,
             Action::Background(Background::Checker) => Icon::Checker,
             Action::OpenWithMenu => Icon::OpenWith,
             Action::ToggleFullscreen => Icon::Fullscreen,
