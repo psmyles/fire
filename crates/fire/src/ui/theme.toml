@@ -90,21 +90,21 @@ ev_up          = 1.0
 ev_reset       = 1.0
 ev_down        = 1.0
 # Backdrop: black, white, grey, checkerboard — and the alpha outline.
-backdrop_black = 0.8
-white          = 0.8
-backdrop_grey  = 0.8
-checker        = 0.8
-outline        = 0.9
+backdrop_black = 0.7
+white          = 0.7
+backdrop_grey  = 0.7
+checker        = 0.7
+outline        = 0.8
 # Open with…, fullscreen, and the flipbook toggle.
-open_with      = 1.0
-fullscreen     = 1.0
+open_with      = 0.75
+fullscreen     = 0.75
 flipbook       = 0.9
 # The transport band's play/pause button (sized off the text line, not `icon_size`).
 play           = 1.0
 pause          = 1.0
 # The » overflow button, and the octagon crop.
 more           = 1.0
-octagon        = 1.0
+octagon        = 0.8
 
 
 # ── The palette ───────────────────────────────────────────────────────────────────────────────────

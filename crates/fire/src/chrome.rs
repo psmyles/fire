@@ -189,7 +189,7 @@ impl ViewSnapshot {
             Action::Background(Background::White) => "White backdrop".into(),
             Action::Background(Background::Grey) => "Grey backdrop".into(),
             Action::Background(Background::Checker) => "Checkerboard backdrop".into(),
-            Action::OpenWithMenu => "Copy, open in app, settings\u{2026}".into(),
+            Action::OpenWithMenu => "More options\u{2026}".into(),
             Action::ToggleFullscreen => format!("Full screen{}", k(KeyAction::ToggleFullscreen)),
             Action::ToggleFlipbook => format!("Flipbook mode{}", k(KeyAction::ToggleFlipbook)),
             Action::Overflow => "More controls\u{2026}".into(),
