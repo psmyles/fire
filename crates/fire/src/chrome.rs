@@ -36,7 +36,9 @@ pub enum Action {
     ZoomIn,
     /// Single button toggling fit-to-window ↔ 1:1 (the icon shows what a click will do).
     ZoomToggle,
-    /// Set/toggle channel isolation (RGB resets; R/G/B/A solo-toggle).
+    /// Set/toggle the channel view. The composite slot toggles RGBA↔RGB (and returns from a solo);
+    /// R/G/B/A solo-toggle. Only [`Channel::Rgb`] is ever laid out as the composite button — the
+    /// mode it currently shows lives in [`ViewSnapshot::channel`], which drives its icon.
     Channel(Channel),
     /// Reinhard ↔ ACES (HDR only).
     ToggleTonemap,
@@ -77,7 +79,8 @@ pub struct ViewSnapshot {
     /// True between an open request and its decode landing. With `!has_image` it distinguishes
     /// "still loading" (show nothing) from "empty" (show the drop hint).
     pub loading: bool,
-    /// Source carries a real alpha channel (drives the RGB↔RGBA icon).
+    /// Source carries a real alpha channel: drives the composite button's RGB↔RGBA icon and toggle,
+    /// and gates the alpha-solo button — which isn't laid out at all for a source with no alpha.
     pub has_alpha: bool,
     pub background: Background,
     /// Image-boundary outline is on (drives the toggle button's highlight).
@@ -139,6 +142,9 @@ impl ViewSnapshot {
     /// buttons (navigation, zoom steps, the fit/1:1 toggle, exposure) never latch.
     pub(crate) fn active(&self, a: Action) -> bool {
         match a {
+            // The composite button latches in *either* composite mode — it marks "not soloing a
+            // channel", and its icon says which of RGBA / RGB is showing.
+            Action::Channel(Channel::Rgb | Channel::Rgba) => self.channel.is_composite(),
             Action::Channel(c) => self.channel == c,
             Action::ToggleTonemap => self.tonemap == Tonemap::Aces,
             Action::Background(b) => self.background == b,
@@ -169,7 +175,16 @@ impl ViewSnapshot {
                     format!("Fit to window{}", k(KeyAction::Fit))
                 }
             }
-            Action::Channel(Channel::Rgb) => format!("All channels{}", k(KeyAction::ChannelRgb)),
+            // Like the zoom toggle, this one names what a click switches *to* — but only when
+            // there is an alpha channel to switch about.
+            Action::Channel(Channel::Rgb | Channel::Rgba) => {
+                let key = k(KeyAction::ChannelRgb);
+                match (self.has_alpha, self.channel) {
+                    (false, _) => format!("All channels{key}"),
+                    (true, Channel::Rgba) => format!("Color without alpha (RGB){key}"),
+                    (true, _) => format!("Composite alpha (RGBA){key}"),
+                }
+            }
             Action::Channel(Channel::R) => format!("Red channel{}", k(KeyAction::ChannelR)),
             Action::Channel(Channel::G) => format!("Green channel{}", k(KeyAction::ChannelG)),
             Action::Channel(Channel::B) => format!("Blue channel{}", k(KeyAction::ChannelB)),
@@ -197,7 +212,8 @@ impl ViewSnapshot {
     }
 
     /// The icon for a button — a couple of which depend on live state: the zoom toggle shows the
-    /// mode a click switches *to*, and the all-channels button reflects alpha presence.
+    /// mode a click switches *to*, and the composite button shows the channel mode now showing
+    /// (RGBA or RGB).
     pub(crate) fn icon(&self, a: Action) -> Icon {
         match a {
             Action::Prev => Icon::Left,
@@ -211,8 +227,15 @@ impl ViewSnapshot {
                     Icon::Fit
                 }
             }
-            Action::Channel(Channel::Rgb) => {
-                if self.has_alpha {
+            // The composite button wears the mode that is *on*. From a single-channel solo it wears
+            // the composite a click would return to — RGBA whenever the source has an alpha.
+            Action::Channel(Channel::Rgb | Channel::Rgba) => {
+                let showing = if self.channel.is_composite() {
+                    self.channel
+                } else {
+                    Channel::composite(self.has_alpha)
+                };
+                if showing == Channel::Rgba {
                     Icon::Rgba
                 } else {
                     Icon::Rgb

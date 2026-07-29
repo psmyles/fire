@@ -20,7 +20,7 @@ cbuffer Params : register(b0) {
     float2 pan;
     float  inv_zoom;
     float  exposure;
-    int    channel;        // 0=RGB 1=R 2=G 3=B 4=A
+    int    channel;        // 0=RGBA 1=R 2=G 3=B 4=A 5=RGB
     int    tonemap;        // 0=Reinhard 1=ACES
     int    is_hdr;
     int    has_image;
@@ -146,7 +146,10 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
     else if (channel == 2) outc = rgb.ggg;
     else if (channel == 3) outc = rgb.bbb;
     else if (channel == 4) outc = srgb_to_linear(float3(a, a, a)).xxx;
-    else {
+    // 5 = RGB: the color values on their own, as if the image were opaque. No composite, so a
+    // transparent region shows whatever color it actually carries instead of the backdrop.
+    else if (channel == 5) outc = rgb;
+    else {                                                   // 0 = RGBA (alpha composited)
         outc = rgb;
         if (a < 0.999) outc = backdrop(sp) * (1.0 - a) + rgb * a;
     }

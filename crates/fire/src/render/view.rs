@@ -39,14 +39,43 @@ impl Viewport {
     }
 }
 
-/// Channel-isolation mode (selects the per-pixel branch in the [`crate::render::gpu`] shader).
+/// Channel view mode (selects the per-pixel branch in the [`crate::render::gpu`] shader).
+///
+/// The first two are the *composite* modes — both show all the color channels at once, and the
+/// toolbar's leftmost channel button toggles between them: [`Channel::Rgba`] composites the color
+/// over the backdrop through its alpha, so transparency reads as transparency, while
+/// [`Channel::Rgb`] shows the color values alone as if the image were opaque (which is what a
+/// texture author usually wants to see — an "invisible" RGB payload hiding under a zero alpha is
+/// exactly the thing the toggle exposes). A source without an alpha channel has nothing to
+/// composite and so only ever sits in [`Channel::Rgb`]; that is why the toggle, the icon and the
+/// alpha-isolation button are all `has_alpha`-driven. The rest isolate one channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Channel {
+    /// Color values only, alpha ignored — the sole composite mode for a source without alpha.
     Rgb,
+    /// Color composited over the backdrop through alpha; the default for a source that has one.
+    Rgba,
     R,
     G,
     B,
     A,
+}
+
+impl Channel {
+    /// The composite mode an image starts in (and returns to when a solo is switched off): the
+    /// alpha is honored whenever the source carries one.
+    pub fn composite(has_alpha: bool) -> Self {
+        if has_alpha {
+            Channel::Rgba
+        } else {
+            Channel::Rgb
+        }
+    }
+
+    /// Whether this is one of the two all-channel modes rather than an isolated single channel.
+    pub fn is_composite(self) -> bool {
+        matches!(self, Channel::Rgb | Channel::Rgba)
+    }
 }
 
 /// HDR tonemap operator (applies to float sources only, #13).
@@ -96,6 +125,8 @@ pub struct DisplayState {
 impl Default for DisplayState {
     fn default() -> Self {
         Self {
+            // Plain RGB is the no-image / no-alpha state; `set_image` upgrades an image that
+            // carries an alpha channel to `Channel::Rgba` (see [`Channel::composite`]).
             channel: Channel::Rgb,
             exposure: 0.0,
             tonemap: Tonemap::Reinhard,
@@ -376,6 +407,20 @@ mod tests {
             ]
         );
         assert_eq!(bg.next(), Background::Black, "the cycle must wrap");
+    }
+
+    /// An image with alpha opens composited; one without has only RGB to show. Both count as
+    /// composite modes, which is what keeps the toolbar's leftmost channel button latched.
+    #[test]
+    fn the_default_composite_follows_the_source_alpha() {
+        assert_eq!(Channel::composite(true), Channel::Rgba);
+        assert_eq!(Channel::composite(false), Channel::Rgb);
+        for ch in [Channel::Rgb, Channel::Rgba] {
+            assert!(ch.is_composite(), "{ch:?} is an all-channels mode");
+        }
+        for ch in [Channel::R, Channel::G, Channel::B, Channel::A] {
+            assert!(!ch.is_composite(), "{ch:?} isolates one channel");
+        }
     }
 
     #[test]

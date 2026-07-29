@@ -132,7 +132,7 @@ impl KeyAction {
             KeyAction::ActualSize => "Actual size (1:1)",
             KeyAction::ZoomIn => "Zoom in",
             KeyAction::ZoomOut => "Zoom out",
-            KeyAction::ChannelRgb => "All channels",
+            KeyAction::ChannelRgb => "All channels: RGBA \u{2194} RGB",
             KeyAction::ChannelR => "Red channel",
             KeyAction::ChannelG => "Green channel",
             KeyAction::ChannelB => "Blue channel",

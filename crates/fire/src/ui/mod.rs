@@ -693,11 +693,17 @@ fn toolbar(
     // A group divider: spacing, a 1px rule, spacing.
     let div_w = spacing * 2.0 + 1.0;
 
-    // Which left slots apply at all (the HDR group is float-only)?
+    // Which left slots apply at all? The HDR group is float-only, and the alpha solo has nothing to
+    // isolate on a source with no alpha channel — so it is not laid out for one: not dimmed, and not
+    // pushed into the overflow menu either. (The composite button stays: it is the all-channels
+    // reset, and only its RGBA↔RGB half depends on alpha.)
     let candidates: Vec<(Action, u8, u8)> = LEFT
         .iter()
         .copied()
-        .filter(|(_, g, _)| *g != HDR_GROUP || snap.is_hdr)
+        .filter(|(a, g, _)| match a {
+            Action::Channel(Ch::A) => snap.has_alpha,
+            _ => *g != HDR_GROUP || snap.is_hdr,
+        })
         .collect();
 
     let right: Vec<(Action, u8)> = RIGHT.to_vec();
@@ -1186,11 +1192,14 @@ fn action_id(a: Action) -> u32 {
         Action::ZoomOut => 3,
         Action::ZoomIn => 4,
         Action::ZoomToggle => 5,
+        // The composite button is always laid out as `Rgb` (see `LEFT`), whichever composite mode it
+        // is currently showing; `Rgba` never reaches a widget, but the match must still cover it.
         Action::Channel(Ch::Rgb) => 10,
         Action::Channel(Ch::R) => 11,
         Action::Channel(Ch::G) => 12,
         Action::Channel(Ch::B) => 13,
         Action::Channel(Ch::A) => 14,
+        Action::Channel(Ch::Rgba) => 15,
         Action::ToggleTonemap => 20,
         Action::ExpUp => 21,
         Action::ExpReset => 22,

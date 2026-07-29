@@ -820,7 +820,7 @@ impl App {
                     self.surface.fit();
                 }
             }
-            Action::Channel(Channel::Rgb) => self.surface.set_channel(Channel::Rgb),
+            Action::Channel(Channel::Rgb | Channel::Rgba) => self.surface.toggle_composite(),
             Action::Channel(c) => self.surface.toggle_channel(c),
             Action::ToggleTonemap => self.surface.toggle_tonemap(),
             Action::ExpUp => self.surface.adjust_exposure(self.cfg.exposure_step),
@@ -914,7 +914,9 @@ impl App {
             KeyAction::ActualSize => self.surface.one_to_one(),
             KeyAction::ZoomIn => self.surface.zoom_centered(self.cfg.zoom_step),
             KeyAction::ZoomOut => self.surface.zoom_centered(1.0 / self.cfg.zoom_step),
-            KeyAction::ChannelRgb => self.surface.set_channel(Channel::Rgb),
+            // Same command as the toolbar's composite button: RGBA↔RGB on an image with alpha, and
+            // the all-channels reset from a solo (or on an image without one).
+            KeyAction::ChannelRgb => self.surface.toggle_composite(),
             KeyAction::ChannelR => self.surface.toggle_channel(Channel::R),
             KeyAction::ChannelG => self.surface.toggle_channel(Channel::G),
             KeyAction::ChannelB => self.surface.toggle_channel(Channel::B),
@@ -1694,8 +1696,18 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
 
         // Open the launch path immediately (decode is async; the image swaps in via
         // WM_APP_DECODE_DONE once the loop runs).
+        //
+        // *Without* activation, deliberately: `foreground::raise` would `ShowWindow(SW_SHOW)` the
+        // still-hidden frame at its restored size, so the maximized show a few lines down would be
+        // a genuine restored→maximized transition — which Windows animates. (That is why launching
+        // with a file zoomed open and launching empty didn't.) The show below is this frame's first
+        // appearance, already in the remembered state, and it takes the foreground on its own: we
+        // are the process the launcher just started. A *forwarded* open still raises — that is what
+        // the one-shot grant is for (§4.1) — because there the window is already up.
         if let Some(path) = initial {
-            app.open(OpenRequest::new(path));
+            let mut req = OpenRequest::new(path);
+            req.flags.activate = false;
+            app.open(req);
         }
 
         let app_raw = Box::into_raw(app);

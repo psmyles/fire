@@ -717,9 +717,13 @@ impl GpuSurface {
             .background_override
             .unwrap_or_else(|| default_background(&img));
         self.tex.current = Some(img);
-        // Neutral display state for the new file (#17), seeded with the configured tonemap.
+        // Neutral display state for the new file (#17), seeded with the configured tonemap and
+        // with the composite mode the source's own format asks for: alpha is honored by default
+        // whenever there is one, so a transparent PNG opens composited over the backdrop rather
+        // than showing whatever colors hide under its zero-alpha pixels.
         self.display = DisplayState {
             tonemap: self.prefs.default_tonemap,
+            channel: Channel::composite(self.has_alpha()),
             ..DisplayState::default()
         };
         // A fresh image starts as a whole-image view; the win shell re-applies any per-path
@@ -748,6 +752,12 @@ impl GpuSurface {
         // is preserved, but the animation plays from the top). The win shell re-arms the timer.
         self.anim.adopt(&img);
         self.tex.current = Some(img);
+        // A re-export can drop the alpha channel. Both alpha-dependent modes stop meaning anything
+        // then — and the toolbar's A button is gone, so an alpha solo would be a state with no way
+        // out — so fall back to the composite the new file does have.
+        if !self.has_alpha() && matches!(self.display.channel, Channel::Rgba | Channel::A) {
+            self.display.channel = Channel::Rgb;
+        }
         // Hot reload keeps flipbook mode active (same path); clamp against the frame rect when in
         // flipbook mode, else the whole image (a no-op while the dims are unchanged).
         if !self.view.fit {
@@ -1201,17 +1211,29 @@ impl GpuSurface {
         self.refresh();
     }
 
+    /// Solo one channel, or switch the solo back off — which lands on the image's composite mode
+    /// ([`Channel::composite`]), not unconditionally on `Rgb`: leaving an alpha image's R solo
+    /// puts you back where the image opened.
     pub fn toggle_channel(&mut self, ch: Channel) {
         self.display.channel = if self.display.channel == ch {
-            Channel::Rgb
+            Channel::composite(self.has_alpha())
         } else {
             ch
         };
         self.refresh();
     }
 
-    pub fn set_channel(&mut self, ch: Channel) {
-        self.display.channel = ch;
+    /// The composite button / `all-channels` key: flip RGBA↔RGB when a composite mode is already
+    /// showing, or return to the image's default composite from a single-channel solo. A source
+    /// without alpha has only `Rgb`, so for it this stays the plain "all channels" reset.
+    pub fn toggle_composite(&mut self) {
+        self.display.channel = if self.display.channel == Channel::Rgba {
+            Channel::Rgb
+        } else {
+            // From RGB this flips to RGBA (or stays RGB with no alpha to composite); from a solo
+            // it returns to the mode the image opened in.
+            Channel::composite(self.has_alpha())
+        };
         self.refresh();
     }
 
@@ -1236,11 +1258,12 @@ impl GpuSurface {
 
 fn channel_code(ch: Channel) -> i32 {
     match ch {
-        Channel::Rgb => 0,
+        Channel::Rgba => 0,
         Channel::R => 1,
         Channel::G => 2,
         Channel::B => 3,
         Channel::A => 4,
+        Channel::Rgb => 5,
     }
 }
 
