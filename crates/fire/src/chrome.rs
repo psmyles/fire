@@ -181,8 +181,8 @@ impl ViewSnapshot {
                 let key = k(KeyAction::ChannelRgb);
                 match (self.has_alpha, self.channel) {
                     (false, _) => format!("All channels{key}"),
-                    (true, Channel::Rgba) => format!("Color without alpha (RGB){key}"),
-                    (true, _) => format!("Composite alpha (RGBA){key}"),
+                    (true, Channel::Rgba) => format!("Color with alpha (RGBA){key}"),
+                    (true, _) => format!("Color without alpha (RGB){key}"),
                 }
             }
             Action::Channel(Channel::R) => format!("Red channel{}", k(KeyAction::ChannelR)),
