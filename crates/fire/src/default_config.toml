@@ -106,6 +106,17 @@
 # default-tonemap = "reinhard"
 
 # ----------------------------------------------------------------------------------------------
+# wheel-action — what a turn of the mouse wheel over the image does.
+#
+#   "zoom"             (default) Zoom in/out about the cursor, by zoom-step per notch.
+#   "navigate-folder"  Step through the folder's images — wheel up for the previous one, wheel
+#                      down for the next, the same order as ← / →.
+#
+# Ctrl+wheel zooms either way, so choosing navigation does not cost you wheel zoom.
+#
+# wheel-action = "zoom"
+
+# ----------------------------------------------------------------------------------------------
 # zoom-step / exposure-step — how far one input step moves the view.
 #
 #   zoom-step      Multiplicative zoom per wheel notch (and per = / - press). 1.15 = +15% per

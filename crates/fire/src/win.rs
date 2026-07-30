@@ -90,7 +90,7 @@ const CF_UNICODETEXT: u32 = 13;
 const CF_HDROP: u32 = 15;
 
 use crate::chrome;
-use crate::config::Config;
+use crate::config::{Config, WheelActionCfg};
 use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool, FlipbookGuess};
 use crate::folder::{self, Folder};
 use crate::foreground;
@@ -287,6 +287,14 @@ struct App {
     /// [`save_window_state`] — persisting live (not just on close) is what lets the next
     /// `NewWindow` launch reopen at the size/maximized state the user last left a window in.
     in_size_move: bool,
+    /// Leftover fraction of a wheel notch, when the wheel is set to walk the folder
+    /// ([`WheelActionCfg::NavigateFolder`]). A precision touchpad or tilt wheel sends `WM_MOUSEWHEEL`
+    /// in fractions of the 120-unit notch; zooming consumes those naturally (a fractional power of
+    /// `zoom_step`), but "next image" is discrete, so the fractions are banked here until they make a
+    /// whole notch. Without this, a fine-grained wheel would either do nothing at all or, if we
+    /// rounded up, skip several images per flick. Reset on direction change so a reversal is
+    /// immediate rather than having to pay off the other direction's debt first.
+    wheel_notches: f32,
 }
 
 impl App {
@@ -376,6 +384,35 @@ impl App {
             _ => return,
         };
         self.load(&path, false);
+    }
+
+    /// Walk the folder by a wheel turn of `notches` (positive = wheel away from the user), when the
+    /// wheel is configured for navigation. Wheel *up* goes to the **previous** image, matching
+    /// Explorer's preview pane and Windows Photos.
+    ///
+    /// Fractional turns are banked in `wheel_notches` rather than rounded, so a precision touchpad
+    /// steps one image per notch's worth of scrolling instead of either doing nothing or racing
+    /// through the folder. A flick that spans several notches moves several images — one `load` each
+    /// would be wasted work, so the cursor is advanced in one hop and only the image landed on is
+    /// decoded.
+    fn wheel_navigate(&mut self, notches: f32) {
+        if notches == 0.0 {
+            return;
+        }
+        // A reversal starts from zero: carrying the old direction's fraction would swallow the
+        // first turn back.
+        if self.wheel_notches != 0.0
+            && self.wheel_notches.is_sign_negative() != notches.is_sign_negative()
+        {
+            self.wheel_notches = 0.0;
+        }
+        self.wheel_notches += notches;
+        let whole = self.wheel_notches.trunc();
+        if whole == 0.0 {
+            return;
+        }
+        self.wheel_notches -= whole;
+        self.navigate(-(whole as isize)); // wheel up (positive) = previous image
     }
 
     /// Scan `path`'s folder for sibling images off the UI thread, posting the result back via
@@ -1680,6 +1717,7 @@ unsafe fn build_app(frame: HWND, hinstance: HMODULE, dark: bool, cfg: Config) ->
         settings: None,
         caret_timer: false,
         in_size_move: false,
+        wheel_notches: 0.0,
     })
 }
 
@@ -2094,10 +2132,22 @@ unsafe fn on_mouse(app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam >> 16) & 0xffff) as u16 as i16 as f32 / 120.0;
-            if delta != 0.0 {
-                let step = app.cfg.zoom_step;
-                app.surface.zoom_at_cursor(step.powf(delta));
-                app.redraw();
+            // Ctrl+wheel is the near-universal zoom gesture, so it zooms whatever the wheel is
+            // configured for — which is also what keeps wheel zoom reachable for someone who put
+            // folder navigation on the plain turn.
+            let action = if key_down(VK_CONTROL) {
+                WheelActionCfg::Zoom
+            } else {
+                app.cfg.wheel_action
+            };
+            match action {
+                WheelActionCfg::Zoom if delta != 0.0 => {
+                    let step = app.cfg.zoom_step;
+                    app.surface.zoom_at_cursor(step.powf(delta));
+                    app.redraw();
+                }
+                WheelActionCfg::NavigateFolder => app.wheel_navigate(delta),
+                WheelActionCfg::Zoom => {}
             }
             0
         }

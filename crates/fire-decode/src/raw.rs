@@ -11,7 +11,9 @@
 //! This module's job is purely to *locate* the largest embedded JPEG and report the
 //! file's display orientation; the actual JPEG decode is handed back to the normal zune
 //! hot path in [`crate`], so ICC handling, bit-depth normalization, and downscale-to-fit
-//! all come for free.
+//! all come for free. Rotating by the reported orientation is [`crate::exif`]'s job, shared
+//! with every other container — the raw path is here only because *finding* the tag means
+//! walking a vendor container's whole directory tree rather than reading IFD0.
 //!
 //! ## How the preview is found
 //!
@@ -28,7 +30,10 @@
 //! All parsing is pure Rust and bounds-checked (reads return `Option`, never index past the
 //! buffer), so a malformed/truncated raw yields "no preview found", never a panic.
 
-use crate::{DecodedImage, PixelFormat};
+// The TIFF/EXIF directory primitives are shared with [`crate::exif`], which owns them: this
+// module walks the *whole* tree looking for previews, that one reads IFD0's Orientation for every
+// other container. Both parse the same 12-byte entries.
+use crate::exif::{entry_scalar, rd_u16, rd_u32};
 
 /// Map a lowercase raw file extension to a human-readable status-bar label. This is the
 /// authoritative set of extensions the decoder *routes* as camera raw; [`crate::SUPPORTED_EXTENSIONS`]
@@ -110,7 +115,11 @@ pub struct Preview<'a> {
     /// The embedded JPEG stream (decoded by the caller through the normal JPEG path). May
     /// extend to end-of-file for marker-scan hits; JPEG decoders stop at the EOI marker.
     pub jpeg: &'a [u8],
-    /// EXIF orientation (1..=8) to apply to the decoded preview; 1 when unknown.
+    /// EXIF orientation (1..=8) for [`crate::exif::apply`] to rotate the decoded preview by; 1
+    /// when unknown. The major brands (Canon/Nikon/Sony) store the full-size preview in *sensor*
+    /// orientation and describe the upright rotation with that one tag, so a portrait shot would
+    /// otherwise show sideways. Containers whose orientation we can't read default to 1; their
+    /// previews are generally stored already upright.
     pub orientation: u16,
 }
 
@@ -145,60 +154,6 @@ pub fn find_preview(b: &[u8]) -> Option<Preview<'_>> {
         jpeg: &b[off..end],
         orientation,
     })
-}
-
-/// Apply an EXIF `orientation` (2..=8) to a decoded image in place, rotating/flipping the
-/// pixels so the image displays upright. Orientation 1 (or any out-of-range value) is a
-/// no-op. Works at `bytes_per_pixel` granularity, so it is format-agnostic.
-///
-/// We apply the orientation read from the raw's TIFF directory to the embedded preview: the
-/// major brands (Canon/Nikon/Sony) store the full-size preview in sensor orientation and
-/// describe the upright rotation with that one tag, so a portrait shot would otherwise show
-/// sideways. (Containers we can't read an orientation from default to 1; their previews are
-/// generally stored already upright.)
-pub fn apply_orientation(img: &mut DecodedImage, orientation: u16) {
-    if !(2..=8).contains(&orientation) {
-        return;
-    }
-    let bpp = img.format.bytes_per_pixel();
-    let (w, h) = (img.width as usize, img.height as usize);
-    if img.pixels.len() < w * h * bpp {
-        return;
-    }
-    // Orientations 5..=8 are 90°/270° rotations (and the diagonal mirrors), which swap axes.
-    let (ow, oh) = if (5..=8).contains(&orientation) {
-        (h, w)
-    } else {
-        (w, h)
-    };
-    let mut out = vec![0u8; ow * oh * bpp];
-
-    for sy in 0..h {
-        for sx in 0..w {
-            let (dx, dy) = match orientation {
-                2 => (w - 1 - sx, sy),         // mirror horizontal
-                3 => (w - 1 - sx, h - 1 - sy), // rotate 180
-                4 => (sx, h - 1 - sy),         // mirror vertical
-                5 => (sy, sx),                 // transpose (mirror along main diagonal)
-                6 => (h - 1 - sy, sx),         // rotate 90° CW
-                7 => (h - 1 - sy, w - 1 - sx), // transverse (mirror along anti-diagonal)
-                8 => (sy, w - 1 - sx),         // rotate 90° CCW
-                _ => (sx, sy),
-            };
-            let si = (sy * w + sx) * bpp;
-            let di = (dy * ow + dx) * bpp;
-            out[di..di + bpp].copy_from_slice(&img.pixels[si..si + bpp]);
-        }
-    }
-
-    img.pixels = out;
-    img.width = ow as u32;
-    img.height = oh as u32;
-    // Preview is always 8-bit RGBA at this point, but keep the invariant explicit.
-    debug_assert!(matches!(
-        img.format,
-        PixelFormat::Rgba8Unorm | PixelFormat::Rgba16Unorm
-    ));
 }
 
 // --- preview candidate selection ---------------------------------------------
@@ -424,16 +379,6 @@ fn collect_tiff(b: &[u8]) -> (Vec<(usize, usize)>, Option<u16>) {
     (cands, orientation)
 }
 
-/// Read a single-value IFD entry (`count == 1`) as a u32, honoring BYTE/SHORT/LONG types.
-/// The value sits inline in the entry's 4-byte value field (all these types fit).
-fn entry_scalar(b: &[u8], eo: usize, typ: u16, le: bool) -> Option<u32> {
-    match typ {
-        1 => rd_u8(b, eo + 8).map(|v| v as u32),      // BYTE
-        3 => rd_u16(b, eo + 8, le).map(|v| v as u32), // SHORT
-        _ => rd_u32(b, eo + 8, le),                   // LONG (4) and best-effort fallback
-    }
-}
-
 /// Read a `SubIFDs`-style array of LONG offsets. For `count == 1` the offset is inline; for
 /// `count > 1` the value field points at an array of u32s. Capped to bound malformed input.
 fn entry_long_array(b: &[u8], eo: usize, n: u32, le: bool) -> Vec<u32> {
@@ -456,30 +401,6 @@ fn entry_long_array(b: &[u8], eo: usize, n: u32, le: bool) -> Vec<u32> {
     out
 }
 
-// --- bounds-checked primitive reads ------------------------------------------
-
-fn rd_u8(b: &[u8], o: usize) -> Option<u8> {
-    b.get(o).copied()
-}
-
-fn rd_u16(b: &[u8], o: usize, le: bool) -> Option<u16> {
-    let s = b.get(o..o + 2)?;
-    Some(if le {
-        u16::from_le_bytes([s[0], s[1]])
-    } else {
-        u16::from_be_bytes([s[0], s[1]])
-    })
-}
-
-fn rd_u32(b: &[u8], o: usize, le: bool) -> Option<u32> {
-    let s = b.get(o..o + 4)?;
-    Some(if le {
-        u32::from_le_bytes([s[0], s[1], s[2], s[3]])
-    } else {
-        u32::from_be_bytes([s[0], s[1], s[2], s[3]])
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,22 +412,6 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         src.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
         buf.into_inner()
-    }
-
-    fn img(w: u32, h: u32, pixels: Vec<u8>) -> DecodedImage {
-        DecodedImage {
-            pixels,
-            width: w,
-            height: h,
-            format: PixelFormat::Rgba8Unorm,
-            bit_depth: 8,
-            channels: 4,
-            icc: None,
-            source_format: "test",
-            alpha_opaque: false,
-            downscaled_from: None,
-            animation: None,
-        }
     }
 
     #[test]
@@ -716,40 +621,6 @@ mod tests {
         tiff.extend_from_slice(&preview);
 
         assert_eq!(find_preview(&tiff).expect("preview").orientation, 1);
-    }
-
-    #[test]
-    fn orientation_rotate_90_cw_swaps_axes() {
-        // 2x1 image: pixel A then B (left, right).
-        let a = [10u8, 11, 12, 255];
-        let b = [20u8, 21, 22, 255];
-        let mut im = img(2, 1, [a, b].concat());
-        apply_orientation(&mut im, 6); // rotate 90° CW -> 1 wide, 2 tall, A on top
-        assert_eq!((im.width, im.height), (1, 2));
-        assert_eq!(&im.pixels[0..4], &a); // top row
-        assert_eq!(&im.pixels[4..8], &b); // bottom row
-    }
-
-    #[test]
-    fn orientation_mirror_horizontal() {
-        let a = [1u8, 1, 1, 255];
-        let b = [2u8, 2, 2, 255];
-        let mut im = img(2, 1, [a, b].concat());
-        apply_orientation(&mut im, 2); // mirror horizontal -> B then A
-        assert_eq!((im.width, im.height), (2, 1));
-        assert_eq!(&im.pixels[0..4], &b);
-        assert_eq!(&im.pixels[4..8], &a);
-    }
-
-    #[test]
-    fn orientation_identity_and_out_of_range_are_noops() {
-        let pixels: Vec<u8> = (0..16).collect();
-        for o in [1u16, 0, 9, 999] {
-            let mut im = img(2, 2, pixels.clone());
-            apply_orientation(&mut im, o);
-            assert_eq!(im.pixels, pixels);
-            assert_eq!((im.width, im.height), (2, 2));
-        }
     }
 
     #[test]

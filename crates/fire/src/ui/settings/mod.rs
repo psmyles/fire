@@ -368,6 +368,7 @@ fn general(ui: &Ui, st: &mut State) {
             "Images open",
             "Backdrop",
             "HDR tone map",
+            "Mouse wheel",
             "Zoom step",
             "Exposure step",
             "Zoom snapping",
@@ -428,6 +429,30 @@ fn general(ui: &Ui, st: &mut State) {
 
     ui.spacing();
     ui.separator_with_text("Input");
+    choice(ui, st, lw, ChoiceField::WheelAction, "Mouse wheel");
+    // Named after the *live* chords for the same reason the Esc checkbox above is: the Keybinds tab
+    // can move them, and a note that keeps claiming "←/→" after you have would be lying.
+    let nav_keys = {
+        let k = |a, fallback: &str| {
+            st.keys
+                .chords(a)
+                .first()
+                .map_or_else(|| fallback.to_string(), |c| c.display())
+        };
+        format!(
+            "{} / {}",
+            k(KeyAction::PrevImage, "\u{2190}"),
+            k(KeyAction::NextImage, "\u{2192}")
+        )
+    };
+    row_note(
+        ui,
+        lw,
+        &format!(
+            "\"Changes image\" walks the folder — wheel up for the previous image, the same order \
+             as {nav_keys}. Ctrl+wheel zooms either way."
+        ),
+    );
     num(ui, st, lw, NumField::ZoomStep, "Zoom step");
     row_note(ui, lw, "Zoom factor per wheel notch or key press.");
     num(ui, st, lw, NumField::ExposureStep, "Exposure step");

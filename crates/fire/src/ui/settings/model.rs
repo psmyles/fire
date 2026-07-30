@@ -10,7 +10,9 @@
 //!   indented row list the Context Menu tab paints, and the edit operations (add / remove / move /
 //!   indent / outdent) work on the `Vec<MenuEntry>` by *path* (the index chain from the root).
 
-use crate::config::{BackgroundCfg, Config, FitCfg, InstanceMode, MenuEntry, TonemapCfg};
+use crate::config::{
+    BackgroundCfg, Config, FitCfg, InstanceMode, MenuEntry, TonemapCfg, WheelActionCfg,
+};
 use crate::flipbook::{FPS_MAX, FPS_MIN};
 
 // ---------------------------------------------------------------------------------------------
@@ -78,6 +80,7 @@ pub(crate) enum ChoiceField {
     Background,
     DefaultTonemap,
     DefaultFit,
+    WheelAction,
 }
 
 impl ChoiceField {
@@ -87,6 +90,7 @@ impl ChoiceField {
             ChoiceField::Background => &["Automatic", "Black", "White", "Grey", "Checkerboard"],
             ChoiceField::DefaultTonemap => &["Reinhard", "ACES"],
             ChoiceField::DefaultFit => &["Fit to window", "Actual size (1:1)"],
+            ChoiceField::WheelAction => &["Zooms", "Changes image"],
         }
     }
 
@@ -111,6 +115,10 @@ impl ChoiceField {
                 FitCfg::Fit => 0,
                 FitCfg::ActualSize => 1,
             },
+            ChoiceField::WheelAction => match c.wheel_action {
+                WheelActionCfg::Zoom => 0,
+                WheelActionCfg::NavigateFolder => 1,
+            },
         }
     }
 
@@ -128,6 +136,8 @@ impl ChoiceField {
             (ChoiceField::DefaultTonemap, 1) => c.default_tonemap = TonemapCfg::Aces,
             (ChoiceField::DefaultFit, 0) => c.default_fit = FitCfg::Fit,
             (ChoiceField::DefaultFit, 1) => c.default_fit = FitCfg::ActualSize,
+            (ChoiceField::WheelAction, 0) => c.wheel_action = WheelActionCfg::Zoom,
+            (ChoiceField::WheelAction, 1) => c.wheel_action = WheelActionCfg::NavigateFolder,
             _ => {}
         }
     }
@@ -677,6 +687,7 @@ mod tests {
             ChoiceField::Background,
             ChoiceField::DefaultTonemap,
             ChoiceField::DefaultFit,
+            ChoiceField::WheelAction,
         ];
         for f in fields {
             for i in 0..f.options().len() {

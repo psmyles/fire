@@ -117,6 +117,23 @@ impl MenuEntry {
     }
 }
 
+/// What a turn of the mouse wheel over the image does — the two things a viewer plausibly wants
+/// from it, and no way to have both as the plain gesture, so it is a setting rather than a guess.
+///
+/// **Ctrl+wheel always zooms**, whichever of these is chosen: it is the near-universal zoom gesture
+/// (browsers, editors, Explorer), so honoring it costs the navigation mode nothing and is what
+/// keeps wheel zoom reachable there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WheelActionCfg {
+    /// Default: zoom about the cursor by `zoom_step` per notch.
+    #[default]
+    Zoom,
+    /// Step to the next/previous image in the folder — wheel up for previous, matching Explorer's
+    /// preview pane and Windows Photos.
+    NavigateFolder,
+}
+
 /// The viewport backdrop a freshly opened image gets. `Auto` keeps the built-in per-image rule
 /// (real transparency → checkerboard, otherwise black); any other value pins the backdrop for every
 /// image, the same override the toolbar's background buttons set at runtime.
@@ -324,6 +341,8 @@ pub struct Config {
     /// convention). Note this governs only the explicit command — images always *open* per
     /// `default-fit`, so a small image is shown at 100% on load and folder navigation.
     pub fit_upscale: bool,
+    /// What a plain turn of the mouse wheel over the image does. Ctrl+wheel zooms either way.
+    pub wheel_action: WheelActionCfg,
     /// Multiplicative zoom per wheel notch / zoom keypress. Clamped to `1.01..=4.0`.
     #[serde(serialize_with = "serialize_f32")]
     pub zoom_step: f32,
@@ -370,6 +389,7 @@ impl Default for Config {
             esc_closes_window: true,
             hot_reload: true,
             fit_upscale: true,
+            wheel_action: WheelActionCfg::default(),
             zoom_step: 1.15,
             exposure_step: 0.25,
             zoom_snap: ZOOM_SNAP_DEFAULT,
@@ -626,6 +646,7 @@ mod tests {
             esc_closes_window: false,
             hot_reload: false,
             fit_upscale: false,
+            wheel_action: WheelActionCfg::NavigateFolder,
             zoom_step: 1.25,
             exposure_step: 0.5,
             zoom_snap: 20.0,
@@ -720,6 +741,7 @@ mod tests {
         assert!(!cfg.fit_upscale);
         // Everything the settings dialog added is defaulted.
         assert_eq!(cfg.zoom_step, 1.15);
+        assert_eq!(cfg.wheel_action, WheelActionCfg::Zoom);
         assert_eq!(cfg.background, BackgroundCfg::Auto);
         assert_eq!(cfg.flipbook, FlipbookCfg::default());
         assert_eq!(cfg.context_menu, ContextMenuCfg::default());

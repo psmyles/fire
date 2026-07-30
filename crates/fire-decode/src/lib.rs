@@ -26,6 +26,11 @@
 //! applied by [`icc`]. Images larger than the caller's `max_dim` are CPU-downscaled to
 //! fit ([`downscale`]).
 //!
+//! No backend honors the EXIF `Orientation` tag, so [`decode`] does it once for all of them
+//! ([`exif`]): the tag is read out of the source bytes and the decoded buffer is rotated before
+//! the ICC pass, so every consumer sees upright dimensions and the renderer stays a single
+//! constant-buffer draw.
+//!
 //! The two FFI backends sit behind the **default-on** `psd` and `heif` features — the only
 //! parts of the workspace that need the vendored native trees. Building without them keeps the
 //! routing identical and returns a "built without" error for those formats, which is what lets
@@ -35,6 +40,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 mod downscale;
+mod exif;
 mod raw;
 mod tiff;
 
@@ -370,7 +376,13 @@ pub fn decode(
     ext_hint: Option<&str>,
     opts: &DecodeOptions,
 ) -> Result<DecodedImage, DecodeError> {
-    let mut img = match sniff(bytes, ext_hint) {
+    let backend = sniff(bytes, ext_hint);
+    // Camera raw resolves its own orientation while walking the container for the preview
+    // (`decode_raw`), and the preview it hands back is already upright — reading the file's TIFF
+    // directory again below would rotate it a second time.
+    let honor_exif = !matches!(&backend, Backend::Raw(_));
+
+    let mut img = match backend {
         Backend::Psd => decode_psd(bytes)?,
         Backend::Exr => decode_exr(bytes)?,
         Backend::Heif(label) => decode_heif(bytes, label)?,
@@ -403,6 +415,14 @@ pub fn decode(
         },
         Backend::Image => decode_image(bytes, ext_hint)?,
     };
+
+    // Rotate to the orientation the file asks for. First, before the ICC transform and the
+    // downscale, because it can swap width/height: doing it here is the only way `downscaled_from`
+    // and every dimension the viewer reports describe the same (upright) image. Orientation 1 —
+    // almost every file — costs one tag lookup and no pixel work at all.
+    if honor_exif {
+        exif::apply(&mut img, exif::orientation(bytes));
+    }
 
     // Honor an embedded ICC profile by transforming into the working space.
     if opts.honor_icc {
@@ -629,7 +649,7 @@ fn decode_raw(bytes: &[u8], label: &'static str) -> Result<DecodedImage, DecodeE
     // The preview is a JPEG; reuse the zune path (ICC + bit-depth + naming) then re-label it
     // as the raw family and orient it.
     let mut img = decode_zune(preview.jpeg, zune_image::codecs::ImageFormat::JPEG)?;
-    raw::apply_orientation(&mut img, preview.orientation);
+    exif::apply(&mut img, preview.orientation);
     img.source_format = label;
     Ok(img)
 }
@@ -1525,6 +1545,72 @@ mod tests {
         // The camera's red is preserved through the JPEG round-trip.
         let [r, g, b] = [out.pixels[0], out.pixels[1], out.pixels[2]];
         assert!(r > 180 && g < 90 && b < 100, "got {r},{g},{b}");
+    }
+
+    /// The end-to-end EXIF-orientation path for an ordinary photo: a JPEG whose `APP1` says
+    /// "rotate 90° CW" comes back with its axes swapped and its content actually turned, not just
+    /// relabeled. No decoder in the stack does this for us — zune, `image`, `tiff` and `exr` all
+    /// hand back the stored pixels — so without [`exif`] every portrait phone photo displayed on
+    /// its side. Regression test for exactly that.
+    #[test]
+    fn jpeg_exif_orientation_is_honored() {
+        // 16 wide, 8 tall: red left half, blue right half.
+        let mut src = image::RgbImage::new(16, 8);
+        for (x, _y, p) in src.enumerate_pixels_mut() {
+            *p = if x < 8 {
+                image::Rgb([220, 30, 30])
+            } else {
+                image::Rgb([30, 30, 220])
+            };
+        }
+        let plain = encode(
+            &image::DynamicImage::ImageRgb8(src),
+            image::ImageFormat::Jpeg,
+        );
+
+        // An `APP1` EXIF segment (a bare IFD0 holding Orientation = 6) spliced in after the SOI,
+        // which is where a camera writes it.
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend_from_slice(b"II\x2a\x00");
+        app1.extend_from_slice(&8u32.to_le_bytes()); // IFD0 at offset 8
+        app1.extend_from_slice(&1u16.to_le_bytes()); // one entry
+        app1.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+        app1.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+        app1.extend_from_slice(&1u32.to_le_bytes()); // count
+        app1.extend_from_slice(&6u32.to_le_bytes()); // 6 = rotate 90° CW
+        app1.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        bytes.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+        bytes.extend_from_slice(&app1);
+        bytes.extend_from_slice(&plain[2..]);
+
+        // Untagged, the JPEG is 16x8 with red on the left.
+        let plain_out = decode(&plain, Some("jpg"), &DecodeOptions::default()).unwrap();
+        assert_eq!((plain_out.width, plain_out.height), (16, 8));
+
+        let out = decode(&bytes, Some("jpg"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.source_format, "JPEG");
+        assert_eq!(out.channels, 3, "rotating must not invent an alpha channel");
+        assert_eq!(
+            (out.width, out.height),
+            (8, 16),
+            "orientation 6 swaps the axes"
+        );
+        // Rotated 90° CW, the red left half is now the top half: first row red, last row blue.
+        let px = |x: u32, y: u32| {
+            let i = ((y * out.width + x) * 4) as usize;
+            [out.pixels[i], out.pixels[i + 1], out.pixels[i + 2]]
+        };
+        let [r, g, b] = px(0, 0);
+        assert!(
+            r > 180 && g < 90 && b < 90,
+            "top row should be red: {r},{g},{b}"
+        );
+        let [r, g, b] = px(0, 15);
+        assert!(
+            b > 180 && r < 90 && g < 90,
+            "bottom row should be blue: {r},{g},{b}"
+        );
     }
 
     /// A format zune sniffs but then fails to decode falls through to the `image` crate.
