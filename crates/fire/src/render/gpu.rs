@@ -361,10 +361,10 @@ struct SessionPrefs {
     /// The tonemap operator a freshly adopted image starts on (the `default-tonemap` config key).
     /// Seeds [`DisplayState`] on each adopt; the `T` toggle still moves the live one.
     default_tonemap: Tonemap,
-    /// The zoom levels the drag detents on, as zoom factors (the config stores percentages), and
-    /// how far past one the drag must travel to break out, in drag px. Both from the config
-    /// (`zoom-snap-levels` / `zoom-snap`) via [`GpuSurface::set_zoom_snapping`]; an empty ladder
-    /// or a zero distance is snapping switched off.
+    /// The zoom levels every zoom input detents on, as zoom factors (the config stores
+    /// percentages), and how far past one the drag must travel to break out, in drag px. Both from
+    /// the config (`zoom-snap-levels` / `zoom-snap`) via [`GpuSurface::set_zoom_snapping`]; an
+    /// empty ladder or a zero distance is snapping switched off.
     zoom_snaps: Vec<f32>,
     zoom_snap_px: f32,
 }
@@ -579,9 +579,11 @@ impl GpuSurface {
         self.prefs.fit_upscale = on;
     }
 
-    /// The right-drag zoom's detents: the levels to snap to as *percentages* (`zoom-snap-levels`,
-    /// converted to zoom factors here) and how far past one the drag has to travel to break out, in
-    /// drag px (`zoom-snap`). Either empty levels or a zero distance switches snapping off.
+    /// The zoom's detents, shared by the right-drag, the wheel and the zoom keys: the levels to
+    /// snap to as *percentages* (`zoom-snap-levels`, converted to zoom factors here) and how far
+    /// past one the drag has to travel to break out, in drag px (`zoom-snap`, read as the detent
+    /// width by the discrete steps — see [`Self::zoom_release`]). Either empty levels or a zero
+    /// distance switches snapping off.
     pub fn set_zoom_snapping(&mut self, levels_pct: &[f32], strength_px: f32) {
         self.prefs.zoom_snaps = levels_pct.iter().map(|p| p / 100.0).collect();
         self.prefs.zoom_snap_px = strength_px;
@@ -1134,11 +1136,12 @@ impl GpuSurface {
                 if let Some(dims) = self.view_dims() {
                     // The break-out distance is configured in drag px; the detent works in the same
                     // log-zoom units the drag accumulates in, so it converts the same way dy does.
+                    let release = self.zoom_release();
                     let zoom = self.gesture.zoom_detent.step(
                         self.view.zoom,
                         dy * ZOOM_DRAG_SENSITIVITY,
                         &self.prefs.zoom_snaps,
-                        self.prefs.zoom_snap_px * ZOOM_DRAG_SENSITIVITY,
+                        release,
                     );
                     self.view
                         .zoom_to(zoom, self.gesture.zoom_anchor, dims, &self.viewport);
@@ -1180,17 +1183,41 @@ impl GpuSurface {
         self.gesture.zoom_dragging
     }
 
+    /// The detent break-out distance in the natural-log zoom units both zoom paths work in.
+    ///
+    /// The config states it in *drag pixels* (`zoom-snap`), which is what makes it tangible for the
+    /// gesture it was written for. Converting through the drag's own sensitivity — rather than
+    /// giving the wheel a second, unrelated knob — is what makes one setting describe one detent
+    /// width, however you reach it.
+    fn zoom_release(&self) -> f32 {
+        self.prefs.zoom_snap_px * ZOOM_DRAG_SENSITIVITY
+    }
+
     pub fn zoom_at_cursor(&mut self, factor: f32) {
         if let Some(dims) = self.view_dims() {
-            self.view
-                .zoom_to_cursor(factor, self.gesture.cursor, dims, &self.viewport);
+            let release = self.zoom_release();
+            self.view.zoom_to_cursor(
+                factor,
+                self.gesture.cursor,
+                dims,
+                &self.viewport,
+                &self.prefs.zoom_snaps,
+                release,
+            );
             self.refresh();
         }
     }
 
     pub fn zoom_centered(&mut self, factor: f32) {
         if let Some(dims) = self.view_dims() {
-            self.view.zoom_centered(factor, dims, &self.viewport);
+            let release = self.zoom_release();
+            self.view.zoom_centered(
+                factor,
+                dims,
+                &self.viewport,
+                &self.prefs.zoom_snaps,
+                release,
+            );
             self.refresh();
         }
     }

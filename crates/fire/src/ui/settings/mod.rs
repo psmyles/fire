@@ -462,12 +462,12 @@ fn general(ui: &Ui, st: &mut State) {
         ui,
         lw,
         "How far the right-drag zoom keeps going, in pixels, before it lets go of a snap level. \
-         0 turns snapping off.",
+         A wheel notch or a zoom key sticks for one step instead. 0 turns snapping off.",
     );
     snap_levels(ui, st, lw);
 }
 
-/// The zoom levels the right-drag zoom snaps to, edited as one comma-separated list. A list rather
+/// The zoom levels the zoom snaps to, edited as one comma-separated list. A list rather
 /// than a row of steppers because it has no fixed length — the point is that you can drop the rungs
 /// you never want and add the ones you do.
 fn snap_levels(ui: &Ui, st: &mut State, label_w: f32) {

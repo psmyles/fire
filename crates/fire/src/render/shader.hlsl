@@ -71,6 +71,22 @@ float3 aces(float3 x) {
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
+// Texture coords for a *point* tap on the texel containing `t`, aimed at that texel's centre.
+//
+// Sampling at `t / size` directly is a half-texel gamble: `t` lands on an exact texel boundary for
+// every pixel at once whenever the mapping is integral — 1:1 with an integral pan and `img_size` /
+// `surf_size` of the same parity (i.e. any window whose viewport is even-sized for an even image),
+// and every whole-number zoom above that. On the boundary the sampler's own float→fixed-point
+// rounding breaks the tie, and because the rounding of `t / size` differs from tap to tap it breaks
+// it *inconsistently*: scattered rows/columns pick the neighbouring texel while their neighbours
+// don't. The image is the right size and roughly right, but fine detail — text especially — comes
+// out with columns dropped or doubled at random, which is the whole reason to point-sample in the
+// first place. Flooring to the texel and re-centring puts every tap a half texel clear of an edge,
+// so no rounding anywhere in the sampler can change which texel is read.
+float2 texel_center(float2 t, float2 size) {
+    return (floor(t) + 0.5) / size;
+}
+
 // Sample the flipbook frame texel `f` (frame-local, 0..img_size) from the sheet cell at origin
 // `cell`. Explicit-LOD: the sheet's mip chain averages across cell boundaries, so implicit mips
 // would ghost neighbouring frames into a minified frame — clamp to `fb_max_lod`. A half-texel
@@ -80,7 +96,7 @@ float4 sample_cell(float2 f, float2 cell) {
     float2 uv = t / sheet_size;
     float4 s;
     if (inv_zoom <= 1.0) {
-        s = tex.SampleLevel(samp_point, uv, 0.0);
+        s = tex.SampleLevel(samp_point, texel_center(t, sheet_size), 0.0);
     } else {
         float lod = min(tex.CalculateLevelOfDetail(samp_aniso, uv), fb_max_lod);
         s = tex.SampleLevel(samp_aniso, uv, lod);
@@ -130,9 +146,11 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
         rgb = s.rgb;
         a = s.a;
     } else {
-        float2 uv = f / img_size;
-        float4 s = (inv_zoom <= 1.0) ? tex.Sample(samp_point, uv)   // magnify/1:1 -> crisp texels
-                                     : tex.Sample(samp_aniso, uv);  // minify -> mips + anisotropic
+        // f is inside [0, img_size) here (the letterbox branch above returned), so the point tap's
+        // floor lands on a real texel and the CLAMP address mode never comes into it.
+        float4 s = (inv_zoom <= 1.0)
+            ? tex.Sample(samp_point, texel_center(f, img_size))  // magnify/1:1 -> crisp texels
+            : tex.Sample(samp_aniso, f / img_size);              // minify -> mips + anisotropic
         rgb = s.rgb;
         a = s.a;
         if (linear_sample == 0) rgb = srgb_to_linear(rgb);

@@ -191,14 +191,24 @@ impl ViewState {
 
     /// Multiply zoom by `factor` about `cursor` (surface px), keeping the image point
     /// currently under the cursor fixed on screen. Manual zoom leaves fit mode.
+    ///
+    /// This is the *discrete* zoom — a wheel notch or a zoom keypress — and it detents on the same
+    /// `snaps` ladder the scrubby drag does, via [`snap_step`]. Without that, a wheel walk landing
+    /// "on 100%" lands on whatever the notches happened to multiply out to; the status bar rounds
+    /// that to `100%` while the shader, which switches between point and anisotropic sampling on
+    /// `zoom == 1`, sees 0.997 and quietly resamples the image. A detent on the ladder is what makes
+    /// the readout mean what it says.
     pub fn zoom_to_cursor(
         &mut self,
         factor: f32,
         cursor: (f32, f32),
         image: (u32, u32),
         vp: &Viewport,
+        snaps: &[f32],
+        release: f32,
     ) {
-        self.zoom_to(self.zoom * factor, cursor, image, vp);
+        let to = snap_step(self.zoom, self.zoom * factor, snaps, release);
+        self.zoom_to(to, cursor, image, vp);
     }
 
     /// As [`Self::zoom_to_cursor`] but for an absolute target zoom — what the snapping scrubby-zoom
@@ -225,10 +235,17 @@ impl ViewState {
         self.clamp_pan(image, vp);
     }
 
-    /// Zoom about the surface center (keyboard zoom).
-    pub fn zoom_centered(&mut self, factor: f32, image: (u32, u32), vp: &Viewport) {
+    /// Zoom about the surface center (keyboard zoom). Detented like [`Self::zoom_to_cursor`].
+    pub fn zoom_centered(
+        &mut self,
+        factor: f32,
+        image: (u32, u32),
+        vp: &Viewport,
+        snaps: &[f32],
+        release: f32,
+    ) {
         let c = vp.center();
-        self.zoom_to_cursor(factor, c, image, vp);
+        self.zoom_to_cursor(factor, c, image, vp, snaps, release);
     }
 
     /// Drag the image by a surface-pixel delta (mouse pan). Leaves fit mode.
@@ -304,8 +321,10 @@ pub struct ZoomDetent {
     held: Option<Held>,
 }
 
-/// A snap the drag is currently sitting in, both fields in natural-log zoom units: the snapped zoom
-/// and the signed travel accumulated since it engaged.
+/// A snap the drag is currently sitting in: the snapped zoom *as the ladder states it* (so holding
+/// a detent hands back that level verbatim rather than a `ln`/`exp` round-trip of it — 1:1 has to
+/// come out exactly 1.0, or the shader drops off its point-sampling path), and the signed travel
+/// accumulated since it engaged, in natural-log zoom units.
 #[derive(Clone, Copy, Debug)]
 struct Held {
     snap: f32,
@@ -329,20 +348,20 @@ impl ZoomDetent {
             held.travel += step;
             if held.travel.abs() <= release {
                 self.held = Some(held);
-                return held.snap.exp();
+                return held.snap;
             }
             // Broken out: resume from the snap, minus the travel spent holding it there.
             self.held = None;
-            return (held.snap + held.travel - release * held.travel.signum()).exp();
+            return (held.snap.ln() + held.travel - release * held.travel.signum()).exp();
         }
         let to = from + step;
         match crossed(from, to, snaps) {
-            Some(snap) if (to - snap).abs() <= release => {
+            Some(snap) if (to - snap.ln()).abs() <= release => {
                 self.held = Some(Held {
                     snap,
-                    travel: to - snap,
+                    travel: to - snap.ln(),
                 });
-                snap.exp()
+                snap
             }
             _ => to.exp(),
         }
@@ -355,21 +374,49 @@ impl ZoomDetent {
     }
 }
 
-/// The last snap (log units) crossed moving `from` → `to`, i.e. the one nearest where the step
+/// Detent one *discrete* zoom step — a wheel notch or a zoom keypress — from `from` to `to` (both
+/// zoom factors), returning the zoom to move to. The counterpart of [`ZoomDetent::step`] for the
+/// inputs that arrive as whole jumps rather than as a stream of drag pixels.
+///
+/// A step that crosses one of `snaps` and lands within `release` of it (in natural-log zoom units,
+/// the same measure the drag accumulates travel in) stops on that level exactly; anything else is
+/// left alone. There is no travel to bank here, so a detent costs exactly one step: the next one
+/// starts *at* the snap, and since `crossed` ignores the level you are already standing on, it can
+/// never be caught by the same rung twice. That is what stops a fine zoom step — which can easily
+/// be shorter than `release` — from ratcheting against 100% forever. A step big enough to clear a
+/// snap by more than `release` flies straight through, exactly as a fast scrub does.
+///
+/// An empty ladder or a non-positive `release` is snapping switched off.
+pub fn snap_step(from: f32, to: f32, snaps: &[f32], release: f32) -> f32 {
+    if release <= 0.0 || snaps.is_empty() || from <= 0.0 || to <= 0.0 {
+        return to;
+    }
+    let (a, b) = (from.max(MIN_ZOOM).ln(), to.max(MIN_ZOOM).ln());
+    match crossed(a, b, snaps) {
+        Some(snap) if (b - snap.ln()).abs() <= release => snap,
+        // Nothing caught it: hand back the caller's own target rather than `b.exp()`, so a step
+        // that doesn't snap isn't perturbed by a log round-trip either.
+        _ => to,
+    }
+}
+
+/// The last snap crossed moving `from` → `to` (**log** units; the snaps themselves are zoom
+/// factors, and the level is returned as the ladder states it), i.e. the one nearest where the step
 /// lands — so a big step that happens to end beside a snap still catches it, rather than being
-/// judged against the first rung it flew past.
+/// judged against the first rung it flew past. `ln` is monotonic, so filtering and reducing in
+/// factor space picks the same rung as doing it in log space would.
 fn crossed(from: f32, to: f32, snaps: &[f32]) -> Option<f32> {
     let up = to > from;
     snaps
         .iter()
         .copied()
         .filter(|z| *z > 0.0)
-        .map(f32::ln)
-        .filter(|s| {
+        .filter(|z| {
+            let s = z.ln();
             if up {
-                *s > from && *s <= to
+                s > from && s <= to
             } else {
-                *s < from && *s >= to
+                s < from && s >= to
             }
         })
         .reduce(|a, b| if up { a.max(b) } else { a.min(b) })
@@ -469,7 +516,7 @@ mod tests {
         let cursor = (700.0, 300.0);
         // The image pixel under the cursor before zooming...
         let before = s.screen_to_image(cursor, image, &v);
-        s.zoom_to_cursor(2.5, cursor, image, &v);
+        s.zoom_to_cursor(2.5, cursor, image, &v, &[], 0.0);
         // ...must still be under the cursor after (within float tolerance, modulo clamp).
         let after = s.screen_to_image(cursor, image, &v);
         assert!(
@@ -585,6 +632,63 @@ mod tests {
             }
             let expect = 0.9 * (NUDGE * 20.0).exp();
             assert!((zoom - expect).abs() < 1e-5, "zoom = {zoom}, want {expect}");
+        }
+    }
+
+    /// The default wheel notch, as a factor (`zoom-step`).
+    const NOTCH: f32 = 1.15;
+
+    /// A wheel walk toward 100% stops *exactly* on 1.0 — not on 0.997, which the status bar would
+    /// round to "100%" while the shader read it as a minification and resampled the image. Then it
+    /// carries on: one notch is all a detent may ever cost, or a step shorter than the break-out
+    /// distance would ratchet against the rung forever.
+    #[test]
+    fn a_wheel_notch_lands_on_a_snap_then_carries_on() {
+        for (from, dir) in [(0.8_f32, 1.0_f32), (1.4, -1.0)] {
+            let step = if dir > 0.0 { NOTCH } else { 1.0 / NOTCH };
+            let mut zoom = from;
+            let mut hits = 0;
+            for _ in 0..6 {
+                zoom = snap_step(zoom, zoom * step, SNAPS, RELEASE);
+                if zoom == 1.0 {
+                    hits += 1;
+                }
+            }
+            assert_eq!(hits, 1, "from {from}: landed on 1.0 {hits}× in six notches");
+            assert!(zoom != 1.0, "from {from}: stuck at 1.0");
+        }
+    }
+
+    /// Exactness is the whole point of the detent, so the level comes back as the ladder states it
+    /// rather than as a `ln`/`exp` round-trip — for the drag as well as for a notch.
+    #[test]
+    fn a_caught_snap_is_the_ladder_value_verbatim() {
+        for &snap in SNAPS {
+            let landed = snap_step(snap * 0.94, snap * 1.02, SNAPS, RELEASE);
+            assert_eq!(landed, snap, "notch onto {snap}");
+        }
+        let mut d = ZoomDetent::default();
+        let mut zoom = 1.4;
+        for _ in 0..10 {
+            zoom = d.step(zoom, NUDGE, SNAPS, RELEASE);
+            if zoom == 1.5 {
+                break;
+            }
+        }
+        assert_eq!(zoom, 1.5, "drag onto 150%");
+    }
+
+    /// A step that clears a rung by more than the break-out distance is not braked by it, and a
+    /// ladder-less (or zero-strength) config leaves every step untouched.
+    #[test]
+    fn snap_step_leaves_a_clear_step_alone() {
+        // 100% → 400% in one go: 150/200/300 are all flown past, and 400 is the landing itself.
+        assert_eq!(snap_step(1.0, 4.0, SNAPS, RELEASE), 4.0);
+        // A big step that ends well clear of every rung keeps its target exactly.
+        let free = snap_step(1.0, 2.6, SNAPS, RELEASE);
+        assert_eq!(free, 2.6, "2.6 is > RELEASE from both 200% and 300%");
+        for (snaps, release) in [(SNAPS, 0.0), (&[][..], RELEASE)] {
+            assert_eq!(snap_step(0.98, 1.002, snaps, release), 1.002);
         }
     }
 

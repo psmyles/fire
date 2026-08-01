@@ -37,7 +37,7 @@ const ZOOM_SNAP_MIN: f32 = 0.0;
 const ZOOM_SNAP_MAX: f32 = 100.0;
 const ZOOM_SNAP_DEFAULT: f32 = 12.0;
 
-/// The zoom levels (percent) a right-drag zoom snaps to out of the box.
+/// The zoom levels (percent) the zoom snaps to out of the box.
 ///
 /// Round halvings and doublings of 100%, which is also the 1:1 snap. They thin out towards the top
 /// deliberately: rungs closer together than the break-out distance would ratchet rather than zoom
@@ -351,10 +351,16 @@ pub struct Config {
     pub exposure_step: f32,
     /// How far (drag px) a right-drag zoom must travel past one of `zoom_snap_levels` before the
     /// zoom moves on — the strength of the detent. `0` switches snapping off. Clamped to `0..=100`.
+    ///
+    /// A wheel notch and a zoom keypress arrive as whole jumps with no travel to accumulate, so
+    /// they read this as the *width* of each detent instead: a step landing within it of a level it
+    /// crossed stops there for exactly one step. Stated in drag px all the same, so one setting
+    /// describes one detent however the zoom is driven.
     #[serde(serialize_with = "serialize_f32")]
     pub zoom_snap: f32,
-    /// The zoom levels (percent) the right-drag zoom snaps to. Out-of-range and duplicate entries
-    /// are dropped on load; an empty list is snapping off, same as `zoom_snap = 0`.
+    /// The zoom levels (percent) the zoom snaps to — the right-drag, the wheel and the zoom keys
+    /// alike. Out-of-range and duplicate entries are dropped on load; an empty list is snapping
+    /// off, same as `zoom_snap = 0`.
     #[serde(serialize_with = "serialize_f32_list")]
     pub zoom_snap_levels: Vec<f32>,
     /// The tonemap operator a freshly adopted HDR image starts on.

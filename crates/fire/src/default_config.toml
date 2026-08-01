@@ -127,12 +127,15 @@
 # exposure-step = 0.25
 
 # ----------------------------------------------------------------------------------------------
-# zoom-snap / zoom-snap-levels — detents for the right-drag zoom (hold the right mouse button and
-#                                move the mouse up/down). As the zoom passes one of the levels it
-#                                sticks there; keep dragging and it carries on from that level.
+# zoom-snap / zoom-snap-levels — detents for the zoom: the right-drag (hold the right mouse button
+#                                and move the mouse up/down), the wheel and the zoom keys all stick
+#                                as they pass one of the levels, then carry on from there. Landing
+#                                exactly on 100% is what makes it pixel-for-pixel; a hair off and
+#                                the image is resampled, however the status bar rounds it.
 #
-#   zoom-snap         How far the drag keeps going past a level, in pixels, before it lets go.
-#                     Range 0 - 100; 0 turns snapping off. Larger is stickier.
+#   zoom-snap         How far past a level the zoom keeps going before it lets go, in pixels of
+#                     drag. A wheel notch or a keypress has no drag to measure, so it sticks for
+#                     one step instead. Range 0 - 100; 0 turns snapping off. Larger is stickier.
 #   zoom-snap-levels  The zoom percentages to stick at. 100 is also the 1:1 snap. Levels outside
 #                     the 2% - 6400% zoom range are ignored, and an empty list [] is snapping off.
 #                     Levels closer together than zoom-snap makes the drag ratchet — there is
