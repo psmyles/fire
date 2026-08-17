@@ -630,12 +630,42 @@ fn context_menu(ui: &Ui, st: &mut State, out: &mut Frame) {
         "Programs to open the current image with. Nest entries to make submenus.",
     );
 
-    // The tree, as a scrolling list of indented rows: full width, and six rows tall — measured in
-    // rows, so it holds six of them whatever the font and the DPI happen to be.
+    // The tree, as a scrolling list of indented rows: full width, and all the height the tab has
+    // left once the tools and the detail form below it are paid for — so a taller window shows more
+    // entries rather than more blank space, and the list scrolls only when it actually overflows.
+    //
+    // The reserve is always for the *leaf* form (the taller of the two: Name / Program / Arguments
+    // and its note), whatever is selected. Measuring the form that is really there would resize the
+    // list every time the selection moved between a leaf, a submenu and nothing — the rows would
+    // slide out from under the cursor mid-click. A fixed reserve costs a little dead space below a
+    // submenu and keeps the list still.
     let row_h = ui.frame_height();
+    let style = ui.clone_style();
+    let gap = style.item_spacing()[1];
+    // Each measured under the push it will be drawn with — `[form.controls]` sizes buttons and
+    // inputs independently, so neither can stand in for the other.
+    let tools_h = {
+        let _p = size_button(ui);
+        ui.frame_height()
+    };
+    let input_h = {
+        let _p = size_input(ui);
+        ui.frame_height()
+    };
+    let labels: Vec<&str> = TEXT_FIELDS.iter().map(|f| f.label()).collect();
+    let lw = label_col(ui, &labels);
+    // The note wraps, so its height is a function of the window's width, not a line.
+    let note_h = wrapped_h(ui, ARGS_NOTE, ui.content_region_avail()[0] - lw);
+    // Six items follow the tree, each one `item_spacing.y` below the last: the tools row, the
+    // `spacing()` before the form, its three rows, and the note.
+    let reserve = gap * 6.0 + tools_h + input_h * 3.0 + note_h;
+    // A floor of four rows: on a window too short to hold the reserve the list stays usable and the
+    // tab scrolls, rather than the list collapsing to ImGui's 4px minimum.
+    let h = (ui.content_region_avail()[1] - reserve).max(row_h * 4.0);
+
     let tree = m::flatten(&st.draft.open_with);
     ui.child_window("##tree")
-        .size([0.0, row_h * 6.0])
+        .size([0.0, h])
         .border(true)
         .build(ui, || {
             if tree.is_empty() {
@@ -646,8 +676,11 @@ fn context_menu(ui: &Ui, st: &mut State, out: &mut Frame) {
                 if indent > 0.0 {
                     ui.indent_by(indent);
                 }
+                // A plain backslash, not a triangle: this used to be U+25B8, which Segoe UI has no
+                // glyph for (nor U+25B6), so it drew as a notdef box. ASCII can't have that problem
+                // whatever the font ends up being.
                 let label = if row.submenu {
-                    format!("{}  \u{25b8}##row-{:?}", row.name, row.path)
+                    format!("{}  \\##row-{:?}", row.name, row.path)
                 } else {
                     format!("{}##row-{:?}", row.name, row.path)
                 };
@@ -787,8 +820,12 @@ fn detail_form(ui: &Ui, st: &mut State, out: &mut Frame) {
     if ui.input_text("##args", &mut st.fields[2]).build() {
         write_field(st, &path, 2);
     }
-    row_note(ui, lw, "{path} is replaced with the image's full path.");
+    row_note(ui, lw, ARGS_NOTE);
 }
+
+/// The arguments note. A const because `context_menu` measures it to size the tree above — the
+/// reserve and the text have to be the same string or the layout drifts from what is drawn.
+const ARGS_NOTE: &str = "{path} is replaced with the image's full path.";
 
 /// Push the text box's contents into the selected entry.
 fn write_field(st: &mut State, path: &[usize], i: usize) {
@@ -875,6 +912,13 @@ fn num(ui: &Ui, st: &mut State, label_w: f32, f: NumField, label: &str) {
     {
         f.set(&mut st.draft, v);
     }
+}
+
+/// Height [`note`] will take for `text` once wrapped at `wrap_w` — one line or several. Used to
+/// reserve space for a note that has not been drawn yet.
+fn wrapped_h(ui: &Ui, text: &str, wrap_w: f32) -> f32 {
+    ui.current_font()
+        .calc_text_size(ui.current_font_size(), f32::MAX, wrap_w.max(1.0), text)[1]
 }
 
 /// Dim explanatory text under a control. **Wrapped**, because the window is resizable now — a note
