@@ -71,17 +71,18 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    GetWindowLongPtrW, GetWindowPlacement, KillTimer, LoadCursorW, LoadIconW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
-    SetWindowTextW, ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HWND_TOP, IDC_ARROW, MINMAXINFO, MSG, SIZE_MAXIMIZED,
-    SIZE_RESTORED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER, SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
-    SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_DROPFILES, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WPF_RESTORETOMAXIMIZED, WS_OVERLAPPEDWINDOW,
+    GetWindowLongPtrW, GetWindowPlacement, KillTimer, LoadCursorW, LoadIconW, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPlacement,
+    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, GWLP_USERDATA, GWL_STYLE, HWND_TOP, IDC_ARROW, MB_ICONERROR, MINMAXINFO, MSG,
+    SIZE_MAXIMIZED, SIZE_RESTORED, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_NOZORDER, SW_FORCEMINIMIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_SHOWMAXIMIZED,
+    SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, WINDOWPLACEMENT, WM_APP, WM_CHAR,
+    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+    WPF_RESTORETOMAXIMIZED, WS_OVERLAPPEDWINDOW,
 };
 
 /// Clipboard format ids (stable Win32 values) not surfaced by windows-sys under the enabled
@@ -95,7 +96,9 @@ use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool, FlipbookGuess};
 use crate::folder::{self, Folder};
 use crate::foreground;
 use crate::ipc_server;
-use crate::keybinds::{KeyAction, KeyChord, Keybinds};
+use std::sync::Arc;
+
+use crate::keybinds::{KeyAction, KeyChord, Keybinds, ShortcutLabels};
 use crate::render::view::Channel;
 use crate::watcher::FileWatcher;
 use crate::window_state::WindowState;
@@ -250,10 +253,16 @@ struct App {
     /// File-change watcher for hot-reload; `None` when disabled in config. Dropped with the
     /// `App`, which stops the watch thread.
     watcher: Option<FileWatcher>,
+    /// Stylesheet hot-reload guard (debug builds only); dropping it ends that watch thread too.
+    #[cfg(debug_assertions)]
+    _hotstyle: Option<crate::hotstyle::HotStyle>,
     /// The live user settings (`config.toml`). The authority for everything the settings dialog can
     /// change: the dialog edits a clone and hands it back via [`WM_APP_SETTINGS_APPLY`], which
     /// [`App::apply_settings`] adopts here and pushes into the renderer/watcher/pool.
     cfg: Config,
+    /// [`Keybinds::labels`] cached — rebuilt only when the bindings change (`apply_settings`),
+    /// then shared into each frame's snapshot by `Arc` clone.
+    shortcut_labels: Arc<ShortcutLabels>,
     /// The keyboard table, resolved from `cfg.keybinds` over the defaults. Drives both key dispatch
     /// ([`App::handle_key`]) and the toolbar tooltips' shortcut suffixes.
     keybinds: Keybinds,
@@ -317,7 +326,8 @@ impl App {
     /// `navigate` (which reuses the existing cursor).
     fn load(&mut self, path: &Path, activate: bool) -> u64 {
         let name = file_name(path);
-        self.file_label = name.clone();
+        // clone_from reuses file_label's existing allocation; this runs on every navigation.
+        self.file_label.clone_from(&name);
         self.meta.clear();
         self.loading = true;
         set_title(
@@ -328,10 +338,10 @@ impl App {
             // Spend the one-shot foreground grant promptly (§4.1).
             foreground::raise(self.frame);
         }
-        self.redraw();
         self.surface.invalidate();
-        // No image yet → the HDR group (if it was showing) must drop out of the layout now.
-        self.redraw();
+        // Repaint: the title/status changed, and with no image yet the HDR group (if it was
+        // showing) must drop out of the layout now. `redraw` is idempotent — it raises
+        // `frames_wanted` to 2 rather than accumulating — so once is all there is.
         self.redraw();
 
         self.begin_decode(path, false)
@@ -399,6 +409,11 @@ impl App {
         if notches == 0.0 {
             return;
         }
+        // Nowhere to go (folder scan not landed yet, or a single-image folder): bank nothing.
+        // Deducting first would silently consume scrolling that `navigate` then ignores.
+        if self.folder.as_ref().is_none_or(|f| f.len() <= 1) {
+            return;
+        }
         // A reversal starts from zero: carrying the old direction's fraction would swallow the
         // first turn back.
         if self.wheel_notches != 0.0
@@ -425,14 +440,9 @@ impl App {
             .spawn(move || {
                 let entries = folder::scan(&path);
                 let payload = Box::new(FolderScan { path, entries });
-                let lparam = Box::into_raw(payload) as isize;
-                // SAFETY: the box outlives the post; the UI thread reclaims it in the wndproc.
-                // If the window is gone the post fails — reclaim here so we don't leak.
-                let posted =
-                    unsafe { PostMessageW(frame as HWND, WM_APP_FOLDER_SCANNED, 0, lparam) };
-                if posted == 0 {
-                    drop(unsafe { Box::from_raw(lparam as *mut FolderScan) });
-                }
+                // The ownership rule (and failure handling) lives in post_boxed; a one-shot
+                // sender has nothing to retire, so the outcome is moot here.
+                let _ = crate::util::post_boxed(frame, WM_APP_FOLDER_SCANNED, payload);
             });
         // Navigation is optional — losing it must not take the viewer down — but a thread the
         // OS refused to start is worth saying out loud, or the "n / m" count just never appears.
@@ -470,7 +480,7 @@ impl App {
         match outcome.result {
             Ok(img) => {
                 let (w, h, fmt) = (img.width, img.height, img.source_format);
-                self.file_label = name.clone();
+                self.file_label.clone_from(&name);
                 let file_size = std::fs::metadata(&outcome.path).map(|m| m.len()).ok();
                 self.meta = format_meta(&img, file_size);
                 // Keep the window at its current (remembered) size; never resize it to the
@@ -500,8 +510,8 @@ impl App {
                 self.shown_path = Some(outcome.path.clone());
                 set_title(self.frame, &format!("{}: {name}", crate::product::NAME));
                 self.surface.invalidate();
-                // A float source brings in the HDR group; an LDR one drops it — relayout either way.
-                self.redraw();
+                // A float source brings in the HDR group; an LDR one drops it — relayout either
+                // way. (One call: `redraw` is idempotent, not accumulating.)
                 self.redraw();
                 // Start playback if this is an animated GIF; stop any prior animation otherwise.
                 self.sync_animation();
@@ -688,8 +698,7 @@ impl App {
                 entry.state = Some(FlipbookState::new(grid, &defaults));
             }
         }
-        self.apply_flipbook();
-        self.redraw();
+        self.apply_flipbook(); // ends in a redraw of its own
     }
 
     /// Arm/kill the flipbook playback timer to match the active state. Paused/off = no timer.
@@ -740,8 +749,7 @@ impl App {
         let now = Instant::now();
         let dt = self
             .flipbook_last_tick
-            .map(|t| (now - t).as_secs_f32().min(MAX_FLIPBOOK_STEP))
-            .unwrap_or(0.0);
+            .map_or(0.0, |t| (now - t).as_secs_f32().min(MAX_FLIPBOOK_STEP));
         s.frame_pos = (s.frame_pos + dt * s.fps).rem_euclid(s.frame_count as f32);
         let pos = s.frame_pos;
         self.flipbook_last_tick = Some(now);
@@ -790,17 +798,15 @@ impl App {
                 return;
             };
             match edit {
-                TransportEdit::SetCols(c) => {
+                // One rule for both axes: when the count was tracking the full grid, keep it
+                // tracking after the axis changes.
+                TransportEdit::SetCols(v) | TransportEdit::SetRows(v) => {
                     let follow = s.frame_count == s.grid.cols * s.grid.rows;
-                    s.grid.cols = c;
-                    if follow {
-                        s.frame_count = s.grid.cols * s.grid.rows;
-                    }
-                    grid_changed = true;
-                }
-                TransportEdit::SetRows(r) => {
-                    let follow = s.frame_count == s.grid.cols * s.grid.rows;
-                    s.grid.rows = r;
+                    *(if matches!(edit, TransportEdit::SetCols(_)) {
+                        &mut s.grid.cols
+                    } else {
+                        &mut s.grid.rows
+                    }) = v;
                     if follow {
                         s.frame_count = s.grid.cols * s.grid.rows;
                     }
@@ -1138,16 +1144,13 @@ impl App {
             }
         }
         self.keybinds = Keybinds::from_config(&new.keybinds);
+        self.shortcut_labels = Arc::new(self.keybinds.labels());
         apply_view_config(&mut self.surface, &new);
         self.cfg = new;
         // Opting into octagon persistence captures the overlay options as they are *right now* —
         // the settings draft only carries the checkbox; the live overlay is the authority.
         if self.cfg.octagon.remember {
-            let s = self.surface.octagon();
-            self.cfg.octagon.color = s.color;
-            self.cfg.octagon.line_opacity = s.line_opacity;
-            self.cfg.octagon.crop = s.crop;
-            self.cfg.octagon.hide = s.hide;
+            self.capture_octagon();
         }
         self.cfg.save();
 
@@ -1156,22 +1159,27 @@ impl App {
         self.redraw();
     }
 
+    /// Copy the octagon overlay's persistable options (color/opacity/crop/hide — never the
+    /// on/off toggle) from the live surface into `cfg.octagon`, reporting whether anything
+    /// actually changed. The two persistence paths below share this so the field list exists
+    /// once.
+    fn capture_octagon(&mut self) -> bool {
+        let s = self.surface.octagon();
+        let oc = &mut self.cfg.octagon;
+        let changed = (oc.color, oc.line_opacity, oc.crop, oc.hide)
+            != (s.color, s.line_opacity, s.crop, s.hide);
+        oc.color = s.color;
+        oc.line_opacity = s.line_opacity;
+        oc.crop = s.crop;
+        oc.hide = s.hide;
+        changed
+    }
+
     /// Persist the octagon overlay's options into `config.toml` on exit, when the user opted in
     /// (Settings ▸ Overlay). The on/off toggle is never persisted — a launch always starts with
     /// the overlay off.
     fn persist_octagon(&mut self) {
-        if !self.cfg.octagon.remember {
-            return;
-        }
-        let s = self.surface.octagon();
-        let oc = &mut self.cfg.octagon;
-        if (oc.color, oc.line_opacity, oc.crop, oc.hide)
-            != (s.color, s.line_opacity, s.crop, s.hide)
-        {
-            oc.color = s.color;
-            oc.line_opacity = s.line_opacity;
-            oc.crop = s.crop;
-            oc.hide = s.hide;
+        if self.cfg.octagon.remember && self.capture_octagon() {
             self.cfg.save();
         }
     }
@@ -1202,18 +1210,22 @@ impl App {
         // Right side: the folder position/count (once the scan lands) followed by the zoom and,
         // for HDR, the exposure. The count shows whenever a cursor exists, even on a failed
         // decode (you can still page past a broken file).
+        // `write!` into the String rather than pushing a `format!` temporary — this is rebuilt
+        // per snapshot, and writing to a String is infallible (the `let _ =` is that, not a
+        // swallowed error).
+        use std::fmt::Write as _;
         let mut status_right = String::new();
         if let Some(f) = &self.folder {
-            status_right.push_str(&format!("{} / {}", f.position(), f.len()));
+            let _ = write!(status_right, "{} / {}", f.position(), f.len());
         }
         if has_image {
             if !status_right.is_empty() {
                 status_right.push_str("    ");
             }
             if is_hdr {
-                status_right.push_str(&format!("EV {:+.2}    {}%", s.exposure(), zoom_pct));
+                let _ = write!(status_right, "EV {:+.2}    {}%", s.exposure(), zoom_pct);
             } else {
-                status_right.push_str(&format!("{}%", zoom_pct));
+                let _ = write!(status_right, "{zoom_pct}%");
             }
         }
 
@@ -1246,7 +1258,7 @@ impl App {
             fullscreen: self.fullscreen,
             flipbook: self.flipbook_state().is_some(),
             has_animation: self.surface.frame_delay_ms().is_some(),
-            shortcuts: self.keybinds.labels(),
+            shortcuts: Arc::clone(&self.shortcut_labels),
             status_left,
             status_right,
         }
@@ -1266,10 +1278,18 @@ impl App {
     /// subtract the origin ourselves; forgetting it would offset every drag by the toolbar's height,
     /// so it lives in one place rather than at each call site.
     fn image_cursor(&self, lparam: LPARAM) -> (f32, f32) {
-        let x = (lparam & 0xffff) as u16 as i16 as f32;
-        let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
+        let (x, y) = Self::client_cursor(lparam);
         let (ox, oy) = self.surface.image_origin();
         (x - ox, y - oy)
+    }
+
+    /// Cursor position from a mouse message's `LPARAM`, in raw **client** coords — the sibling
+    /// of [`Self::image_cursor`] for the paths that hit-test against client-space rects, so the
+    /// sign-extension dance is written once.
+    fn client_cursor(lparam: LPARAM) -> (f32, f32) {
+        let x = (lparam & 0xffff) as u16 as i16 as f32;
+        let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
+        (x, y)
     }
 
     /// The image's sub-rect of the client, in physical px. In full-screen the chrome is hidden and
@@ -1643,8 +1663,9 @@ unsafe fn create_frame(hinstance: HMODULE) -> Option<(HWND, Option<WindowState>,
 /// watcher and the keybind table.
 ///
 /// **Construction order matters here.** The surface comes first because ImGui is built from its
-/// live D3D11 device and context; everything after is independent.
-unsafe fn build_app(frame: HWND, hinstance: HMODULE, dark: bool, cfg: Config) -> Box<App> {
+/// live D3D11 device and context; everything after is independent. `Err` is the D3D11/DXGI
+/// failure that kept the surface from existing — terminal, and the caller's to report.
+unsafe fn build_app(frame: HWND, dark: bool, cfg: Config) -> windows::core::Result<Box<App>> {
     let dpi = GetDpiForWindow(frame).max(96);
     let metrics = Metrics::new(dpi);
 
@@ -1654,13 +1675,7 @@ unsafe fn build_app(frame: HWND, hinstance: HMODULE, dark: bool, cfg: Config) ->
     // The swapchain covers the whole client; the image is drawn into a sub-rect of it, recomputed
     // every frame (see `App::image_rect`).
     let (fw, fh) = client_size(frame);
-    let mut surface = GpuSurface::new(
-        frame as isize,
-        hinstance as isize,
-        fw.max(1),
-        fh.max(1),
-        cfg.fit_upscale,
-    );
+    let mut surface = GpuSurface::new(frame as isize, fw.max(1), fh.max(1), cfg.fit_upscale)?;
     surface.set_clear(crate::ui::theme::view_clear_packed(dark));
     // The view-related config the surface owns (backdrop / open-fit / tonemap defaults). Same
     // path the settings dialog re-runs on Apply — see `App::apply_view_config`.
@@ -1681,7 +1696,7 @@ unsafe fn build_app(frame: HWND, hinstance: HMODULE, dark: bool, cfg: Config) ->
     // Debug only: watch `ui/theme.toml` in the source tree, so editing the stylesheet restyles
     // this window without a rebuild. Posts WM_APP_THEME_RELOADED; compiled out of release.
     #[cfg(debug_assertions)]
-    crate::hotstyle::spawn(frame as isize);
+    let hotstyle = crate::hotstyle::spawn(frame as isize);
 
     // Workers and the pipe server post here (this window owns title/size/lifecycle).
     let pool = DecodePool::new(frame as isize);
@@ -1689,8 +1704,9 @@ unsafe fn build_app(frame: HWND, hinstance: HMODULE, dark: bool, cfg: Config) ->
     // disabled, so no watch thread is spawned.
     let watcher = cfg.hot_reload.then(|| FileWatcher::spawn(frame as isize));
     let keybinds = Keybinds::from_config(&cfg.keybinds);
+    let shortcut_labels = Arc::new(keybinds.labels());
 
-    Box::new(App {
+    Ok(Box::new(App {
         frame: frame as isize,
         surface,
         imgui,
@@ -1706,7 +1722,10 @@ unsafe fn build_app(frame: HWND, hinstance: HMODULE, dark: bool, cfg: Config) ->
         current_path: None,
         shown_path: None,
         watcher,
+        #[cfg(debug_assertions)]
+        _hotstyle: hotstyle,
         cfg,
+        shortcut_labels,
         keybinds,
         fullscreen: false,
         windowed_placement: std::mem::zeroed(),
@@ -1718,7 +1737,23 @@ unsafe fn build_app(frame: HWND, hinstance: HMODULE, dark: bool, cfg: Config) ->
         caret_timer: false,
         in_size_move: false,
         wheel_notches: 0.0,
-    })
+    }))
+}
+
+/// Last-resort startup failure report. The release build is `windows_subsystem = "windows"`,
+/// so stderr goes nowhere and a panic would be an invisible abort — a message box is the only
+/// channel the user actually sees at this point.
+fn fatal_startup_error(text: &str) {
+    let text_w = wide(text);
+    let caption = wide("fire");
+    unsafe {
+        MessageBoxW(
+            ptr::null_mut(),
+            text_w.as_ptr(),
+            caption.as_ptr(),
+            MB_ICONERROR,
+        );
+    }
 }
 
 /// Create the frame + child view, wire up the decode pool, optionally serve the pipe
@@ -1728,9 +1763,18 @@ pub fn run(initial: Option<PathBuf>, serve_pipe: bool, cfg: Config) {
     unsafe {
         let hinstance = GetModuleHandleW(ptr::null());
         let Some((frame, saved, dark)) = create_frame(hinstance) else {
+            fatal_startup_error("fire could not create its window.");
             return;
         };
-        let mut app = build_app(frame, hinstance, dark, cfg);
+        let mut app = match build_app(frame, dark, cfg) {
+            Ok(app) => app,
+            Err(e) => {
+                fatal_startup_error(&format!(
+                    "fire could not initialize Direct3D 11 and cannot draw.\n\n{e}"
+                ));
+                return;
+            }
+        };
 
         // Open the launch path immediately (decode is async; the image swaps in via
         // WM_APP_DECODE_DONE once the loop runs).
@@ -1970,6 +2014,11 @@ unsafe fn frame_wndproc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             // Remember where/how the window was before it goes away, to restore next launch.
             save_window_state(hwnd, app);
             app.persist_octagon();
+            // Detach the App pointer: the box is freed after the message loop returns, and
+            // while Windows purges a destroyed window's queue, anything that still holds this
+            // HWND (a future tray icon, hook, or second window) must find null here rather
+            // than a soon-dangling pointer. Safe today by construction, not by accident.
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             PostQuitMessage(0);
             0
         }
@@ -2043,13 +2092,16 @@ unsafe fn on_layout(
         }
         WM_GETMINMAXINFO => {
             // Keep the window wide enough that the toolbar can still lay out (the right group plus
-            // a collapsed "»"), and tall enough for the chrome plus a sliver of image.
+            // a collapsed "»"), and tall enough for the chrome plus a sliver of image. Use the
+            // App's own `metrics`/`dpi` (maintained by WM_DPICHANGED and theme reloads) rather
+            // than re-deriving them here — two sources for the same numbers is exactly how a
+            // chrome-height change ends up not reflected in the minimum size.
             let mmi = &mut *(lparam as *mut MINMAXINFO);
-            let m = Metrics::new(GetDpiForWindow(hwnd).max(96));
+            let m = &app.metrics;
             let cw = (420.0 * m.scale) as i32;
             let ch = (m.toolbar_h + m.status_h + 80.0 * m.scale) as i32;
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
-            let dpi = GetDpiForWindow(hwnd).max(96);
+            let dpi = app.dpi;
             let mut r = RECT {
                 left: 0,
                 top: 0,
@@ -2096,8 +2148,7 @@ unsafe fn on_mouse(app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_LBUTTONDBLCLK => {
             // Double-clicking the empty viewport opens the file picker (matching the on-screen hint).
             if app.empty_view_active() {
-                let x = (lparam & 0xffff) as u16 as i16 as f32;
-                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
+                let (x, y) = App::client_cursor(lparam);
                 let (ix, iy, iw, ih) = app.image_rect();
                 if x >= ix && x < ix + iw && y >= iy && y < iy + ih {
                     app.open_via_dialog();
@@ -2118,8 +2169,7 @@ unsafe fn on_mouse(app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // A right *click* (the gesture never moved past the zoom-drag slop) opens the actions
             // menu at the cursor; an actual zoom-drag just ends.
             if !app.surface.end_zoom_drag() {
-                let x = (lparam & 0xffff) as u16 as i16 as f32;
-                let y = ((lparam >> 16) & 0xffff) as u16 as i16 as f32;
+                let (x, y) = App::client_cursor(lparam);
                 app.open_menu(crate::ui::MenuKind::Actions, (x, y));
             }
             0
@@ -2358,9 +2408,7 @@ fn open_file_dialog(owner: HWND) -> Option<PathBuf> {
     run_open_dialog(owner, &image_filter_wide())
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::util::wide;
 
 /// The common Open dialog, filtered to executables — the settings window's "Browse…", behind an
 /// open-with entry's program path.
@@ -2495,14 +2543,15 @@ fn format_meta(img: &DecodedImage, file_size: Option<u64>) -> String {
         "{}   {}×{}   {}-bit {}",
         img.source_format, img.width, img.height, img.bit_depth, ch
     );
+    use std::fmt::Write as _;
     if let Some(bytes) = file_size {
-        s.push_str(&format!("   {}", human_size(bytes)));
+        let _ = write!(s, "   {}", human_size(bytes));
     }
     if img.icc.is_some() {
         s.push_str("   ICC");
     }
     if let Some((ow, oh)) = img.downscaled_from {
-        s.push_str(&format!("   (from {ow}×{oh})"));
+        let _ = write!(s, "   (from {ow}×{oh})");
     }
     s
 }

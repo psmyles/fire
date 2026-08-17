@@ -21,12 +21,23 @@ pub fn to_fit(img: &mut DecodedImage, max_dim: u32) {
     let new_h = ((src_h as f64 * scale).floor() as u32).clamp(1, max_dim);
 
     let bpp = img.format.bytes_per_pixel();
-    img.pixels = resample(&img.pixels, src_w, src_h, new_w, new_h, bpp);
-    if let Some(anim) = img.animation.as_mut() {
-        for frame in &mut anim.frames {
-            frame.pixels = resample(&frame.pixels, src_w, src_h, new_w, new_h, bpp);
-        }
+    // Same posture as `exif::apply`: never index past a buffer shorter than its declared
+    // dimensions. A short canvas leaves the image at full size (shown un-shrunk rather than
+    // panicking the decode); `transform_buffers` drops any short frame, because after the
+    // canvas resamples, every surviving frame must match the new size or the player reads
+    // out of bounds.
+    let Some(needed) = (src_w as usize)
+        .checked_mul(src_h as usize)
+        .and_then(|n| n.checked_mul(bpp))
+    else {
+        return;
+    };
+    if img.pixels.len() < needed {
+        return;
     }
+    img.transform_buffers(needed, |pixels| {
+        *pixels = resample(pixels, src_w, src_h, new_w, new_h, bpp);
+    });
 
     img.downscaled_from = Some((src_w, src_h));
     img.width = new_w;
@@ -70,6 +81,56 @@ mod tests {
             downscaled_from: None,
             animation: None,
         }
+    }
+
+    /// A buffer shorter than its declared dimensions must degrade, never index out of bounds.
+    /// The canvas being short leaves the whole image untouched; a short animation frame is
+    /// dropped while the healthy ones still shrink with the canvas.
+    #[test]
+    fn short_buffers_degrade_instead_of_panicking() {
+        // Canvas 1 byte short of what 20000x10000 RGBA declares: left at full size.
+        let mut img = solid(20000, 10000);
+        img.pixels.pop();
+        to_fit(&mut img, 16384);
+        assert_eq!((img.width, img.height), (20000, 10000));
+        assert_eq!(img.downscaled_from, None);
+
+        // Healthy canvas, one short frame among two: the short one is dropped, the other
+        // resampled to the new size.
+        let mut img = solid(20000, 10000);
+        let full = (20000u64 * 10000 * 4) as usize;
+        img.animation = Some(crate::Animation {
+            frames: vec![
+                crate::AnimationFrame {
+                    pixels: vec![0xCD; full],
+                    delay_ms: 10,
+                },
+                crate::AnimationFrame {
+                    pixels: vec![0xEF; full - 1],
+                    delay_ms: 10,
+                },
+            ],
+        });
+        to_fit(&mut img, 16384);
+        assert_eq!((img.width, img.height), (16384, 8192));
+        let anim = img.animation.as_ref().expect("healthy frame survives");
+        assert_eq!(anim.frames.len(), 1);
+        assert_eq!(
+            anim.frames[0].pixels.len(),
+            (img.width * img.height * 4) as usize
+        );
+
+        // Every frame short: the animation is dropped entirely, the canvas still shrinks.
+        let mut img = solid(20000, 10000);
+        img.animation = Some(crate::Animation {
+            frames: vec![crate::AnimationFrame {
+                pixels: vec![0xEF; 4],
+                delay_ms: 10,
+            }],
+        });
+        to_fit(&mut img, 16384);
+        assert_eq!((img.width, img.height), (16384, 8192));
+        assert!(img.animation.is_none());
     }
 
     #[test]

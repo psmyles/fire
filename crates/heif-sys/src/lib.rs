@@ -67,6 +67,18 @@ pub fn decode_heif(bytes: &[u8]) -> Result<HeifImage, HeifError> {
             ffi::fire_heif_image_free(&mut out);
             return Err(HeifError(-101));
         }
+        // ...and a buffer whose length agrees with them. This is the one backend where the
+        // pixel count and the byte count arrive in separate untrusted fields; every consumer
+        // sizes its reads from width*height*bpp, so a mismatch admitted here surfaces later
+        // as an out-of-bounds panic (downscale) or a silent no-op (exif) instead of an error.
+        let bpp: usize = if out.is_16bit != 0 { 8 } else { 4 };
+        let expected = (out.width as usize)
+            .checked_mul(out.height as usize)
+            .and_then(|n| n.checked_mul(bpp));
+        if expected != Some(out.pixels_len) {
+            ffi::fire_heif_image_free(&mut out);
+            return Err(HeifError(-102));
+        }
 
         let pixels = std::slice::from_raw_parts(out.pixels, out.pixels_len).to_vec();
         // Cap the C-provided ICC length before trusting it to build a slice. Real profiles are

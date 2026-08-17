@@ -492,8 +492,7 @@ impl Keybinds {
         self.bindings
             .iter()
             .find(|(a, _)| *a == action)
-            .map(|(_, c)| c.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[], |(_, c)| c.as_slice())
     }
 
     /// The action a press maps to, or `None` if the chord is unbound. Flipbook-context bindings are

@@ -25,6 +25,15 @@ fn main() {
     // (the vendored sources exclude the POSIX/Obj-C++ platform files). Short-circuit on any other
     // host rather than failing deep inside bindgen or cl.exe with something unrecognisable.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        // Returning with no bindings.rs would defeat the point: lib.rs's `include!` then fails
+        // with a missing-file error from inside a macro, which is *less* recognisable than the
+        // failure this short-circuit exists to avoid. Leave a stub that states the constraint.
+        std::fs::write(
+            out_dir.join("bindings.rs"),
+            "compile_error!(\"psd-sdk-sys builds only on Windows: the vendored psd_sdk and \
+             wrapper.cpp are compiled with MSVC\");\n",
+        )
+        .expect("failed to write stub bindings.rs");
         return;
     }
 

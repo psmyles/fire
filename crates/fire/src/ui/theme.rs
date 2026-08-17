@@ -52,7 +52,15 @@ static THEME: LazyLock<RwLock<Arc<Theme>>> = LazyLock::new(|| RwLock::new(Arc::n
 
 /// The stylesheet in force right now.
 pub fn current() -> Arc<Theme> {
-    THEME.read().expect("theme lock poisoned").clone()
+    // A poisoned lock means some earlier frame panicked while holding it — but the data is an
+    // immutable `Arc` swapped atomically on write, so a torn value is impossible and the poison
+    // carries no information here. Panicking instead would turn the *paint path* into an
+    // amplifier: every subsequent frame panics into the wndproc's firewall and the window
+    // silently stops drawing.
+    THEME
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Re-read `theme.toml` from the source tree and install it — the hot-reload path
@@ -62,7 +70,10 @@ pub fn current() -> Arc<Theme> {
 pub fn reload() -> Result<(), String> {
     let src = std::fs::read_to_string(SOURCE_PATH).map_err(|e| format!("{SOURCE_PATH}: {e}"))?;
     let theme = Theme::parse(&src)?;
-    *THEME.write().expect("theme lock poisoned") = Arc::new(theme);
+    // Poison-tolerant for the same reason as `current()`: the value is a whole-Arc swap.
+    *THEME
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(theme);
     Ok(())
 }
 
@@ -346,6 +357,25 @@ impl Theme {
                 ));
             }
         }
+        // The other numeric fields get the same posture: these feed allocations and layout
+        // directly — `[font] icon_size` sizes the icon atlas (whose bytes scale with its
+        // *square*, again per DPI scale), and the `[chrome]` heights feed the image-rect
+        // math — so a typo'd magnitude must be a load error, not a quarter-GB atlas rebuilt
+        // on every DPI change or a chrome that swallows the whole client.
+        let bounded = |what: &str, v: f32, min: f32, max: f32| -> Result<(), String> {
+            if v.is_finite() && (min..=max).contains(&v) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "theme.toml: {what} = {v}: must be between {min} and {max}"
+                ))
+            }
+        };
+        bounded("font.size", theme.font.size, 1.0, 100.0)?;
+        bounded("font.icon_size", theme.font.icon_size, 1.0, 128.0)?;
+        bounded("chrome.toolbar_h", theme.chrome.toolbar_h, 0.0, 500.0)?;
+        bounded("chrome.status_h", theme.chrome.status_h, 0.0, 500.0)?;
+        bounded("chrome.transport_h", theme.chrome.transport_h, 0.0, 500.0)?;
         for dark in [true, false] {
             let mode = if dark { "colors.dark" } else { "colors.light" };
             let cx = theme.cx(dark);
@@ -447,6 +477,43 @@ impl Metrics {
 /// Apply the **chrome** style — the toolbar, status bar, transport, chip and popup menus. Called at
 /// startup and again whenever the theme, the accent, the DPI or the stylesheet changes.
 ///
+/// The tokens `[chrome.colors]` and `[form.colors]` both define, mapped to their ImGui slots
+/// exactly once. [`apply`] and [`form`] used to spell these ~25 `set_color` lines each, and the
+/// two copies were token-for-token identical — a slot rewired in one and forgotten in the other
+/// is precisely the drift this list exists to prevent. A macro (not a function) because the two
+/// colour structs are distinct types that merely share field names.
+macro_rules! common_color_pairs {
+    ($c:expr) => {
+        [
+            (StyleColor::Text, &$c.text),
+            (StyleColor::TextDisabled, &$c.text_disabled),
+            (StyleColor::WindowBg, &$c.window_bg),
+            (StyleColor::ChildBg, &$c.child_bg),
+            (StyleColor::PopupBg, &$c.popup_bg),
+            (StyleColor::Border, &$c.border),
+            (StyleColor::BorderShadow, &$c.border_shadow),
+            (StyleColor::Separator, &$c.separator),
+            (StyleColor::Button, &$c.button),
+            (StyleColor::ButtonHovered, &$c.button_hovered),
+            (StyleColor::ButtonActive, &$c.button_active),
+            (StyleColor::FrameBg, &$c.frame_bg),
+            (StyleColor::FrameBgHovered, &$c.frame_bg_hovered),
+            (StyleColor::FrameBgActive, &$c.frame_bg_active),
+            (StyleColor::Header, &$c.header),
+            (StyleColor::HeaderHovered, &$c.header_hovered),
+            (StyleColor::HeaderActive, &$c.header_active),
+            (StyleColor::SliderGrab, &$c.slider_grab),
+            (StyleColor::SliderGrabActive, &$c.slider_grab_active),
+            (StyleColor::CheckboxSelectedBg, &$c.checkbox_selected_bg),
+            (StyleColor::CheckMark, &$c.check_mark),
+            (StyleColor::ScrollbarBg, &$c.scrollbar_bg),
+            (StyleColor::ScrollbarGrab, &$c.scrollbar_grab),
+            (StyleColor::ScrollbarGrabHovered, &$c.scrollbar_grab_hovered),
+            (StyleColor::ScrollbarGrabActive, &$c.scrollbar_grab_active),
+        ]
+    };
+}
+
 /// `scale` is the DPI factor. Every size in the stylesheet is logical px and is scaled here; ImGui's
 /// `font_scale_dpi` covers glyphs only, so without this the chrome would stay 96-dpi-sized on a
 /// HiDPI monitor.
@@ -462,45 +529,9 @@ pub fn apply(style: &mut Style, dark: bool, scale: f32) {
     // *for this mode* rather than from whatever was left in the style — see `seed_colors`.
     crate::render::imgui::seed_colors(style, dark);
 
-    style.set_color(StyleColor::Text, cx.c(&c.text));
-    style.set_color(StyleColor::TextDisabled, cx.c(&c.text_disabled));
-    style.set_color(StyleColor::WindowBg, cx.c(&c.window_bg));
-    style.set_color(StyleColor::ChildBg, cx.c(&c.child_bg));
-    style.set_color(StyleColor::PopupBg, cx.c(&c.popup_bg));
-    style.set_color(StyleColor::Border, cx.c(&c.border));
-    style.set_color(StyleColor::BorderShadow, cx.c(&c.border_shadow));
-    style.set_color(StyleColor::Separator, cx.c(&c.separator));
-
-    style.set_color(StyleColor::Button, cx.c(&c.button));
-    style.set_color(StyleColor::ButtonHovered, cx.c(&c.button_hovered));
-    style.set_color(StyleColor::ButtonActive, cx.c(&c.button_active));
-
-    style.set_color(StyleColor::FrameBg, cx.c(&c.frame_bg));
-    style.set_color(StyleColor::FrameBgHovered, cx.c(&c.frame_bg_hovered));
-    style.set_color(StyleColor::FrameBgActive, cx.c(&c.frame_bg_active));
-
-    style.set_color(StyleColor::Header, cx.c(&c.header));
-    style.set_color(StyleColor::HeaderHovered, cx.c(&c.header_hovered));
-    style.set_color(StyleColor::HeaderActive, cx.c(&c.header_active));
-
-    style.set_color(StyleColor::SliderGrab, cx.c(&c.slider_grab));
-    style.set_color(StyleColor::SliderGrabActive, cx.c(&c.slider_grab_active));
-    style.set_color(
-        StyleColor::CheckboxSelectedBg,
-        cx.c(&c.checkbox_selected_bg),
-    );
-    style.set_color(StyleColor::CheckMark, cx.c(&c.check_mark));
-
-    style.set_color(StyleColor::ScrollbarBg, cx.c(&c.scrollbar_bg));
-    style.set_color(StyleColor::ScrollbarGrab, cx.c(&c.scrollbar_grab));
-    style.set_color(
-        StyleColor::ScrollbarGrabHovered,
-        cx.c(&c.scrollbar_grab_hovered),
-    );
-    style.set_color(
-        StyleColor::ScrollbarGrabActive,
-        cx.c(&c.scrollbar_grab_active),
-    );
+    for (slot, expr) in common_color_pairs!(c) {
+        style.set_color(slot, cx.c(expr));
+    }
 }
 
 /// Apply the **settings window's** style.
@@ -516,15 +547,11 @@ pub fn form(style: &mut Style, dark: bool, scale: f32) {
 
     geom(style, &t.form.geom, scale);
 
-    style.set_color(StyleColor::Text, cx.c(&c.text));
-    style.set_color(StyleColor::TextDisabled, cx.c(&c.text_disabled));
-    style.set_color(StyleColor::WindowBg, cx.c(&c.window_bg));
-    style.set_color(StyleColor::PopupBg, cx.c(&c.popup_bg));
-    style.set_color(StyleColor::ChildBg, cx.c(&c.child_bg));
-    style.set_color(StyleColor::Border, cx.c(&c.border));
-    style.set_color(StyleColor::BorderShadow, cx.c(&c.border_shadow));
-    style.set_color(StyleColor::Separator, cx.c(&c.separator));
+    for (slot, expr) in common_color_pairs!(c) {
+        style.set_color(slot, cx.c(expr));
+    }
 
+    // The rest are the form-only slots: window furniture and controls the chrome never draws.
     style.set_color(StyleColor::TitleBg, cx.c(&c.title_bg));
     style.set_color(StyleColor::TitleBgActive, cx.c(&c.title_bg_active));
     style.set_color(StyleColor::TitleBgCollapsed, cx.c(&c.title_bg_collapsed));
@@ -533,24 +560,6 @@ pub fn form(style: &mut Style, dark: bool, scale: f32) {
     // silently falls back to ImGui's white default.
     style.set_color(StyleColor::ModalWindowDimBg, cx.c(&c.modal_dim_bg));
 
-    style.set_color(StyleColor::FrameBg, cx.c(&c.frame_bg));
-    style.set_color(StyleColor::FrameBgHovered, cx.c(&c.frame_bg_hovered));
-    style.set_color(StyleColor::FrameBgActive, cx.c(&c.frame_bg_active));
-
-    style.set_color(StyleColor::Button, cx.c(&c.button));
-    style.set_color(StyleColor::ButtonHovered, cx.c(&c.button_hovered));
-    style.set_color(StyleColor::ButtonActive, cx.c(&c.button_active));
-
-    style.set_color(StyleColor::CheckMark, cx.c(&c.check_mark));
-    style.set_color(
-        StyleColor::CheckboxSelectedBg,
-        cx.c(&c.checkbox_selected_bg),
-    );
-    style.set_color(StyleColor::SliderGrab, cx.c(&c.slider_grab));
-    style.set_color(StyleColor::SliderGrabActive, cx.c(&c.slider_grab_active));
-    style.set_color(StyleColor::Header, cx.c(&c.header));
-    style.set_color(StyleColor::HeaderHovered, cx.c(&c.header_hovered));
-    style.set_color(StyleColor::HeaderActive, cx.c(&c.header_active));
     style.set_color(StyleColor::NavCursor, cx.c(&c.nav_cursor));
     style.set_color(StyleColor::TextSelectedBg, cx.c(&c.text_selected_bg));
     style.set_color(StyleColor::InputTextCursor, cx.c(&c.input_text_cursor));
@@ -567,17 +576,6 @@ pub fn form(style: &mut Style, dark: bool, scale: f32) {
     style.set_color(
         StyleColor::TabDimmedSelectedOverline,
         cx.c(&c.tab_dimmed_selected_overline),
-    );
-
-    style.set_color(StyleColor::ScrollbarBg, cx.c(&c.scrollbar_bg));
-    style.set_color(StyleColor::ScrollbarGrab, cx.c(&c.scrollbar_grab));
-    style.set_color(
-        StyleColor::ScrollbarGrabHovered,
-        cx.c(&c.scrollbar_grab_hovered),
-    );
-    style.set_color(
-        StyleColor::ScrollbarGrabActive,
-        cx.c(&c.scrollbar_grab_active),
     );
 
     style.set_color(StyleColor::ResizeGrip, cx.c(&c.resize_grip));
@@ -771,7 +769,7 @@ fn parse_color(s: &str) -> Result<Expr, String> {
         return parse_hex(hex).map(Expr::Lit);
     }
     if let Some((head, args)) = as_call(s) {
-        let args = split_args(args);
+        let args = split_call_args(args);
         return match (head, args.len()) {
             ("lift", 2) => Ok(Expr::Lift(
                 Box::new(parse_color(args[0])?),
@@ -805,8 +803,10 @@ fn as_call(s: &str) -> Option<(&str, &str)> {
     Some((s[..open].trim(), inner[open + 1..].trim()))
 }
 
-/// Split on top-level commas, so a nested call keeps its own arguments.
-fn split_args(s: &str) -> Vec<&str> {
+/// Split a stylesheet call's argument list on top-level commas, so a nested call keeps its own
+/// arguments. (Named apart from `settings::model::split_args`, which tokenizes a *command line* —
+/// same verb, entirely different grammar.)
+fn split_call_args(s: &str) -> Vec<&str> {
     let (mut out, mut depth, mut start) = (Vec::new(), 0u32, 0usize);
     for (i, ch) in s.char_indices() {
         match ch {

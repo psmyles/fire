@@ -31,6 +31,7 @@ mod product;
 mod render;
 mod transport;
 mod ui;
+mod util;
 mod watcher;
 mod win;
 mod window_state;
@@ -87,10 +88,7 @@ struct SingleInstance(HANDLE);
 impl SingleInstance {
     /// Returns `Some` if we are the first instance, `None` if another already holds it.
     fn acquire() -> Option<Self> {
-        let name: Vec<u16> = MUTEX_NAME
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let name = util::wide(MUTEX_NAME);
         // SAFETY: name is a valid null-terminated wide string; null attributes are fine.
         let handle = unsafe {
             CreateMutexW(ptr::null(), 1 /* initial owner */, name.as_ptr())

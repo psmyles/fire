@@ -211,7 +211,7 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
     if !fullscreen {
         toolbar(ui, tex, snap, m, icon_px, w, &mut out);
         if let Some(t) = transport {
-            transport_band(ui, tex, snap, t, m, icon_px, w, h, dark, &mut out);
+            transport_band(ui, tex, t, m, w, h, &mut out);
         }
         status_bar(ui, snap, m, dark, w, h);
         if let Some(g) = chip {
@@ -697,7 +697,7 @@ fn toolbar(
     // isolate on a source with no alpha channel — so it is not laid out for one: not dimmed, and not
     // pushed into the overflow menu either. (The composite button stays: it is the all-channels
     // reset, and only its RGBA↔RGB half depends on alpha.)
-    let candidates: Vec<(Action, u8, u8)> = LEFT
+    let mut kept: Vec<(Action, u8, u8)> = LEFT
         .iter()
         .copied()
         .filter(|(a, g, _)| match a {
@@ -706,17 +706,10 @@ fn toolbar(
         })
         .collect();
 
-    let right: Vec<(Action, u8)> = RIGHT.to_vec();
-    let right_w = strip_width(
-        &right.iter().map(|(a, g)| (*a, *g)).collect::<Vec<_>>(),
-        bs[0],
-        spacing,
-        div_w,
-    );
+    let right_w = strip_width(RIGHT.iter().map(|&(_, g)| g), bs[0], spacing, div_w);
 
     // Drop the lowest-priority left slots until the strip fits. Ties break toward the *right*, so a
     // group collapses from its tail inward — same rule the GDI chrome used.
-    let mut kept = candidates.clone();
     let mut dropped: Vec<Action> = Vec::new();
     let edge = m.edge_pad;
     loop {
@@ -725,12 +718,7 @@ fn toolbar(
         } else {
             bs[0] + spacing
         };
-        let left_w = strip_width(
-            &kept.iter().map(|(a, g, _)| (*a, *g)).collect::<Vec<_>>(),
-            bs[0],
-            spacing,
-            div_w,
-        );
+        let left_w = strip_width(kept.iter().map(|&(_, g, _)| g), bs[0], spacing, div_w);
         if left_w + more_w + right_w + edge * 2.0 <= w || kept.is_empty() {
             break;
         }
@@ -764,7 +752,7 @@ fn toolbar(
                         x += div_w;
                     }
                 }
-                icon_button(ui, tex, *action, snap, [x, y], bs, icon_px, m, out);
+                icon_button(ui, tex, *action, snap, [x, y], bs, icon_px, out);
                 x += bs[0] + spacing;
                 prev_group = Some(*group);
             }
@@ -777,11 +765,9 @@ fn toolbar(
                     Icon::More,
                     "##overflow",
                     [x, y],
-                    bs,
                     icon_px,
                     true,
                     false,
-                    m,
                 ) {
                     out.menu = Some(MenuAnchor {
                         kind: MenuKind::Overflow(dropped.clone()),
@@ -796,32 +782,34 @@ fn toolbar(
             // Right strip, right-aligned.
             let mut rx = w - edge - right_w;
             let mut prev_group: Option<u8> = None;
-            for (action, group) in &right {
+            for (action, group) in RIGHT.iter() {
                 if let Some(pg) = prev_group {
                     if pg != *group {
                         divider(ui, rx + spacing, m);
                         rx += div_w;
                     }
                 }
-                icon_button(ui, tex, *action, snap, [rx, y], bs, icon_px, m, out);
+                icon_button(ui, tex, *action, snap, [rx, y], bs, icon_px, out);
                 rx += bs[0] + spacing;
                 prev_group = Some(*group);
             }
         });
 }
 
-/// Width of a strip of buttons including the dividers between differing groups.
-fn strip_width(slots: &[(Action, u8)], bw: f32, spacing: f32, div_w: f32) -> f32 {
+/// Width of a strip of buttons including the dividers between differing groups. Takes the
+/// slots' group ids as an iterator so callers measure without materializing a `Vec` — the
+/// overflow-shedding loop asks once per shed candidate, every frame.
+fn strip_width(groups: impl Iterator<Item = u8>, bw: f32, spacing: f32, div_w: f32) -> f32 {
     let mut total = 0.0;
     let mut prev: Option<u8> = None;
-    for (_, g) in slots {
+    for g in groups {
         if let Some(p) = prev {
-            if p != *g {
+            if p != g {
                 total += div_w;
             }
         }
         total += bw + spacing;
-        prev = Some(*g);
+        prev = Some(g);
     }
     total
 }
@@ -853,7 +841,6 @@ fn icon_button(
     pos: [f32; 2],
     bs: [f32; 2],
     icon_px: f32,
-    m: &Metrics,
     out: &mut Frame,
 ) {
     let enabled = snap.enabled(action);
@@ -861,7 +848,7 @@ fn icon_button(
     let icon = snap.icon(action);
     let id = format!("##tb{}", action_id(action));
 
-    if button(ui, tex, icon, &id, pos, bs, icon_px, enabled, active, m) {
+    if button(ui, tex, icon, &id, pos, icon_px, enabled, active) {
         match action {
             // Not an action — it drops a menu from under itself.
             Action::OpenWithMenu => {
@@ -881,6 +868,8 @@ fn icon_button(
 }
 
 /// One icon button. Latched buttons fill with the accent; disabled ones dim and stop responding.
+/// The button's *outer* size is not a parameter: ImGui derives it from icon + frame padding,
+/// which the theme keeps in lockstep with `button_size`.
 #[allow(clippy::too_many_arguments)]
 fn button(
     ui: &Ui,
@@ -888,11 +877,9 @@ fn button(
     icon: Icon,
     id: &str,
     pos: [f32; 2],
-    _bs: [f32; 2],
     icon_px: f32,
     enabled: bool,
     active: bool,
-    _m: &Metrics,
 ) -> bool {
     ui.set_cursor_pos(pos);
 
@@ -917,8 +904,6 @@ fn button(
         .bg_color([0.0, 0.0, 0.0, 0.0])
         .tint_color(tint)
         .build()
-        // `bs` is the button's outer size; ImGui derives it from icon + frame padding, which the
-        // theme keeps in lockstep with `button_size`. Nothing to do here but return the click.
         && enabled
 }
 
@@ -980,20 +965,15 @@ fn empty_hint(ui: &Ui, m: &Metrics, image: (f32, f32, f32, f32)) {
 /// (so the slider knows how much room it has), and the readout's column (so the slider doesn't shuffle
 /// left and right as the frame number gains and loses a digit). Both are derived from measured text,
 /// not from a table of pixel constants.
-#[allow(clippy::too_many_arguments)]
 fn transport_band(
     ui: &Ui,
     tex: TextureId,
-    snap: &ViewSnapshot,
     t: &TransportSnapshot,
     m: &Metrics,
-    icon_px: f32,
     w: f32,
     h: f32,
-    dark: bool,
     out: &mut Frame,
 ) {
-    let _ = (snap, dark, icon_px);
     let y0 = h - m.status_h - m.transport_h;
 
     ui.window("##transport")

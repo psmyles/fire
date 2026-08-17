@@ -2,12 +2,9 @@
 //! and the first pixels. Run: `cargo run -p psd-sdk-sys --example psd_roundtrip <file.psd>`
 
 fn main() {
-    let path = match std::env::args().nth(1) {
-        Some(p) => p,
-        None => {
-            eprintln!("usage: psd_roundtrip <file.psd>");
-            std::process::exit(2);
-        }
+    let Some(path) = std::env::args().nth(1) else {
+        eprintln!("usage: psd_roundtrip <file.psd>");
+        std::process::exit(2);
     };
     let bytes = std::fs::read(&path).expect("failed to read PSD");
     match psd_sdk_sys::decode_psd(&bytes) {
@@ -20,8 +17,7 @@ fn main() {
                 img.bits_per_channel,
                 img.icc
                     .as_ref()
-                    .map(|v| format!("{} bytes", v.len()))
-                    .unwrap_or("none".into())
+                    .map_or("none".into(), |v| format!("{} bytes", v.len()))
             );
             // `rgba` is in the document's own depth — u8, native-endian u16, or f32 — so the
             // raw bytes are what this smoke test can honestly print.

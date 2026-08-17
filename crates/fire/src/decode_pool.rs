@@ -14,15 +14,14 @@
 //! dropped on arrival — which wastes a little work but keeps the pool dead simple.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{unbounded, Sender};
 use fire_decode::{decode_path, DecodeError, DecodeOptions, DecodedImage};
 
-use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
-
+use crate::util::{post_boxed, PostOutcome};
 use crate::win::{WM_APP_DECODE_DONE, WM_APP_FLIPBOOK_GUESS};
 
 /// Plan-adopted default pool size: `min(num_cpus, 4)`.
@@ -68,6 +67,11 @@ pub struct FlipbookGuess {
 /// Sender handle to the worker pool; held by the `App` for the window's lifetime.
 pub struct DecodePool {
     tx: Sender<DecodeJob>,
+    /// The newest generation ever submitted. Workers consult it before decoding: the queue is
+    /// unbounded, so key-repeat navigation can enqueue jobs faster than they retire, and every
+    /// superseded job decoded in full is a wasted allocation (up to ~1 GiB at `MAX_CPU_DIM`)
+    /// parked in the message queue until the UI thread drains it.
+    latest: Arc<AtomicU64>,
 }
 
 impl DecodePool {
@@ -76,14 +80,22 @@ impl DecodePool {
     /// (a raw HWND is just an integer).
     pub fn new(hwnd: isize) -> Self {
         let (tx, rx) = unbounded::<DecodeJob>();
+        let latest = Arc::new(AtomicU64::new(0));
         let workers = worker_count();
+        let mut started = 0usize;
         for i in 0..workers {
             let rx = rx.clone();
-            thread::Builder::new()
+            let latest = Arc::clone(&latest);
+            let spawned = thread::Builder::new()
                 .name(format!("fire-decode-{i}"))
                 .spawn(move || {
                     // Exits when the pool (and thus `tx`) is dropped at shutdown.
                     while let Ok(job) = rx.recv() {
+                        // A superseded job's result would be stale-dropped on arrival anyway;
+                        // once a newer submit exists, skip the decode itself.
+                        if job.generation < latest.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         let result = decode(&job).map(Arc::new);
                         // Keep a clone to run flipbook detection *after* the image is posted, so a
                         // large sheet reaches the screen without waiting on the per-pixel scan.
@@ -104,15 +116,12 @@ impl DecodePool {
                             result,
                             reload: job.reload,
                         });
-                        let lparam = Box::into_raw(outcome) as isize;
-                        // SAFETY: the box outlives the post; the UI thread reclaims it in
-                        // the wndproc. If the post fails (window gone), reclaim here so we
-                        // don't leak.
-                        let posted =
-                            unsafe { PostMessageW(hwnd as HWND, WM_APP_DECODE_DONE, 0, lparam) };
-                        if posted == 0 {
-                            drop(unsafe { Box::from_raw(lparam as *mut DecodeOutcome) });
-                            break; // window is gone; stop working
+                        match post_boxed(hwnd, WM_APP_DECODE_DONE, outcome) {
+                            PostOutcome::Posted => {}
+                            // The result is lost, but the pool must outlive one full queue;
+                            // there is no image to hint at, so skip detection too.
+                            PostOutcome::Dropped => continue,
+                            PostOutcome::WindowGone => break,
                         }
 
                         // --- Then detect the flipbook grid off the critical path and post the hint
@@ -129,25 +138,34 @@ impl DecodePool {
                                 path,
                                 guess,
                             });
-                            let hint_lparam = Box::into_raw(hint) as isize;
-                            let posted = unsafe {
-                                PostMessageW(hwnd as HWND, WM_APP_FLIPBOOK_GUESS, 0, hint_lparam)
-                            };
-                            if posted == 0 {
-                                drop(unsafe { Box::from_raw(hint_lparam as *mut FlipbookGuess) });
-                                break; // window is gone; stop working
+                            if post_boxed(hwnd, WM_APP_FLIPBOOK_GUESS, hint)
+                                == PostOutcome::WindowGone
+                            {
+                                break;
                             }
                         }
                     }
-                })
-                .expect("failed to spawn decode worker");
+                });
+            // A thread the OS refused to start must not abort the viewer before its window
+            // exists (the folder-scan and watcher threads already degrade this way); any
+            // workers that did start carry the load.
+            match spawned {
+                Ok(_) => started += 1,
+                Err(e) => eprintln!("fire: could not start decode worker {i}: {e}"),
+            }
         }
-        Self { tx }
+        if started == 0 {
+            eprintln!("fire: no decode workers could be started; images will not decode");
+        }
+        Self { tx, latest }
     }
 
     /// Enqueue a decode. The unbounded channel only fails to send once every worker
     /// has exited (shutdown), so a dropped job here is benign.
     pub fn submit(&self, job: DecodeJob) {
+        // fetch_max, not store: submit order and the generation counter agree today, but the
+        // skip must never move backwards if they ever don't.
+        self.latest.fetch_max(job.generation, Ordering::Relaxed);
         let _ = self.tx.send(job);
     }
 }
@@ -164,7 +182,6 @@ fn decode(job: &DecodeJob) -> Result<DecodedImage, DecodeError> {
 
 fn worker_count() -> usize {
     thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+        .map_or(1, |n| n.get())
         .clamp(1, MAX_WORKERS)
 }

@@ -81,7 +81,9 @@ const MAX_DECODE_BYTES: usize = 4 << 30; // 4 GiB
 /// claiming billions of pixels has to be turned away here; nothing downstream can catch it.
 ///
 /// Applied by every backend that sizes a buffer from parsed dimensions *and* can see those
-/// dimensions before allocating: PNG, GIF, Radiance HDR, OpenEXR. The zune hot path cannot —
+/// dimensions before allocating: PNG, GIF, Radiance HDR, OpenEXR, TIFF. PSD applies it after
+/// the fact — its allocation happens behind the FFI, guarded by the C++ side's own cap — so
+/// the shared policy holds there even if that guard drifts. The zune hot path cannot —
 /// `zune_image::Image::read` decodes in one shot and only reports dimensions afterwards — so it
 /// relies on zune's own per-axis caps ([`MAX_DECODE_DIM`]) and remains bounded only by the product
 /// of those; see `decode_zune`.
@@ -105,6 +107,13 @@ fn check_dims(
             "{what} {width}x{height} needs more than the {MAX_DECODE_BYTES}-byte decode guard"
         ))),
     }
+}
+
+/// One scalar slice, reinterpreted as native-endian bytes. `cast_slice` makes this a single
+/// memcpy; the per-backend widening loops it replaced were an extra full pass over buffers
+/// that can be gigabytes — and there were seven of them.
+pub(crate) fn to_ne_bytes<T: bytemuck::Pod>(v: &[T]) -> Vec<u8> {
+    bytemuck::cast_slice(v).to_vec()
 }
 
 /// Every file extension fire can open, lower-case.
@@ -220,6 +229,31 @@ pub struct Animation {
     /// Every frame in play order (frame 0 included, matching [`DecodedImage::pixels`]). Each is a
     /// complete canvas at the image's dimensions, so playback is a plain texture swap per frame.
     pub frames: Vec<AnimationFrame>,
+}
+
+impl DecodedImage {
+    /// Run one whole-buffer transform over every pixel buffer this image owns — the canvas,
+    /// then every animation frame — so the post-decode passes (EXIF orientation, ICC
+    /// conversion, downscale) can never leave `pixels` and [`Animation::frames`] describing
+    /// different images: frame 0 duplicates the canvas, and a pass that touched only `pixels`
+    /// would desync the moment playback starts. Today only GIF is animated and carries
+    /// neither EXIF nor ICC, but that is a property of the current format set, not an
+    /// invariant — the next animated format (WebP, AVIF) walks straight into any pass that
+    /// skipped the frames. Frames shorter than `needed` bytes (the canvas size the transform
+    /// assumes) are dropped rather than indexed past, and an animation left with no frames is
+    /// removed entirely.
+    pub(crate) fn transform_buffers(&mut self, needed: usize, mut f: impl FnMut(&mut Vec<u8>)) {
+        f(&mut self.pixels);
+        if let Some(anim) = self.animation.as_mut() {
+            anim.frames.retain(|frame| frame.pixels.len() >= needed);
+            for frame in &mut anim.frames {
+                f(&mut frame.pixels);
+            }
+            if anim.frames.is_empty() {
+                self.animation = None;
+            }
+        }
+    }
 }
 
 /// Options controlling a decode.
@@ -411,7 +445,15 @@ pub fn decode(
         Backend::Zune(fmt) => match decode_zune(bytes, fmt) {
             Ok(img) => img,
             Err(DecodeError::TooLarge(m)) => return Err(DecodeError::TooLarge(m)),
-            Err(zune_err) => decode_image(bytes, ext_hint).map_err(|_| zune_err)?,
+            Err(zune_err) => match decode_image(bytes, ext_hint) {
+                Ok(img) => img,
+                // The *fallback's* guard rejections keep their identity too: `TooLarge` means
+                // "we decided not to", and must stay distinguishable from "failed to decode"
+                // no matter which decoder's guard fired.
+                Err(e @ DecodeError::TooLarge(_)) => return Err(e),
+                // Both decoders said no: report zune's error, the more precise one.
+                Err(_) => return Err(zune_err),
+            },
         },
         Backend::Image => decode_image(bytes, ext_hint)?,
     };
@@ -481,6 +523,13 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     let result = std::panic::catch_unwind(|| psd_sdk_sys::decode_psd(bytes))
         .map_err(|_| DecodeError::Ffi("psd_sdk panicked".into()))?;
     let psd = result.map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    // The buffer is already allocated (psd-sdk-sys sizes it, bounded by the C++ guard and
+    // its own cap — it cannot wait for us, the dimensions live behind the FFI), so this
+    // check_dims is enforcement of the shared policy rather than the allocation guard the
+    // other backends use it as: the per-axis cap and byte budget hold for PSD too, even if
+    // the guards on the far side of the boundary drift.
+    let bps = (psd.bits_per_channel as usize).div_ceil(8);
+    check_dims(psd.width as usize, psd.height as usize, 4 * bps, "PSD")?;
     // The wrapper hands back the document's own depth rather than always narrowing to 8-bit:
     // a 16-bit PSD keeps its precision (and a 32-bit one its linear/HDR range) instead of
     // being flattened on the way in, and `bit_depth` now describes the buffer it labels.
@@ -565,12 +614,7 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 
     let size = image.layer_data.size;
     let buf = image.layer_data.channel_data.pixels;
-    let mut pixels = Vec::with_capacity(buf.pixels.len() * 16);
-    for px in &buf.pixels {
-        for c in px {
-            pixels.extend_from_slice(&c.to_ne_bytes());
-        }
-    }
+    let pixels = to_ne_bytes(&buf.pixels);
     Ok(DecodedImage {
         pixels,
         width: size.width() as u32,
@@ -683,10 +727,7 @@ fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     let (width, height) = (dynimg.width(), dynimg.height());
 
     let rgba = dynimg.into_rgba32f();
-    let mut pixels = Vec::with_capacity(rgba.as_raw().len() * 4);
-    for f in rgba.as_raw() {
-        pixels.extend_from_slice(&f.to_ne_bytes());
-    }
+    let pixels = to_ne_bytes(rgba.as_raw());
 
     Ok(DecodedImage {
         pixels,
@@ -748,11 +789,7 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     let (pixels, format, bit_depth) = if is_16bit {
         // The CPU shader reads Rgba16Unorm back as native-endian u16.
         let rgba = dynimg.into_rgba16();
-        let mut out = Vec::with_capacity(rgba.as_raw().len() * 2);
-        for v in rgba.as_raw() {
-            out.extend_from_slice(&v.to_ne_bytes());
-        }
-        (out, PixelFormat::Rgba16Unorm, 16u8)
+        (to_ne_bytes(rgba.as_raw()), PixelFormat::Rgba16Unorm, 16u8)
     } else {
         (dynimg.into_rgba8().into_raw(), PixelFormat::Rgba8Unorm, 8)
     };
@@ -866,21 +903,19 @@ fn decode_zune(
         BitDepth::Eight => (frame.flatten::<u8>(), PixelFormat::Rgba8Unorm, 8u8),
         BitDepth::Sixteen => {
             // The CPU shader reads Rgba16Unorm back as native-endian u16.
-            let u16s = frame.flatten::<u16>();
-            let mut out = Vec::with_capacity(u16s.len() * 2);
-            for v in u16s {
-                out.extend_from_slice(&v.to_ne_bytes());
-            }
-            (out, PixelFormat::Rgba16Unorm, 16)
+            (
+                to_ne_bytes(&frame.flatten::<u16>()),
+                PixelFormat::Rgba16Unorm,
+                16,
+            )
         }
         BitDepth::Float32 => {
             // Float sources are linear/HDR → exposure + tonemap apply.
-            let f32s = frame.flatten::<f32>();
-            let mut out = Vec::with_capacity(f32s.len() * 4);
-            for v in f32s {
-                out.extend_from_slice(&v.to_ne_bytes());
-            }
-            (out, PixelFormat::Rgba32Float, 32)
+            (
+                to_ne_bytes(&frame.flatten::<f32>()),
+                PixelFormat::Rgba32Float,
+                32,
+            )
         }
         // BitDepth::Unknown and any future variant.
         _ => return Err(DecodeError::Malformed("unsupported bit depth".into())),
@@ -906,12 +941,12 @@ fn zune_format_name(f: zune_image::codecs::ImageFormat) -> &'static str {
     match f {
         JPEG => "JPEG",
         PPM => "PPM",
-        PSD => "PSD",
         Farbfeld => "Farbfeld",
         QOI => "QOI",
         JPEG_XL => "JPEG XL",
         BMP => "BMP",
         WEBP => "WebP",
+        // No PSD arm: `sniff` routes `8BPS` to Backend::Psd before zune is ever consulted.
         _ => "image",
     }
 }
@@ -1038,7 +1073,7 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         dims.0 as usize,
         dims.1 as usize,
         4 * usize::from(color.bytes_per_pixel() / color.channel_count()).max(1),
-        format.map(format_name).unwrap_or("image"),
+        format.map_or("image", format_name),
     )?;
     let dynimg =
         DynamicImage::from_decoder(decoder).map_err(|e| DecodeError::Malformed(e.to_string()))?;
@@ -1054,11 +1089,7 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         // Float sources (Radiance HDR, float TIFF) stay 32-bit float / linear (HDR).
         DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_) => {
             let rgba = dynimg.to_rgba32f();
-            let mut bytes = Vec::with_capacity(rgba.as_raw().len() * 4);
-            for f in rgba.as_raw() {
-                bytes.extend_from_slice(&f.to_ne_bytes());
-            }
-            (bytes, PixelFormat::Rgba32Float, 32)
+            (to_ne_bytes(rgba.as_raw()), PixelFormat::Rgba32Float, 32)
         }
         _ => (dynimg.to_rgba8().into_raw(), PixelFormat::Rgba8Unorm, 8),
     };
@@ -1071,7 +1102,7 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         bit_depth,
         channels: src_channels,
         icc,
-        source_format: format.map(format_name).unwrap_or("image"),
+        source_format: format.map_or("image", format_name),
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
         animation: None,
@@ -1138,6 +1169,12 @@ mod icc {
         // the alpha channel passes through untouched (lcms only transforms color).
         let intent = Intent::Perceptual;
 
+        // The same conversion runs over the canvas and every animation frame
+        // (`transform_buffers`): a converted canvas over unconverted frames would visibly
+        // shift color the moment playback starts.
+        let needed = (img.width as usize)
+            .saturating_mul(img.height as usize)
+            .saturating_mul(img.format.bytes_per_pixel());
         match img.format {
             PixelFormat::Rgba8Unorm => {
                 let t: Transform<[u8; 4], [u8; 4]> = match Transform::new_flags(
@@ -1151,9 +1188,11 @@ mod icc {
                     Ok(t) => t,
                     Err(_) => return,
                 };
-                if let Ok(px) = bytemuck::try_cast_slice_mut::<u8, [u8; 4]>(&mut img.pixels) {
-                    t.transform_in_place(px);
-                }
+                img.transform_buffers(needed, |pixels| {
+                    if let Ok(px) = bytemuck::try_cast_slice_mut::<u8, [u8; 4]>(pixels) {
+                        t.transform_in_place(px);
+                    }
+                });
             }
             PixelFormat::Rgba16Unorm => {
                 let t: Transform<[u16; 4], [u16; 4]> = match Transform::new_flags(
@@ -1169,9 +1208,11 @@ mod icc {
                 };
                 // 16-bit pixels are native-endian u16 bytes; cast may fail on alignment,
                 // in which case we skip (sRGB assumption) rather than panic.
-                if let Ok(px) = bytemuck::try_cast_slice_mut::<u8, [u16; 4]>(&mut img.pixels) {
-                    t.transform_in_place(px);
-                }
+                img.transform_buffers(needed, |pixels| {
+                    if let Ok(px) = bytemuck::try_cast_slice_mut::<u8, [u16; 4]>(pixels) {
+                        t.transform_in_place(px);
+                    }
+                });
             }
             // Float is handled by the is_hdr() early-out in apply().
             _ => {}
@@ -1949,6 +1990,27 @@ mod tests {
     // as a clean `Err` from the header check, never reaching an allocation: a `Vec` that fails to
     // allocate aborts the process (`handle_alloc_error`), which no `catch_unwind` can intercept —
     // so "the test passes" and "the test process is still alive" are the same assertion here.
+
+    /// The zune and image-crate label tables overlap, and the zune→image fallback means the
+    /// *same file* can be named by either depending on which decoder won — so the shared
+    /// entries must agree, or the status bar's format label changes spelling with the decode
+    /// path taken.
+    #[test]
+    fn format_label_tables_agree_on_shared_formats() {
+        use zune_image::codecs::ImageFormat as Z;
+        assert_eq!(
+            zune_format_name(Z::JPEG),
+            format_name(image::ImageFormat::Jpeg)
+        );
+        assert_eq!(
+            zune_format_name(Z::BMP),
+            format_name(image::ImageFormat::Bmp)
+        );
+        assert_eq!(
+            zune_format_name(Z::WEBP),
+            format_name(image::ImageFormat::WebP)
+        );
+    }
 
     /// The product, not the axes, is what gets allocated: both of these pass a per-axis cap of
     /// 131072 and still ask for far more than [`MAX_DECODE_BYTES`].

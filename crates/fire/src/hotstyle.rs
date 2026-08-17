@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use windows_sys::Win32::Foundation::HWND;
@@ -33,21 +33,33 @@ use crate::win::WM_APP_THEME_RELOADED;
 /// multi-burst save (and to let the editor finish writing), short enough to feel instant.
 const DEBOUNCE: Duration = Duration::from_millis(120);
 
+/// Handle to the watcher thread, held by the `App` for the window's lifetime. Dropping it closes
+/// the channel the thread selects on, which ends the thread and releases the directory watch —
+/// the same shutdown discipline as [`crate::watcher::FileWatcher`]. Without it this was the one
+/// watcher in the codebase that outlived its window, blocked in `recv()` holding a
+/// `ReadDirectoryChangesW` handle on the source tree.
+#[derive(Debug)]
+pub struct HotStyle {
+    _stop: Sender<()>,
+}
+
 /// Start watching the stylesheet. `frame` is the window's HWND (as `isize`, so it crosses the thread
 /// boundary like the decode pool's). Any failure to set the watch up disables hot reload and is
 /// otherwise harmless — the app runs on the stylesheet it loaded at startup.
-pub fn spawn(frame: isize) {
+pub fn spawn(frame: isize) -> Option<HotStyle> {
     let path = PathBuf::from(theme::SOURCE_PATH);
     if !path.is_file() {
         // A debug build running away from its source tree (someone copied the exe). Nothing to watch.
-        return;
+        return None;
     }
+    let (stop_tx, stop_rx) = unbounded::<()>();
     let _ = std::thread::Builder::new()
         .name("fire-theme-watch".into())
-        .spawn(move || run(frame, path));
+        .spawn(move || run(frame, path, stop_rx));
+    Some(HotStyle { _stop: stop_tx })
 }
 
-fn run(frame: isize, path: PathBuf) {
+fn run(frame: isize, path: PathBuf, stop_rx: Receiver<()>) {
     let Some(dir) = path.parent().map(Path::to_path_buf) else {
         return;
     };
@@ -77,7 +89,12 @@ fn run(frame: isize, path: PathBuf) {
 
     loop {
         // Block until something in the directory changes; ignore its siblings (theme.rs, mod.rs…).
-        match rx.recv() {
+        let received = select! {
+            recv(rx) -> ev => ev,
+            // The App dropped its guard: the window is going away, and the watch with it.
+            recv(stop_rx) -> _ => return,
+        };
+        match received {
             Ok(Ok(event)) if event.paths.iter().any(|p| p.file_name() == Some(&name)) => {}
             Ok(_) => continue,
             // The watcher died, or the app is going away.

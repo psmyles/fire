@@ -54,7 +54,15 @@ pub enum PsdError {
 impl std::fmt::Display for PsdError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PsdError::OpenFailed => write!(f, "psd_sdk failed to open the document"),
+            // Open rejections are one NULL from C++, so the common refusals (malformed,
+            // oversized header, 1-bit Bitmap mode) all land here — say so, rather than
+            // implying only parse failure. `UnsupportedDepth` below stays as the belt-and-
+            // braces arm for a depth that somehow got past open.
+            PsdError::OpenFailed => write!(
+                f,
+                "psd_sdk could not open the document (malformed, oversized, or an unsupported \
+                 bit depth)"
+            ),
             PsdError::InfoFailed => write!(f, "could not read PSD header info"),
             PsdError::NoMergedImage => write!(
                 f,
@@ -116,12 +124,16 @@ pub fn decode_psd(bytes: &[u8]) -> Result<PsdImage, PsdError> {
         };
         // FFI = validation boundary: reject zero/degenerate dimensions and size the buffer with
         // checked arithmetic, so a malformed header can never wrap to an undersized allocation
-        // that the C++ merged-image read then overruns.
+        // that the C++ merged-image read then overruns. The cap mirrors the C++ side's
+        // MAX_PSD_BYTES (and fire-decode's MAX_DECODE_BYTES): a `vec!` this size that fails
+        // to allocate aborts the process, which nothing — not even catch_unwind — can stop,
+        // so an oversized header must be refused rather than attempted.
+        const MAX_RGBA_BYTES: usize = 4 << 30;
         let len = (w as usize)
             .checked_mul(h as usize)
             .and_then(|n| n.checked_mul(4))
             .and_then(|n| n.checked_mul(bytes_per_sample))
-            .filter(|&n| n != 0)
+            .filter(|&n| n != 0 && n < MAX_RGBA_BYTES)
             .ok_or(PsdError::InfoFailed)?;
         let mut rgba = vec![0u8; len];
         let rc = ffi::fire_psd_read_merged(handle, rgba.as_mut_ptr().cast(), rgba.len());

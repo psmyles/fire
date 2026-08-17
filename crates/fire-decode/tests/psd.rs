@@ -368,6 +368,57 @@ fn psd_truncated_is_rejected_not_rendered_from_uninitialized_memory() {
     assert!(decode(&missing_plane, Some("psd"), &DecodeOptions::default()).is_err());
 }
 
+/// A colour mode that requires more planes than the header declared must be refused, not
+/// read past.
+///
+/// `color_channel_count` answers 4 for CMYK and 3 for Lab from the colour mode alone, while
+/// the `images[]` array is sized from the header's `channelCount` — and the CMYK/Lab sampling
+/// branches walk all of their colour planes unconditionally. A one-channel CMYK document
+/// therefore sent the sampler three `PlanarImage` structs past the end of a one-element heap
+/// array, dereferencing whatever pointers it found there. The data section here is complete
+/// for the single declared plane, so the short-read rejection never fires; only the plane-count
+/// check in `fire_psd_read_merged` stands between the header and that walk.
+#[test]
+fn psd_cmyk_and_lab_with_missing_color_planes_are_refused() {
+    const CMYK: u16 = 4;
+    const LAB: u16 = 9;
+
+    // CMYK needs 4 colour planes; the header declares 1.
+    let bytes = psd(1, 1, CMYK, 8, &[vec![255]]);
+    assert!(
+        decode(&bytes, Some("psd"), &DecodeOptions::default()).is_err(),
+        "a 1-channel CMYK document must be refused, never sampled past its planes"
+    );
+
+    // Lab needs 3; the header declares 2.
+    let bytes = psd(1, 1, LAB, 8, &[vec![255], vec![128]]);
+    assert!(
+        decode(&bytes, Some("psd"), &DecodeOptions::default()).is_err(),
+        "a 2-channel Lab document must be refused, never sampled past its planes"
+    );
+}
+
+/// The size guard must bound the RGBA *output*, not just psd_sdk's planar source data.
+///
+/// A 65536x65536 8-bit greyscale header describes exactly 4 GiB of planar source — the old
+/// guard's boundary value, which `<=` admitted (and precisely the quantity that wraps psd_sdk's
+/// 32-bit plane-size arithmetic to zero) — while the interleaved RGBA buffer the Rust side then
+/// allocates is 16 GiB. A `vec!` that size failing to allocate aborts the process; nothing
+/// downstream, including `catch_unwind`, can intercept it, so the header has to be turned away
+/// at open.
+#[test]
+fn psd_grayscale_bomb_amplified_by_rgba_output_is_rejected() {
+    let small = vec![vec![0u8; 4]];
+    let mut liar = psd(2, 2, COLOR_MODE_GRAYSCALE, 8, &small);
+    liar[14..18].copy_from_slice(&65_536u32.to_be_bytes()); // height
+    liar[18..22].copy_from_slice(&65_536u32.to_be_bytes()); // width
+
+    assert!(
+        decode(&liar, Some("psd"), &DecodeOptions::default()).is_err(),
+        "a header whose RGBA output would exceed the byte budget must be refused at open"
+    );
+}
+
 /// A PSD decode bomb: a 40-byte file whose header claims 60000x60000. psd_sdk allocates its planar
 /// channel buffers from that header inside `fire_psd_open` — ~10 GB — before Rust sees a single
 /// dimension, and a failed allocation aborts the process rather than unwinding. The guard has to

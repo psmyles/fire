@@ -8,22 +8,8 @@
 /// Product/display name (e.g. shown in the window title and taskbar). From `productName`.
 pub const NAME: &str = env!("FIRE_PRODUCT_NAME");
 
-/// Marketing version string (e.g. "0.1.0"). From `version`.
-#[allow(dead_code)] // surfaced by a future About/settings dialog
-pub const VERSION: &str = env!("FIRE_VERSION");
-
-/// One-line product description. From `description`.
-#[allow(dead_code)] // surfaced by a future About/settings dialog
-pub const DESCRIPTION: &str = env!("FIRE_DESCRIPTION");
-
-/// Publisher / company name. From `publisher`.
-#[allow(dead_code)] // surfaced by a future About/settings dialog
-pub const PUBLISHER: &str = env!("FIRE_PUBLISHER");
-
-/// Copyright line. From `copyright`.
-#[allow(dead_code)] // surfaced by a future About/settings dialog
-pub const COPYRIGHT: &str = env!("FIRE_COPYRIGHT");
-
-/// Project homepage URL. From `homepage`.
-#[allow(dead_code)] // surfaced by a future About/settings dialog
-pub const HOMEPAGE: &str = env!("FIRE_HOMEPAGE");
+// The other product.json fields (version, description, publisher, copyright, homepage) are
+// exported by build.rs as FIRE_* env vars too; surface one here with `env!` the moment
+// something user-facing (an About box, say) actually reads it. Constants for all of them sat
+// here for a while annotated "surfaced by a future About/settings dialog" — the settings
+// dialog then shipped without touching any, which is the fate of most speculative plumbing.

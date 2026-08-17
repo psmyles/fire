@@ -32,6 +32,15 @@ fn main() {
     // `wrapper.c` is compiled by cl.exe. Short-circuit on any other host rather than failing deep
     // inside bindgen or the linker with something unrecognisable.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        // Returning with no bindings.rs would defeat the point: lib.rs's `include!` then fails
+        // with a missing-file error from inside a macro, which is *less* recognisable than the
+        // failure this short-circuit exists to avoid. Leave a stub that states the constraint.
+        std::fs::write(
+            out_dir.join("bindings.rs"),
+            "compile_error!(\"heif-sys builds only on Windows: the vendored libheif stack is \
+             MSVC static libs and wrapper.c is compiled by cl.exe\");\n",
+        )
+        .expect("failed to write stub bindings.rs");
         return;
     }
 

@@ -205,8 +205,7 @@ fn find_fxc() -> PathBuf {
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
     candidates
         .pop()
-        .map(|(_, p)| p)
-        .unwrap_or_else(|| PathBuf::from("fxc.exe"))
+        .map_or_else(|| PathBuf::from("fxc.exe"), |(_, p)| p)
 }
 
 /// Embed the Fire `.ico` + product metadata into the exe (Explorer file icon, Task Manager name,
@@ -240,11 +239,15 @@ fn embed_resources(p: &Product) {
 }
 
 /// Pack a dotted "major.minor.patch[.build]" string into the u64 VS_FIXEDFILEINFO layout
-/// (`major<<48 | minor<<32 | patch<<16 | build`). Missing components default to 0.
+/// (`major<<48 | minor<<32 | patch<<16 | build`). Missing components default to 0; each field
+/// is 16 bits, so a component above 65535 is clamped rather than silently bleeding into its
+/// neighbour.
 fn packed_version(version: &str) -> u64 {
-    let mut parts = version.split('.').map(|s| s.parse::<u64>().unwrap_or(0));
-    let mut next = || parts.next().unwrap_or(0);
-    (next() << 48) | (next() << 32) | (next() << 16) | next()
+    let mut fields = [0u64; 4];
+    for (field, part) in fields.iter_mut().zip(version.split('.')) {
+        *field = part.parse::<u64>().unwrap_or(0).min(0xFFFF);
+    }
+    (fields[0] << 48) | (fields[1] << 32) | (fields[2] << 16) | fields[3]
 }
 
 /// Re-export the product strings as compile-time env vars (`FIRE_PRODUCT_NAME`, `FIRE_VERSION`, …)

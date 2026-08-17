@@ -313,24 +313,20 @@ pub(crate) fn insert_after(
     path: Option<&[usize]>,
     entry: MenuEntry,
 ) -> Vec<usize> {
-    match path {
-        Some(p) if !p.is_empty() => {
-            let idx = *p.last().unwrap();
-            if let Some(c) = container(root, p) {
-                let at = (idx + 1).min(c.len());
-                c.insert(at, entry);
-                let mut new = p.to_vec();
-                *new.last_mut().unwrap() = at;
-                return new;
-            }
-            root.push(entry);
-            vec![root.len() - 1]
-        }
-        _ => {
-            root.push(entry);
-            vec![root.len() - 1]
+    // New paths are built as "the parents, plus the new leaf index" rather than by patching a
+    // clone's last element — same result, no `last_mut().unwrap()` to justify (here and in the
+    // sibling helpers below).
+    if let Some(p) = path {
+        if let (Some(&idx), Some(c)) = (p.last(), container(root, p)) {
+            let at = (idx + 1).min(c.len());
+            c.insert(at, entry);
+            let mut new = p[..p.len() - 1].to_vec();
+            new.push(at);
+            return new;
         }
     }
+    root.push(entry);
+    vec![root.len() - 1]
 }
 
 /// Remove the entry at `path` (and its children). Returns the path that should be selected
@@ -349,8 +345,8 @@ pub(crate) fn remove_at(root: &mut Vec<MenuEntry>, path: &[usize]) -> Option<Vec
         let parent = &path[..path.len() - 1];
         return (!parent.is_empty()).then(|| parent.to_vec());
     }
-    let mut sel = path.to_vec();
-    *sel.last_mut().unwrap() = idx.min(remaining - 1);
+    let mut sel = path[..path.len() - 1].to_vec();
+    sel.push(idx.min(remaining - 1));
     Some(sel)
 }
 
@@ -368,8 +364,8 @@ pub(crate) fn move_sibling(
         return None;
     }
     c.swap(idx, target);
-    let mut new = path.to_vec();
-    *new.last_mut().unwrap() = target;
+    let mut new = path[..path.len() - 1].to_vec();
+    new.push(target);
     Some(new)
 }
 
@@ -392,8 +388,8 @@ pub(crate) fn indent(root: &mut Vec<MenuEntry>, path: &[usize]) -> Option<Vec<us
     let prev = c.get_mut(idx - 1)?;
     prev.items.push(entry);
     let child = prev.items.len() - 1;
-    let mut new = path.to_vec();
-    *new.last_mut().unwrap() = idx - 1;
+    let mut new = path[..path.len() - 1].to_vec();
+    new.push(idx - 1);
     new.push(child);
     Some(new)
 }

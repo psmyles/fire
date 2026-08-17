@@ -99,7 +99,10 @@ pub struct ViewSnapshot {
     pub has_animation: bool,
     /// The live keyboard shortcuts, so a button's tooltip shows the key that *currently* drives it
     /// rather than a literal baked into the string (the settings dialog can rebind any of them).
-    pub shortcuts: ShortcutLabels,
+    /// Behind an `Arc`: the snapshot is rebuilt every drawn frame (every mouse move), and the
+    /// labels only change on a rebind — cloning ~23 `String`s per frame for at most one tooltip
+    /// was the one recurring allocation in an otherwise free idle frame.
+    pub shortcuts: std::sync::Arc<ShortcutLabels>,
     pub status_left: String,
     pub status_right: String,
 }
@@ -301,9 +304,7 @@ pub fn apply_dark_titlebar(hwnd: HWND, dark: bool) {
     }
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use crate::util::wide;
 
 // There used to be an `apply_dark_menus` here: three undocumented `uxtheme.dll` ordinals (133/135/136
 // — `AllowDarkModeForWindow` / `SetPreferredAppMode` / `FlushMenuThemes`), resolved by `GetProcAddress`

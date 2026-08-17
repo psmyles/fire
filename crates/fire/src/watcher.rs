@@ -104,6 +104,16 @@ fn run(frame: isize, cmd_rx: Receiver<WatchCmd>) {
     let mut deadline: Option<Instant> = None;
 
     loop {
+        // Fire a due reload BEFORE waiting: crossbeam runs the `default(timeout)` arm below
+        // only when no other arm is ready, and a busy directory (say, a renderer writing a
+        // frame sequence beside the watched image) keeps `event_rx` permanently ready — a
+        // pending deadline would starve forever if it were only checked in that arm.
+        if let (Some(t), Some(d)) = (target.as_ref(), deadline) {
+            if Instant::now() >= d {
+                post_changed(frame, t.generation);
+                deadline = None;
+            }
+        }
         let timeout = match deadline {
             Some(d) => d.saturating_duration_since(Instant::now()),
             None => IDLE,
@@ -190,8 +200,7 @@ fn event_is_relevant(event: &Event, name_lc: &str) -> bool {
     kind_ok
         && event.paths.iter().any(|p| {
             p.file_name()
-                .map(|n| n.to_string_lossy().to_lowercase() == name_lc)
-                .unwrap_or(false)
+                .is_some_and(|n| n.to_string_lossy().to_lowercase() == name_lc)
         })
 }
 

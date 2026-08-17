@@ -89,7 +89,7 @@ private:
 // ~10 GB, and an allocation that fails aborts the process — nothing on the Rust side, not even
 // catch_unwind, can intervene. Refuse it at the point of allocation instead.
 const uint64_t MAX_PSD_DIM = 131072;              // per axis
-const uint64_t MAX_PSD_BYTES = 4ull << 30;        // 4 GiB of planar channel data
+const uint64_t MAX_PSD_BYTES = 4ull << 30;        // 4 GiB, applied to both layouts below
 
 bool psd_size_is_sane(const psd::Document* document) {
     const uint64_t w = document->width;
@@ -99,8 +99,16 @@ bool psd_size_is_sane(const psd::Document* document) {
     }
     const uint64_t channels = document->channelCount ? document->channelCount : 1;
     const uint64_t bytesPerSample = (document->bitsPerChannel + 7u) / 8u;
-    // w*h <= 2^34 and channels/bytesPerSample are small, so this cannot overflow 64 bits.
-    return w * h * channels * bytesPerSample <= MAX_PSD_BYTES;
+    // Two allocations hang off this header and both must fit the budget: psd_sdk's planar
+    // source planes (w*h*channels*bytesPerSample, allocated below in C++) and the
+    // interleaved RGBA output (w*h*4*bytesPerSample, allocated by the Rust caller).
+    // Bounding only the planar side let a 1-channel greyscale document amplify 4x on the
+    // way out — past what a Vec allocation can fail without aborting. Strictly `<`, not
+    // `<=`: psd_sdk sizes each plane in 32-bit arithmetic, and the admitted boundary
+    // value 2^32 is exactly the one that wraps its RLE plane size to zero.
+    // w*h <= 2^34 and channels/bytesPerSample are small, so neither product overflows 64 bits.
+    return w * h * channels * bytesPerSample < MAX_PSD_BYTES
+        && w * h * 4 * bytesPerSample < MAX_PSD_BYTES;
 }
 
 // Everything parsed for one document, owned behind a single opaque handle.
@@ -342,6 +350,16 @@ int fire_psd_read_merged(const fire_psd* doc, void* out_pixels, size_t out_len) 
     // just RGB. Keying it on "is there a 4th plane" instead used a spot channel as opacity
     // on an RGB document that had one, and dropped alpha entirely on greyscale.
     const bool hasAlpha = imageCount > colorChannels && images[colorChannels].data;
+
+    // The CMYK and Lab branches below sample every colour plane unconditionally (their
+    // conversion is meaningless without the full set), so a header that declared fewer
+    // channels than the colour mode requires would send them straight past the end of the
+    // `images[]` array. The RGB/Multichannel default degrades per-plane instead, and the
+    // greyscale family only ever touches plane 0 — neither needs this.
+    if ((mode == psd::colorMode::CMYK || mode == psd::colorMode::LAB)
+        && imageCount < colorChannels) {
+        return 4;
+    }
 
     // A plane we are told to read but that was never allocated: treat the document as
     // malformed rather than sampling a null pointer.

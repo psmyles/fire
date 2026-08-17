@@ -401,12 +401,20 @@ impl Imgui {
             dear_imgui_backend_win32_new_frame();
         }
         let ui = self.ctx.frame();
-        let out = build(ui, icon_id);
+        // The frame must be CLOSED even when `build` panics: the wndproc's panic firewall
+        // keeps the window alive, so the next WM_PAINT calls NewFrame again — and on a
+        // context still mid-frame that is an IM_ASSERT in debug and undefined draw-list
+        // state in release. Catch the unwind, render whatever was built up to the panic
+        // (one partial frame), and only then let it continue up to the firewall.
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(ui, icon_id)));
         let draw_data = self.ctx.render();
         unsafe {
             dear_imgui_backend_dx11_render_draw_data(draw_data as *mut _ as *mut c_void);
         }
-        out
+        match out {
+            Ok(r) => r,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 }
 

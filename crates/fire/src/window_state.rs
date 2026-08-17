@@ -42,6 +42,5 @@ impl WindowState {
 }
 
 fn state_path() -> Option<PathBuf> {
-    let appdata = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(appdata).join("fire").join("window.toml"))
+    Some(crate::util::fire_dir()?.join("window.toml"))
 }

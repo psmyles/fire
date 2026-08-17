@@ -166,9 +166,8 @@ fn pick_largest(b: &[u8], cands: &[(usize, usize)]) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize, u64)> = None;
     for &(off, len) in cands {
         let end = off.saturating_add(len).min(b.len());
-        let slice = match b.get(off..end) {
-            Some(s) => s,
-            None => continue,
+        let Some(slice) = b.get(off..end) else {
+            continue;
         };
         if slice.len() < 4 || slice[0] != 0xFF || slice[1] != 0xD8 {
             continue;
@@ -308,17 +307,12 @@ fn collect_tiff(b: &[u8]) -> (Vec<(usize, usize)>, Option<u16>) {
 
         for e in 0..count {
             let eo = base + 2 + e * 12;
-            let tag = match rd_u16(b, eo, le) {
-                Some(t) => t,
-                None => break,
+            let Some(tag) = rd_u16(b, eo, le) else { break };
+            let Some(typ) = rd_u16(b, eo + 2, le) else {
+                break;
             };
-            let typ = match rd_u16(b, eo + 2, le) {
-                Some(t) => t,
-                None => break,
-            };
-            let n = match rd_u32(b, eo + 4, le) {
-                Some(n) => n,
-                None => break,
+            let Some(n) = rd_u32(b, eo + 4, le) else {
+                break;
             };
 
             match tag {

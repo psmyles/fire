@@ -298,9 +298,9 @@ fn grid_from_signal(image: &DecodedImage, signal: Signal) -> Option<Grid> {
     // and none on the other (each frame spans the sheet's short dimension). Take rows/cols = 1
     // when that axis carries no period.
     let grid = match (axis_period(&col_act, tw), axis_period(&row_act, th)) {
-        (Some((c, _)), Some((r, _))) => Grid::new(c, r),
-        (Some((c, _)), None) => Grid::new(c, 1), // horizontal strip
-        (None, Some((r, _))) => Grid::new(1, r), // vertical strip
+        (Some(c), Some(r)) => Grid::new(c, r),
+        (Some(c), None) => Grid::new(c, 1), // horizontal strip
+        (None, Some(r)) => Grid::new(1, r), // vertical strip
         (None, None) => return None,
     };
     let (min_axis, max_axis) = (grid.cols.min(grid.rows), grid.cols.max(grid.rows));
@@ -331,9 +331,9 @@ fn grid_from_signal(image: &DecodedImage, signal: Signal) -> Option<Grid> {
 }
 
 /// Detect the fundamental grid period along one axis from its activity `profile` (the thumbnail is
-/// `thumb_dim` samples along this axis). Returns `(cells, confidence)` where `cells =
-/// round(thumb_dim / period)` in `2..=GRID_MAX`, or `None` when the profile shows no clear
-/// repeating period (a single object or a flat texture).
+/// `thumb_dim` samples along this axis). Returns the cell count `round(thumb_dim / period)` in
+/// `2..=GRID_MAX`, or `None` when the profile shows no clear repeating period (a single object or
+/// a flat texture).
 ///
 /// Method: the YIN cumulative-mean-normalized difference function. `d(τ) = mean_i (a[i] −
 /// a[i+τ])²` dips toward 0 at the true period (the profile lines up with itself one cell over);
@@ -341,8 +341,8 @@ fn grid_from_signal(image: &DecodedImage, signal: Signal) -> Option<Grid> {
 /// crucially, the amplitude *envelope* bias — a flipbook whose frames grow/fade across the sheet
 /// still has aligned gutters, so the dip survives even though a raw autocorrelation would lock
 /// onto the low-frequency envelope instead (that bug detected FireFar's 8×8 as 5×5). The
-/// fundamental is the smallest-lag dip below [`YIN_THRESHOLD`]; confidence is the dip depth.
-fn axis_period(profile: &[f32], thumb_dim: u32) -> Option<(u32, f32)> {
+/// fundamental is the smallest-lag dip below [`YIN_THRESHOLD`].
+fn axis_period(profile: &[f32], thumb_dim: u32) -> Option<u32> {
     let l = profile.len();
     if l < 16 {
         return None;
@@ -384,16 +384,12 @@ fn axis_period(profile: &[f32], thumb_dim: u32) -> Option<(u32, f32)> {
     }
 
     // Smallest-lag local minimum of d' that drops below the threshold (YIN "absolute threshold").
-    let mut best: Option<(u32, f32)> = None;
     for tau in tau_min..tau_max {
         if dp[tau] < YIN_THRESHOLD as f64 && dp[tau] <= dp[tau - 1] && dp[tau] <= dp[tau + 1] {
-            let cells = ((thumb_dim as f32 / tau as f32).round() as u32).clamp(2, GRID_MAX);
-            let conf = (1.0 - dp[tau]).clamp(0.0, 1.0) as f32;
-            best = Some((cells, conf));
-            break;
+            return Some(((thumb_dim as f32 / tau as f32).round() as u32).clamp(2, GRID_MAX));
         }
     }
-    best
+    None
 }
 
 enum Axis {

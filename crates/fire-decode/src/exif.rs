@@ -54,7 +54,8 @@ pub fn apply(img: &mut DecodedImage, orientation: u16) {
     }
     let bpp = img.format.bytes_per_pixel();
     let (w, h) = (img.width as usize, img.height as usize);
-    if img.pixels.len() < w * h * bpp {
+    let needed = w * h * bpp;
+    if img.pixels.len() < needed {
         return;
     }
     // Orientations 5..=8 are 90°/270° rotations (and the diagonal mirrors), which swap axes.
@@ -63,27 +64,30 @@ pub fn apply(img: &mut DecodedImage, orientation: u16) {
     } else {
         (w, h)
     };
-    let mut out = vec![0u8; ow * oh * bpp];
 
-    for sy in 0..h {
-        for sx in 0..w {
-            let (dx, dy) = match orientation {
-                2 => (w - 1 - sx, sy),         // mirror horizontal
-                3 => (w - 1 - sx, h - 1 - sy), // rotate 180
-                4 => (sx, h - 1 - sy),         // mirror vertical
-                5 => (sy, sx),                 // transpose (mirror along main diagonal)
-                6 => (h - 1 - sy, sx),         // rotate 90° CW
-                7 => (h - 1 - sy, w - 1 - sx), // transverse (mirror along anti-diagonal)
-                8 => (sy, w - 1 - sx),         // rotate 90° CCW
-                _ => (sx, sy),
-            };
-            let si = (sy * w + sx) * bpp;
-            let di = (dy * ow + dx) * bpp;
-            out[di..di + bpp].copy_from_slice(&img.pixels[si..si + bpp]);
+    // Every buffer — the canvas and each animation frame — gets the same rotation; the
+    // dimension swap happens once, afterwards.
+    img.transform_buffers(needed, |pixels| {
+        let mut out = vec![0u8; ow * oh * bpp];
+        for sy in 0..h {
+            for sx in 0..w {
+                let (dx, dy) = match orientation {
+                    2 => (w - 1 - sx, sy),         // mirror horizontal
+                    3 => (w - 1 - sx, h - 1 - sy), // rotate 180
+                    4 => (sx, h - 1 - sy),         // mirror vertical
+                    5 => (sy, sx),                 // transpose (mirror along main diagonal)
+                    6 => (h - 1 - sy, sx),         // rotate 90° CW
+                    7 => (h - 1 - sy, w - 1 - sx), // transverse (mirror along anti-diagonal)
+                    8 => (sy, w - 1 - sx),         // rotate 90° CCW
+                    _ => (sx, sy),
+                };
+                let si = (sy * w + sx) * bpp;
+                let di = (dy * ow + dx) * bpp;
+                out[di..di + bpp].copy_from_slice(&pixels[si..si + bpp]);
+            }
         }
-    }
-
-    img.pixels = out;
+        *pixels = out;
+    });
     img.width = ow as u32;
     img.height = oh as u32;
 }

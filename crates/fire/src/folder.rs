@@ -42,7 +42,7 @@ pub fn scan(file: &Path) -> Vec<PathBuf> {
         .filter_map(|e| e.ok())
         // file_type() comes free from the directory enumeration on Windows (no extra stat), so
         // excluding subdirectories named like images is cheap.
-        .filter(|e| e.file_type().map(|t| !t.is_dir()).unwrap_or(true))
+        .filter(|e| e.file_type().map_or(true, |t| !t.is_dir()))
         .map(|e| e.path())
         .filter(|p| is_supported_image(p))
         .filter_map(|p| Some((p.file_name()?.to_string_lossy().into_owned(), p)))

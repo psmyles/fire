@@ -74,6 +74,30 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> 
         return Some(Err(e));
     }
 
+    // The readout below hands back `src_channels` samples per pixel — the crate trims any
+    // further extra channels (spot/unspecified samples) itself — but its *file-side* buffers
+    // are laid out from the full SamplesPerPixel, which `colortype()` hides. The check above
+    // bounds only the output; with `Limits::unlimited()` deferring the size question to us, a
+    // crafted SamplesPerPixel would otherwise inflate the intermediate strip buffers past the
+    // byte budget unchecked, and an allocation that fails aborts rather than erroring.
+    let file_spp = dec
+        .find_tag_unsigned::<u16>(Tag::SamplesPerPixel)
+        .ok()
+        .flatten()
+        .map_or(src_channels as usize, usize::from);
+    if file_spp < src_channels as usize {
+        // Fewer samples than the named colour type needs: malformed; let the image crate say so.
+        return None;
+    }
+    if let Err(e) = check_dims(
+        width as usize,
+        height as usize,
+        file_spp * (bits as usize / 8),
+        "TIFF",
+    ) {
+        return Some(Err(e));
+    }
+
     // Associated alpha means premultiplied. Read it before the samples so the un-premultiply
     // below is decided by the file rather than guessed from the pixels.
     let premultiplied = src_channels % 2 == 0
@@ -83,7 +107,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> 
             .flatten()
             .and_then(|v| v.first().copied())
             == Some(EXTRA_ASSOCIATED_ALPHA);
-    let icc = dec.get_tag_u8_vec(Tag::IccProfile).ok();
+    // `.filter`: a present-but-empty profile tag must surface as "no profile", the way the PNG
+    // and image-crate paths already read it, not as `Some(vec![])` for consumers to trip on.
+    let icc = dec
+        .get_tag_u8_vec(Tag::IccProfile)
+        .ok()
+        .filter(|v| !v.is_empty());
 
     let samples = match dec.read_image() {
         Ok(s) => s,
@@ -113,11 +142,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> 
         ),
         DecodingResult::U16(v) => {
             let rgba = expand::<u16>(&v, n, src_channels, u16::MAX, premultiplied);
-            (to_ne_bytes_u16(&rgba), PixelFormat::Rgba16Unorm, 16)
+            // The CPU shader reads Rgba16Unorm / Rgba32Float back as native-endian,
+            // matching the other backends.
+            (crate::to_ne_bytes(&rgba), PixelFormat::Rgba16Unorm, 16)
         }
         DecodingResult::F32(v) => {
             let rgba = expand::<f32>(&v, n, src_channels, 1.0, premultiplied);
-            (to_ne_bytes_f32(&rgba), PixelFormat::Rgba32Float, 32)
+            (crate::to_ne_bytes(&rgba), PixelFormat::Rgba32Float, 32)
         }
         // 64-bit, signed, and half-float TIFFs are rare enough that the `image` crate's
         // conversions are a better answer than a hand-rolled one here.
@@ -142,11 +173,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> 
 /// One sample type's worth of "widen to RGBA".
 trait Sample: Copy {
     /// Straighten a premultiplied sample: `c / a`, saturating, with `a == 0` leaving it at 0.
-    fn unpremultiply(c: Self, a: Self, opaque: Self) -> Self;
+    fn unpremultiply(c: Self, a: Self) -> Self;
 }
 
 impl Sample for u8 {
-    fn unpremultiply(c: u8, a: u8, _opaque: u8) -> u8 {
+    fn unpremultiply(c: u8, a: u8) -> u8 {
         if a == 0 {
             0
         } else {
@@ -156,7 +187,7 @@ impl Sample for u8 {
 }
 
 impl Sample for u16 {
-    fn unpremultiply(c: u16, a: u16, _opaque: u16) -> u16 {
+    fn unpremultiply(c: u16, a: u16) -> u16 {
         if a == 0 {
             0
         } else {
@@ -166,7 +197,7 @@ impl Sample for u16 {
 }
 
 impl Sample for f32 {
-    fn unpremultiply(c: f32, a: f32, _opaque: f32) -> f32 {
+    fn unpremultiply(c: f32, a: f32) -> f32 {
         if a <= 0.0 {
             0.0
         } else {
@@ -197,32 +228,14 @@ fn expand<T: Sample>(
         };
         if premultiplied {
             out.extend_from_slice(&[
-                T::unpremultiply(r, a, opaque),
-                T::unpremultiply(g, a, opaque),
-                T::unpremultiply(b, a, opaque),
+                T::unpremultiply(r, a),
+                T::unpremultiply(g, a),
+                T::unpremultiply(b, a),
                 a,
             ]);
         } else {
             out.extend_from_slice(&[r, g, b, a]);
         }
-    }
-    out
-}
-
-/// The CPU shader reads `Rgba16Unorm` / `Rgba32Float` back as native-endian, matching the
-/// other backends.
-fn to_ne_bytes_u16(v: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * 2);
-    for s in v {
-        out.extend_from_slice(&s.to_ne_bytes());
-    }
-    out
-}
-
-fn to_ne_bytes_f32(v: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * 4);
-    for s in v {
-        out.extend_from_slice(&s.to_ne_bytes());
     }
     out
 }
@@ -270,22 +283,10 @@ fn unspecified_extra_sample(bytes: &[u8]) -> Option<usize> {
         [b'M', b'M', 0, 42] => false,
         _ => return None,
     };
-    let u16at = |o: usize| -> Option<u16> {
-        let b = bytes.get(o..o.checked_add(2)?)?.try_into().ok()?;
-        Some(if little_endian {
-            u16::from_le_bytes(b)
-        } else {
-            u16::from_be_bytes(b)
-        })
-    };
-    let u32at = |o: usize| -> Option<u32> {
-        let b = bytes.get(o..o.checked_add(4)?)?.try_into().ok()?;
-        Some(if little_endian {
-            u32::from_le_bytes(b)
-        } else {
-            u32::from_be_bytes(b)
-        })
-    };
+    // The bounds-checked primitive readers are `exif`'s (which `raw` also imports) — the
+    // third file to walk a TIFF IFD must not grow a third copy of them.
+    let u16at = |o: usize| crate::exif::rd_u16(bytes, o, little_endian);
+    let u32at = |o: usize| crate::exif::rd_u32(bytes, o, little_endian);
 
     let ifd = u32at(4)? as usize;
     for i in 0..u16at(ifd)? as usize {
@@ -320,7 +321,7 @@ mod tests {
         photometric: u32,
         samples: u32,
         bits: u16,
-        extra: Option<u32>,
+        extra: &[u16],
         data: &[u8],
     ) -> Vec<u8> {
         let mut tags: Vec<(u16, u16, u32, u32)> = vec![
@@ -334,8 +335,14 @@ mod tests {
             (278, 3, 1, h),
             (279, 4, 1, data.len() as u32),
         ];
-        if let Some(e) = extra {
-            tags.push((338, 3, 1, e)); // ExtraSamples
+        if !extra.is_empty() {
+            // One or two SHORTs pack inline into the entry's value field — all any test needs.
+            assert!(extra.len() <= 2);
+            let packed = extra
+                .iter()
+                .enumerate()
+                .fold(0u32, |acc, (i, &e)| acc | (u32::from(e) << (16 * i)));
+            tags.push((338, 3, extra.len() as u32, packed)); // ExtraSamples
         }
         tags.sort_by_key(|t| t.0); // entries must ascend by tag
 
@@ -395,14 +402,57 @@ mod tests {
     /// sample. A texture sheet with white RGB and its shape in alpha became a white square.
     #[test]
     fn unspecified_extra_sample_is_read_as_alpha() {
-        let out = run(&build(1, 1, RGB, 4, 8, Some(0), &[255, 255, 255, 128]));
+        let out = run(&build(1, 1, RGB, 4, 8, &[0], &[255, 255, 255, 128]));
         assert_eq!(out.channels, 4);
         assert_eq!(out.pixels, vec![255, 255, 255, 128]);
 
         // A file that already says "unassociated alpha" needs no patch and decodes the same.
-        let declared = build(1, 1, RGB, 4, 8, Some(2), &[255, 255, 255, 128]);
+        let declared = build(1, 1, RGB, 4, 8, &[2], &[255, 255, 255, 128]);
         assert!(matches!(extra_sample_as_alpha(&declared), Cow::Borrowed(_)));
         assert_eq!(run(&declared).pixels, vec![255, 255, 255, 128]);
+    }
+
+    /// Extra channels beyond the first alpha must not shift the readout.
+    ///
+    /// `colortype()` reports RGBA for RGB + alpha + spot (Photoshop's layout: SamplesPerPixel
+    /// = 5, ExtraSamples = [unassociated alpha, unspecified]) while the file stores five
+    /// samples per pixel. The `tiff` crate trims the unnamed extras during readout, and
+    /// `expand` strides by the named count — this test pins that pairing: if a crate upgrade
+    /// ever hands back the file's full layout instead, striding it by the named count would
+    /// silently smear every pixel after the first diagonally.
+    #[test]
+    fn extra_channels_beyond_alpha_do_not_smear() {
+        let out = run(&build(
+            2,
+            1,
+            RGB,
+            5,
+            8,
+            &[2, 0],
+            &[10, 20, 30, 40, 99, 50, 60, 70, 80, 111],
+        ));
+        assert_eq!(
+            out.channels, 4,
+            "alpha is still seen through the spot channel"
+        );
+        assert_eq!(
+            out.pixels,
+            vec![10, 20, 30, 40, 50, 60, 70, 80],
+            "second pixel must come from the 5-sample stride, spot samples skipped"
+        );
+
+        // Extras that are not alpha at all: plain RGB plus two unspecified channels.
+        let out = run(&build(
+            2,
+            1,
+            RGB,
+            5,
+            8,
+            &[0, 0],
+            &[10, 20, 30, 98, 99, 50, 60, 70, 110, 111],
+        ));
+        assert_eq!(out.channels, 3, "no alpha among the extras");
+        assert_eq!(out.pixels, vec![10, 20, 30, 255, 50, 60, 70, 255]);
     }
 
     /// Greyscale + alpha opens at all.
@@ -411,7 +461,7 @@ mod tests {
     /// `image` crate maps to `Unknown(16)` and refuses outright — the file simply would not open.
     #[test]
     fn grayscale_plus_alpha_decodes() {
-        for extra in [Some(2), Some(0), None] {
+        for extra in [&[2u16][..], &[0], &[]] {
             let out = run(&build(
                 2,
                 1,
@@ -435,15 +485,7 @@ mod tests {
     #[test]
     fn sixteen_bit_is_not_narrowed() {
         let le = |v: [u16; 4]| -> Vec<u8> { v.iter().flat_map(|s| s.to_le_bytes()).collect() };
-        let out = run(&build(
-            1,
-            1,
-            RGB,
-            4,
-            16,
-            Some(2),
-            &le([65535, 4660, 0, 32768]),
-        ));
+        let out = run(&build(1, 1, RGB, 4, 16, &[2], &le([65535, 4660, 0, 32768])));
         assert_eq!(out.format, PixelFormat::Rgba16Unorm);
         assert_eq!(out.bit_depth, 16);
         let s: Vec<u16> = out
@@ -464,7 +506,7 @@ mod tests {
             BLACK_IS_ZERO,
             1,
             16,
-            None,
+            &[],
             &4660u16.to_le_bytes(),
         ));
         assert_eq!(out.format, PixelFormat::Rgba16Unorm);
@@ -478,7 +520,7 @@ mod tests {
     #[test]
     fn associated_alpha_is_unpremultiplied() {
         // Full red at 50% alpha, stored premultiplied: 255*0.5 = 128.
-        let out = run(&build(1, 1, RGB, 4, 8, Some(1), &[128, 0, 0, 128]));
+        let out = run(&build(1, 1, RGB, 4, 8, &[1], &[128, 0, 0, 128]));
         assert_eq!(
             out.pixels,
             vec![255, 0, 0, 128],
@@ -486,12 +528,12 @@ mod tests {
         );
 
         // The same samples labelled unassociated are already straight and must not be touched.
-        let out = run(&build(1, 1, RGB, 4, 8, Some(2), &[128, 0, 0, 128]));
+        let out = run(&build(1, 1, RGB, 4, 8, &[2], &[128, 0, 0, 128]));
         assert_eq!(out.pixels, vec![128, 0, 0, 128]);
 
         // Fully transparent premultiplied pixels carry no colour to recover; they must not
         // divide by zero.
-        let out = run(&build(1, 1, RGB, 4, 8, Some(1), &[0, 0, 0, 0]));
+        let out = run(&build(1, 1, RGB, 4, 8, &[1], &[0, 0, 0, 0]));
         assert_eq!(out.pixels, vec![0, 0, 0, 0]);
     }
 
@@ -499,17 +541,17 @@ mod tests {
     #[test]
     fn unowned_color_types_fall_back_to_the_image_crate() {
         // CMYK (photometric 5): full cyan ink. `image` converts it; we must not swallow it.
-        let out = run(&build(1, 1, 5, 4, 8, None, &[255, 0, 0, 0]));
+        let out = run(&build(1, 1, 5, 4, 8, &[], &[255, 0, 0, 0]));
         assert_eq!(out.source_format, "TIFF");
         assert_eq!(out.pixels[..3], [0, 255, 255], "cyan survives the fallback");
 
         // Plain RGB and plain grey stay on the native path and report honest channel counts.
         assert_eq!(
-            run(&build(2, 1, RGB, 3, 8, None, &[255, 0, 0, 0, 255, 0])).channels,
+            run(&build(2, 1, RGB, 3, 8, &[], &[255, 0, 0, 0, 255, 0])).channels,
             3
         );
         assert_eq!(
-            run(&build(2, 1, BLACK_IS_ZERO, 1, 8, None, &[64, 192])).channels,
+            run(&build(2, 1, BLACK_IS_ZERO, 1, 8, &[], &[64, 192])).channels,
             1
         );
     }
@@ -517,7 +559,7 @@ mod tests {
     /// The byte patch rewrites two bytes and nothing else, and only in a classic TIFF.
     #[test]
     fn extra_sample_patch_is_minimal_and_safe() {
-        let original = build(1, 1, RGB, 4, 8, Some(0), &[1, 2, 3, 4]);
+        let original = build(1, 1, RGB, 4, 8, &[0], &[1, 2, 3, 4]);
         let Cow::Owned(patched) = extra_sample_as_alpha(&original) else {
             panic!("expected a patched copy")
         };
@@ -529,11 +571,11 @@ mod tests {
         assert_eq!(diffs, 1, "exactly one byte differs");
 
         for bytes in [
-            &build(1, 1, RGB, 3, 8, None, &[1, 2, 3])[..], // no ExtraSamples tag
-            &build(1, 1, RGB, 4, 8, Some(2), &[1, 2, 3, 4])[..], // already alpha
-            &original[..20],                               // truncated mid-IFD
-            b"II\x2a\x00",                                 // header only
-            b"\x89PNG\r\n\x1a\n",                          // not a TIFF
+            &build(1, 1, RGB, 3, 8, &[], &[1, 2, 3])[..], // no ExtraSamples tag
+            &build(1, 1, RGB, 4, 8, &[2], &[1, 2, 3, 4])[..], // already alpha
+            &original[..20],                              // truncated mid-IFD
+            b"II\x2a\x00",                                // header only
+            b"\x89PNG\r\n\x1a\n",                         // not a TIFF
             b"",
         ] {
             assert!(matches!(extra_sample_as_alpha(bytes), Cow::Borrowed(_)));

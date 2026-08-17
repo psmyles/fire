@@ -24,8 +24,13 @@ int fire_heif_decode(const uint8_t* data, size_t len, fire_heif_image* out) {
     if (!data || len == 0) return -2;
 
     /* Register the built-in decoder plugins (libde265, dav1d). Refcounted and
-     * thread-safe, so concurrent decode workers calling this is fine. */
-    heif_init(NULL);
+     * thread-safe, so concurrent decode workers calling this is fine. A failed init means
+     * no plugins; decoding would only fail later with a less specific code — and there is
+     * nothing to deinit yet, so cleanup() (which deinits) must not run for this return. */
+    struct heif_error err = heif_init(NULL);
+    if (err.code != heif_error_Ok) {
+        return err.code ? (int)err.code : -9;
+    }
 
     struct heif_context* ctx = heif_context_alloc();
     if (!ctx) {
@@ -33,8 +38,7 @@ int fire_heif_decode(const uint8_t* data, size_t len, fire_heif_image* out) {
         return -3;
     }
 
-    struct heif_error err =
-        heif_context_read_from_memory_without_copy(ctx, data, len, NULL);
+    err = heif_context_read_from_memory_without_copy(ctx, data, len, NULL);
     if (err.code != heif_error_Ok) {
         cleanup(NULL, NULL, ctx);
         return err.code ? (int)err.code : -4;
@@ -90,6 +94,15 @@ int fire_heif_decode(const uint8_t* data, size_t len, fire_heif_image* out) {
         return -8;
     }
     size_t row_bytes = (size_t)w * bpp;
+    /* The copy loops below read `row_bytes` from each stride-spaced row start, so a stride
+     * narrower than a row (which the `stride <= 0` check above admits) would over-read the
+     * source plane on every row and run off its end on the last. The 16-bit loop additionally
+     * casts each row start to uint16_t*, so an odd stride would be a misaligned load — UB in
+     * C, even where the hardware happens to tolerate it. */
+    if ((size_t)stride < row_bytes || (use16 && (stride % 2) != 0)) {
+        cleanup(img, handle, ctx);
+        return -7;
+    }
     if ((size_t)h > MAX_OUT_BYTES / row_bytes) {
         cleanup(img, handle, ctx);
         return -8;

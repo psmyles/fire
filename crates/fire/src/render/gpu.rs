@@ -152,38 +152,42 @@ pub struct FlipbookParams {
     pub blend: bool,
 }
 
-/// Playback state of an animated image (animated GIF): every frame as a full RGBA canvas + delay,
-/// and which one is currently uploaded to the texture. Empty for a still image, which is the
-/// common case — a still costs one empty `Vec`. The playback timer lives in the win shell and
-/// advances this through [`GpuSurface::advance_frame`].
+/// Playback state of an animated image (animated GIF): which frame is currently uploaded to
+/// the texture, over an `Arc` of the decoded image itself. Holding the `Arc` (shared with
+/// `tex.current` and the decode worker) and indexing its frames in place is the point —
+/// cloning the frame list here used to duplicate every composited canvas, i.e. the whole
+/// animation, in RAM. `None` for a still image, the common case. The playback timer lives in
+/// the win shell and advances this through [`GpuSurface::advance_frame`].
 #[derive(Default)]
 struct AnimState {
-    frames: Vec<AnimationFrame>,
+    img: Option<Arc<DecodedImage>>,
     index: usize,
 }
 
 impl AnimState {
-    /// Take `img`'s frames (if it has any) and rewind to frame 0. The image is shared with the
-    /// decode worker for flipbook detection, so frames are cloned rather than moved out; a still
-    /// image — the shared case — leaves the list empty and clones nothing.
-    fn adopt(&mut self, img: &DecodedImage) {
-        self.frames = img
-            .animation
-            .as_ref()
-            .map(|a| a.frames.clone())
-            .unwrap_or_default();
+    /// Adopt `img`'s animation (if it has one) and rewind to frame 0.
+    fn adopt(&mut self, img: &Arc<DecodedImage>) {
+        self.img = img.animation.is_some().then(|| Arc::clone(img));
         self.index = 0;
     }
 
     fn clear(&mut self) {
-        self.frames.clear();
+        self.img = None;
         self.index = 0;
+    }
+
+    fn frames(&self) -> &[AnimationFrame] {
+        self.img
+            .as_ref()
+            .and_then(|i| i.animation.as_ref())
+            .map_or(&[], |a| &a.frames)
     }
 
     /// How long the current frame should be shown, or `None` if this isn't an animation. One
     /// frame is a still: nothing to schedule.
     fn delay_ms(&self) -> Option<u32> {
-        (self.frames.len() > 1).then(|| self.frames[self.index].delay_ms)
+        let frames = self.frames();
+        (frames.len() > 1).then(|| frames[self.index].delay_ms)
     }
 }
 
@@ -210,13 +214,13 @@ struct DeviceObjects {
 }
 
 impl DeviceObjects {
-    fn new(hwnd: HWND, width: u32, height: u32) -> Self {
-        let (device, context) = create_device();
-        let swapchain = create_swapchain(&device, hwnd, width, height);
-        let (vs, ps) = create_shaders(&device);
-        let (samp_aniso, samp_point) = create_samplers(&device);
-        let cbuffer = create_const_buffer(&device);
-        Self {
+    fn new(hwnd: HWND, width: u32, height: u32) -> windows::core::Result<Self> {
+        let (device, context) = create_device()?;
+        let swapchain = create_swapchain(&device, hwnd, width, height)?;
+        let (vs, ps) = create_shaders(&device)?;
+        let (samp_aniso, samp_point) = create_samplers(&device)?;
+        let cbuffer = create_const_buffer(&device)?;
+        Ok(Self {
             device,
             context,
             swapchain,
@@ -227,7 +231,7 @@ impl DeviceObjects {
             samp_aniso,
             samp_point,
             cbuffer,
-        }
+        })
     }
 
     /// (Re)create the two render-target views over the current backbuffer.
@@ -449,15 +453,21 @@ pub struct GpuSurface {
 }
 
 impl GpuSurface {
-    /// Build the D3D11 device + flip-model swapchain on the window. `width`/`height` are the whole
+    /// Build the D3D11 device + flip-model swapchain on the window. Returns the D3D/DXGI error
+    /// instead of panicking — startup runs in a `windows_subsystem = "windows"` process, where a
+    /// panic is an invisible abort; the caller owns telling the user. `width`/`height` are the whole
     /// client: the swapchain covers it all, and the image is drawn into a sub-rect of it (see
-    /// [`Self::set_image_rect`]) with the chrome painted over the remainder. `_hinstance` is unused
-    /// (D3D needs only the HWND); kept for signature parity with the CPU surface.
-    pub fn new(hwnd: isize, _hinstance: isize, width: u32, height: u32, fit_upscale: bool) -> Self {
+    /// [`Self::set_image_rect`]) with the chrome painted over the remainder.
+    pub fn new(
+        hwnd: isize,
+        width: u32,
+        height: u32,
+        fit_upscale: bool,
+    ) -> windows::core::Result<Self> {
         let win_hwnd = HWND(hwnd as *mut c_void);
-        Self {
+        Ok(Self {
             hwnd,
-            gfx: DeviceObjects::new(win_hwnd, width.max(1), height.max(1)),
+            gfx: DeviceObjects::new(win_hwnd, width.max(1), height.max(1))?,
             origin: (0.0, 0.0),
             chrome_clear: [0.0, 0.0, 0.0, 1.0],
             tex: ImageContent {
@@ -486,7 +496,7 @@ impl GpuSurface {
             flipbook: None,
             display: DisplayState::default(),
             gesture: GestureState::default(),
-        }
+        })
     }
 
     /// Set the letterbox / no-image backdrop color (packed `0x00RRGGBB`); stored both packed and
@@ -557,7 +567,7 @@ impl GpuSurface {
     pub fn set_background(&mut self, bg: Background) {
         self.prefs.background = bg;
         self.prefs.background_override = Some(bg);
-        self.refresh();
+        self.invalidate();
     }
 
     /// Apply the configured backdrop preference (settings dialog / startup): `Some` pins that
@@ -571,7 +581,7 @@ impl GpuSurface {
                 .as_ref()
                 .map_or(Background::Black, |img| default_background(img))
         });
-        self.refresh();
+        self.invalidate();
     }
 
     /// Whether the explicit fit command upscales small images (the `fit-upscale` config key).
@@ -608,7 +618,7 @@ impl GpuSurface {
     /// Toggle the image-boundary outline and repaint.
     pub fn toggle_outline(&mut self) {
         self.prefs.outline = !self.prefs.outline;
-        self.refresh();
+        self.invalidate();
     }
 
     /// Apply the configured outline preference (settings dialog / startup). The outline is one
@@ -616,7 +626,7 @@ impl GpuSurface {
     /// reaches the image already on screen rather than seeding the next one.
     pub fn set_outline(&mut self, on: bool) {
         self.prefs.outline = on;
-        self.refresh();
+        self.invalidate();
     }
 
     pub fn octagon(&self) -> crate::octagon::OctagonState {
@@ -628,14 +638,14 @@ impl GpuSurface {
     pub fn set_octagon(&mut self, mut s: crate::octagon::OctagonState) {
         s.clamp();
         self.prefs.octagon = s;
-        self.refresh();
+        self.invalidate();
     }
 
     /// Toggle the octagon overlay (toolbar) and repaint. The options — color, crop, hide — survive
     /// the off state, so re-enabling picks up where the user left off.
     pub fn toggle_octagon(&mut self) {
         self.prefs.octagon.enabled = !self.prefs.octagon.enabled;
-        self.refresh();
+        self.invalidate();
     }
 
     /// The displayed frame's rect in **image-region** coords (pan/zoom applied): the whole image,
@@ -677,7 +687,7 @@ impl GpuSurface {
                 self.view.fit_to_window(dims, &self.viewport, false);
             }
         }
-        self.refresh();
+        self.invalidate();
     }
 
     /// Update only the fractional playback position (the hot path: playback tick / slider scrub).
@@ -685,7 +695,7 @@ impl GpuSurface {
     pub fn set_flipbook_pos(&mut self, frame_pos: f32) {
         if let Some(fb) = &mut self.flipbook {
             fb.frame_pos = frame_pos;
-            self.refresh();
+            self.invalidate();
         }
     }
 
@@ -782,7 +792,7 @@ impl GpuSurface {
     /// frame is left unchanged and the current frame's delay is returned, so a transient failure
     /// paces the retry rather than wedging playback.
     pub fn advance_frame(&mut self) -> Option<u32> {
-        let n = self.anim.frames.len();
+        let n = self.anim.frames().len();
         if n <= 1 {
             return None;
         }
@@ -792,7 +802,7 @@ impl GpuSurface {
         match create_image_texture(
             &self.gfx.device,
             &self.gfx.context,
-            &self.anim.frames[next].pixels,
+            &self.anim.frames()[next].pixels,
             w,
             h,
             format,
@@ -835,7 +845,7 @@ impl GpuSurface {
             return;
         }
         self.gfx.resize(width, height);
-        self.request_redraw();
+        self.invalidate();
     }
 
     /// Schedule a repaint (delivered as `WM_PAINT`).
@@ -844,17 +854,18 @@ impl GpuSurface {
         unsafe { InvalidateRect(self.hwnd as SysHwnd, std::ptr::null(), 0) };
     }
 
-    fn request_redraw(&self) {
-        self.invalidate();
-    }
-
-    fn refresh(&self) {
-        self.request_redraw();
-    }
-
     /// The image's sub-rect of the client, in physical px. The chrome owns the rest.
     pub fn set_image_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        let (w, h) = (w.max(0.0), h.max(0.0));
+        // The early-out must compare against what `Viewport::new` will actually store — it
+        // clamps each axis to at least 1 px — or a legitimately zero-size region never matches
+        // the stored 1.0 and every frame re-enters, re-running fit_to_window against a 1-px
+        // viewport and driving the zoom to its floor. Unreachable today (WM_GETMINMAXINFO
+        // keeps the client big enough), which is exactly why it would go unnoticed when a
+        // future layout change makes it reachable.
+        let (w, h) = (
+            (w.max(0.0) as u32).max(1) as f32,
+            (h.max(0.0) as u32).max(1) as f32,
+        );
         if self.origin == (x, y) && self.viewport.width == w && self.viewport.height == h {
             return;
         }
@@ -1115,7 +1126,7 @@ impl GpuSurface {
         if self.gesture.dragging {
             if let Some(dims) = self.view_dims() {
                 self.view.pan_by(delta, dims, &self.viewport);
-                self.refresh();
+                self.invalidate();
             }
         } else if self.gesture.zoom_dragging {
             // Past the click slop this is a real zoom-drag, so the release won't open the menu.
@@ -1145,7 +1156,7 @@ impl GpuSurface {
                     );
                     self.view
                         .zoom_to(zoom, self.gesture.zoom_anchor, dims, &self.viewport);
-                    self.refresh();
+                    self.invalidate();
                 }
             }
         }
@@ -1204,7 +1215,7 @@ impl GpuSurface {
                 &self.prefs.zoom_snaps,
                 release,
             );
-            self.refresh();
+            self.invalidate();
         }
     }
 
@@ -1218,7 +1229,7 @@ impl GpuSurface {
                 &self.prefs.zoom_snaps,
                 release,
             );
-            self.refresh();
+            self.invalidate();
         }
     }
 
@@ -1226,7 +1237,7 @@ impl GpuSurface {
         if let Some(dims) = self.view_dims() {
             self.view
                 .fit_to_window(dims, &self.viewport, self.prefs.fit_upscale);
-            self.refresh();
+            self.invalidate();
         }
     }
 
@@ -1235,7 +1246,7 @@ impl GpuSurface {
         if let Some(dims) = self.view_dims() {
             self.view.clamp_pan(dims, &self.viewport);
         }
-        self.refresh();
+        self.invalidate();
     }
 
     /// Solo one channel, or switch the solo back off — which lands on the image's composite mode
@@ -1247,7 +1258,7 @@ impl GpuSurface {
         } else {
             ch
         };
-        self.refresh();
+        self.invalidate();
     }
 
     /// The composite button / `all-channels` key: flip RGBA↔RGB when a composite mode is already
@@ -1261,17 +1272,17 @@ impl GpuSurface {
             // it returns to the mode the image opened in.
             Channel::composite(self.has_alpha())
         };
-        self.refresh();
+        self.invalidate();
     }
 
     pub fn adjust_exposure(&mut self, delta: f32) {
         self.display.exposure = (self.display.exposure + delta).clamp(-16.0, 16.0);
-        self.refresh();
+        self.invalidate();
     }
 
     pub fn reset_exposure(&mut self) {
         self.display.exposure = 0.0;
-        self.refresh();
+        self.invalidate();
     }
 
     pub fn toggle_tonemap(&mut self) {
@@ -1279,7 +1290,7 @@ impl GpuSurface {
             Tonemap::Reinhard => Tonemap::Aces,
             Tonemap::Aces => Tonemap::Reinhard,
         };
-        self.refresh();
+        self.invalidate();
     }
 }
 
@@ -1329,8 +1340,12 @@ fn srgb_to_linear(c: f32) -> f32 {
 }
 
 /// Create a hardware D3D11 device, falling back to the WARP software rasterizer (RDP/headless).
-fn create_device() -> (ID3D11Device, ID3D11DeviceContext) {
+/// Errors (both drivers refused) propagate instead of panicking: this runs at startup in a
+/// `windows_subsystem = "windows"` process, where a panic is an *invisible* abort — the caller
+/// owns telling the user.
+fn create_device() -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
     let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+    let mut last_err = windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL);
     for (driver, is_warp) in [
         (D3D_DRIVER_TYPE_HARDWARE, false),
         (D3D_DRIVER_TYPE_WARP, true),
@@ -1350,19 +1365,28 @@ fn create_device() -> (ID3D11Device, ID3D11DeviceContext) {
                 Some(&mut context),
             )
         };
-        if r.is_ok() {
-            if is_warp {
-                eprintln!("fire: no hardware D3D11 device — using WARP software renderer");
+        match r {
+            Ok(()) => {
+                if is_warp {
+                    eprintln!("fire: no hardware D3D11 device — using WARP software renderer");
+                }
+                // Success filled both out-params; `unwrap` here is unreachable by contract.
+                return Ok((device.unwrap(), context.unwrap()));
             }
-            return (device.unwrap(), context.unwrap());
+            Err(e) => last_err = e,
         }
     }
-    panic!("fire: D3D11CreateDevice failed for both hardware and WARP");
+    Err(last_err)
 }
 
 /// Create the DXGI flip-model swapchain on `hwnd`. Backbuffer is plain `UNORM` (flip model
 /// disallows `*_SRGB` swapchain formats); the sRGB encode is done by the `*_SRGB` RTV.
-fn create_swapchain(device: &ID3D11Device, hwnd: HWND, w: u32, h: u32) -> IDXGISwapChain1 {
+fn create_swapchain(
+    device: &ID3D11Device,
+    hwnd: HWND,
+    w: u32,
+    h: u32,
+) -> windows::core::Result<IDXGISwapChain1> {
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: w,
         Height: h,
@@ -1379,35 +1403,33 @@ fn create_swapchain(device: &ID3D11Device, hwnd: HWND, w: u32, h: u32) -> IDXGIS
         ..Default::default()
     };
     unsafe {
-        let dxgi_device: IDXGIDevice = device.cast().expect("IDXGIDevice");
-        let adapter: IDXGIAdapter = dxgi_device.GetAdapter().expect("GetAdapter");
-        let factory: IDXGIFactory2 = adapter.GetParent().expect("IDXGIFactory2");
-        factory
-            .CreateSwapChainForHwnd(device, hwnd, &desc, None, None)
-            .expect("CreateSwapChainForHwnd")
+        let dxgi_device: IDXGIDevice = device.cast()?;
+        let adapter: IDXGIAdapter = dxgi_device.GetAdapter()?;
+        let factory: IDXGIFactory2 = adapter.GetParent()?;
+        factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None)
     }
 }
 
 /// Create the vertex + pixel shaders from the DXBC that `fxc` precompiled at build time (see
 /// `build.rs`); the bytecode is embedded in the exe, so there is no runtime HLSL compile.
-fn create_shaders(device: &ID3D11Device) -> (ID3D11VertexShader, ID3D11PixelShader) {
+fn create_shaders(
+    device: &ID3D11Device,
+) -> windows::core::Result<(ID3D11VertexShader, ID3D11PixelShader)> {
     const VS_DXBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vs_main.dxbc"));
     const PS_DXBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ps_main.dxbc"));
     unsafe {
         let mut vs: Option<ID3D11VertexShader> = None;
         let mut ps: Option<ID3D11PixelShader> = None;
-        device
-            .CreateVertexShader(VS_DXBC, None, Some(&mut vs))
-            .expect("CreateVertexShader");
-        device
-            .CreatePixelShader(PS_DXBC, None, Some(&mut ps))
-            .expect("CreatePixelShader");
-        (vs.unwrap(), ps.unwrap())
+        device.CreateVertexShader(VS_DXBC, None, Some(&mut vs))?;
+        device.CreatePixelShader(PS_DXBC, None, Some(&mut ps))?;
+        Ok((vs.unwrap(), ps.unwrap()))
     }
 }
 
 /// Two samplers: anisotropic+mips for minify, point for crisp magnify/1:1. Both clamp at edges.
-fn create_samplers(device: &ID3D11Device) -> (ID3D11SamplerState, ID3D11SamplerState) {
+fn create_samplers(
+    device: &ID3D11Device,
+) -> windows::core::Result<(ID3D11SamplerState, ID3D11SamplerState)> {
     let base = D3D11_SAMPLER_DESC {
         Filter: D3D11_FILTER_ANISOTROPIC,
         AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -1428,18 +1450,14 @@ fn create_samplers(device: &ID3D11Device) -> (ID3D11SamplerState, ID3D11SamplerS
     unsafe {
         let mut aniso: Option<ID3D11SamplerState> = None;
         let mut pt: Option<ID3D11SamplerState> = None;
-        device
-            .CreateSamplerState(&base, Some(&mut aniso))
-            .expect("CreateSamplerState aniso");
-        device
-            .CreateSamplerState(&point, Some(&mut pt))
-            .expect("CreateSamplerState point");
-        (aniso.unwrap(), pt.unwrap())
+        device.CreateSamplerState(&base, Some(&mut aniso))?;
+        device.CreateSamplerState(&point, Some(&mut pt))?;
+        Ok((aniso.unwrap(), pt.unwrap()))
     }
 }
 
 /// Create the dynamic per-frame constant buffer ([`Params`], 128 bytes, 16-byte aligned).
-fn create_const_buffer(device: &ID3D11Device) -> ID3D11Buffer {
+fn create_const_buffer(device: &ID3D11Device) -> windows::core::Result<ID3D11Buffer> {
     let desc = D3D11_BUFFER_DESC {
         ByteWidth: std::mem::size_of::<Params>() as u32,
         Usage: D3D11_USAGE_DYNAMIC,
@@ -1450,10 +1468,8 @@ fn create_const_buffer(device: &ID3D11Device) -> ID3D11Buffer {
     };
     unsafe {
         let mut buf: Option<ID3D11Buffer> = None;
-        device
-            .CreateBuffer(&desc, None, Some(&mut buf))
-            .expect("CreateBuffer (constants)");
-        buf.unwrap()
+        device.CreateBuffer(&desc, None, Some(&mut buf))?;
+        Ok(buf.unwrap())
     }
 }
 
@@ -1480,6 +1496,21 @@ fn create_image_texture(
         PixelFormat::Rgba16Float => (DXGI_FORMAT_R16G16B16A16_FLOAT, 8, 1),
         PixelFormat::Rgba32Float => (DXGI_FORMAT_R32G32B32A32_FLOAT, 16, 1),
     };
+
+    // The dimensions and the buffer arrive from different producers (decode headers vs the
+    // pixel Vec — part of it native FFI), and UpdateSubresource below reads `height` rows of
+    // `width * bpp` bytes with no length of its own: a short buffer is an out-of-bounds read
+    // into the driver, not a panic. This function already returns the GPU's errors; a
+    // mismatched buffer is refused the same way.
+    let needed = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(bpp as usize));
+    if needed.is_none_or(|n| pixels.len() < n) {
+        return Err(windows::core::Error::new(
+            windows::Win32::Foundation::E_INVALIDARG,
+            "pixel buffer is shorter than its dimensions declare",
+        ));
+    }
 
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
