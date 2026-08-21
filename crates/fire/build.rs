@@ -30,8 +30,43 @@ fn main() {
     let product = read_product();
     compile_shaders();
     rasterize_icons();
+    decode_logo();
     embed_resources(&product);
     export_env(&product);
+}
+
+/// Edge (px) of the empty-window logo raster. Keep in sync with `render::imgui::LOGO_EDGE`.
+const LOGO_EDGE: u32 = 256;
+
+/// Decode the logo PNG (`assets/icon-256.png`, pre-sized from the 1024 px master) to raw
+/// straight-alpha RGBA in `OUT_DIR`, which `render::imgui` embeds for the empty-window card.
+/// Decoded here so no PNG decoder ships in the exe and a malformed asset is a build error,
+/// not a launch panic — the same posture as the icons and the shaders.
+fn decode_logo() {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let png = Path::new(&manifest).join("../../assets/icon-256.png");
+    println!("cargo:rerun-if-changed={}", png.display());
+
+    let data = std::fs::read(&png)
+        .unwrap_or_else(|e| panic!("failed to read logo {}: {e}", png.display()));
+    let pixmap = resvg::tiny_skia::Pixmap::decode_png(&data)
+        .unwrap_or_else(|e| panic!("{} is not valid PNG: {e}", png.display()));
+    assert_eq!(
+        (pixmap.width(), pixmap.height()),
+        (LOGO_EDGE, LOGO_EDGE),
+        "logo raster must be {LOGO_EDGE}×{LOGO_EDGE}"
+    );
+
+    // tiny-skia hands back premultiplied alpha; ImGui blends straight alpha, so demultiply.
+    let mut rgba = Vec::with_capacity((LOGO_EDGE * LOGO_EDGE * 4) as usize);
+    for px in pixmap.pixels() {
+        let c = px.demultiply();
+        rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    let out = Path::new(&out_dir).join("logo.rgba");
+    std::fs::write(&out, &rgba)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", out.display()));
 }
 
 /// Master rasterization size (px) for each toolbar icon. The icon module embeds these square A8

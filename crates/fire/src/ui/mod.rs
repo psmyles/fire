@@ -179,6 +179,9 @@ pub struct Inputs<'a> {
     pub form: FormStyle,
     pub m: &'a Metrics,
     pub icon_px: f32,
+    /// The empty-window card's logo texture — zero id when it isn't built (an image is up, or
+    /// creation failed), which drops the card back to its text-only form.
+    pub logo: TextureId,
     pub dark: bool,
     /// Window client size, physical px.
     pub client: (f32, f32),
@@ -200,6 +203,7 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
         form,
         m,
         icon_px,
+        logo,
         dark,
         client,
         image,
@@ -231,7 +235,7 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
     // Empty state: no image and none loading. Purely decorative — OVERLAY takes no mouse input, so
     // the shell still sees the double-click that opens the file picker.
     if !snap.has_image && !snap.loading {
-        empty_hint(ui, m, image);
+        empty_hint(ui, m, image, logo);
     }
 
     // The popups last, and outside any window — which is where ImGui expects them to live.
@@ -929,7 +933,10 @@ fn status_bar(ui: &Ui, snap: &ViewSnapshot, m: &Metrics, dark: bool, w: f32, h: 
         });
 }
 
-fn empty_hint(ui: &Ui, m: &Metrics, image: (f32, f32, f32, f32)) {
+/// The empty-window card: logo, product identity (long name + version), and the drop/open hint,
+/// centered as one block. Falls back to the two hint lines alone when the viewport is too short
+/// for the block or the logo texture isn't there.
+fn empty_hint(ui: &Ui, m: &Metrics, image: (f32, f32, f32, f32), logo: TextureId) {
     let (x, y, w, h) = image;
     if w <= 0.0 || h <= 0.0 {
         return;
@@ -940,19 +947,40 @@ fn empty_hint(ui: &Ui, m: &Metrics, image: (f32, f32, f32, f32)) {
         .size([w, h], Condition::Always)
         .flags(OVERLAY)
         .build(|| {
-            const LINE1: &str = "Drop an image here";
-            const LINE2: &str = "or double-click to open";
+            const HINT1: &str = "Drop an image here";
+            const HINT2: &str = "or double-click to open";
             let lh = ui.text_line_height();
-            let cy = (h * 0.5 - lh).round();
-            for (i, s) in [LINE1, LINE2].iter().enumerate() {
+            let step = lh * m.empty_hint_line_gap;
+            let line = |s: &str, ly: f32, dim: bool| {
                 let tw = text_w(ui, s);
-                let y = cy + i as f32 * lh * m.empty_hint_line_gap;
-                ui.set_cursor_pos([((w - tw) * 0.5).round(), y]);
-                if i == 0 {
-                    ui.text(*s);
+                ui.set_cursor_pos([((w - tw) * 0.5).round(), ly.round()]);
+                if dim {
+                    ui.text_disabled(s);
                 } else {
-                    ui.text_disabled(*s);
+                    ui.text(s);
                 }
+            };
+
+            // The long name is the description's lead ("Fast Image REview - a fast, …").
+            let tagline = crate::product::DESCRIPTION
+                .split(" - ")
+                .next()
+                .unwrap_or(crate::product::NAME);
+            let version = format!("Version {}", crate::product::VERSION);
+            let edge = m.empty_logo;
+            let block = edge + step * 5.0 + lh;
+            if logo.id() != 0 && block + step * 2.0 <= h {
+                let top = ((h - block) * 0.5).round();
+                ui.set_cursor_pos([((w - edge) * 0.5).round(), top]);
+                ui.image(logo, [edge, edge]);
+                line(tagline, top + edge + step, false);
+                line(&version, top + edge + step * 2.0, true);
+                line(HINT1, top + edge + step * 4.0, false);
+                line(HINT2, top + edge + step * 5.0, true);
+            } else {
+                let cy = (h * 0.5 - lh).round();
+                line(HINT1, cy, false);
+                line(HINT2, cy + step, true);
             }
         });
 }

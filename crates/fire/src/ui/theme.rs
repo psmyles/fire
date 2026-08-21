@@ -146,6 +146,7 @@ pub struct Chrome {
     divider_top: f32,
     divider_bottom: f32,
     empty_hint_line_gap: f32,
+    empty_logo_size: f32,
     geom: Geom,
     pub controls: ChromeControls,
     colors: ChromeColors,
@@ -445,6 +446,8 @@ pub struct Metrics {
     pub divider_bottom: f32,
     /// Line spacing of the empty-state hint, as a multiple of the line height.
     pub empty_hint_line_gap: f32,
+    /// Edge of the empty-window card's logo.
+    pub empty_logo: f32,
 }
 
 impl Metrics {
@@ -466,6 +469,7 @@ impl Metrics {
             divider_top: c.divider_top,
             divider_bottom: c.divider_bottom,
             empty_hint_line_gap: c.empty_hint_line_gap,
+            empty_logo: s(c.empty_logo_size),
         }
     }
 }

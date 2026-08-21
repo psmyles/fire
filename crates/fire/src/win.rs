@@ -1475,6 +1475,13 @@ impl App {
         let fullscreen = self.fullscreen;
         let icon_px = self.imgui.icon_px();
         let form = self.imgui.form_style(dark);
+        // Only an empty-state frame asks for the logo — an image launch never builds it, which
+        // keeps the upload off the time-to-first-photon path (see Imgui::logo).
+        let logo = if snap.has_image || snap.loading {
+            dear_imgui_rs::TextureId::new(0)
+        } else {
+            self.imgui.logo(self.surface.device())
+        };
 
         // The settings and menu state are *edited* by the UI, so they go in by `&mut`. Move them out
         // for the duration rather than borrow fields of `self` across `self.imgui.frame(…)`.
@@ -1498,6 +1505,7 @@ impl App {
                     form,
                     m: &metrics,
                     icon_px,
+                    logo,
                     dark,
                     client: (cw as f32, ch as f32),
                     image: (ix, iy, iw, ih),

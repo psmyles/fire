@@ -33,6 +33,12 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SA
 
 use crate::icons;
 
+/// The empty-window logo: `assets/icon-256.png`, decoded to raw straight-alpha RGBA at build
+/// time by build.rs (no PNG decoder ships in the exe). Edge kept in sync with build.rs's
+/// `LOGO_EDGE`.
+const LOGO_EDGE: u32 = 256;
+static LOGO_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo.rgba"));
+
 // ocornut's Win32 + DX11 backends, compiled by dear-imgui-sys. Declared, never implemented.
 unsafe extern "C" {
     fn dear_imgui_backend_win32_init(hwnd: *mut c_void) -> bool;
@@ -63,6 +69,14 @@ pub struct Imgui {
     /// ...and the per-icon scales it was rastered with, which a hot reload can move on their own.
     /// Zeroes until the first build, and zero is never a legal scale, so the first check builds.
     icon_built_scales: [f32; icons::COUNT],
+    /// The empty-window logo, built lazily by [`Imgui::logo`] — an image launch never uploads it.
+    /// Same ownership rule as the icon atlas: ImGui holds the raw SRV pointer, so both live here.
+    _logo_tex: Option<ID3D11Texture2D>,
+    _logo_srv: Option<ID3D11ShaderResourceView>,
+    logo_id: TextureId,
+    /// Set once [`Imgui::logo`] has tried, success or not — a failed build is not retried (and
+    /// not re-logged) every empty-state frame.
+    logo_built: bool,
     dpi: u32,
     /// ImGui's factory style, captured at creation *before* [`crate::ui::theme`] overwrites it.
     /// The settings window is drawn with this — see [`StockStyle`].
@@ -238,6 +252,10 @@ impl Imgui {
             icon_id: TextureId::new(0),
             icon_built_px: 0.0,
             icon_built_scales: [0.0; icons::COUNT],
+            _logo_tex: None,
+            _logo_srv: None,
+            logo_id: TextureId::new(0),
+            logo_built: false,
             dpi: dpi.max(96),
             stock,
         };
@@ -316,47 +334,7 @@ impl Imgui {
         let scales = self.icon_scales();
         let (pixels, w) = icons::atlas(n, &scales);
 
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: w as u32,
-            Height: n as u32,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_IMMUTABLE,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
-        };
-        let init = D3D11_SUBRESOURCE_DATA {
-            pSysMem: pixels.as_ptr() as *const c_void,
-            SysMemPitch: (w * 4) as u32,
-            SysMemSlicePitch: 0,
-        };
-
-        let mut tex: Option<ID3D11Texture2D> = None;
-        let mut srv: Option<ID3D11ShaderResourceView> = None;
-        unsafe {
-            if device
-                .CreateTexture2D(&desc, Some(&init), Some(&mut tex))
-                .is_err()
-            {
-                eprintln!("fire: icon atlas CreateTexture2D failed");
-                return;
-            }
-            let Some(t) = tex.as_ref() else { return };
-            if device
-                .CreateShaderResourceView(t, None, Some(&mut srv))
-                .is_err()
-            {
-                eprintln!("fire: icon atlas CreateShaderResourceView failed");
-                return;
-            }
-        }
-
+        let (tex, srv) = rgba_texture(device, &pixels, w as u32, n as u32, "icon atlas");
         // The DX11 backend takes ImTextureID to *be* the SRV pointer.
         self.icon_id = match srv.as_ref() {
             Some(s) => TextureId::new(s.as_raw() as u64),
@@ -366,6 +344,23 @@ impl Imgui {
         self.icon_srv = srv;
         self.icon_built_px = px;
         self.icon_built_scales = scales;
+    }
+
+    /// The empty-window logo texture, built on first call — which the shell only makes on an
+    /// empty-state frame, so a launch straight into an image never pays the upload on its
+    /// time-to-first-photon path. Zero id when creation failed; the card then draws text alone.
+    pub fn logo(&mut self, device: &ID3D11Device) -> TextureId {
+        if !self.logo_built {
+            self.logo_built = true;
+            let (tex, srv) = rgba_texture(device, LOGO_RGBA, LOGO_EDGE, LOGO_EDGE, "logo");
+            self.logo_id = match srv.as_ref() {
+                Some(s) => TextureId::new(s.as_raw() as u64),
+                None => TextureId::new(0),
+            };
+            self._logo_tex = tex;
+            self._logo_srv = srv;
+        }
+        self.logo_id
     }
 
     /// Feed a Win32 message to ImGui. `true` means ImGui consumed it and the shell should not.
@@ -416,6 +411,61 @@ impl Imgui {
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
+}
+
+/// Create an immutable RGBA8 texture + SRV from CPU pixels (the icon atlas, the logo). On
+/// failure the missing pieces come back `None` (logged) and the caller draws without the
+/// texture rather than the app failing.
+fn rgba_texture(
+    device: &ID3D11Device,
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    what: &str,
+) -> (Option<ID3D11Texture2D>, Option<ID3D11ShaderResourceView>) {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w,
+        Height: h,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_IMMUTABLE,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let init = D3D11_SUBRESOURCE_DATA {
+        pSysMem: pixels.as_ptr() as *const c_void,
+        SysMemPitch: w * 4,
+        SysMemSlicePitch: 0,
+    };
+
+    let mut tex: Option<ID3D11Texture2D> = None;
+    let mut srv: Option<ID3D11ShaderResourceView> = None;
+    unsafe {
+        if device
+            .CreateTexture2D(&desc, Some(&init), Some(&mut tex))
+            .is_err()
+        {
+            eprintln!("fire: {what} CreateTexture2D failed");
+            return (None, None);
+        }
+        let Some(t) = tex.as_ref() else {
+            return (None, None);
+        };
+        if device
+            .CreateShaderResourceView(t, None, Some(&mut srv))
+            .is_err()
+        {
+            eprintln!("fire: {what} CreateShaderResourceView failed");
+            return (tex, None);
+        }
+    }
+    (tex, srv)
 }
 
 impl Drop for Imgui {

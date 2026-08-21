@@ -162,6 +162,9 @@ divider_top    = 0.2
 divider_bottom = 0.8
 # Line spacing of the two-line "Drop an image here" hint, as a multiple of the line height.
 empty_hint_line_gap = 1.5
+# Logical edge of the logo on the empty-window card (drawn from an embedded 256 px raster,
+# so it stays crisp up to 200 % DPI).
+empty_logo_size = 128.0
 
 [chrome.geom]
 # Padding *inside* a toolbar button — so a button is icon_size + 2×frame_padding on each axis.
@@ -270,7 +273,9 @@ tab_rounding       = 0.0
 tab_bar_overline   = 2.0
 window_border = 1.0
 child_border  = 1.0
-frame_border  = 0.0
+# Framed widgets (checkboxes, combos, inputs, sliders) get a 1 px outline: their "field" fill is
+# nearly the surface color, so without an edge an unchecked box or an idle combo disappears.
+frame_border  = 1.0
 popup_border  = 1.0
 image_border  = 0.0
 
