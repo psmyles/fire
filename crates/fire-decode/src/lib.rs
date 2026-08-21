@@ -491,18 +491,26 @@ fn alpha_is_opaque(img: &DecodedImage) -> bool {
     let px = &img.pixels;
     match img.format {
         // 8-bit: 4 bytes/px, alpha is byte 3; opaque == 0xff.
-        PixelFormat::Rgba8Unorm => px.chunks_exact(4).all(|p| p[3] == 0xff),
+        PixelFormat::Rgba8Unorm => px.as_chunks::<4>().0.iter().all(|p| p[3] == 0xff),
         // 16-bit unorm (native-endian u16): 8 bytes/px, alpha is bytes 6..8; opaque == 0xffff.
-        PixelFormat::Rgba16Unorm => px.chunks_exact(8).all(|p| p[6] == 0xff && p[7] == 0xff),
+        PixelFormat::Rgba16Unorm => px
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .all(|p| p[6] == 0xff && p[7] == 0xff),
         // 16-bit half-float: opaque == 1.0 == 0x3c00. No decode path emits this today, but keep
         // the lane handling exhaustive over PixelFormat.
         PixelFormat::Rgba16Float => px
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .all(|p| u16::from_ne_bytes([p[6], p[7]]) == 0x3c00),
         // 32-bit float (linear/HDR): 16 bytes/px, alpha is the 4th f32. Opaque == 1.0; values
         // above 1.0 count as opaque, NaN does not (keeping the alpha channel is the safe default).
         PixelFormat::Rgba32Float => px
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .all(|p| f32::from_ne_bytes([p[12], p[13], p[14], p[15]]) >= 1.0),
     }
 }
