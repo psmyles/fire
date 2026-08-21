@@ -142,7 +142,13 @@ fn rasterize_icons() {
         resvg::render(&tree, transform, &mut pixmap.as_mut());
 
         // Keep only the alpha (coverage) byte of each RGBA texel — the mask the chrome tints.
-        let alpha: Vec<u8> = pixmap.data().chunks_exact(4).map(|px| px[3]).collect();
+        let alpha: Vec<u8> = pixmap
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| px[3])
+            .collect();
         let out = Path::new(&out_dir).join(format!("{stem}.a8"));
         std::fs::write(&out, &alpha)
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", out.display()));

@@ -482,7 +482,7 @@ fn cell_descriptor(
     let ch = y1 - y0;
     let tw = tw as usize;
     let mut d = [0.0f32; 64];
-    for (by, dcell) in d.chunks_exact_mut(8).enumerate() {
+    for (by, dcell) in d.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         let sy0 = y0 + (by as u32 * ch) / 8;
         let sy1 = (y0 + ((by as u32 + 1) * ch) / 8).max(sy0 + 1);
         for (bx, out) in dcell.iter_mut().enumerate() {

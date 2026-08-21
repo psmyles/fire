@@ -1469,8 +1469,10 @@ mod tests {
         // Native-endian u16 RGBA.
         let px: Vec<u16> = out
             .pixels
-            .chunks_exact(2)
-            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_ne_bytes(*c))
             .collect();
         assert_eq!(px, vec![0xFFFF, 0x8000, 0x0001, 0xFFFF]);
     }

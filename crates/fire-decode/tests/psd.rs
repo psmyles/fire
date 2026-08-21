@@ -133,8 +133,10 @@ fn psd_rgb16_scales_from_photoshops_32768_range() {
     assert_eq!(out.bit_depth, 16);
     let s: Vec<u16> = out
         .pixels
-        .chunks_exact(2)
-        .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_ne_bytes(*c))
         .collect();
     // 32768 is full white, not half. 16384 is the midpoint.
     assert_eq!(s, vec![65535, 32768, 0, 65535, 0, 65535, 32768, 65535]);
@@ -158,8 +160,10 @@ fn psd_rgb32f_stays_linear_float() {
     assert_eq!(out.bit_depth, 32);
     let s: Vec<f32> = out
         .pixels
-        .chunks_exact(4)
-        .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_ne_bytes(*c))
         .collect();
     assert_eq!(
         s,
