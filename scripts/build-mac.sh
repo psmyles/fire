@@ -5,20 +5,26 @@
 # packages, so the Developer ID certificate and the App Store Connect key never have to exist as
 # secrets on a public repo.
 #
-#   scripts/build-mac.sh                          build + sign + .dmg (no notarization)
-#   scripts/build-mac.sh --notarize-profile fire  ... and notarize + staple both
+#   scripts/build-mac.sh                          a release: build, sign, notarize, staple, .dmg
+#   scripts/build-mac.sh --no-notarize            signed but not notarized (faster; not shippable)
 #   scripts/build-mac.sh --no-sign                unsigned bundle, for local testing only
 #   scripts/build-mac.sh --no-dmg --no-build      re-wrap the binary that is already built
+#
+# The no-argument form is the shipping one, and takes both of its credentials from the keychain:
+# the "Developer ID Application" identity, and the `notarytool` profile named below. Neither is
+# ever passed on a command line, and neither lives in the repo.
 #
 # Options
 #   --sign-id <identity>       codesign identity; default is the "Developer ID Application" one
 #                              in the keychain, which is the only kind Gatekeeper accepts for
 #                              distribution outside the App Store.
 #   --no-sign                  skip codesign entirely. The bundle runs here and nowhere else:
-#                              another Mac will refuse it. Never ship this.
-#   --notarize-profile <name>  a `xcrun notarytool store-credentials` profile. Without one,
-#                              notarization is skipped and the .dmg is signed but not stapled —
-#                              fine for a colleague who will right-click → Open, not for a link.
+#                              another Mac will refuse it. Implies --no-notarize. Never ship this.
+#   --notarize-profile <name>  use a different `xcrun notarytool store-credentials` profile.
+#   --no-notarize              skip notarization and stapling. The .dmg is still signed, but
+#                              macOS 15+ has no Control-click bypass any more — opening it on
+#                              another Mac means System Settings → Privacy & Security → Open
+#                              Anyway. Use it to iterate, not to ship.
 #   --no-dmg                   stop after the .app.
 #   --no-build                 reuse target/release/fire as it stands.
 #   --out <dir>                where the .dmg goes (default: dist/).
@@ -35,18 +41,19 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 sign_id=""
 do_sign=1
-notary_profile=""
+do_notarize=1
 do_dmg=1
 do_build=1
 out_dir="$repo/dist"
 
-usage() { sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sign-id)           sign_id="$2"; shift 2 ;;
         --no-sign)           do_sign=0; shift ;;
         --notarize-profile)  notary_profile="$2"; shift 2 ;;
+        --no-notarize)       do_notarize=0; shift ;;
         --no-dmg)            do_dmg=0; shift ;;
         --no-build)          do_build=0; shift ;;
         --out)               out_dir="$2"; shift 2 ;;
@@ -64,6 +71,38 @@ name="$(plutil -extract productName raw -o - "$repo/product.json")"
 version="$(plutil -extract version raw -o - "$repo/product.json")"
 copyright="$(plutil -extract copyright raw -o - "$repo/product.json")"
 bundle_id="com.psmyles.fire"
+# The `xcrun notarytool store-credentials` profile to use when none is named. It is the product
+# name, lower-cased, which is what this script's own setup instructions tell you to create. The
+# credential itself lives in the data-protection keychain — `security(1)` cannot even enumerate
+# it, which is also why there is no point pre-flighting its existence here: notarytool's own
+# error is immediate and says exactly what is missing.
+notary_profile="${notary_profile:-$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')}"
+
+# `--no-sign` leaves nothing notarizable: notarization is a check on a Developer ID signature.
+[[ $do_sign -eq 1 ]] || do_notarize=0
+
+# Submit `path` and wait. On failure, print the one command that says *why* — notarytool's exit
+# status alone does not, and `set -e` would otherwise kill the script before the ID is visible.
+notarize() {
+    local path="$1" log status id
+    log="$(mktemp)"
+    xcrun notarytool submit "$path" --keychain-profile "$notary_profile" --wait 2>&1 | tee "$log"
+    status=${PIPESTATUS[0]}
+    if [[ $status -ne 0 ]]; then
+        id="$(sed -n 's/^ *id: *\([0-9a-f-]*\)$/\1/p' "$log" | head -1)"
+        echo >&2
+        if [[ -n $id ]]; then
+            echo "error: notarization failed. Apple's reasons:" >&2
+            echo "  xcrun notarytool log $id --keychain-profile $notary_profile" >&2
+        else
+            echo "error: notarization failed before submitting — is the '$notary_profile' profile set up?" >&2
+            echo "  xcrun notarytool store-credentials $notary_profile --apple-id <id> --team-id <team> --password <app-specific-password>" >&2
+        fi
+        rm -f "$log"
+        exit 1
+    fi
+    rm -f "$log"
+}
 
 # ---------------------------------------------------------------------------------------------
 # 1. Build
@@ -220,14 +259,13 @@ fi
 # that is offline or behind a filter. Without it Gatekeeper has to reach Apple on first launch,
 # and the failure looks like "damaged and can't be opened" rather than "no network".
 
-if [[ -n $notary_profile ]]; then
-    [[ $do_sign -eq 1 ]] || die "--notarize-profile needs a signed bundle; drop --no-sign"
-    say "notarize $name.app"
+if [[ $do_notarize -eq 1 ]]; then
+    say "notarize $name.app — profile '$notary_profile'"
     zip_path="$(mktemp -d)/$name.zip"
     # ditto, not zip(1): only ditto preserves the bundle's symlinks and extended attributes, and
     # notarytool rejects an archive that has lost them.
     ditto -c -k --keepParent "$app" "$zip_path"
-    xcrun notarytool submit "$zip_path" --keychain-profile "$notary_profile" --wait
+    notarize "$zip_path"
     xcrun stapler staple "$app"
     xcrun stapler validate "$app"
 fi
@@ -264,9 +302,9 @@ if [[ $do_sign -eq 1 ]]; then
     codesign --force --timestamp --sign "$sign_id" "$dmg"
 fi
 
-if [[ -n $notary_profile ]]; then
+if [[ $do_notarize -eq 1 ]]; then
     say "notarize $(basename "$dmg")"
-    xcrun notarytool submit "$dmg" --keychain-profile "$notary_profile" --wait
+    notarize "$dmg"
     xcrun stapler staple "$dmg"
     xcrun stapler validate "$dmg"
     # The question the user's Mac will actually ask. `spctl` here is the same check Gatekeeper
@@ -278,10 +316,13 @@ fi
 say "done"
 echo "  app: $app"
 echo "  dmg: $dmg"
-if [[ -z $notary_profile ]]; then
+if [[ $do_notarize -eq 0 ]]; then
     echo
-    echo "  Not notarized. macOS will refuse this on another Mac until the user right-clicks →"
-    echo "  Open. Set up a profile once with:"
-    echo "    xcrun notarytool store-credentials fire --apple-id <id> --team-id <team> --password <app-specific-password>"
-    echo "  then re-run with --notarize-profile fire."
+    echo "  NOT NOTARIZED — do not ship this. On another Mac it opens only via System Settings →"
+    if [[ $do_sign -eq 0 ]]; then
+        echo "  Privacy & Security → Open Anyway, and unsigned it may not open at all."
+    else
+        echo "  Privacy & Security → Open Anyway (macOS 15 removed the Control-click bypass)."
+    fi
+    echo "  Re-run without --no-notarize / --no-sign for a shippable build."
 fi

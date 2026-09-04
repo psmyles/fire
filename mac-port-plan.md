@@ -71,8 +71,8 @@ Each is stated with the reason and what it costs, so a future revision can revis
 | D8 | **Timers: `ControlFlow::WaitUntil` + a deadline min-heap** | Preserves the event-driven invariant (no input, no timer → no frame) with zero threads | Small scheduler in the app; every timer (GIF, flipbook, caret) goes through it | Shipped |
 | D9 | **Keybinds: physical `KeyCode` by name + a `Primary` modifier** (Ctrl on Windows, ⌘ on macOS) | Layout-independent, one `config.toml` works on both | One-time migration of existing VK-code chords; `Ctrl+`/`Cmd+` still parse as `Primary+` | Shipped |
 | D10 | **macOS: Apple Silicon only, vendored arm64 static libs** for libheif/libde265/dav1d + `cc`-built psd_sdk | Same vendoring model as the Windows `.lib`s; no Intel users to serve | Re-run `VENDOR.txt` on a Mac; universal deferred | Planned |
-| D11 | **Build, sign and notarize only on the dev Mac, via `scripts/build-mac.sh`** - CI never builds a mac artifact | Keeps the Developer ID cert and App Store Connect key off CI entirely, on a public repo; CI's mac leg (D23) stays lint/test only | Releases are a manual step on the dev Mac rather than a CI-triggered build | Shipped (`scripts/build-mac.sh`; the notarization leg awaits a Developer ID cert) |
-| D12 | **Packaging: `scripts/build-mac.sh` + `Info.plist` template from `product.json`, signed + notarized `.dmg`** | Mirrors `build-installer.ps1`; plist is hand-tuned anyway (cargo-bundle would hide it) | `.dmg` is more script than `.zip`; accepted for polish. The plist turned out to be worth hand-writing for a second reason: the document types are parsed out of `fire-decode`'s one extension table, so unlike the installer's copy they cannot drift, and `NSSupportsSuddenTermination` is pointedly *not* declared - it would let the OS skip the `atexit` that removes the instance socket | Shipped (notarization untested) |
+| D11 | **Build, sign and notarize only on the dev Mac, via `scripts/build-mac.sh`** - CI never builds a mac artifact | Keeps the Developer ID cert and App Store Connect key off CI entirely, on a public repo; CI's mac leg (D23) stays lint/test only | Releases are a manual step on the dev Mac rather than a CI-triggered build | Shipped (`scripts/build-mac.sh`, run with no arguments; both credentials come from the keychain) |
+| D12 | **Packaging: `scripts/build-mac.sh` + `Info.plist` template from `product.json`, signed + notarized `.dmg`** | Mirrors `build-installer.ps1`; plist is hand-tuned anyway (cargo-bundle would hide it) | `.dmg` is more script than `.zip`; accepted for polish. The plist turned out to be worth hand-writing for a second reason: the document types are parsed out of `fire-decode`'s one extension table, so unlike the installer's copy they cannot drift, and `NSSupportsSuddenTermination` is pointedly *not* declared - it would let the OS skip the `atexit` that removes the instance socket | Shipped |
 | D13 | **Windows first, then macOS** | The shared code and the TTFP risk were the Windows migration; mac is leaves + packaging | Colleagues wait one extra phase | Done |
 | D14 | *(wgpu-era: pinned backend, no debug layers, decode kicked off before device creation)* | - | - | Superseded (A.2); the surviving idea is D18 |
 | D15 | **Pinch-to-zoom mapped to the wheel zoom; 1:1 = one texel per *physical* pixel** | Crisp on Retina, matches what artists mean by 100 %, zoom-snap ladder stays in image space | `scale_factor` enters the fit/1:1 math | Shipped. Pinch maps `WindowEvent::PinchGesture`'s incremental magnification to the wheel's about-cursor zoom (NaN filtered, as winit permits one). The cost line proved wrong: fit and 1:1 are already in physical px end to end, so `scale_factor` enters nothing there — 1:1 is one texel per physical pixel by construction, measured exact on a 2× display (§ Phase 2 step 6). It enters the *gesture* math instead, which is the opposite conversion |
@@ -749,12 +749,27 @@ nothing after them can be checked without it.
    `.dmg` mounting with the app and the `/Applications` symlink; and the auto-detect refusing,
    with instructions, when no Developer ID certificate is present.
 
-   **What was not**: signing with a real **Developer ID Application** certificate, notarization
-   and stapling. This Mac's keychain holds only an *Apple Development* identity, which signs
-   correctly here and is rejected on every other Mac - so picking one automatically would just
-   move the failure to the colleague, and the script refuses to. The codesign path was exercised
-   with it; `notarytool submit --wait` and `stapler` are untested until a Developer ID cert and a
-   `store-credentials` profile exist.
+   **The full release path ran end to end** (2026-09-05), once the Developer ID Application
+   certificate and a `notarytool` keychain profile were in place. Both submissions came back
+   `Accepted` first try, both artifacts stapled and validated, and the check that actually matters
+   passes on the app, on the `.dmg`, and on the app *inside* the mounted `.dmg`:
+
+   ```
+   accepted
+   source=Notarized Developer ID
+   origin=Developer ID Application: Chandan Singh (48QFANT8RD)
+   ```
+
+   Signature: hardened runtime (`flags=0x10000(runtime)`), secure timestamp, `TeamIdentifier`
+   set, `Mach-O thin (arm64)`. The stapled ticket means it opens on a Mac that is offline.
+
+   Neither credential is ever passed on a command line: `scripts/build-mac.sh` with **no
+   arguments** is the shipping build, taking the identity and the notary profile from the
+   keychain. `--no-notarize` and `--no-sign` step down from there for iteration, and say plainly
+   that what they produce is not shippable - including that macOS 15 removed the Control-click
+   bypass, so an un-notarized build now needs System Settings → Privacy & Security → Open Anyway.
+   A failed submission prints the `notarytool log <id>` command rather than dying on a bare exit
+   status.
 
    Also worth knowing while testing: the shipping bundle (`com.psmyles.fire`) and the dev one
    (`com.psmyles.fire.dev`) **share the instance socket**, because its name belongs to the product
