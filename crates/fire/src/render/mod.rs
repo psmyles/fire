@@ -14,6 +14,10 @@
 
 #[cfg(windows)]
 pub mod d3d11;
+/// The sokol_gfx shader reflection generated from `shader.glsl` — bindings, uniform-block layout
+/// and per-backend entry points. Machine-written by `scripts/gen-shaders.sh`; never edit it.
+#[path = "generated/shader.rs"]
+pub mod generated_shader;
 pub mod gpu;
 pub mod imgui;
 #[cfg(target_os = "macos")]

@@ -64,7 +64,7 @@ Each is stated with the reason and what it costs, so a future revision can revis
 | D1 | **Shared shell: winit + sokol_gfx on both OSes** (not AppKit+Metal beside Win32+D3D11) | Minimum platform code: the per-OS part is a device/swapchain module, not a renderer | Windows re-plumbed; TTFP re-measured (§8) | Shipped |
 | D2 | **Windows migrates too**, gated on the TTFP benchmark | Keeping a whole D3D11 renderer behind a trait *is* the two-shell maintenance | Budget: ≤ 10 ms median regression on the 8.9 MB case; ≤ 5 ms on the 38 KB case | Met (§8) |
 | D3 | **`dear-imgui-rs` Context + `dear-imgui-winit` (input) + `sokol_imgui` (renderer)** replace `dear-imgui-sys` + the C++ win32/dx11 shims | No per-OS backend code of our own; the renderer is the same header sokol_gfx's author maintains beside it | `ui/` moved from the raw 10-function ABI to the safe API; `simgui.c` must compile against the same cimgui `dear-imgui-sys` links (D22) | Shipped |
-| D4 | **Shader is precompiled to bytecode on both OSes** - HLSL → DXBC by `fxc` today; for macOS, **adopt `sokol-shdc`**: one annotated-GLSL source generating HLSL + MSL *and* the `ShaderDesc` reflection, with the MSL compiled to a `.metallib` by `xcrun metal` (D24) | Nothing on the cold-start path (no runtime shader compile) on either OS, and a broken shader is a build error; one source beats two hand-kept-in-sync twins once a second backend exists | `fxc` + the Windows SDK on Windows, the Metal toolchain on macOS (D24). Phase 2 rewrites the shader in sokol-shdc's dialect and replaces the hand-written `ShaderDesc` in `render::gpu::make_shader` with generated code | Windows shipped; sokol-shdc planned |
+| D4 | **Shader is precompiled to bytecode on both OSes** - HLSL → DXBC by `fxc` today; for macOS, **adopt `sokol-shdc`**: one annotated-GLSL source generating HLSL + MSL *and* the `ShaderDesc` reflection, with the MSL compiled to a `.metallib` by `xcrun metal` (D24) | Nothing on the cold-start path (no runtime shader compile) on either OS, and a broken shader is a build error; one source beats two hand-kept-in-sync twins once a second backend exists | `fxc` + the Windows SDK on Windows, the Metal toolchain on macOS (D24). The shader is now one annotated-GLSL source; `scripts/gen-shaders.sh` generates the per-backend sources *and* the `ShaderDesc` into `render/generated/`, checked in, and build.rs compiles the host's pair to bytecode. `make_shader` keeps only the bytecode swap | Shipped (HLSL half needs a Windows build to confirm) |
 | D5 | **One process, N windows** everywhere (instance mode is `open-in = new-window \| reuse-window`) | Finder never launches a second process - it sends an open-file event to the running app - so per-launch processes have no mac equivalent; winit runs N windows in one loop cleanly | Windows NewWindow users get the same UX from one process; crash isolation is per-process (D7) | Shipped |
 | D6 | **IPC via the `interprocess` crate** (named pipe / Unix socket behind one API) on both OSes | One forward path, one test | macOS also needs the Apple-Event hook (§5) feeding the same open path | Shipped (mac hook planned) |
 | D7 | **Accept single-process crash exposure** | FFI already runs under `catch_unwind` on a worker with validated inputs; a viewer has no unsaved state | A true segfault in libheif/psd_sdk closes every window, not one | Accepted |
@@ -84,7 +84,7 @@ Each is stated with the reason and what it costs, so a future revision can revis
 | D21 | **The mip chain is built on the CPU, on the decode worker** | sokol_gfx has no `GenerateMips`, and its rules forbid rendering into an image created with data | ~5 ms on an 8.9 MB image, off the UI thread; the upload is one `sg_make_image` carrying every level | Shipped |
 | D22 | **`sokol-rust` is vendored (`vendor/sokol-rust`); `sokol_imgui.h` is compiled by `fire`'s build.rs** | The crates.io `sokol` name belongs to an unrelated 2019 crate; sokol_imgui must be compiled with the *same* cimgui defines and the same `SOKOL_*` backend as its neighbours or the struct layouts differ | A vendored tree to update by hand; three sets of defines (backend, `SOKOL_IMGUI_NO_SOKOL_APP`, the cimgui five) that must stay in lockstep | Shipped |
 | D23 | **The whole dev pipeline runs on macOS**, not just the app: clippy, `cargo test`, the native decoders, the TTFP harness, the release build and packaging | A platform you cannot lint, test or measure on is a platform you cannot maintain; the alternative is mac fixes that only Windows CI can verify | The two sys crates lose their Windows-only short-circuit, the vendor layout goes per-target, CI grows a mac leg, `ttfp.ps1` gets a portable twin (§7) | Planned |
-| D24 | **Metal shaders are precompiled to a `.metallib` with `xcrun metal`** - so the toolchain floor on macOS is **full Xcode** (plus the separately-downloaded Metal toolchain on Xcode 16+), not Command Line Tools | Keeps D4's "no shader compile on the cold-start path" on both OSes; the wgpu branch lost ~32 ms to exactly this (A.2), and TTFP is the project's primary metric | Every dev machine and the CI runner need Xcode, not CLT; a second offline compile step in build.rs | Planned |
+| D24 | **Metal shaders are precompiled to a `.metallib` with `xcrun metal`** - so the toolchain floor on macOS is **full Xcode** (plus the separately-downloaded Metal toolchain on Xcode 16+), not Command Line Tools | Keeps D4's "no shader compile on the cold-start path" on both OSes; the wgpu branch lost ~32 ms to exactly this (A.2), and TTFP is the project's primary metric | Every dev machine and the CI runner need Xcode, not CLT; a second offline compile step in build.rs. The toolchain is an **839 MB** `xcodebuild -downloadComponent MetalToolchain`, and its absence is near-silent (§7.1) | Shipped |
 | D25 | **The arm64 HEIF stack is built with vcpkg (`arm64-osx` static), mirroring `VENDOR.txt`**, and the vendored tree goes per-target - one directory per target holding *both* its `include/` and `lib/` | One vendoring story on both OSes, one dav1d port patch, a self-contained `.app` with no dylib embedding or per-dylib signing | A one-time `brew install cmake ninja meson nasm pkg-config` + vcpkg bootstrap on the Mac; `heif-sys`'s hardcoded `lib/` path and `.lib` names become target-aware. Headers turned out to need the split too (the two targets landed on different libheif versions), and the mac build needs a third port patch, `ENABLE_PLUGIN_LOADING=OFF` (§7.2) | Shipped |
 
 ---
@@ -210,33 +210,39 @@ Pinch (`WindowEvent::PinchGesture`, macOS) will drive the same about-cursor zoom
 
 ## 4. Shader
 
-`render/shader.hlsl` survives the migration. `build.rs` compiles each entry point with `fxc`
-(`vs_5_0` / `ps_5_0`) to a `.dxbc` in `OUT_DIR`, which `render::gpu` embeds via `include_bytes!`
-and hands to sokol_gfx as bytecode: no runtime shader compilation, nothing on the cold-start
-path, and a broken shader is a build error rather than a launch-time failure.
+`render/shader.glsl` is **the one source**: sokol-shdc's annotated GLSL (Vulkan syntax, separate
+texture and sampler objects). `scripts/gen-shaders.sh` turns it into everything else, all of it
+checked in under `render/generated/`:
 
-What sokol_gfx cannot reflect out of DXBC is written by hand beside it in
-`render::gpu::make_shader`: the one 128-byte uniform block at `b0` (fragment stage), the texture
-at `t0`, the anisotropic sampler at `s0`, the point sampler at `s1`, and which sampler pairs
-with the texture. The stages are the same and in the same order as before: sample (point when
-magnifying, aniso+mip when minifying, chosen by the two samplers) → HDR exposure/tonemap (float
-formats only) → channel isolation → checkerboard composite. `Rgba16Unorm` still does its
-sRGB→linear in the shader.
+* `shader_viewport_hlsl5_{vertex,fragment}.hlsl` and `..._metal_macos_{vertex,fragment}.metal` -
+  the per-backend sources, which **build.rs compiles to bytecode**: `fxc` to `.dxbc` on Windows,
+  `xcrun metal` + `metallib` to a `.metallib` per stage on macOS (one library per stage, because
+  SPIRV-Cross names every entry point `main0` and two functions cannot share a library).
+* `shader.rs` - the sokol_gfx reflection: the 128-byte uniform block, the texture, the two
+  samplers, which sampler pairs with the texture, and the per-backend entry-point names. This is
+  what used to be written out by hand in `render::gpu::make_shader`; all that is left there is
+  swapping the generated desc's `source` for build.rs's `bytecode`.
 
-**One rule the shader must keep:** never `Sample` inside a per-pixel branch. The letterbox and
-outline tests above the sampling are branches, and an implicitly-derived LOD inside a branch is
-undefined where the quad diverges - which is what produced a flickering 1 px line on all four
-image edges. The minify path uses `SampleGrad` with explicit derivatives; the fix is commit
-`897bc7e` and the flicker is gone.
+So a plain `cargo build` never needs sokol-shdc, there is no runtime shader compile on either OS,
+and a broken shader is still a build error. Editing the shader means editing the `.glsl`, running
+the script and committing both - the script's output is platform-independent text, so either OS
+can regenerate it.
 
-**Phase 2 (D4):** the Metal build needs an MSL twin, and two hand-written shaders kept in sync
-is exactly the duplication this plan exists to avoid. So the shader moves to `sokol-shdc` -
-sokol's own offline compiler, which takes one annotated-GLSL source and emits HLSL *and* MSL
-(compiled per backend) plus the generated `ShaderDesc`, replacing both the `fxc` step and the
-hand-written reflection above. It is a prebuilt binary (`floooh/sokol-tools-bin`), so it is
-vendored or fetched like any other build tool and its output is checked in, keeping a plain
-`cargo build` free of it. The port is a one-time rewrite of ~220 lines of HLSL; the acceptance
-test is that the Windows output is pixel-identical.
+`gpu.rs` asserts `size_of::<Params>()` equals the *generated* uniform-block struct's size, so an
+edit that changes the block fails the build rather than producing a wrong-looking image.
+
+The stages are unchanged from the hand-written HLSL: sample (point when magnifying, aniso+mip when
+minifying, chosen by the two samplers) → HDR exposure/tonemap (float formats only) → channel
+isolation → checkerboard composite, with `Rgba16Unorm` sRGB→linear in the shader. The generated
+HLSL's `packoffset`s and its `b0`/`t0`/`s0`/`s1` registers came out byte-identical to the
+hand-written cbuffer, and neither backend's generated code inserts a Y-flip: `gl_FragCoord` maps
+to `SV_Position` and `[[position]]`, both top-left origin, which is what the pixel math assumes.
+
+**One rule the shader must keep:** never sample inside a per-pixel branch without explicit
+derivatives. The letterbox and outline tests above the sampling are branches, and an
+implicitly-derived LOD inside a branch is undefined where the quad diverges - which is what
+produced a flickering 1 px line on all four image edges. Every tap is `textureLod` or
+`textureGrad`; the fix is commit `897bc7e` and the flicker is gone.
 
 ---
 
@@ -250,7 +256,7 @@ and this table is what it is pointing at.
 | --- | --- | --- | --- |
 | Window, loop, DPI, DnD, theme change, fullscreen, placement | - | - | `winit` |
 | GPU device + swapchain | `render/d3d11.rs` (~230 lines): D3D11 device + DXGI flip-model swapchain | `render/metal.rs` (~210 lines): a `CAMetalLayer` on the winit window, handing sokol_gfx its `MTLDevice` and per-frame drawable | `sokol_gfx` above them |
-| Shader bytecode | HLSL → DXBC (`fxc`, build.rs) | MSL → `.metallib` (`xcrun metal`, build.rs; planned - D4, D24) | one `sokol-shdc` source once it lands |
+| Shader bytecode | HLSL → DXBC (`fxc`, build.rs) | MSL → `.metallib` (`xcrun metal` + `metallib`, build.rs) | one `sokol-shdc` source (`render/shader.glsl`) generating both, plus the reflection |
 | Config dir | `%APPDATA%\fire` | `~/Library/Application Support/fire` | `dirs` |
 | Dark mode | - | - | `winit` `Window::theme()` / `ThemeChanged` (registry read removed) |
 | Open-file dialog + startup error boxes | - | - | `rfd` |
@@ -313,8 +319,13 @@ checkout must do too. What that needs, and what is in the way.
 
 * **Xcode** (full, not just Command Line Tools), plus the separately-downloaded Metal toolchain
   on Xcode 16+. D24 puts `xcrun metal` on the build path; Xcode also carries `notarytool` /
-  `stapler` for D12 and Instruments for launch-path profiling. Verify with
-  `xcrun --find metal notarytool stapler` before believing an install is complete.
+  `stapler` for D12 and Instruments for launch-path profiling. **`xcrun --find metal` is not a
+  sufficient check**: on Xcode 16+ it finds a *stub* that exists before the Metal toolchain does,
+  and only fails when run ("cannot execute tool 'metal' due to missing Metal Toolchain"). Install
+  it with `xcodebuild -downloadComponent MetalToolchain` (839 MB) and verify by *running*
+  `xcrun -sdk macosx metal --version`. The failure this hides is quiet in both directions:
+  sokol-shdc, asked for bytecode without it, emits shader *source* and exits 0 - which would put
+  shader compilation back on the launch path, the cost D4 exists to avoid.
 * **rustup**, stable channel. `rust-toolchain.toml` currently pins
   `targets = ["x86_64-pc-windows-msvc"]`, which makes a Mac download a Windows std it will never
   use; make the list host-conditional or add `aarch64-apple-darwin` beside it.
@@ -411,9 +422,11 @@ and clippy on macOS never sees `render/d3d11.rs`, so a single-host CI cannot kee
 lint-clean once the second leaf exists.
 
 `scripts/ttfp.ps1` is PowerShell; it gets a shell twin (or runs under `pwsh`). `ttfp.rs`'s
-non-Windows arm measures from the process's own clock, which cannot see loader/dyld time, so mac
-numbers compare mac builds against each other - the Windows figures in §8 are not a baseline
-for them.
+non-Windows arm does not yet measure anything: it initialises its `OnceLock` start instant inside
+the measurement itself, so it always reports ~0.000 ms. Step 7 has to give it a real origin -
+`kinfo_proc.kp_proc.p_starttime` via sysctl is the true equivalent of the Windows arm's kernel
+process-creation time, and unlike an `Instant` set in `main` it sees dyld. Either way mac numbers
+compare mac builds against each other; the Windows figures in §8 are not a baseline for them.
 
 ---
 
@@ -483,6 +496,13 @@ nothing after them can be checked without it.
 4. Shader: adopt `sokol-shdc` (D4) so one source produces both DXBC and MSL plus the reflection,
    and compile the MSL to a `.metallib` with `xcrun metal` in build.rs (D24); verify the Windows
    output is unchanged before deleting the hand-written path. First `cargo run -p fire`.
+   **Done** (2026-09-04): `shader.hlsl` is gone, replaced by `shader.glsl` + `render/generated/`
+   (§4). **First pixel on macOS** - debug and release both present image frames through the Metal
+   swapchain with no sokol validation errors, which also exercises the whole of `render/metal.rs`
+   for the first time. Release phases: Metal device 49 ms (D3D11 is ~135 ms), `sg_setup` 0.9 ms,
+   pipeline 0.9 ms, window 32 ms (Windows: 9 ms), swapchain 0.4 ms, ImGui 3.4 ms. The
+   hand-written HLSL path was deleted per the step's own instruction, so **the Windows half is
+   generated but unbuilt** - that is the outstanding verification, and `git` holds the old file.
 5. Leaves: the open-file delegate hook, the `muda` menu bar, native fullscreen mapping, pinch,
    the clipboard twin.
 6. Retina: `scale_factor` into fit/1:1; verify the zoom-snap ladder lands on true 100 %.
@@ -530,10 +550,12 @@ now reports).
   at once, sometimes before the first window exists. The open path must tolerate "no window
   yet" and a batch.
 - **The toolchain floor is full Xcode (D24)** - not Command Line Tools, and on Xcode 16+ the
-  Metal toolchain is a further download. Every dev machine and the CI runner pay it, and the
-  failure mode is a `xcrun metal` that is simply absent. If that becomes intolerable, the
-  fallback is shipping MSL source and letting sokol_gfx compile it at pipeline creation - which
-  puts shader compilation back on the launch path, the cost D4 exists to avoid.
+  Metal toolchain is a further 839 MB download. Every dev machine and the CI runner pay it. The
+  failure mode is worse than "absent": `xcrun --find metal` *succeeds* against a stub, and
+  sokol-shdc asked for bytecode without the real toolchain emits source and exits 0, so the
+  build silently degrades into runtime shader compilation - the cost D4 exists to avoid. §7.1
+  has the check that actually detects it. If the floor becomes intolerable, that same degraded
+  mode is the deliberate fallback.
 - **The vendored native trees are now per-target (D25)** - two sets of artifacts under one
   `vendor/`, produced by two runs of the same recipe, cached by CI under keys that must not
   collide. The failure mode is a silently stale or wrong-arch lib, which surfaces as a link

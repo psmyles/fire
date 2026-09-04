@@ -34,6 +34,10 @@ fn main() {
     if target_os == "windows" {
         compile_shaders();
     }
+    #[cfg(target_os = "macos")]
+    if target_os == "macos" {
+        compile_shaders_metal();
+    }
     compile_simgui(&target_os);
     rasterize_icons();
     decode_logo();
@@ -245,26 +249,90 @@ fn read_product() -> Product {
 fn compile_shaders() {
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir = env::var("OUT_DIR").unwrap();
-    let hlsl = Path::new(&manifest).join("src/render/shader.hlsl");
-    println!("cargo:rerun-if-changed={}", hlsl.display());
+    let gen = Path::new(&manifest).join("src/render/generated");
+    // The one source is `shader.glsl`, but cargo never compiles it: `scripts/gen-shaders.sh`
+    // turns it into the per-backend sources below, which are checked in (D4). Rebuild when
+    // either changes, so an edit to the .glsl that was not regenerated is still noticed here.
+    println!("cargo:rerun-if-changed={}", gen.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        Path::new(&manifest)
+            .join("src/render/shader.glsl")
+            .display()
+    );
     println!("cargo:rerun-if-env-changed=FXC");
 
     let fxc = find_fxc();
-    for (entry, target) in [("vs_main", "vs_5_0"), ("ps_main", "ps_5_0")] {
-        let out = Path::new(&out_dir).join(format!("{entry}.dxbc"));
+    // SPIRV-Cross emits one file per stage, each with entry point `main`.
+    for (stage, target) in [("vertex", "vs_5_0"), ("fragment", "ps_5_0")] {
+        let src = gen.join(format!("shader_viewport_hlsl5_{stage}.hlsl"));
+        let out = Path::new(&out_dir).join(format!("{stage}.dxbc"));
         let output = std::process::Command::new(&fxc)
-            .args(["/nologo", "/O3", "/T", target, "/E", entry, "/Fo"])
+            .args(["/nologo", "/O3", "/T", target, "/E", "main", "/Fo"])
             .arg(&out)
-            .arg(&hlsl)
+            .arg(&src)
             .output()
             .unwrap_or_else(|e| panic!("failed to run fxc ({}): {e}", fxc.display()));
         if !output.status.success() {
             panic!(
-                "fxc failed to compile {entry} ({target}):\n{}{}",
+                "fxc failed to compile {} ({target}):\n{}{}",
+                src.display(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
         }
+    }
+}
+
+/// Compile the generated MSL to a `.metallib` per stage with `xcrun metal` + `metallib` (D24), so
+/// nothing compiles a shader on the cold-start path. One library per stage rather than one for
+/// both: SPIRV-Cross names every entry point `main0`, so two functions cannot share a library.
+///
+/// The Metal toolchain is a **separate download** on Xcode 16+ (`xcodebuild -downloadComponent
+/// MetalToolchain`); `xcrun --find metal` succeeds without it, because what it finds is a stub
+/// that fails only when run. That is why the failure below quotes the tool's own stderr.
+#[cfg(target_os = "macos")]
+fn compile_shaders_metal() {
+    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let gen = Path::new(&manifest).join("src/render/generated");
+    println!("cargo:rerun-if-changed={}", gen.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        Path::new(&manifest)
+            .join("src/render/shader.glsl")
+            .display()
+    );
+
+    for stage in ["vertex", "fragment"] {
+        let src = gen.join(format!("shader_viewport_metal_macos_{stage}.metal"));
+        let air = Path::new(&out_dir).join(format!("{stage}.air"));
+        let lib = Path::new(&out_dir).join(format!("{stage}.metallib"));
+
+        run_metal_tool("metal", &["-c", "-O2"], &src, &air);
+        run_metal_tool("metallib", &[], &air, &lib);
+    }
+}
+
+/// One `xcrun -sdk macosx <tool> <args> -o <out> <input>` step of the Metal compile.
+#[cfg(target_os = "macos")]
+fn run_metal_tool(tool: &str, args: &[&str], input: &Path, out: &Path) {
+    let output = std::process::Command::new("xcrun")
+        .args(["-sdk", "macosx", tool])
+        .args(args)
+        .arg("-o")
+        .arg(out)
+        .arg(input)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run `xcrun {tool}`: {e}"));
+    if !output.status.success() {
+        panic!(
+            "`xcrun {tool}` failed on {}:\n{}{}\n\nIf this says the Metal Toolchain is \
+             missing, install it with `xcodebuild -downloadComponent MetalToolchain`.",
+            input.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }
 

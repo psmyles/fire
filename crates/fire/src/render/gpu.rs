@@ -38,11 +38,11 @@ use fire_decode::{AnimationFrame, DecodedImage, PixelFormat};
 use sokol::gfx as sg;
 use winit::window::Window;
 
-use crate::render::backend;
 use crate::render::mips;
 use crate::render::view::{
     Background, Channel, DisplayState, Tonemap, ViewState, Viewport, ZoomDetent,
 };
+use crate::render::{backend, generated_shader};
 
 /// Scrubby-zoom sensitivity: an RMB vertical drag multiplies zoom by `exp(dy * this)` per pixel
 /// (~2.7× per 100 px). Exponential-in-pixels so the gesture feels uniform across the zoom range;
@@ -113,6 +113,9 @@ struct Params {
 
 const PARAMS_SIZE: usize = std::mem::size_of::<Params>();
 const _: () = assert!(PARAMS_SIZE == 128);
+// The uniform block the shader actually declares, as sokol-shdc reflected it. If an edit to
+// `shader.glsl` changes the block, this stops the build here rather than at a wrong-looking image.
+const _: () = assert!(PARAMS_SIZE == std::mem::size_of::<generated_shader::Params>());
 const _: () = assert!(PARAMS_SIZE.is_multiple_of(16));
 
 /// Flipbook render parameters mirrored onto the surface from the active per-path state (the
@@ -370,69 +373,38 @@ impl Drop for Gpu {
     }
 }
 
-/// The viewport shader, from the DXBC `fxc` precompiled at build time (see `build.rs`). The
-/// description is the reflection sokol_gfx cannot do for us: the one 128-byte uniform block at
-/// `b0` (fragment stage), the texture at `t0`, the anisotropic sampler at `s0` and the point
-/// sampler at `s1`, and which sampler pairs with the texture.
-#[cfg(windows)]
+/// The viewport shader: the sokol_gfx reflection generated from the one `shader.glsl` source by
+/// `scripts/gen-shaders.sh` (D4), with this platform's precompiled bytecode swapped in (D24).
+///
+/// build.rs compiles the *generated* per-backend source to bytecode — `fxc` to DXBC on Windows,
+/// `xcrun metal` to a `.metallib` on macOS — so there is no runtime shader compile on either OS
+/// and a broken shader is a build error. What the generated desc brings, and what used to be
+/// written out by hand here, is the reflection sokol_gfx cannot recover from bytecode: the one
+/// 128-byte uniform block, the texture, the anisotropic and point samplers, which sampler pairs
+/// with the texture, and the per-backend entry-point names (`main` for DXBC, `main0` for MSL).
 fn make_shader() -> Result<sg::Shader, String> {
-    static VS_DXBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vs_main.dxbc"));
-    static PS_DXBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ps_main.dxbc"));
+    #[cfg(windows)]
+    static VS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vertex.dxbc"));
+    #[cfg(windows)]
+    static FS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fragment.dxbc"));
+    #[cfg(target_os = "macos")]
+    static VS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vertex.metallib"));
+    #[cfg(target_os = "macos")]
+    static FS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fragment.metallib"));
 
-    let mut d = sg::ShaderDesc::new();
-    d.vertex_func.bytecode = sg::slice_as_range(VS_DXBC);
-    d.fragment_func.bytecode = sg::slice_as_range(PS_DXBC);
-    d.uniform_blocks[0] = sg::ShaderUniformBlock {
-        stage: sg::ShaderStage::Fragment,
-        size: PARAMS_SIZE as u32,
-        hlsl_register_b_n: 0,
-        ..sg::ShaderUniformBlock::new()
-    };
-    d.views[0].texture = sg::ShaderTextureView {
-        stage: sg::ShaderStage::Fragment,
-        image_type: sg::ImageType::Dim2,
-        sample_type: sg::ImageSampleType::Float,
-        multisampled: false,
-        hlsl_register_t_n: 0,
-        ..sg::ShaderTextureView::new()
-    };
-    d.samplers[0] = sg::ShaderSampler {
-        stage: sg::ShaderStage::Fragment,
-        sampler_type: sg::SamplerType::Filtering,
-        hlsl_register_s_n: 0,
-        ..sg::ShaderSampler::new()
-    };
-    d.samplers[1] = sg::ShaderSampler {
-        stage: sg::ShaderStage::Fragment,
-        sampler_type: sg::SamplerType::Nonfiltering,
-        hlsl_register_s_n: 1,
-        ..sg::ShaderSampler::new()
-    };
-    d.texture_sampler_pairs[0] = sg::ShaderTextureSamplerPair {
-        stage: sg::ShaderStage::Fragment,
-        view_slot: 0,
-        sampler_slot: 0,
-        ..sg::ShaderTextureSamplerPair::new()
-    };
-    d.texture_sampler_pairs[1] = sg::ShaderTextureSamplerPair {
-        stage: sg::ShaderStage::Fragment,
-        view_slot: 0,
-        sampler_slot: 1,
-        ..sg::ShaderTextureSamplerPair::new()
-    };
-    d.label = c"fire viewport".as_ptr();
+    let mut d = generated_shader::viewport_shader_desc(sg::query_backend());
+    // The generated desc points its funcs at the source it embedded, because that file is checked
+    // in and has to be byte-identical whichever OS regenerates it. Replace them with the bytecode
+    // build.rs produced; every binding it set stays as generated.
+    d.vertex_func.source = std::ptr::null();
+    d.vertex_func.bytecode = sg::slice_as_range(VS);
+    d.fragment_func.source = std::ptr::null();
+    d.fragment_func.bytecode = sg::slice_as_range(FS);
     let shader = sg::make_shader(&d);
     if sg::query_shader_state(shader) != sg::ResourceState::Valid {
         return Err("the viewport shader could not be created".into());
     }
     Ok(shader)
-}
-
-/// The Metal (MSL) twin of the viewport shader is not compiled yet; this prototype measures the
-/// Windows shell.
-#[cfg(not(windows))]
-fn make_shader() -> Result<sg::Shader, String> {
-    Err("the viewport shader is only built for D3D11 in this prototype".into())
 }
 
 /// A pixel conversion applied to every level when the device lacks the source format.

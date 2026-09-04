@@ -45,3 +45,6 @@ desktop.ini
 
 untracked_docs
 CLAUDE.md
+
+# sokol-shdc, fetched on demand by scripts/gen-shaders.sh (see D4). Not needed by cargo build.
+.tools/
