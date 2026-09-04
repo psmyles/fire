@@ -170,6 +170,12 @@ fn main() {
     if let Err(e) = event_loop.run_app(&mut fire) {
         eprintln!("fire: event loop error: {e}");
     }
+    // Anything the loop could not report while it was running — a window that would not open.
+    // Deferred to here because a message box is modal, and a modal loop entered from inside a
+    // winit handler is the re-entrancy crash `app::viewer::Dialog` describes.
+    if let Some(message) = fire.take_fatal() {
+        fatal_startup_error(&message);
+    }
 }
 
 /// Last-resort startup failure report. The release build has no console on Windows, so stderr

@@ -58,6 +58,14 @@ pub enum AppEvent {
     /// only the *watcher* that sends it is debug-gated.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     ThemeReloaded,
+    /// A native file dialog finished (or was cancelled). It runs on a worker thread — see
+    /// [`viewer::Dialog`] for why it cannot run inside a handler — so its answer comes back
+    /// through the loop like any other cross-thread result.
+    DialogDone {
+        window: WindowId,
+        dialog: Dialog,
+        path: Option<PathBuf>,
+    },
     /// A macOS menu-bar item that Fire performs itself (D16). It carries a [`KeyAction`] rather
     /// than a command of its own so the menu and the keyboard cannot drift apart: both end in
     /// `Viewer::perform_key_action`.
@@ -77,6 +85,14 @@ impl std::fmt::Debug for AppEvent {
             AppEvent::FileChanged { window, generation } => {
                 write!(f, "FileChanged({window:?}, gen {generation})")
             }
+            AppEvent::DialogDone {
+                window,
+                dialog,
+                path,
+            } => match path {
+                Some(p) => write!(f, "DialogDone({window:?}, {dialog:?}, {})", p.display()),
+                None => write!(f, "DialogDone({window:?}, {dialog:?}, cancelled)"),
+            },
             AppEvent::ThemeReloaded => write!(f, "ThemeReloaded"),
             #[cfg(target_os = "macos")]
             AppEvent::MenuCommand(a) => write!(f, "MenuCommand({})", a.name()),
@@ -104,6 +120,8 @@ pub struct Initial {
 
 /// The application: the event-loop handler and everything shared between windows.
 pub struct Fire {
+    /// A fatal error to report once the event loop has returned; see `create_viewer`.
+    fatal: Option<String>,
     cfg: Config,
     proxy: EventLoopProxy<AppEvent>,
     pool: DecodePool,
@@ -137,6 +155,7 @@ impl Fire {
         #[cfg(debug_assertions)]
         let hotstyle = crate::hotstyle::spawn(proxy.clone());
         Fire {
+            fatal: None,
             cfg,
             proxy,
             pool,
@@ -151,6 +170,11 @@ impl Fire {
             #[cfg(debug_assertions)]
             _hotstyle: hotstyle,
         }
+    }
+
+    /// A fatal error the loop could not report itself, for `main` to show after `run_app`.
+    pub fn take_fatal(&mut self) -> Option<String> {
+        self.fatal.take()
     }
 
     /// The GPU: the bring-up thread's result the first time, then the shared handle.
@@ -211,15 +235,14 @@ impl Fire {
                 if self.viewers.is_empty() {
                     // The release build has no console, so stderr goes nowhere and a silent exit
                     // would be indistinguishable from a crash: a dialog is the only channel the
-                    // user actually sees at this point.
-                    rfd::MessageDialog::new()
-                        .set_title(crate::product::NAME)
-                        .set_level(rfd::MessageLevel::Error)
-                        .set_description(format!(
-                            "{} could not open a window.\n\n{e}",
-                            crate::product::NAME
-                        ))
-                        .show();
+                    // user actually sees at this point. It is *recorded* rather than shown here,
+                    // and `main` puts it up once the loop has returned — a message box is modal
+                    // too, and a modal loop opened from inside a handler is the crash `Dialog`
+                    // describes. There is no window left to be modal to anyway.
+                    self.fatal = Some(format!(
+                        "{} could not open a window.\n\n{e}",
+                        crate::product::NAME
+                    ));
                     el.exit();
                 }
             }
@@ -285,6 +308,17 @@ impl Fire {
                     v.reload(generation);
                 }
             }
+            AppEvent::DialogDone {
+                window,
+                dialog,
+                path,
+            } => {
+                // The window may have closed while the picker was up; then there is nothing to
+                // apply the answer to.
+                if let Some(v) = self.viewers.get_mut(&window) {
+                    v.dialog_done(dialog, path);
+                }
+            }
             AppEvent::ThemeReloaded => {
                 for v in self.viewers.values_mut() {
                     v.restyle();
@@ -328,9 +362,9 @@ impl Fire {
         }
     }
 
-    /// Run any native dialog a viewer asked for. Deliberately here, at the top of the loop's idle
-    /// point, and never from inside a redraw: the open-file dialog pumps its own modal message
-    /// loop for as long as it is up.
+    /// Start any native dialog a viewer asked for. Cheap now — each one goes to its own thread
+    /// and answers with [`AppEvent::DialogDone`] — but still done here at the idle point rather
+    /// than mid-event, so a request made during a redraw does not put a picker up underneath it.
     fn run_dialogs(&mut self) {
         let pending: Vec<(WindowId, Dialog)> = self
             .viewers

@@ -98,15 +98,52 @@ fn anim_deadline(delay_ms: u32) -> Instant {
     Instant::now() + Duration::from_millis(delay_ms.max(1) as u64)
 }
 
-/// A native dialog a viewer wants run. Requested during an event and run from the loop's idle
-/// step (`Fire::run_dialogs`): the dialog pumps its own modal message loop, which must never be
-/// entered from inside a redraw.
+/// A native dialog a viewer wants run. Requested during an event, started from the loop's idle
+/// step (`Fire::run_dialogs`), and answered later by [`AppEvent::DialogDone`].
+///
+/// **The dialog runs on a worker thread, and that is not an optimisation.** `rfd` puts up an
+/// app-modal picker that pumps its own event loop for as long as it is up. Run from inside a
+/// winit callback — which is what every one of our handlers is, the idle step included — that
+/// nested loop feeds events straight back into winit's dispatcher, which refuses to re-enter and
+/// panics ("tried to handle event while another event is currently being handled"). The panic
+/// then unwinds into a CoreFoundation run-loop callback, where unwinding is not allowed, and the
+/// process aborts. It was a reliable crash: open the picker, move the mouse over it, gone.
+///
+/// Off-thread, `rfd` hands the panel to the main thread itself (a `dispatch_sync` on macOS,
+/// per-call COM init on Windows), so the modal loop runs from the *run loop* rather than from
+/// inside our handler and re-entrancy never arises. It also means the window behind the picker
+/// keeps redrawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialog {
     /// Ctrl+O / the empty-viewport double-click: pick an image to open.
     OpenImage,
     /// The settings window's "Browse…": pick a program for an open-with entry.
     BrowseProgram,
+}
+
+/// Put up the native file picker and wait for it. **Worker thread only** — see [`Dialog`].
+///
+/// `window` is the owner: it is what the picker is modal to, and on Windows what it is centred
+/// over. `rfd` resolves it on the main thread, inside its own hand-off, so passing it across the
+/// thread boundary here is sound.
+fn pick(dialog: Dialog, window: &Window) -> Option<PathBuf> {
+    match dialog {
+        // The extensions come from `fire_decode::SUPPORTED_EXTENSIONS` — the same list folder
+        // navigation uses. (A file the filter misses is still openable via "All files": the
+        // decoder routes by magic bytes, not by name.)
+        Dialog::OpenImage => rfd::FileDialog::new()
+            .set_title("Open image")
+            .add_filter("Image files", fire_decode::SUPPORTED_EXTENSIONS)
+            .add_filter("All files", &["*"])
+            .set_parent(window)
+            .pick_file(),
+        Dialog::BrowseProgram => rfd::FileDialog::new()
+            .set_title("Choose a program")
+            .add_filter("Programs", &["exe", "com", "bat", "cmd", "app"])
+            .add_filter("All files", &["*"])
+            .set_parent(window)
+            .pick_file(),
+    }
 }
 
 /// What a viewer asked the shell for during the last event (see `Fire::after_dispatch`).
@@ -220,6 +257,8 @@ pub struct Viewer {
     maximized: bool,
     requests: Requests,
     dialog: Option<Dialog>,
+    /// A picker is up. One at a time: see `run_dialog`.
+    dialog_running: bool,
 }
 
 impl Viewer {
@@ -360,6 +399,7 @@ impl Viewer {
             maximized,
             requests: Requests::default(),
             dialog: None,
+            dialog_running: false,
         };
         me.apply_min_size();
         if launcher == Some(LaunchShow::Minimized) {
@@ -1311,36 +1351,47 @@ impl Viewer {
         self.dialog = Some(Dialog::OpenImage);
     }
 
-    /// Run a deferred dialog. The picker pumps its own modal loop; a cancel is a no-op.
+    /// Start a deferred dialog on its own thread. The answer comes back as
+    /// [`AppEvent::DialogDone`]; see [`Dialog`] for why it must not run here.
     pub fn run_dialog(&mut self, dialog: Dialog) {
+        // One picker at a time. It is app-modal, so the user cannot normally ask for a second —
+        // but a stray request must not put up two panels or spawn a thread per frame.
+        if self.dialog_running {
+            return;
+        }
+        let (proxy, window, id) = (self.proxy.clone(), Arc::clone(&self.window), self.id());
+        let spawned = std::thread::Builder::new()
+            .name("fire-file-dialog".into())
+            .spawn(move || {
+                let path = pick(dialog, &window);
+                // A closed event loop means the app is exiting; the answer has nowhere to go.
+                let _ = proxy.send_event(AppEvent::DialogDone {
+                    window: id,
+                    dialog,
+                    path,
+                });
+            });
+        match spawned {
+            Ok(_) => self.dialog_running = true,
+            // Refusing to open a picker is better than opening one that crashes the process.
+            Err(e) => eprintln!("fire: could not start the file-dialog thread: {e}"),
+        }
+    }
+
+    /// Apply a finished dialog. A cancel (`None`) is a no-op beyond releasing the guard.
+    pub fn dialog_done(&mut self, dialog: Dialog, path: Option<PathBuf>) {
+        self.dialog_running = false;
+        let Some(path) = path else {
+            return;
+        };
         match dialog {
-            Dialog::OpenImage => {
-                // The extensions come from `fire_decode::SUPPORTED_EXTENSIONS` — the same list
-                // folder navigation uses. (A file the filter misses is still openable via "All
-                // files": the decoder routes by magic bytes, not by name.)
-                let picked = rfd::FileDialog::new()
-                    .set_title("Open image")
-                    .add_filter("Image files", fire_decode::SUPPORTED_EXTENSIONS)
-                    .add_filter("All files", &["*"])
-                    .set_parent(&*self.window)
-                    .pick_file();
-                if let Some(path) = picked {
-                    self.open(OpenRequest::new(path));
-                }
-            }
+            Dialog::OpenImage => self.open(OpenRequest::new(path)),
             Dialog::BrowseProgram => {
-                let picked = rfd::FileDialog::new()
-                    .set_title("Choose a program")
-                    .add_filter("Programs", &["exe", "com", "bat", "cmd", "app"])
-                    .add_filter("All files", &["*"])
-                    .set_parent(&*self.window)
-                    .pick_file();
-                if let Some(path) = picked {
-                    if let Some(s) = &mut self.settings {
-                        s.set_program(&path.to_string_lossy());
-                    }
-                    self.redraw();
+                // The settings window may have been closed while the picker was up.
+                if let Some(s) = &mut self.settings {
+                    s.set_program(&path.to_string_lossy());
                 }
+                self.redraw();
             }
         }
     }

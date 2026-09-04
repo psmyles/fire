@@ -226,8 +226,34 @@ must be the framebuffer's, not winit's logical one. A DPI change is then just
 `set_font_scale_dpi` - ImGui 1.92 rasterizes glyphs on first use, so there is no atlas to
 rebuild; only the icon texture, a real raster, is rebuilt.
 
-Pinch (`WindowEvent::PinchGesture`, macOS) will drive the same about-cursor zoom as the wheel
-(D15, planned).
+Pinch (`WindowEvent::PinchGesture`, macOS) drives the same about-cursor zoom as the wheel (D15).
+
+### 3.5 No modal loop inside a winit handler
+
+**Nothing called from a winit callback may pump an event loop of its own.** That is a rule the
+Win32 shell did not have, and breaking it is not a glitch - it aborts the process.
+
+Found the hard way (2026-09-04): the Open… picker crashed Fire on macOS, reliably, as soon as the
+mouse moved over the panel. `rfd`'s `pick_file` puts up an app-modal `NSOpenPanel` and calls
+`runModal`, which pumps its own loop. We were calling it from `about_to_wait` - deliberately, from
+the Win32 days: "never from inside a redraw". But **every** one of our handlers, the idle step
+included, runs inside winit's dispatcher, which holds a `RefCell` borrow for the whole call.
+AppKit's modal loop then routes a mouse event through winit's `sendEvent:` override, a gesture
+recognizer spins a *third* loop (`runUntilDate:`), a run-loop block re-enters winit's
+`handle_event`, and it panics: *"tried to handle event while another event is currently being
+handled"*. The panic unwinds into a CoreFoundation callback, where unwinding is forbidden, so the
+process aborts - `firewall`'s `catch_unwind` is nowhere near that path, and could not have caught
+it anyway. Windows has the same guard in its runner and so is exposed to the same class of bug.
+
+The fix is to start the picker on a worker thread and answer with an `AppEvent`
+(`app::viewer::Dialog`). `rfd` hands the panel to the main thread itself (`dispatch_sync` on
+macOS, per-call COM init on Windows), so the modal loop runs from the *run loop* rather than from
+inside our handler, and re-entrancy never arises. As a bonus the window behind the picker stays
+live - verified on screen: an image forwarded from a second launch loaded and redrew *while* the
+picker was up, which is exactly the dispatch that used to abort.
+
+The same rule retired the last blocking call: the "could not open a window" message box in
+`create_viewer` is now recorded and shown by `main` after `run_app` returns.
 
 ---
 
