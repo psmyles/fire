@@ -71,7 +71,7 @@ Each is stated with the reason and what it costs, so a future revision can revis
 | D8 | **Timers: `ControlFlow::WaitUntil` + a deadline min-heap** | Preserves the event-driven invariant (no input, no timer → no frame) with zero threads | Small scheduler in the app; every timer (GIF, flipbook, caret) goes through it | Shipped |
 | D9 | **Keybinds: physical `KeyCode` by name + a `Primary` modifier** (Ctrl on Windows, ⌘ on macOS) | Layout-independent, one `config.toml` works on both | One-time migration of existing VK-code chords; `Ctrl+`/`Cmd+` still parse as `Primary+` | Shipped |
 | D10 | **macOS: Apple Silicon only, vendored arm64 static libs** for libheif/libde265/dav1d + `cc`-built psd_sdk | Same vendoring model as the Windows `.lib`s; no Intel users to serve | Re-run `VENDOR.txt` on a Mac; universal deferred | Planned |
-| D11 | **Build on the dev Mac; CI on GitHub Actions `macos-latest`** for sign + notarize | Public repo, free arm64 minutes | Developer ID cert + App Store Connect key as secrets | Planned |
+| D11 | **Build, sign and notarize only on the dev Mac, via `scripts/build-mac.sh`** - CI never builds a mac artifact | Keeps the Developer ID cert and App Store Connect key off CI entirely, on a public repo; CI's mac leg (D23) stays lint/test only | Releases are a manual step on the dev Mac rather than a CI-triggered build | Planned |
 | D12 | **Packaging: `scripts/build-mac.sh` + `Info.plist` template from `product.json`, signed + notarized `.dmg`** | Mirrors `build-installer.ps1`; plist is hand-tuned anyway (cargo-bundle would hide it) | `.dmg` is more script than `.zip`; accepted for polish | Planned |
 | D13 | **Windows first, then macOS** | The shared code and the TTFP risk were the Windows migration; mac is leaves + packaging | Colleagues wait one extra phase | Done |
 | D14 | *(wgpu-era: pinned backend, no debug layers, decode kicked off before device creation)* | - | - | Superseded (A.2); the surviving idea is D18 |
@@ -361,8 +361,10 @@ what unblocks it.
 
 CI gains a `macos-latest` leg mirroring the two Windows jobs - `check` with
 `--no-default-features` (no vendored input, no libclang needed) and `full` gated on a restored
-vendor tree - plus the sign/notarize job of D11/D12. The `full` leg's cache key must include the
-target, or the arm64 `.a`s and the x64 `.lib`s collide in one cache entry.
+vendor tree. The `full` leg's cache key must include the target, or the arm64 `.a`s and the x64
+`.lib`s collide in one cache entry. Per D11, CI stops there: it never signs, notarizes or
+packages a `.dmg` - that only runs on the dev Mac via `scripts/build-mac.sh`, so the Developer ID
+cert and App Store Connect key never need to exist as CI secrets.
 
 Both legs are mandatory rather than nice-to-have: clippy on Windows never sees `render/metal.rs`
 and clippy on macOS never sees `render/d3d11.rs`, so a single-host CI cannot keep the workspace
@@ -442,7 +444,8 @@ nothing after them can be checked without it.
 9. `build-mac.sh`: `.app` layout, `Info.plist` from `product.json` (every extension from the
    installer's list, `LSHandlerRank = Alternate`, `CFBundleIconFile`), `codesign --options
    runtime --timestamp`, `notarytool submit --wait`, `stapler`, `hdiutil` → `dist/Fire-<ver>.dmg`;
-   then the CI job that runs it with the cert/key from secrets, artifact = the dmg.
+   run by hand on the dev Mac, whose keychain holds the Developer ID cert (D11) - no CI job
+   invokes it.
 10. Hand the dmg to the colleagues; the first thing to test is Finder double-click on an
     already-running Fire (the Apple-Event path) and drag onto the Dock icon.
 
