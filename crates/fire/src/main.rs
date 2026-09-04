@@ -1,25 +1,24 @@
-//! fire — a native Win32 image viewer (single self-coordinating exe; Explorer launches it
-//! directly with the image path).
+//! fire — a native image viewer. One process, one event loop, N windows (see `app`).
 //!
-//! Lifecycle is chosen by config (`InstanceMode`):
-//!   * **NewWindow** (default): just open our own window for the path. No mutex, no pipe,
-//!     nothing listening — each launch is an independent process that exits when its window
-//!     closes.
-//!   * **SingleInstance**: acquire a mutex. If we win, open the window AND serve a pipe so
-//!     later launches reuse this window; if another instance already owns it, forward the
-//!     path to it over the pipe and exit. The pipe lives only inside the running window's
-//!     process — nothing stays resident once the window closes.
+//! Launch: read the config, then try to become the instance by binding the local socket
+//! ([`ipc_server::bind`]). The first launch succeeds and runs the event loop; every later one finds
+//! the socket taken, forwards its path to the owner ([`forward`]) and exits. What the owner does
+//! with a forwarded path — a new window, or the focused one — is the `open-in` setting. The bind
+//! *is* the single-instance lock; there is no mutex.
+//!
+//! The launch path's decode is submitted before the event loop starts and before any window or GPU
+//! exists, so the file is read while those come up: nothing waits on anything it does not need.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod app;
 mod chrome;
 mod config;
 mod decode_pool;
 mod flipbook;
 mod folder;
-mod foreground;
 mod forward;
-// Live-reload of `ui/theme.toml` into the running window. Debug only — a release build has no
+// Live-reload of `ui/theme.toml` into the running windows. Debug only — a release build has no
 // source tree to watch and embeds the stylesheet instead.
 #[cfg(debug_assertions)]
 mod hotstyle;
@@ -27,93 +26,99 @@ mod icons;
 mod ipc_server;
 mod keybinds;
 mod octagon;
+mod platform;
 mod product;
 mod render;
 mod transport;
+mod ttfp;
 mod ui;
 mod util;
 mod watcher;
-mod win;
 mod window_state;
 
 use std::path::PathBuf;
-use std::ptr;
 
-use config::{Config, InstanceMode};
-use fire_ipc::MUTEX_NAME;
+use winit::event_loop::EventLoop;
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
-use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-};
+use app::{AppEvent, Fire, Initial, MAX_CPU_DIM};
+use config::Config;
+use decode_pool::{fresh_generation, DecodeJob, DecodePool};
 
 fn main() {
-    // Declare Per-Monitor-V2 DPI awareness *before* any window exists, so the OS never
-    // bitmap-stretches us: the title bar/non-client area auto-scale, WM_DPICHANGED fires on
-    // monitor moves, and our client chrome scales from GetDpiForWindow. (Doing this in code
-    // rather than a manifest keeps it in one place and avoids manifest-embedding plumbing.)
-    unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
-
-    // Explorer passes the double-clicked file as the first argument.
+    // The file manager passes the double-clicked file as the first argument.
     let path: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
     // Drop a commented config.toml on first run (no-op if one already exists), so the settings are
     // discoverable, then read it.
     config::ensure_default_config();
     let cfg = Config::load();
 
-    match cfg.instance_mode {
-        InstanceMode::NewWindow => {
-            // Plain app: our own window, no coordination of any kind.
-            win::run(path, false, cfg);
-        }
-        InstanceMode::SingleInstance => match SingleInstance::acquire() {
-            // We're the owner: open the window and serve the pipe for later launches.
-            Some(_guard) => win::run(path, true, cfg),
-            // Another window owns the pipe: hand it the path and exit.
-            None => {
-                if let Err(e) = forward::forward(path) {
-                    eprintln!("fire: forward to running instance failed: {e}");
-                }
+    // Start the GPU bring-up *now*, on its own thread — it needs no window, and it is the longest
+    // single item on the launch path (see `render::gpu::Gpu::start`). It runs alongside
+    // everything below and the first window joins it.
+    let gpu = render::gpu::Gpu::start();
+
+    let listener = match ipc_server::bind() {
+        Ok(l) => Some(l),
+        // Another Fire owns the socket: hand it the path and exit.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            if let Err(e) = forward::forward(path) {
+                eprintln!("fire: forward to running instance failed: {e}");
             }
-        },
+            return;
+        }
+        // The OS refused the socket outright. Run anyway, un-coordinated: refusing to open an
+        // image over a missing convenience would be the wrong trade.
+        Err(e) => {
+            eprintln!("fire: instance socket unavailable ({e}); running without it");
+            None
+        }
+    };
+
+    let event_loop = match EventLoop::<AppEvent>::with_user_event().build() {
+        Ok(l) => l,
+        Err(e) => {
+            fatal_startup_error(&format!("fire could not create its event loop.\n\n{e}"));
+            return;
+        }
+    };
+    let proxy = event_loop.create_proxy();
+
+    // Start the decode *now* — before the window, before the GPU — so the file is being read
+    // while both come up. The first window adopts the request when it is created.
+    let pool = DecodePool::new(proxy.clone());
+    let initial = path.map(|path| {
+        let generation = fresh_generation();
+        pool.submit(DecodeJob {
+            window: None,
+            generation,
+            path: path.clone(),
+            opts: fire_decode::DecodeOptions {
+                max_dim: MAX_CPU_DIM,
+                honor_icc: true,
+            },
+            reload: false,
+            detect_flipbook: cfg.flipbook.auto_detect,
+        });
+        Initial { path, generation }
+    });
+
+    if let Some(listener) = listener {
+        ipc_server::spawn(listener, proxy.clone());
+    }
+
+    let mut fire = Fire::new(cfg, proxy, pool, initial, gpu);
+    if let Err(e) = event_loop.run_app(&mut fire) {
+        eprintln!("fire: event loop error: {e}");
     }
 }
 
-/// Holds the single-instance mutex for the process lifetime (SingleInstance mode only).
-struct SingleInstance(HANDLE);
-
-impl SingleInstance {
-    /// Returns `Some` if we are the first instance, `None` if another already holds it.
-    fn acquire() -> Option<Self> {
-        let name = util::wide(MUTEX_NAME);
-        // SAFETY: name is a valid null-terminated wide string; null attributes are fine.
-        let handle = unsafe {
-            CreateMutexW(ptr::null(), 1 /* initial owner */, name.as_ptr())
-        };
-        if handle.is_null() {
-            // Couldn't create the mutex; proceed without the guarantee rather than refuse, but
-            // surface why single-instance coordination silently degraded to multi-instance.
-            eprintln!(
-                "fire: CreateMutexW failed (err {}); running without the single-instance guarantee",
-                unsafe { GetLastError() }
-            );
-            return Some(SingleInstance(ptr::null_mut()));
-        }
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            unsafe { CloseHandle(handle) };
-            return None;
-        }
-        Some(SingleInstance(handle))
-    }
-}
-
-impl Drop for SingleInstance {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { CloseHandle(self.0) };
-        }
-    }
+/// Last-resort startup failure report. The release build has no console on Windows, so stderr
+/// goes nowhere and a panic would be an invisible abort — a message box is the only channel the
+/// user actually sees at this point.
+fn fatal_startup_error(text: &str) {
+    rfd::MessageDialog::new()
+        .set_title(product::NAME)
+        .set_level(rfd::MessageLevel::Error)
+        .set_description(text)
+        .show();
 }

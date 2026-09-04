@@ -1,67 +1,73 @@
-//! The Dear ImGui layer: context, the two upstream backends, and the icon atlas texture.
+//! The Dear ImGui layer: one context per window, its winit platform backend and wgpu renderer,
+//! and the two textures the UI draws from (the icon atlas, the empty-window logo).
 //!
-//! Lives in `render/` because it is the *other* place that legitimately touches the typed `windows`
-//! crate — it hands D3D11 device/context pointers to the DX11 backend and builds the icon texture.
-//! Everything above it (`crate::ui`) is pure immediate-mode UI code with no Win32 or COM in sight.
+//! Lives in `render/` because it is the *other* place that legitimately names `wgpu` — it builds
+//! the textures and hands the renderer a render pass. Everything above it (`crate::ui`) is pure
+//! immediate-mode UI code with no GPU API in sight.
 //!
-//! **We own no backend code.** `dear-imgui-sys`'s `backend-shim-win32` / `backend-shim-dx11`
-//! features compile ocornut's own `imgui_impl_win32.cpp` / `imgui_impl_dx11.cpp` and expose them
-//! over the C ABI declared below. That is the whole reason this dependency is acceptable: the
-//! platform/renderer glue — historically the part that rots — is upstream's problem, not ours.
+//! **We own no backend code.** `dear-imgui-winit` and `dear-imgui-wgpu` are the maintained
+//! backends of the same crate family as `dear-imgui-rs` itself, released in step with it. That is
+//! the whole reason this dependency is acceptable: the platform/renderer glue — historically the
+//! part that rots — is upstream's problem, and it is the same glue on every OS.
 //!
-//! Two things here are load-bearing and easy to get wrong:
+//! **One context per window, and only one is ever current.** Dear ImGui has a single current
+//! context; `dear-imgui-rs` models that as an active [`Context`] or a [`SuspendedContext`]. Every
+//! window's context lives here *suspended*, and each operation activates it for exactly the
+//! duration of a closure ([`Imgui::with`]) — so N windows in one process never race over the global,
+//! and there is no ordering rule for the caller to remember.
 //!
-//! * **sRGB.** The image pass renders through an `*_SRGB` RTV (the shader emits linear light).
+//! Three things here are load-bearing and easy to get wrong:
+//!
+//! * **sRGB.** The image pass renders through an `*Srgb` view (the shader emits linear light).
 //!   ImGui's colors are *already* sRGB, so drawing it through that same view would double-encode and
-//!   wash the entire UI out. The UI pass therefore binds a second, plain-`UNORM` view of the very
-//!   same backbuffer — see [`crate::render::gpu::GpuSurface::begin_frame`].
+//!   wash the entire UI out. The UI pass therefore draws through the plain `Unorm` view of the very
+//!   same texture — see [`crate::render::gpu::GpuSurface::render_frame`] — and the renderer is told
+//!   that UNORM format so it does not gamma-correct either.
 //! * **DPI.** ImGui 1.92's dynamic font system rasterizes glyphs on first use, so a DPI change is
 //!   just `set_font_scale_dpi` — there is no atlas to rebuild. Only the icon texture (a real
-//!   raster) gets rebuilt, in [`Imgui::set_dpi`].
+//!   raster) gets rebuilt, in [`Imgui::refresh_icons`]. The platform backend runs with its DPI
+//!   handling *locked to 1.0*: the whole UI lays out in physical pixels (`ui::theme::Metrics` scales
+//!   from the DPI itself), so ImGui's coordinate space must be the framebuffer's, not winit's logical
+//!   one.
+//! * **The frame closes even if the UI panics.** A panic mid-frame would leave the context between
+//!   `NewFrame` and `Render`, and the next frame would assert. The build closure runs under
+//!   `catch_unwind`; whatever it managed to build is rendered, the panic is logged, and the app
+//!   carries on — the same recovery the Win32 shell's wndproc firewall used to give.
 
-use std::ffi::c_void;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
 
-use dear_imgui_rs::{Context, FontSource, TextureId, Ui};
-use dear_imgui_sys as sys;
-use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_IMMUTABLE,
-};
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+use dear_imgui_rs::{sys, Context, FontSource, Style, SuspendedContext, TextureId, Ui};
+use dear_imgui_wgpu::{ExternalTextureId, FramebufferExtent, WgpuInitInfo, WgpuRenderer};
+use dear_imgui_winit::{HiDpiMode, WinitPlatform};
+use winit::event::WindowEvent;
+use winit::window::Window;
 
 use crate::icons;
+use crate::render::gpu::{Gpu, SURFACE_FORMAT};
 
 /// The empty-window logo: `assets/icon-256.png`, decoded to raw straight-alpha RGBA at build
 /// time by build.rs (no PNG decoder ships in the exe). Edge kept in sync with build.rs's
 /// `LOGO_EDGE`.
-const LOGO_EDGE: u32 = 256;
-static LOGO_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo.rgba"));
+pub const LOGO_EDGE: u32 = 256;
+pub static LOGO_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo.rgba"));
 
-// ocornut's Win32 + DX11 backends, compiled by dear-imgui-sys. Declared, never implemented.
-unsafe extern "C" {
-    fn dear_imgui_backend_win32_init(hwnd: *mut c_void) -> bool;
-    fn dear_imgui_backend_win32_new_frame();
-    fn dear_imgui_backend_win32_wnd_proc_handler(
-        hwnd: *mut c_void,
-        msg: u32,
-        wparam: usize,
-        lparam: isize,
-    ) -> isize;
-    fn dear_imgui_backend_win32_shutdown();
-    fn dear_imgui_backend_dx11_init(device: *mut c_void, device_context: *mut c_void) -> bool;
-    fn dear_imgui_backend_dx11_new_frame();
-    fn dear_imgui_backend_dx11_render_draw_data(draw_data: *mut c_void);
-    fn dear_imgui_backend_dx11_shutdown();
+/// A texture the UI draws from, owned here: the GPU texture and the renderer's handle to it. Both
+/// must outlive every frame that references the handle, so they are only ever replaced wholesale.
+struct UiTexture {
+    _tex: wgpu::Texture,
+    handle: ExternalTextureId,
 }
 
 pub struct Imgui {
-    ctx: Context,
-    /// The icon atlas. ImGui refers to it by raw SRV pointer, so both must outlive every frame that
-    /// references them — hence they are owned here and only ever replaced wholesale.
-    _icon_tex: Option<ID3D11Texture2D>,
-    icon_srv: Option<ID3D11ShaderResourceView>,
+    ctx: SuspendedContext,
+    platform: WinitPlatform,
+    renderer: WgpuRenderer,
+    gpu: Rc<Gpu>,
+    window: Arc<Window>,
+    /// The icon atlas.
+    icon: Option<UiTexture>,
     icon_id: TextureId,
     /// Physical edge the atlas was last rastered at, so [`Imgui::refresh_icons`] can tell whether a
     /// DPI or stylesheet change actually moved it.
@@ -70,17 +76,21 @@ pub struct Imgui {
     /// Zeroes until the first build, and zero is never a legal scale, so the first check builds.
     icon_built_scales: [f32; icons::COUNT],
     /// The empty-window logo, built lazily by [`Imgui::logo`] — an image launch never uploads it.
-    /// Same ownership rule as the icon atlas: ImGui holds the raw SRV pointer, so both live here.
-    _logo_tex: Option<ID3D11Texture2D>,
-    _logo_srv: Option<ID3D11ShaderResourceView>,
+    logo: Option<UiTexture>,
     logo_id: TextureId,
     /// Set once [`Imgui::logo`] has tried, success or not — a failed build is not retried (and
     /// not re-logged) every empty-state frame.
     logo_built: bool,
     dpi: u32,
     /// ImGui's factory style, captured at creation *before* [`crate::ui::theme`] overwrites it.
-    /// The settings window is drawn with this — see [`StockStyle`].
+    /// The settings window is drawn with this — see [`FormStyle`].
     stock: sys::ImGuiStyle,
+    /// ImGui's ownership booleans, cached after every event and frame so the shell can route
+    /// input without activating the context: does a widget own the pointer, do the keys belong to
+    /// ImGui, is a text field being typed into.
+    want_mouse: bool,
+    want_keyboard: bool,
+    want_text: bool,
 }
 
 /// A second, independent ImGui style — the settings window's.
@@ -99,10 +109,10 @@ pub struct FormStyle(sys::ImGuiStyle);
 impl FormStyle {
     /// Mutable access, so the UI layer can theme it. `Style` is a `#[repr(transparent)]` wrapper over
     /// `ImGuiStyle` (the crate asserts the layout), which keeps every color decision in `ui::theme`
-    /// and out of this FFI module.
-    pub fn style_mut(&mut self) -> &mut dear_imgui_rs::Style {
+    /// and out of this module.
+    pub fn style_mut(&mut self) -> &mut Style {
         // SAFETY: layout-compatible by the wrapper's own const assertions.
-        unsafe { &mut *(&mut self.0 as *mut sys::ImGuiStyle as *mut dear_imgui_rs::Style) }
+        unsafe { &mut *(&mut self.0 as *mut sys::ImGuiStyle as *mut Style) }
     }
 
     /// Install it until the guard drops.
@@ -112,7 +122,7 @@ impl FormStyle {
     /// are untouched.
     #[must_use]
     pub fn push(self) -> StyleGuard {
-        // SAFETY: one context, made current at creation; we are inside a frame.
+        // SAFETY: called from inside a frame, where this window's context is current.
         unsafe {
             let live = sys::igGetStyle();
             let saved = *live;
@@ -122,7 +132,7 @@ impl FormStyle {
     }
 }
 
-/// Restores the style [`StockStyle::push`] replaced.
+/// Restores the style [`FormStyle::push`] replaced.
 pub struct StyleGuard(sys::ImGuiStyle);
 
 impl Drop for StyleGuard {
@@ -143,10 +153,10 @@ impl Drop for StyleGuard {
 /// value for this mode" instead of "a stale value from startup".
 ///
 /// (`FormStyle` seeds itself the same way in [`Imgui::form_style`] — this is that, for the live style.)
-pub fn seed_colors(style: &mut dear_imgui_rs::Style, dark: bool) {
+pub fn seed_colors(style: &mut Style, dark: bool) {
     // SAFETY: `Style` is `#[repr(transparent)]` over `ImGuiStyle` (the crate asserts the layout), and
     // `igStyleColors*` only writes the color array — the metrics and font fields are untouched.
-    let raw = style as *mut dear_imgui_rs::Style as *mut sys::ImGuiStyle;
+    let raw = style as *mut Style as *mut sys::ImGuiStyle;
     unsafe {
         if dark {
             sys::igStyleColorsDark(raw);
@@ -214,53 +224,85 @@ pub fn size_next_window(size: (f32, f32)) {
 }
 
 impl Imgui {
-    pub fn new(
-        hwnd: isize,
-        device: &ID3D11Device,
-        device_ctx: &ID3D11DeviceContext,
-        dpi: u32,
-    ) -> Self {
-        let mut ctx = Context::create();
-        // No imgui.ini: fire has no dockspaces or user-arranged windows to persist, and a settings
-        // file that rewrites itself on a timer would break the "an idle window costs ~0" invariant.
-        let _ = ctx.set_ini_filename(None::<std::path::PathBuf>);
+    /// Build the context, attach the winit platform to `window`, and bind the wgpu renderer to the
+    /// shared device. Errors are strings for the caller to show.
+    pub fn new(gpu: Rc<Gpu>, window: Arc<Window>, dpi: u32) -> Result<Self, String> {
+        let mut ctx = SuspendedContext::create();
+        let window_for_platform = Arc::clone(&window);
+        let gpu_for_renderer = Rc::clone(&gpu);
+        let built = ctx.try_with_active(|c| -> Result<_, String> {
+            // No imgui.ini: fire has no dockspaces or user-arranged windows to persist, and a
+            // settings file that rewrites itself on a timer would break the "an idle window costs
+            // ~0" invariant.
+            c.set_ini_filename(None::<PathBuf>)
+                .map_err(|e| format!("set_ini_filename: {e}"))?;
 
-        // Segoe UI, to match the rest of the desktop. Registering the font costs ~0.4 ms and bakes
-        // no glyphs (1.92 rasterizes on first draw); if it is somehow missing, ImGui's built-in
-        // font stands in rather than the app failing to start.
-        if let Ok(ttf) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
-            ctx.fonts().add_font(&[FontSource::TtfData {
-                data: &ttf,
-                size_pixels: None, // dynamic: sized per-frame from the style below
-                config: None,
-            }]);
-        }
+            // The system UI font, to match the rest of the desktop. Registering the font costs
+            // ~0.4 ms and bakes no glyphs (1.92 rasterizes on first draw); if it is somehow
+            // missing, ImGui's built-in font stands in rather than the app failing to start.
+            if let Some(ttf) = crate::platform::ui_font_path().and_then(|p| std::fs::read(p).ok()) {
+                // SAFETY: `ttf` is a complete font file read from the OS's own font directory,
+                // and it is not touched between here and `add_font`, which copies it. Dynamic
+                // sizing: glyphs are sized per frame from the style, not from the source.
+                let source = unsafe { FontSource::ttf_data(&ttf) };
+                c.font_atlas().add_font(&[source]);
+            }
 
-        unsafe {
-            dear_imgui_backend_win32_init(hwnd as *mut c_void);
-            dear_imgui_backend_dx11_init(device.as_raw(), device_ctx.as_raw());
-        }
+            let mut platform = WinitPlatform::new(c).map_err(|e| format!("winit backend: {e}"))?;
+            // Physical pixels throughout (see the module notes on DPI).
+            platform
+                .set_hidpi_mode(HiDpiMode::Locked(1.0))
+                .map_err(|e| format!("winit backend: {e}"))?;
+            platform
+                .attach_window(window_for_platform, HiDpiMode::Locked(1.0), c)
+                .map_err(|e| format!("winit backend: {e}"))?;
 
-        // Snapshot the factory style *now*, before `ui::theme::apply` runs over it — this is the
-        // only moment it exists. SAFETY: `Context::create` made this context current.
-        let stock = unsafe { *sys::igGetStyle() };
+            // Told the *UNORM* surface format: the UI pass draws through that view, and the
+            // renderer must not gamma-correct colors that are already sRGB.
+            let init = WgpuInitInfo::new(
+                gpu_for_renderer.device.clone(),
+                gpu_for_renderer.queue.clone(),
+                SURFACE_FORMAT,
+            )
+            .with_adapter(gpu_for_renderer.adapter.clone());
+            let renderer = WgpuRenderer::new(init, c).map_err(|e| format!("wgpu backend: {e}"))?;
+
+            // Snapshot the factory style *now*, before `ui::theme::apply` runs over it — this is
+            // the only moment it exists. SAFETY: this context is current inside the closure.
+            let stock = unsafe { *sys::igGetStyle() };
+            Ok((platform, renderer, stock))
+        });
+        let (platform, renderer, stock) = match built {
+            Ok(v) => v,
+            Err(e) => return Err(format!("ImGui: {e}")),
+        };
 
         let mut me = Imgui {
             ctx,
-            _icon_tex: None,
-            icon_srv: None,
+            platform,
+            renderer,
+            gpu,
+            window,
+            icon: None,
             icon_id: TextureId::new(0),
             icon_built_px: 0.0,
             icon_built_scales: [0.0; icons::COUNT],
-            _logo_tex: None,
-            _logo_srv: None,
+            logo: None,
             logo_id: TextureId::new(0),
             logo_built: false,
             dpi: dpi.max(96),
             stock,
+            want_mouse: false,
+            want_keyboard: false,
+            want_text: false,
         };
-        me.refresh_icons(device);
-        me
+        me.refresh_icons();
+        Ok(me)
+    }
+
+    /// Run `f` with this window's context current.
+    fn with<R>(&mut self, f: impl FnOnce(&mut Context) -> R) -> R {
+        self.ctx.with_active_or_panic(f)
     }
 
     /// The settings window's base style: ImGui's factory geometry, scaled for the monitor, carrying
@@ -269,25 +311,28 @@ impl Imgui {
     /// Composed per call rather than cached: it is a ~1 KB POD copy plus two library calls, against a
     /// frame that is only drawn when something happened. Caching it would mean invalidating it on DPI
     /// *and* theme changes, which is more state than it saves.
-    pub fn form_style(&self, dark: bool) -> FormStyle {
+    pub fn form_style(&mut self, dark: bool) -> FormStyle {
         let mut s = self.stock;
-        // Factory geometry, scaled to the monitor. `ui::theme::form` then overrides the metrics it
-        // cares about; the rest (cell padding, separator-text padding, …) stay correctly scaled.
-        unsafe { sys::ImGuiStyle_ScaleAllSizes(&mut s, self.dpi as f32 / 96.0) };
-        // Seeds every color, including the dozens the theme doesn't name (plots, drag-drop, tables).
-        unsafe {
-            if dark {
-                sys::igStyleColorsDark(&mut s);
-            } else {
-                sys::igStyleColorsLight(&mut s);
+        let dpi = self.dpi;
+        self.with(|c| {
+            // Factory geometry, scaled to the monitor. `ui::theme::form` then overrides the
+            // metrics it cares about; the rest (cell padding, separator-text padding, …) stay
+            // correctly scaled. Seeds every color, including the dozens the theme doesn't name.
+            unsafe {
+                sys::ImGuiStyle_ScaleAllSizes(&mut s, dpi as f32 / 96.0);
+                if dark {
+                    sys::igStyleColorsDark(&mut s);
+                } else {
+                    sys::igStyleColorsLight(&mut s);
+                }
             }
-        }
-        // The font is ours (Segoe UI); its size and DPI scale come from the live style so the
-        // settings window renders text exactly like the rest of the app.
-        let live = self.ctx.style();
-        s.FontSizeBase = live.font_size_base();
-        s.FontScaleMain = live.font_scale_main();
-        s.FontScaleDpi = live.font_scale_dpi();
+            // The font is ours (the system UI font); its size and DPI scale come from the live
+            // style so the settings window renders text exactly like the rest of the app.
+            let live = c.style();
+            s.FontSizeBase = live.font_size_base();
+            s.FontScaleMain = live.font_scale_main();
+            s.FontScaleDpi = live.font_scale_dpi();
+        });
         FormStyle(s)
     }
 
@@ -306,8 +351,9 @@ impl Imgui {
         std::array::from_fn(|i| theme.icon_scale(icons::ALL[i]))
     }
 
-    pub fn style_mut(&mut self) -> &mut dear_imgui_rs::Style {
-        self.ctx.style_mut()
+    /// Edit the live style (the chrome's) — [`crate::ui::theme::apply`] goes through here.
+    pub fn restyle(&mut self, f: impl FnOnce(&mut Style)) {
+        self.with(|c| f(c.style_mut()));
     }
 
     /// Adopt a new DPI. ImGui 1.92 re-bakes *glyphs* lazily, so there is no font atlas to rebuild
@@ -322,26 +368,21 @@ impl Imgui {
     /// DPI change or a stylesheet edit) or the per-icon scales (a stylesheet edit alone, which
     /// leaves the size untouched). Cheap no-op when nothing has, so the restyle path can call it
     /// unconditionally.
-    pub fn refresh_icons(&mut self, device: &ID3D11Device) {
+    pub fn refresh_icons(&mut self) {
         if self.icon_px() != self.icon_built_px || self.icon_scales() != self.icon_built_scales {
-            self.rebuild_icons(device);
+            self.rebuild_icons();
         }
     }
 
-    fn rebuild_icons(&mut self, device: &ID3D11Device) {
+    fn rebuild_icons(&mut self) {
         let px = self.icon_px();
         let n = px as usize;
         let scales = self.icon_scales();
         let (pixels, w) = icons::atlas(n, &scales);
-
-        let (tex, srv) = rgba_texture(device, &pixels, w as u32, n as u32, "icon atlas");
-        // The DX11 backend takes ImTextureID to *be* the SRV pointer.
-        self.icon_id = match srv.as_ref() {
-            Some(s) => TextureId::new(s.as_raw() as u64),
-            None => TextureId::new(0),
-        };
-        self._icon_tex = tex;
-        self.icon_srv = srv;
+        let old = self.icon.take();
+        let (texture, id) = self.register_texture(old, &pixels, w as u32, n as u32, "icon atlas");
+        self.icon = texture;
+        self.icon_id = id;
         self.icon_built_px = px;
         self.icon_built_scales = scales;
     }
@@ -349,132 +390,193 @@ impl Imgui {
     /// The empty-window logo texture, built on first call — which the shell only makes on an
     /// empty-state frame, so a launch straight into an image never pays the upload on its
     /// time-to-first-photon path. Zero id when creation failed; the card then draws text alone.
-    pub fn logo(&mut self, device: &ID3D11Device) -> TextureId {
+    pub fn logo(&mut self) -> TextureId {
         if !self.logo_built {
             self.logo_built = true;
-            let (tex, srv) = rgba_texture(device, LOGO_RGBA, LOGO_EDGE, LOGO_EDGE, "logo");
-            self.logo_id = match srv.as_ref() {
-                Some(s) => TextureId::new(s.as_raw() as u64),
-                None => TextureId::new(0),
-            };
-            self._logo_tex = tex;
-            self._logo_srv = srv;
+            let (texture, id) =
+                self.register_texture(None, LOGO_RGBA, LOGO_EDGE, LOGO_EDGE, "logo");
+            self.logo = texture;
+            self.logo_id = id;
         }
         self.logo_id
     }
 
-    /// Feed a Win32 message to ImGui. `true` means ImGui consumed it and the shell should not.
-    pub fn wnd_proc(&mut self, hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> bool {
-        unsafe {
-            dear_imgui_backend_win32_wnd_proc_handler(hwnd as *mut c_void, msg, wparam, lparam) != 0
+    /// Upload an RGBA8 texture and register it with the renderer (unregistering `old` first). On
+    /// failure the missing pieces come back `None` / zero id (logged) and the caller draws without
+    /// the texture rather than the app failing.
+    fn register_texture(
+        &mut self,
+        old: Option<UiTexture>,
+        pixels: &[u8],
+        w: u32,
+        h: u32,
+        what: &str,
+    ) -> (Option<UiTexture>, TextureId) {
+        let tex = rgba_texture(&self.gpu, pixels, w, h, what);
+        let view = tex.create_view(&Default::default());
+        let renderer = &mut self.renderer;
+        let registered = self.ctx.with_active_or_panic(|_c| {
+            if let Some(old) = old {
+                let _ = renderer.unregister_external_texture(old.handle);
+            }
+            renderer.register_external_texture(&view)
+        });
+        match registered {
+            Ok(handle) => {
+                let id = handle.texture_id();
+                (Some(UiTexture { _tex: tex, handle }), id)
+            }
+            Err(e) => {
+                eprintln!("fire: {what} could not be registered with the UI renderer: {e}");
+                (None, TextureId::new(0))
+            }
         }
     }
 
+    /// Feed a window event to ImGui. The ownership booleans are refreshed afterwards for the
+    /// shell's routing.
+    pub fn handle_event(&mut self, event: &WindowEvent) {
+        let (platform, window) = (&mut self.platform, &self.window);
+        let want = self.ctx.with_active_or_panic(|c| {
+            if let Err(e) = platform.handle_window_event(c, window, event) {
+                eprintln!("fire: ImGui platform rejected an event: {e}");
+            }
+            let io = c.io();
+            (
+                io.want_capture_mouse(),
+                io.want_capture_keyboard(),
+                io.want_text_input(),
+            )
+        });
+        (self.want_mouse, self.want_keyboard, self.want_text) = want;
+    }
+
     /// True when a widget (not the image) owns the pointer — the toolbar, status bar, a popup.
-    pub fn wants_mouse(&mut self) -> bool {
-        self.ctx.io_mut().want_capture_mouse()
+    pub fn wants_mouse(&self) -> bool {
+        self.want_mouse
     }
 
     /// True when ImGui wants the keys — a focused text field, or an open popup.
-    pub fn wants_keyboard(&mut self) -> bool {
-        self.ctx.io_mut().want_capture_keyboard()
+    pub fn wants_keyboard(&self) -> bool {
+        self.want_keyboard
     }
 
     /// True while a text field is being edited. The *only* thing in fire that needs a repaint with
     /// no input behind it (the caret blink), so the shell arms a timer on it — and kills it the
     /// moment this goes false, or an idle window would stop being free.
-    pub fn wants_text_input(&mut self) -> bool {
-        self.ctx.io_mut().want_text_input()
+    pub fn wants_text_input(&self) -> bool {
+        self.want_text
     }
 
-    /// Build and render one UI frame into whatever RTV is currently bound. The caller binds the
-    /// **UNORM** view first (see the sRGB note above) and presents afterwards.
-    pub fn frame<R>(&mut self, build: impl FnOnce(&Ui, TextureId) -> R) -> R {
+    /// Build and render one UI frame into `pass` (the UNORM view of the frame — see the sRGB
+    /// note above). Returns what `build` produced, or `None` if it panicked (logged; the frame is
+    /// still closed and whatever was built is drawn).
+    pub fn frame<R>(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        extent: FramebufferExtent,
+        build: impl FnOnce(&Ui, TextureId) -> R,
+    ) -> Option<R> {
         let icon_id = self.icon_id;
-        unsafe {
-            dear_imgui_backend_dx11_new_frame();
-            dear_imgui_backend_win32_new_frame();
-        }
-        let ui = self.ctx.frame();
-        // The frame must be CLOSED even when `build` panics: the wndproc's panic firewall
-        // keeps the window alive, so the next WM_PAINT calls NewFrame again — and on a
-        // context still mid-frame that is an IM_ASSERT in debug and undefined draw-list
-        // state in release. Catch the unwind, render whatever was built up to the panic
-        // (one partial frame), and only then let it continue up to the firewall.
-        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(ui, icon_id)));
-        let draw_data = self.ctx.render();
-        unsafe {
-            dear_imgui_backend_dx11_render_draw_data(draw_data as *mut _ as *mut c_void);
-        }
+        let Self {
+            ctx,
+            platform,
+            renderer,
+            window,
+            ..
+        } = self;
+        let (out, want) = ctx.with_active_or_panic(|c| {
+            if let Err(e) = platform.prepare_frame(c, window) {
+                eprintln!("fire: ImGui platform prepare_frame failed: {e}");
+            }
+            let ui: &Ui = c.frame();
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(ui, icon_id)));
+            // The OS cursor and IME state follow the UI that was just built.
+            if let Err(e) = platform.prepare_render(ui, window) {
+                eprintln!("fire: ImGui platform prepare_render failed: {e}");
+            }
+            let io = c.io();
+            let want = (
+                io.want_capture_mouse(),
+                io.want_capture_keyboard(),
+                io.want_text_input(),
+            );
+            // Close the frame and draw it — even after a panic in `build`, so the context is
+            // never left mid-frame.
+            let consumer = renderer
+                .renderer_consumer()
+                .expect("the ImGui renderer is bound to this context");
+            let pending = c.render(consumer);
+            if let Err(e) = renderer.render(pending, pass, extent) {
+                eprintln!("fire: ImGui render failed: {e}");
+            }
+            (out, want)
+        });
+        (self.want_mouse, self.want_keyboard, self.want_text) = want;
         match out {
-            Ok(r) => r,
-            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(r) => Some(r),
+            Err(_) => {
+                eprintln!("fire: recovered from a panic while building the UI");
+                None
+            }
         }
     }
-}
-
-/// Create an immutable RGBA8 texture + SRV from CPU pixels (the icon atlas, the logo). On
-/// failure the missing pieces come back `None` (logged) and the caller draws without the
-/// texture rather than the app failing.
-fn rgba_texture(
-    device: &ID3D11Device,
-    pixels: &[u8],
-    w: u32,
-    h: u32,
-    what: &str,
-) -> (Option<ID3D11Texture2D>, Option<ID3D11ShaderResourceView>) {
-    let desc = D3D11_TEXTURE2D_DESC {
-        Width: w,
-        Height: h,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_IMMUTABLE,
-        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-        CPUAccessFlags: 0,
-        MiscFlags: 0,
-    };
-    let init = D3D11_SUBRESOURCE_DATA {
-        pSysMem: pixels.as_ptr() as *const c_void,
-        SysMemPitch: w * 4,
-        SysMemSlicePitch: 0,
-    };
-
-    let mut tex: Option<ID3D11Texture2D> = None;
-    let mut srv: Option<ID3D11ShaderResourceView> = None;
-    unsafe {
-        if device
-            .CreateTexture2D(&desc, Some(&init), Some(&mut tex))
-            .is_err()
-        {
-            eprintln!("fire: {what} CreateTexture2D failed");
-            return (None, None);
-        }
-        let Some(t) = tex.as_ref() else {
-            return (None, None);
-        };
-        if device
-            .CreateShaderResourceView(t, None, Some(&mut srv))
-            .is_err()
-        {
-            eprintln!("fire: {what} CreateShaderResourceView failed");
-            return (tex, None);
-        }
-    }
-    (tex, srv)
 }
 
 impl Drop for Imgui {
     fn drop(&mut self) {
-        // Shut the backends down before the Context (they hold pointers into it). The D3D
-        // device/SRV outlive this via their own COM refcounts.
-        unsafe {
-            dear_imgui_backend_dx11_shutdown();
-            dear_imgui_backend_win32_shutdown();
-        }
+        // Release the backends in order (renderer, then platform) with the context current, so
+        // their teardown transactions are honored; the context itself goes with the struct. Errors
+        // are ignored — there is nothing left to draw with.
+        let icon = self.icon.take();
+        let logo = self.logo.take();
+        let (renderer, platform) = (&mut self.renderer, &mut self.platform);
+        let _ = self.ctx.try_with_active(|c| -> Result<(), ()> {
+            for t in [icon, logo].into_iter().flatten() {
+                let _ = renderer.unregister_external_texture(t.handle);
+            }
+            let _ = renderer.shutdown(c);
+            let _ = platform.shutdown(c);
+            Ok(())
+        });
     }
+}
+
+/// Create an RGBA8 texture from CPU pixels (the icon atlas, the logo). Straight sRGB bytes: the
+/// UI pass writes through the UNORM view, so nothing is decoded on the way through.
+fn rgba_texture(gpu: &Gpu, pixels: &[u8], w: u32, h: u32, what: &str) -> wgpu::Texture {
+    let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(what),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    tex
 }

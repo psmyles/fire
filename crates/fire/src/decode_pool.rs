@@ -1,17 +1,19 @@
 //! Off-thread decode worker pool (Option A from the plan — no async runtime).
 //!
-//! Decoding a large PSD/EXR can take tens of milliseconds; doing it on the UI thread
-//! would freeze the window between the click and the image. Instead, `open` shows the
-//! window with a placeholder immediately and hands a [`DecodeJob`] to this pool. A worker
-//! decodes on a background thread and posts the result back to the UI thread by
-//! `PostMessage`-ing the window with [`crate::win::WM_APP_DECODE_DONE`] and a boxed
-//! [`DecodeOutcome`] in the LPARAM (workers never touch the window or the renderer — same
-//! discipline as the pipe-server thread).
+//! Decoding a large PSD/EXR can take tens of milliseconds; doing it on the UI thread would
+//! freeze the window between the click and the image. Instead, `open` shows the window with a
+//! placeholder immediately and hands a [`DecodeJob`] to this pool. A worker decodes on a
+//! background thread and sends the result back to the UI thread as an [`AppEvent::DecodeDone`]
+//! through the event loop's proxy (workers never touch a window or the renderer — same
+//! discipline as the instance-socket server thread).
 //!
-//! Each job carries the issuing window's monotonic `generation`; the UI uploads a result
-//! only if it is still the window's latest generation, so a slow decode can never clobber
-//! a newer one (stale-drop). A superseded job is still decoded — its result is just
-//! dropped on arrival — which wastes a little work but keeps the pool dead simple.
+//! Each job carries a process-wide monotonic `generation` (see [`fresh_generation`]) plus the
+//! window it was issued for; the UI uploads a result only if it is still that window's latest
+//! generation, so a slow decode can never clobber a newer one (stale-drop). A superseded job is
+//! still decoded — its result is just dropped on arrival — which wastes a little work but keeps
+//! the pool dead simple.
+//!
+//! The pool is shared by every window in the process (there is one process — see `main.rs`).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,16 +22,31 @@ use std::thread;
 
 use crossbeam_channel::{unbounded, Sender};
 use fire_decode::{decode_path, DecodeError, DecodeOptions, DecodedImage};
+use winit::event_loop::EventLoopProxy;
+use winit::window::WindowId;
 
-use crate::util::{post_boxed, PostOutcome};
-use crate::win::{WM_APP_DECODE_DONE, WM_APP_FLIPBOOK_GUESS};
+use crate::app::AppEvent;
 
 /// Plan-adopted default pool size: `min(num_cpus, 4)`.
 const MAX_WORKERS: usize = 4;
 
+/// The process-wide decode generation counter. Every open, navigate, reload and close takes a
+/// fresh value, and every cross-thread result carries the one it was issued under; a result whose
+/// generation is no longer its window's current one is stale and dropped. Process-wide rather than
+/// per-window so the pool's skip check below needs no per-window bookkeeping.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The next decode generation. Strictly increasing for the life of the process.
+pub fn fresh_generation() -> u64 {
+    GENERATION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 /// A unit of decode work handed to a worker thread.
 #[derive(Debug)]
 pub struct DecodeJob {
+    /// The window the result is for. `None` for the launch path's decode, which is submitted
+    /// before any window exists and lands in the first one created.
+    pub window: Option<WindowId>,
     /// The issuing window's generation at submit time; used for stale-drop.
     pub generation: u64,
     pub path: PathBuf,
@@ -39,14 +56,15 @@ pub struct DecodeJob {
     pub reload: bool,
     /// Whether to run sprite-sheet auto-detection after posting the image (the
     /// `flipbook.auto-detect` config key). False skips the per-pixel scan entirely — no
-    /// [`WM_APP_FLIPBOOK_GUESS`] is posted, so no hint chip can appear.
+    /// [`AppEvent::FlipbookGuess`] is sent, so no hint chip can appear.
     pub detect_flipbook: bool,
 }
 
-/// A finished decode, delivered back to the UI thread (boxed, via the message LPARAM). The image
-/// is `Arc`-wrapped so the worker can keep a clone and run flipbook detection *after* posting this
-/// (detection stays off the time-to-first-pixel path); the UI stores its clone in the surface.
+/// A finished decode, delivered back to the UI thread. The image is `Arc`-wrapped so the worker
+/// can keep a clone and run flipbook detection *after* posting this (detection stays off the
+/// time-to-first-pixel path); the UI stores its clone in the surface.
 pub struct DecodeOutcome {
+    pub window: Option<WindowId>,
     pub generation: u64,
     pub path: PathBuf,
     pub result: Result<Arc<DecodedImage>, DecodeError>,
@@ -55,30 +73,30 @@ pub struct DecodeOutcome {
 }
 
 /// The flipbook auto-detection result for a decoded image, delivered to the UI thread *after* the
-/// image itself (a separate [`WM_APP_FLIPBOOK_GUESS`] message) so the analysis — which for a large
-/// sheet scans every pixel — never delays the image reaching the screen. `guess` is the detected
-/// grid, or `None` for a non-sheet image. Stale-dropped by `generation` like a decode.
+/// image itself (a separate [`AppEvent::FlipbookGuess`]) so the analysis — which for a large sheet
+/// scans every pixel — never delays the image reaching the screen. `guess` is the detected grid,
+/// or `None` for a non-sheet image. Stale-dropped by `generation` like a decode.
 pub struct FlipbookGuess {
+    pub window: Option<WindowId>,
     pub generation: u64,
     pub path: PathBuf,
     pub guess: Option<crate::flipbook::Grid>,
 }
 
-/// Sender handle to the worker pool; held by the `App` for the window's lifetime.
+/// Sender handle to the worker pool. Cheap to clone; every window holds one.
+#[derive(Clone)]
 pub struct DecodePool {
     tx: Sender<DecodeJob>,
     /// The newest generation ever submitted. Workers consult it before decoding: the queue is
     /// unbounded, so key-repeat navigation can enqueue jobs faster than they retire, and every
     /// superseded job decoded in full is a wasted allocation (up to ~1 GiB at `MAX_CPU_DIM`)
-    /// parked in the message queue until the UI thread drains it.
+    /// parked in the event queue until the UI thread drains it.
     latest: Arc<AtomicU64>,
 }
 
 impl DecodePool {
-    /// Spawn the worker threads. Each posts results back to `hwnd` (the UI window) via
-    /// `PostMessage`; `hwnd` is passed as an `isize` so it crosses the thread boundary
-    /// (a raw HWND is just an integer).
-    pub fn new(hwnd: isize) -> Self {
+    /// Spawn the worker threads. Each sends its results to the event loop through `proxy`.
+    pub fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
         let (tx, rx) = unbounded::<DecodeJob>();
         let latest = Arc::new(AtomicU64::new(0));
         let workers = worker_count();
@@ -86,10 +104,11 @@ impl DecodePool {
         for i in 0..workers {
             let rx = rx.clone();
             let latest = Arc::clone(&latest);
+            let proxy = proxy.clone();
             let spawned = thread::Builder::new()
                 .name(format!("fire-decode-{i}"))
                 .spawn(move || {
-                    // Exits when the pool (and thus `tx`) is dropped at shutdown.
+                    // Exits when the pool (and thus every `tx`) is dropped at shutdown.
                     while let Ok(job) = rx.recv() {
                         // A superseded job's result would be stale-dropped on arrival anyway;
                         // once a newer submit exists, skip the decode itself.
@@ -107,25 +126,24 @@ impl DecodePool {
                             .filter(|img| job.detect_flipbook && img.animation.is_none())
                             .map(Arc::clone);
                         let generation = job.generation;
+                        let window = job.window;
                         let path = job.path.clone();
 
-                        // --- Post the decoded image immediately (time-to-first-pixel path) ---
+                        // --- Send the decoded image immediately (time-to-first-pixel path) ---
                         let outcome = Box::new(DecodeOutcome {
+                            window,
                             generation,
                             path: job.path,
                             result,
                             reload: job.reload,
                         });
-                        match post_boxed(hwnd, WM_APP_DECODE_DONE, outcome) {
-                            PostOutcome::Posted => {}
-                            // The result is lost, but the pool must outlive one full queue;
-                            // there is no image to hint at, so skip detection too.
-                            PostOutcome::Dropped => continue,
-                            PostOutcome::WindowGone => break,
+                        // The only way a send fails is a closed event loop: the app is exiting.
+                        if proxy.send_event(AppEvent::DecodeDone(outcome)).is_err() {
+                            break;
                         }
 
-                        // --- Then detect the flipbook grid off the critical path and post the hint
-                        // separately. Detection never touches the window/renderer and is never
+                        // --- Then detect the flipbook grid off the critical path and send the hint
+                        // separately. Detection never touches a window/renderer and is never
                         // allowed to kill the worker (a malformed sheet mustn't take the pool down).
                         if let Some(img) = detect_input {
                             let guess =
@@ -134,13 +152,12 @@ impl DecodePool {
                                 }))
                                 .unwrap_or(None);
                             let hint = Box::new(FlipbookGuess {
+                                window,
                                 generation,
                                 path,
                                 guess,
                             });
-                            if post_boxed(hwnd, WM_APP_FLIPBOOK_GUESS, hint)
-                                == PostOutcome::WindowGone
-                            {
+                            if proxy.send_event(AppEvent::FlipbookGuess(hint)).is_err() {
                                 break;
                             }
                         }

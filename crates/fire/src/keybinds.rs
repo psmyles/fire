@@ -1,22 +1,30 @@
-//! Keyboard bindings — pure logic, no Win32 (unit-tested like [`crate::folder`] and
+//! Keyboard bindings — pure logic, no window system (unit-tested like [`crate::folder`] and
 //! [`crate::render::view`]).
 //!
 //! Every keyboard command the viewer has is a [`KeyAction`]; a [`Keybinds`] table maps chords to
-//! them. The win shell builds a [`KeyChord`] from the `WM_KEYDOWN` virtual-key plus the live
-//! modifier state, looks it up here, and dispatches — so *what* a key does lives in one table
-//! instead of a `match` on hex VK codes, which is what makes the settings dialog's rebind editor
-//! possible. It is also where the toolbar's tooltips get their "(F)" suffixes ([`Keybinds::labels`]),
-//! so a rebound key relabels the button it belongs to.
+//! them. The shell builds a [`KeyChord`] from the pressed *physical* key plus the live modifier
+//! state, looks it up here, and dispatches — so *what* a key does lives in one table instead of a
+//! `match` on key codes, which is what makes the settings dialog's rebind editor possible. It is
+//! also where the toolbar's tooltips get their "(F)" suffixes ([`Keybinds::labels`]), so a rebound
+//! key relabels the button it belongs to.
+//!
+//! **Keys are physical.** A chord names a [`KeyCode`] — the key at the position `F` has on a US
+//! keyboard — not the character it types, so one `config.toml` means the same thing on every layout
+//! and every OS. The modifier is `Primary`: Ctrl on Windows and Linux, ⌘ on macOS, resolved when
+//! the chord is matched.
 //!
 //! **Chords match exactly.** `Left` and `Ctrl+Left` are different bindings, so a modifier held by
 //! accident no longer triggers the plain command (and, conversely, `Ctrl+…` chords are bindable).
 //! The one concession is `Shift+=`, bound alongside `=` by default, because that is how you type
 //! `+` on most layouts.
 //!
-//! Chords round-trip through `config.toml` as strings (`"F"`, `"Ctrl+Shift+K"`, `"Num+"`) — see
-//! [`Keybinds::from_config`] / [`Keybinds::to_config`]. Only bindings that *differ* from the
-//! defaults are written, so a user who never rebinds anything keeps an empty `[keybinds]` table and
-//! inherits future default changes.
+//! Chords round-trip through `config.toml` as strings (`"F"`, `"Primary+Shift+K"`, `"Num+"`) — see
+//! [`Keybinds::from_config`] / [`Keybinds::to_config`]. `Ctrl+` and `Cmd+` are accepted as
+//! spellings of `Primary+`, so a file written by an earlier version still reads. Only bindings that
+//! *differ* from the defaults are written, so a user who never rebinds anything keeps an empty
+//! `[keybinds]` table and inherits future default changes.
+
+use winit::keyboard::KeyCode;
 
 use crate::config::{KeyValue, KeybindsCfg};
 
@@ -197,75 +205,95 @@ impl KeyAction {
     }
 }
 
-/// One key press: a virtual-key code plus the modifiers held with it. Matched exactly.
+/// One key press: a physical key plus the modifiers held with it. Matched exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyChord {
-    pub vk: u32,
-    pub ctrl: bool,
+    pub key: KeyCode,
+    /// The platform's command modifier: Ctrl on Windows and Linux, ⌘ on macOS.
+    pub primary: bool,
     pub alt: bool,
     pub shift: bool,
 }
 
+/// How the primary modifier is spelled in the UI on this OS. (The config file always says
+/// `Primary+`, so one file serves both.)
+const PRIMARY_LABEL: &str = if cfg!(target_os = "macos") {
+    "Cmd+"
+} else {
+    "Ctrl+"
+};
+
 impl KeyChord {
     /// A chord with no modifiers.
-    pub fn plain(vk: u32) -> Self {
+    pub fn plain(key: KeyCode) -> Self {
         Self {
-            vk,
-            ctrl: false,
+            key,
+            primary: false,
             alt: false,
             shift: false,
         }
     }
 
-    /// The canonical config/UI string: `"Ctrl+Alt+Shift+K"`. An unnamed VK falls back to `"0x2F"`
-    /// hex so even an exotic capture round-trips rather than being silently dropped.
+    /// The canonical config string: `"Primary+Alt+Shift+K"`. A key without a name of its own
+    /// falls back to its `KeyCode` identifier (`"IntlBackslash"`), so even an exotic capture
+    /// round-trips rather than being silently dropped.
     pub fn format(self) -> String {
-        let mut s = String::new();
-        if self.ctrl {
-            s.push_str("Ctrl+");
+        self.format_with(if self.primary { "Primary+" } else { "" })
+    }
+
+    /// The string the UI shows: like [`Self::format`], but with the primary modifier spelled for
+    /// this OS (`Ctrl+` / `Cmd+`) and arrow glyphs for the arrow keys. The config file keeps the
+    /// typeable `Primary+Left` form.
+    pub fn display(self) -> String {
+        let mut s = self.format_with(if self.primary { PRIMARY_LABEL } else { "" });
+        let arrow = match self.key {
+            KeyCode::ArrowLeft => Some('\u{2190}'),
+            KeyCode::ArrowUp => Some('\u{2191}'),
+            KeyCode::ArrowRight => Some('\u{2192}'),
+            KeyCode::ArrowDown => Some('\u{2193}'),
+            _ => None,
+        };
+        if let Some(g) = arrow {
+            let cut = s.len() - key_name(self.key).len();
+            s.truncate(cut);
+            s.push(g);
         }
+        s
+    }
+
+    fn format_with(self, primary: &str) -> String {
+        let mut s = String::from(primary);
         if self.alt {
             s.push_str("Alt+");
         }
         if self.shift {
             s.push_str("Shift+");
         }
-        s.push_str(&vk_name(self.vk));
+        s.push_str(&key_name(self.key));
         s
     }
 
-    /// Like [`Self::format`] but with arrow glyphs — nicer in a tooltip or the keybind list, while
-    /// the config file keeps the typeable `Left`/`Right` names.
-    pub fn display(self) -> String {
-        let arrow = match self.vk {
-            VK_LEFT => Some('\u{2190}'),
-            VK_UP => Some('\u{2191}'),
-            VK_RIGHT => Some('\u{2192}'),
-            VK_DOWN => Some('\u{2193}'),
-            _ => None,
-        };
-        match arrow {
-            Some(g) => {
-                let mut s = self.format();
-                let cut = s.len() - vk_name(self.vk).len();
-                s.truncate(cut);
-                s.push(g);
-                s
-            }
-            None => self.format(),
-        }
-    }
-
-    /// Parse a config/UI string. Modifier names are case-insensitive; the key name matches the
-    /// canonical table (also case-insensitively) or a `0x..` hex VK. Returns `None` for an empty or
-    /// unrecognized string — the caller treats that as "leave the default in place".
+    /// Parse a config/UI string. Modifier names are case-insensitive (`Primary`, and its
+    /// per-OS spellings `Ctrl`/`Control`/`Cmd`/`Command`, plus `Alt`/`Option` and `Shift`); the
+    /// key name matches the canonical table (also case-insensitively) or a bare `KeyCode`
+    /// identifier. Returns `None` for an empty or unrecognized string — the caller treats that as
+    /// "leave the default in place".
     ///
     /// Modifier *prefixes* are stripped one at a time rather than splitting on `+`, because the key
     /// name itself can be `+` or `Num+` ("Ctrl++" is a legitimate chord).
     pub fn parse(s: &str) -> Option<Self> {
-        const MODS: &[(&str, u8)] = &[("ctrl+", 0), ("control+", 0), ("alt+", 1), ("shift+", 2)];
+        const MODS: &[(&str, u8)] = &[
+            ("primary+", 0),
+            ("ctrl+", 0),
+            ("control+", 0),
+            ("cmd+", 0),
+            ("command+", 0),
+            ("alt+", 1),
+            ("option+", 1),
+            ("shift+", 2),
+        ];
         let mut rest = s.trim();
-        let mut chord = KeyChord::plain(0);
+        let mut chord = KeyChord::plain(KeyCode::Escape);
         'strip: loop {
             for (prefix, which) in MODS {
                 // `len() > prefix.len()` keeps a bare "Ctrl+" (a modifier with no key) unparseable,
@@ -274,7 +302,7 @@ impl KeyChord {
                     && rest.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
                 {
                     match which {
-                        0 => chord.ctrl = true,
+                        0 => chord.primary = true,
                         1 => chord.alt = true,
                         _ => chord.shift = true,
                     }
@@ -284,115 +312,221 @@ impl KeyChord {
             }
             break;
         }
-        chord.vk = parse_vk(rest)?;
+        chord.key = parse_key(rest)?;
         Some(chord)
     }
 
     /// Whether this chord is one the dialog must not let the user bind (see
-    /// [`crate::settings`]): the keys the dialog itself needs to stay usable.
+    /// [`crate::ui::settings`]): a bare modifier key is not a chord at all, and the OS key opens
+    /// the system menu.
     pub fn is_reserved(self) -> bool {
-        // Alt alone (or with modifiers) opens the system menu / is the accelerator prefix, and a
-        // bare modifier key is not a chord at all.
-        matches!(self.vk, VK_MENU | VK_CONTROL | VK_SHIFT | VK_LWIN | VK_RWIN)
+        matches!(
+            self.key,
+            KeyCode::ShiftLeft
+                | KeyCode::ShiftRight
+                | KeyCode::ControlLeft
+                | KeyCode::ControlRight
+                | KeyCode::AltLeft
+                | KeyCode::AltRight
+                | KeyCode::SuperLeft
+                | KeyCode::SuperRight
+                | KeyCode::Meta
+                | KeyCode::Hyper
+        )
     }
 }
 
-// Virtual-key codes we name directly (windows-sys exposes these, but keeping them local keeps this
-// module Win32-free and unit-testable).
-const VK_BACK: u32 = 0x08;
-const VK_TAB: u32 = 0x09;
-const VK_RETURN: u32 = 0x0D;
-const VK_SHIFT: u32 = 0x10;
-const VK_CONTROL: u32 = 0x11;
-const VK_MENU: u32 = 0x12;
-const VK_ESCAPE: u32 = 0x1B;
-const VK_SPACE: u32 = 0x20;
-const VK_LEFT: u32 = 0x25;
-const VK_UP: u32 = 0x26;
-const VK_RIGHT: u32 = 0x27;
-const VK_DOWN: u32 = 0x28;
-const VK_LWIN: u32 = 0x5B;
-const VK_RWIN: u32 = 0x5C;
-
-/// Virtual keys with a fixed printable name. Letters, digits, numpad digits and function keys are
-/// computed instead (see [`vk_name`] / [`parse_vk`]).
-const NAMED_VKS: &[(u32, &str)] = &[
-    (VK_BACK, "Backspace"),
-    (VK_TAB, "Tab"),
-    (VK_RETURN, "Enter"),
-    (VK_ESCAPE, "Esc"),
-    (VK_SPACE, "Space"),
-    (0x21, "PageUp"),
-    (0x22, "PageDown"),
-    (0x23, "End"),
-    (0x24, "Home"),
-    (VK_LEFT, "Left"),
-    (VK_UP, "Up"),
-    (VK_RIGHT, "Right"),
-    (VK_DOWN, "Down"),
-    (0x2D, "Insert"),
-    (0x2E, "Delete"),
-    (0x6A, "Num*"),
-    (0x6B, "Num+"),
-    (0x6C, "NumEnter"),
-    (0x6D, "Num-"),
-    (0x6E, "Num."),
-    (0x6F, "Num/"),
-    (0xBA, ";"),
-    (0xBB, "="),
-    (0xBC, ","),
-    (0xBD, "-"),
-    (0xBE, "."),
-    (0xBF, "/"),
-    (0xC0, "`"),
-    (0xDB, "["),
-    (0xDC, "\\"),
-    (0xDD, "]"),
-    (0xDE, "'"),
+/// Keys with a fixed printable name. Letters, digits, numpad digits and function keys are
+/// computed instead (see [`key_name`] / [`parse_key`]); anything else falls back to the `KeyCode`
+/// identifier, which [`EXTRA`] makes parseable too.
+const NAMED: &[(KeyCode, &str)] = &[
+    (KeyCode::Backspace, "Backspace"),
+    (KeyCode::Tab, "Tab"),
+    (KeyCode::Enter, "Enter"),
+    (KeyCode::Escape, "Esc"),
+    (KeyCode::Space, "Space"),
+    (KeyCode::PageUp, "PageUp"),
+    (KeyCode::PageDown, "PageDown"),
+    (KeyCode::End, "End"),
+    (KeyCode::Home, "Home"),
+    (KeyCode::ArrowLeft, "Left"),
+    (KeyCode::ArrowUp, "Up"),
+    (KeyCode::ArrowRight, "Right"),
+    (KeyCode::ArrowDown, "Down"),
+    (KeyCode::Insert, "Insert"),
+    (KeyCode::Delete, "Delete"),
+    (KeyCode::NumpadMultiply, "Num*"),
+    (KeyCode::NumpadAdd, "Num+"),
+    (KeyCode::NumpadEnter, "NumEnter"),
+    (KeyCode::NumpadSubtract, "Num-"),
+    (KeyCode::NumpadDecimal, "Num."),
+    (KeyCode::NumpadDivide, "Num/"),
+    (KeyCode::Semicolon, ";"),
+    (KeyCode::Equal, "="),
+    (KeyCode::Comma, ","),
+    (KeyCode::Minus, "-"),
+    (KeyCode::Period, "."),
+    (KeyCode::Slash, "/"),
+    (KeyCode::Backquote, "`"),
+    (KeyCode::BracketLeft, "["),
+    (KeyCode::Backslash, "\\"),
+    (KeyCode::BracketRight, "]"),
+    (KeyCode::Quote, "'"),
 ];
 
-/// A virtual key's canonical name (`"F"`, `"F11"`, `"Num+"`, `"["`), or `"0x2F"` hex for one we
-/// have no name for.
-fn vk_name(vk: u32) -> String {
-    if let Some((_, n)) = NAMED_VKS.iter().find(|(v, _)| *v == vk) {
+/// Keys without a name of their own that are still worth being able to *parse* back from their
+/// `KeyCode` identifier — the ones a keyboard is likely to have. A key outside this list still
+/// formats (as its identifier); it just cannot be typed into `config.toml` by hand.
+const EXTRA: &[KeyCode] = &[
+    KeyCode::CapsLock,
+    KeyCode::NumLock,
+    KeyCode::ScrollLock,
+    KeyCode::PrintScreen,
+    KeyCode::Pause,
+    KeyCode::ContextMenu,
+    KeyCode::IntlBackslash,
+    KeyCode::IntlRo,
+    KeyCode::IntlYen,
+    KeyCode::NumpadEqual,
+    KeyCode::NumpadComma,
+    KeyCode::Fn,
+];
+
+const LETTERS: [KeyCode; 26] = [
+    KeyCode::KeyA,
+    KeyCode::KeyB,
+    KeyCode::KeyC,
+    KeyCode::KeyD,
+    KeyCode::KeyE,
+    KeyCode::KeyF,
+    KeyCode::KeyG,
+    KeyCode::KeyH,
+    KeyCode::KeyI,
+    KeyCode::KeyJ,
+    KeyCode::KeyK,
+    KeyCode::KeyL,
+    KeyCode::KeyM,
+    KeyCode::KeyN,
+    KeyCode::KeyO,
+    KeyCode::KeyP,
+    KeyCode::KeyQ,
+    KeyCode::KeyR,
+    KeyCode::KeyS,
+    KeyCode::KeyT,
+    KeyCode::KeyU,
+    KeyCode::KeyV,
+    KeyCode::KeyW,
+    KeyCode::KeyX,
+    KeyCode::KeyY,
+    KeyCode::KeyZ,
+];
+
+const DIGITS: [KeyCode; 10] = [
+    KeyCode::Digit0,
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+    KeyCode::Digit6,
+    KeyCode::Digit7,
+    KeyCode::Digit8,
+    KeyCode::Digit9,
+];
+
+const NUMPAD: [KeyCode; 10] = [
+    KeyCode::Numpad0,
+    KeyCode::Numpad1,
+    KeyCode::Numpad2,
+    KeyCode::Numpad3,
+    KeyCode::Numpad4,
+    KeyCode::Numpad5,
+    KeyCode::Numpad6,
+    KeyCode::Numpad7,
+    KeyCode::Numpad8,
+    KeyCode::Numpad9,
+];
+
+const FKEYS: [KeyCode; 24] = [
+    KeyCode::F1,
+    KeyCode::F2,
+    KeyCode::F3,
+    KeyCode::F4,
+    KeyCode::F5,
+    KeyCode::F6,
+    KeyCode::F7,
+    KeyCode::F8,
+    KeyCode::F9,
+    KeyCode::F10,
+    KeyCode::F11,
+    KeyCode::F12,
+    KeyCode::F13,
+    KeyCode::F14,
+    KeyCode::F15,
+    KeyCode::F16,
+    KeyCode::F17,
+    KeyCode::F18,
+    KeyCode::F19,
+    KeyCode::F20,
+    KeyCode::F21,
+    KeyCode::F22,
+    KeyCode::F23,
+    KeyCode::F24,
+];
+
+/// A key's canonical name (`"F"`, `"F11"`, `"Num+"`, `"["`), or its `KeyCode` identifier for one
+/// we have no name for.
+fn key_name(key: KeyCode) -> String {
+    if let Some((_, n)) = NAMED.iter().find(|(k, _)| *k == key) {
         return (*n).to_string();
     }
-    match vk {
-        0x30..=0x39 => char::from(b'0' + (vk - 0x30) as u8).to_string(), // 0-9
-        0x41..=0x5A => char::from(b'A' + (vk - 0x41) as u8).to_string(), // A-Z
-        0x60..=0x69 => format!("Num{}", vk - 0x60),                      // numpad 0-9
-        0x70..=0x87 => format!("F{}", vk - 0x70 + 1),                    // F1-F24
-        _ => format!("{vk:#04X}"),
+    if let Some(i) = LETTERS.iter().position(|k| *k == key) {
+        return char::from(b'A' + i as u8).to_string();
     }
+    if let Some(i) = DIGITS.iter().position(|k| *k == key) {
+        return char::from(b'0' + i as u8).to_string();
+    }
+    if let Some(i) = NUMPAD.iter().position(|k| *k == key) {
+        return format!("Num{i}");
+    }
+    if let Some(i) = FKEYS.iter().position(|k| *k == key) {
+        return format!("F{}", i + 1);
+    }
+    format!("{key:?}")
 }
 
-/// Inverse of [`vk_name`] (case-insensitive), including the `0x..` hex fallback.
-fn parse_vk(name: &str) -> Option<u32> {
-    if let Some((v, _)) = NAMED_VKS.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)) {
-        return Some(*v);
+/// Inverse of [`key_name`] (case-insensitive), including the identifier fallback for [`EXTRA`].
+fn parse_key(name: &str) -> Option<KeyCode> {
+    if let Some((k, _)) = NAMED.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)) {
+        return Some(*k);
     }
-    // "+" is how `Num+`-less layouts spell VK_OEM_PLUS; accept it as an alias for "=".
+    // "+" is how `Num+`-less layouts spell the plus key; accept it as an alias for "=".
     if name == "+" {
-        return Some(0xBB);
+        return Some(KeyCode::Equal);
     }
     let upper = name.to_ascii_uppercase();
-    let b = upper.as_bytes();
-    match b {
-        [c @ b'0'..=b'9'] => Some(0x30 + (c - b'0') as u32),
-        [c @ b'A'..=b'Z'] => Some(0x41 + (c - b'A') as u32),
+    match upper.as_bytes() {
+        [c @ b'0'..=b'9'] => Some(DIGITS[(c - b'0') as usize]),
+        [c @ b'A'..=b'Z'] => Some(LETTERS[(c - b'A') as usize]),
         _ => {
-            if let Some(hex) = upper.strip_prefix("0X") {
-                return u32::from_str_radix(hex, 16).ok().filter(|v| *v <= 0xFF);
+            // `Num5` / `F11` — but `NumLock` and `Fn` also start this way and are identifiers
+            // (below), so a prefix that isn't followed by a number falls through.
+            if let Some(d) = upper
+                .strip_prefix("NUM")
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                return NUMPAD.get(d).copied();
             }
-            if let Some(n) = upper.strip_prefix("NUM") {
-                let d: u32 = n.parse().ok()?;
-                return (d <= 9).then_some(0x60 + d);
+            if let Some(d) = upper
+                .strip_prefix('F')
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                return (1..=24).contains(&d).then(|| FKEYS[d - 1]);
             }
-            if let Some(n) = upper.strip_prefix('F') {
-                let d: u32 = n.parse().ok()?;
-                return (1..=24).contains(&d).then_some(0x70 + d - 1);
-            }
-            None
+            EXTRA
+                .iter()
+                .copied()
+                .find(|k| format!("{k:?}").eq_ignore_ascii_case(name))
         }
     }
 }
@@ -418,8 +552,8 @@ impl Keybinds {
         let bind = |a: KeyAction, keys: &[&str]| (a, keys.iter().map(|s| c(s)).collect::<Vec<_>>());
         Self {
             bindings: vec![
-                bind(KeyAction::OpenFile, &["Ctrl+O"]),
-                bind(KeyAction::CloseImage, &["Ctrl+W"]),
+                bind(KeyAction::OpenFile, &["Primary+O"]),
+                bind(KeyAction::CloseImage, &["Primary+W"]),
                 bind(KeyAction::Fit, &["F"]),
                 bind(KeyAction::ActualSize, &["1"]),
                 bind(KeyAction::ZoomIn, &["=", "Shift+=", "Num+"]),
@@ -456,12 +590,18 @@ impl Keybinds {
             let Some(action) = KeyAction::from_name(name) else {
                 continue;
             };
-            let chords: Vec<KeyChord> = value
-                .as_strings()
+            let strings = value.as_strings();
+            let chords: Vec<KeyChord> = strings
                 .iter()
                 .filter_map(|s| KeyChord::parse(s))
                 .filter(|c| !c.is_reserved())
                 .collect();
+            // Nothing parsed: an explicit `""` is an unbind, but a typo keeps the default rather
+            // than silently unbinding the action.
+            let explicit_unbind = strings.iter().all(|s| s.trim().is_empty());
+            if chords.is_empty() && !explicit_unbind {
+                continue;
+            }
             kb.set_chords(action, chords);
         }
         kb
@@ -598,321 +738,287 @@ impl ShortcutLabels {
 mod tests {
     use super::*;
 
-    /// Every VK we can name round-trips through `format` → `parse`, including the hex fallback and
-    /// the computed letter/digit/numpad/function ranges.
+    /// Every key with a name round-trips through format → parse, including the identifier
+    /// fallback for the extras.
     #[test]
-    fn chord_round_trip() {
-        let vks = NAMED_VKS
+    fn names_round_trip() {
+        let keys = NAMED
             .iter()
-            .map(|(v, _)| *v)
-            .chain(0x30..=0x39) // digits
-            .chain(0x41..=0x5A) // letters
-            .chain(0x60..=0x69) // numpad digits
-            .chain(0x70..=0x87) // F1-F24
-            .chain([0x2F]); // unnamed → hex fallback
-        for vk in vks {
-            for (ctrl, alt, shift) in [
+            .map(|(k, _)| *k)
+            .chain(LETTERS)
+            .chain(DIGITS)
+            .chain(NUMPAD)
+            .chain(FKEYS)
+            .chain(EXTRA.iter().copied());
+        for key in keys {
+            for (primary, alt, shift) in [
                 (false, false, false),
                 (true, false, false),
-                (false, true, false),
-                (false, false, true),
                 (true, true, true),
             ] {
-                let c = KeyChord {
-                    vk,
-                    ctrl,
+                let chord = KeyChord {
+                    key,
+                    primary,
                     alt,
                     shift,
                 };
-                let s = c.format();
-                assert_eq!(KeyChord::parse(&s), Some(c), "round-trip {s:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn chord_parse_is_lenient_but_strict_enough() {
-        assert_eq!(KeyChord::parse("f"), Some(KeyChord::plain(0x46)));
-        assert_eq!(
-            KeyChord::parse("ctrl+shift+k"),
-            Some(KeyChord {
-                vk: 0x4B,
-                ctrl: true,
-                alt: false,
-                shift: true
-            })
-        );
-        // "+" is accepted as an alias for the `=` key (VK_OEM_PLUS), with or without modifiers.
-        assert_eq!(KeyChord::parse("+"), Some(KeyChord::plain(0xBB)));
-        assert_eq!(KeyChord::parse(""), None);
-        assert_eq!(KeyChord::parse("Ctrl"), None); // modifier with no key
-        assert_eq!(KeyChord::parse("F+G"), None); // two keys
-        assert_eq!(KeyChord::parse("Nope"), None);
-    }
-
-    /// Arrow keys read as glyphs in the UI but stay typeable in the config file.
-    #[test]
-    fn arrow_display_vs_format() {
-        let left = KeyChord::plain(VK_LEFT);
-        assert_eq!(left.format(), "Left");
-        assert_eq!(left.display(), "\u{2190}");
-        let ctrl_right = KeyChord {
-            vk: VK_RIGHT,
-            ctrl: true,
-            alt: false,
-            shift: false,
-        };
-        assert_eq!(ctrl_right.format(), "Ctrl+Right");
-        assert_eq!(ctrl_right.display(), "Ctrl+\u{2192}");
-    }
-
-    /// The two actions that ship deliberately unbound. Anything else missing from
-    /// [`Keybinds::defaults`] is an oversight, not a decision.
-    const INTENTIONALLY_UNBOUND: &[KeyAction] =
-        &[KeyAction::ExposureReset, KeyAction::ToggleOutline];
-
-    /// `defaults()` is a hand-written `vec!`, so — unlike `name`/`label`/`group`, which are
-    /// exhaustive matches the compiler polices — a newly added [`KeyAction`] compiles perfectly
-    /// while shipping unbound and absent from the settings list, which walks this table in
-    /// [`ALL_ACTIONS`] order. Pin both the coverage and the order.
-    #[test]
-    fn defaults_cover_every_action_in_order() {
-        let kb = Keybinds::defaults();
-        let listed: Vec<KeyAction> = kb.bindings.iter().map(|(a, _)| *a).collect();
-        assert_eq!(
-            listed, ALL_ACTIONS,
-            "defaults() must list every action exactly once, in ALL_ACTIONS order"
-        );
-
-        for action in ALL_ACTIONS {
-            let bound = !kb.chords(*action).is_empty();
-            let expected = !INTENTIONALLY_UNBOUND.contains(action);
-            assert_eq!(
-                bound,
-                expected,
-                "`{}` is {} — update defaults() or INTENTIONALLY_UNBOUND",
-                action.name(),
-                if bound {
-                    "bound but listed as unbound"
-                } else {
-                    "unbound"
-                }
-            );
-        }
-    }
-
-    /// `is_flipbook_context` is a `matches!` that defaults to `false`, so a new flipbook action
-    /// forgotten there silently becomes a *global* binding — `Space` scrubbing a still image.
-    /// `group()` is an exhaustive match the compiler forces you to fill in, so tie the loose one
-    /// to it: everything filed under "Flipbook" is mode-scoped, except the toggle that enters the
-    /// mode (which must work from outside it).
-    #[test]
-    fn flipbook_context_agrees_with_the_settings_grouping() {
-        for action in ALL_ACTIONS {
-            let grouped = action.group() == "Flipbook";
-            let scoped = action.is_flipbook_context();
-            if *action == KeyAction::ToggleFlipbook {
-                assert!(grouped && !scoped, "the toggle must fire outside the mode");
-            } else {
                 assert_eq!(
-                    grouped,
-                    scoped,
-                    "`{}` is grouped under Flipbook but not context-scoped (or vice-versa)",
-                    action.name()
+                    KeyChord::parse(&chord.format()),
+                    Some(chord),
+                    "{}",
+                    chord.format()
                 );
             }
         }
     }
 
-    /// The defaults reproduce the keyboard Fire shipped with (the table that used to live in
-    /// `App::handle_key` as raw VK matches).
     #[test]
-    fn defaults_match_the_legacy_key_table() {
+    fn parse_is_case_insensitive_and_accepts_every_primary_spelling() {
+        assert_eq!(KeyChord::parse("f"), Some(KeyChord::plain(KeyCode::KeyF)));
+        let expect = KeyChord {
+            key: KeyCode::KeyK,
+            primary: true,
+            alt: false,
+            shift: true,
+        };
+        for s in [
+            "Primary+Shift+K",
+            "ctrl+shift+k",
+            "Control+Shift+K",
+            "Cmd+Shift+K",
+            "command+shift+k",
+        ] {
+            assert_eq!(KeyChord::parse(s), Some(expect), "{s}");
+        }
+        // "+" is accepted as an alias for the `=` key, with or without modifiers.
+        assert_eq!(KeyChord::parse("+"), Some(KeyChord::plain(KeyCode::Equal)));
+        assert_eq!(
+            KeyChord::parse("Ctrl++"),
+            Some(KeyChord {
+                key: KeyCode::Equal,
+                primary: true,
+                alt: false,
+                shift: false
+            })
+        );
+        // A bare modifier, an empty string and an unknown name all fail to parse.
+        assert_eq!(KeyChord::parse("Ctrl+"), None);
+        assert_eq!(KeyChord::parse(""), None);
+        assert_eq!(KeyChord::parse("Bogus"), None);
+    }
+
+    #[test]
+    fn display_uses_arrow_glyphs_and_the_os_modifier_name() {
+        let left = KeyChord::plain(KeyCode::ArrowLeft);
+        assert_eq!(left.display(), "\u{2190}");
+        assert_eq!(left.format(), "Left");
+        let ctrl_right = KeyChord {
+            key: KeyCode::ArrowRight,
+            primary: true,
+            alt: false,
+            shift: false,
+        };
+        assert_eq!(ctrl_right.format(), "Primary+Right");
+        assert_eq!(ctrl_right.display(), format!("{PRIMARY_LABEL}\u{2192}"));
+    }
+
+    #[test]
+    fn defaults_match_the_shipped_keyboard() {
         let kb = Keybinds::defaults();
-        let cases: &[(u32, KeyAction)] = &[
-            (0x46, KeyAction::Fit),
-            (0x31, KeyAction::ActualSize),
-            (0x52, KeyAction::ChannelR),
-            (0x47, KeyAction::ChannelG),
-            (0x42, KeyAction::ChannelB),
-            (0x41, KeyAction::ChannelA),
-            (0x43, KeyAction::ChannelRgb),
-            (0x54, KeyAction::ToggleTonemap),
-            (0x4B, KeyAction::ToggleFlipbook),
-            (0xDD, KeyAction::ExposureUp),
-            (0xDB, KeyAction::ExposureDown),
-            (0xBB, KeyAction::ZoomIn),
-            (0x6B, KeyAction::ZoomIn),
-            (0xBD, KeyAction::ZoomOut),
-            (0x6D, KeyAction::ZoomOut),
-            (0x25, KeyAction::PrevImage),
-            (0x27, KeyAction::NextImage),
-            (0x7A, KeyAction::ToggleFullscreen),
-            (0x1B, KeyAction::CloseOrExitFullscreen),
+        let cases = [
+            (KeyCode::KeyF, KeyAction::Fit),
+            (KeyCode::Digit1, KeyAction::ActualSize),
+            (KeyCode::KeyR, KeyAction::ChannelR),
+            (KeyCode::KeyG, KeyAction::ChannelG),
+            (KeyCode::KeyB, KeyAction::ChannelB),
+            (KeyCode::KeyA, KeyAction::ChannelA),
+            (KeyCode::KeyC, KeyAction::ChannelRgb),
+            (KeyCode::KeyT, KeyAction::ToggleTonemap),
+            (KeyCode::KeyK, KeyAction::ToggleFlipbook),
+            (KeyCode::BracketRight, KeyAction::ExposureUp),
+            (KeyCode::BracketLeft, KeyAction::ExposureDown),
+            (KeyCode::Equal, KeyAction::ZoomIn),
+            (KeyCode::NumpadAdd, KeyAction::ZoomIn),
+            (KeyCode::Minus, KeyAction::ZoomOut),
+            (KeyCode::NumpadSubtract, KeyAction::ZoomOut),
+            (KeyCode::ArrowLeft, KeyAction::PrevImage),
+            (KeyCode::ArrowRight, KeyAction::NextImage),
+            (KeyCode::F11, KeyAction::ToggleFullscreen),
+            (KeyCode::Escape, KeyAction::CloseOrExitFullscreen),
         ];
-        for (vk, action) in cases {
+        for (key, action) in cases {
             assert_eq!(
-                kb.lookup(KeyChord::plain(*vk), false),
-                Some(*action),
-                "vk {vk:#04X}"
+                kb.lookup(KeyChord::plain(key), false),
+                Some(action),
+                "{key:?}"
             );
         }
-        // Shift+= (how "+" is typed) also zooms in.
+        // Shift+= is bound alongside = (that's how + is typed).
         assert_eq!(
             kb.lookup(
                 KeyChord {
-                    vk: 0xBB,
-                    ctrl: false,
+                    key: KeyCode::Equal,
+                    primary: false,
                     alt: false,
-                    shift: true
+                    shift: true,
                 },
                 false
             ),
             Some(KeyAction::ZoomIn)
         );
-        // The flipbook keys fire only inside the mode.
-        for (vk, action) in [
-            (0x20, KeyAction::FlipbookPlayPause),
-            (0xBC, KeyAction::FlipbookPrevFrame),
-            (0xBE, KeyAction::FlipbookNextFrame),
+        // The flipbook keys are inert outside the mode.
+        for (key, action) in [
+            (KeyCode::Space, KeyAction::FlipbookPlayPause),
+            (KeyCode::Comma, KeyAction::FlipbookPrevFrame),
+            (KeyCode::Period, KeyAction::FlipbookNextFrame),
         ] {
-            assert_eq!(kb.lookup(KeyChord::plain(vk), true), Some(action));
-            assert_eq!(kb.lookup(KeyChord::plain(vk), false), None);
+            assert_eq!(kb.lookup(KeyChord::plain(key), true), Some(action));
+            assert_eq!(kb.lookup(KeyChord::plain(key), false), None);
         }
-        // Two actions ship unbound.
-        assert!(kb.chords(KeyAction::ExposureReset).is_empty());
-        assert!(kb.chords(KeyAction::ToggleOutline).is_empty());
-        // Z walks the backdrops.
+        // Z cycles the backdrop, in either mode.
         assert_eq!(
-            kb.lookup(KeyChord::plain(0x5A), false),
+            kb.lookup(KeyChord::plain(KeyCode::KeyZ), false),
             Some(KeyAction::CycleBackdrop)
         );
-    }
-
-    /// The file commands ship on Ctrl chords, so a bare `O` / `W` stays free — and, being global,
-    /// they still fire inside flipbook mode.
-    #[test]
-    fn file_commands_are_ctrl_chords() {
-        let kb = Keybinds::defaults();
-        let ctrl = |vk| KeyChord {
-            vk,
-            ctrl: true,
+        // Ctrl+O / Ctrl+W are chords; the bare letters do nothing.
+        let ctrl = |key| KeyChord {
+            key,
+            primary: true,
             alt: false,
             shift: false,
         };
         for in_flipbook in [false, true] {
             assert_eq!(
-                kb.lookup(ctrl(0x4F), in_flipbook),
+                kb.lookup(ctrl(KeyCode::KeyO), in_flipbook),
                 Some(KeyAction::OpenFile)
             );
             assert_eq!(
-                kb.lookup(ctrl(0x57), in_flipbook),
+                kb.lookup(ctrl(KeyCode::KeyW), in_flipbook),
                 Some(KeyAction::CloseImage)
             );
-            // Chords match exactly, so the unmodified letters are untouched.
-            assert_eq!(kb.lookup(KeyChord::plain(0x4F), in_flipbook), None);
-            assert_eq!(kb.lookup(KeyChord::plain(0x57), in_flipbook), None);
+            assert_eq!(kb.lookup(KeyChord::plain(KeyCode::KeyO), in_flipbook), None);
+            assert_eq!(kb.lookup(KeyChord::plain(KeyCode::KeyW), in_flipbook), None);
         }
     }
 
-    /// A chord held by another action is *stolen*, leaving the table conflict-free.
     #[test]
-    fn rebind_steals_the_chord() {
-        let mut kb = Keybinds::defaults();
-        let f = KeyChord::plain(0x46); // F, currently Fit
-        assert_eq!(kb.conflict(f, KeyAction::NextImage), Some(KeyAction::Fit));
-
-        let loser = kb.rebind(KeyAction::NextImage, f);
-        assert_eq!(loser, Some(KeyAction::Fit));
-        assert_eq!(kb.lookup(f, false), Some(KeyAction::NextImage));
-        assert!(kb.chords(KeyAction::Fit).is_empty());
-        // Next image's old binding is gone (rebind replaces, it doesn't append).
-        assert_eq!(kb.lookup(KeyChord::plain(0x27), false), None);
-
-        kb.reset(KeyAction::NextImage);
+    fn chords_match_exactly() {
+        let kb = Keybinds::defaults();
+        // A stray modifier no longer triggers the plain command.
         assert_eq!(
-            kb.lookup(KeyChord::plain(0x27), false),
-            Some(KeyAction::NextImage)
+            kb.lookup(
+                KeyChord {
+                    key: KeyCode::KeyF,
+                    primary: true,
+                    alt: false,
+                    shift: false,
+                },
+                false
+            ),
+            None
         );
     }
 
-    /// Stealing only one chord of a multi-chord action leaves its other chords alone.
     #[test]
-    fn rebind_steals_only_the_one_chord() {
-        let mut kb = Keybinds::defaults();
-        let numplus = KeyChord::plain(0x6B); // an alias of ZoomIn
-        kb.rebind(KeyAction::ExposureReset, numplus);
-        assert_eq!(kb.lookup(numplus, false), Some(KeyAction::ExposureReset));
-        // `=` still zooms in.
+    fn config_overrides_and_unbinds() {
+        let mut cfg = KeybindsCfg::new();
+        cfg.insert("fit".into(), KeyValue::One("Ctrl+F".into()));
+        cfg.insert(
+            "zoom-in".into(),
+            KeyValue::Many(vec!["=".into(), "Num+".into()]),
+        );
+        cfg.insert("toggle-tonemap".into(), KeyValue::One(String::new()));
+        cfg.insert("no-such-action".into(), KeyValue::One("Q".into()));
+        cfg.insert("zoom-out".into(), KeyValue::One("Bogus".into()));
+        let kb = Keybinds::from_config(&cfg);
+        assert_eq!(kb.lookup(KeyChord::plain(KeyCode::KeyF), false), None);
         assert_eq!(
-            kb.lookup(KeyChord::plain(0xBB), false),
+            kb.lookup(
+                KeyChord {
+                    key: KeyCode::KeyF,
+                    primary: true,
+                    alt: false,
+                    shift: false,
+                },
+                false
+            ),
+            Some(KeyAction::Fit)
+        );
+        // Shift+= dropped by the override; = and Num+ kept.
+        assert_eq!(
+            kb.lookup(KeyChord::plain(KeyCode::Equal), false),
             Some(KeyAction::ZoomIn)
         );
+        assert_eq!(
+            kb.lookup(
+                KeyChord {
+                    key: KeyCode::Equal,
+                    primary: false,
+                    alt: false,
+                    shift: true,
+                },
+                false
+            ),
+            None
+        );
+        // "" unbinds.
+        assert_eq!(kb.lookup(KeyChord::plain(KeyCode::KeyT), false), None);
+        // A bad chord leaves the default in place.
+        assert_eq!(
+            kb.lookup(KeyChord::plain(KeyCode::Minus), false),
+            Some(KeyAction::ZoomOut)
+        );
     }
 
-    /// Only rebound actions are written; an untouched table serializes to nothing.
     #[test]
-    fn to_config_writes_only_overrides() {
-        let kb = Keybinds::defaults();
-        assert!(kb.to_config().is_empty());
-
+    fn to_config_writes_only_the_differences() {
         let mut kb = Keybinds::defaults();
-        // Q, a chord nothing ships bound to — so exactly two actions end up differing from the
-        // defaults. (Rebinding onto an *occupied* chord would unbind its owner and write a third
-        // entry; that's `rebind_steals_the_chord`'s job, not this test's.)
-        kb.rebind(KeyAction::Fit, KeyChord::plain(0x51));
-        kb.unbind(KeyAction::ToggleTonemap);
+        assert!(kb.to_config().is_empty());
+        kb.rebind(KeyAction::Fit, KeyChord::plain(KeyCode::KeyQ));
+        kb.unbind(KeyAction::ChannelR);
         let cfg = kb.to_config();
-        assert_eq!(cfg.get("fit"), Some(&KeyValue::One("Q".into())));
-        assert_eq!(
-            cfg.get("toggle-tonemap"),
-            Some(&KeyValue::One(String::new()))
-        );
         assert_eq!(cfg.len(), 2);
-
-        // …and reading it back reproduces the table exactly.
+        assert_eq!(cfg.get("fit"), Some(&KeyValue::One("Q".into())));
+        assert_eq!(cfg.get("red-channel"), Some(&KeyValue::One(String::new())));
+        // And reading it back reproduces the table.
         assert_eq!(Keybinds::from_config(&cfg), kb);
     }
 
-    /// A garbage config entry costs one binding at most — never the whole keyboard.
     #[test]
-    fn from_config_ignores_junk() {
-        let mut cfg = KeybindsCfg::new();
-        cfg.insert("not-an-action".into(), KeyValue::One("Q".into()));
-        cfg.insert("fit".into(), KeyValue::One("NotAKey".into()));
-        cfg.insert(
-            "zoom-in".into(),
-            KeyValue::Many(vec!["W".into(), "bogus".into()]),
-        );
-        let kb = Keybinds::from_config(&cfg);
-        // "fit" had no parseable chord → it ends up unbound (the entry was present, just useless).
-        assert!(kb.chords(KeyAction::Fit).is_empty());
-        // zoom-in keeps the one chord that parsed.
-        assert_eq!(kb.chords(KeyAction::ZoomIn), &[KeyChord::plain(0x57)]);
-        // Everything else is untouched.
+    fn rebind_steals_and_reports_the_loser() {
+        let mut kb = Keybinds::defaults();
+        let f = KeyChord::plain(KeyCode::KeyF);
+        assert_eq!(kb.rebind(KeyAction::ZoomIn, f), Some(KeyAction::Fit));
+        assert_eq!(kb.chords(KeyAction::Fit), &[]);
+        assert_eq!(kb.chords(KeyAction::ZoomIn), &[f]);
+        assert_eq!(kb.conflict(f, KeyAction::ZoomIn), None);
+        // A chord nobody holds reports no loser.
         assert_eq!(
-            kb.lookup(KeyChord::plain(0x54), false),
-            Some(KeyAction::ToggleTonemap)
+            kb.rebind(KeyAction::ExposureReset, KeyChord::plain(KeyCode::KeyQ)),
+            None
         );
+        // Reset restores the shipped chord (F), which now conflicts with ZoomIn.
+        kb.reset(KeyAction::Fit);
+        assert_eq!(kb.conflict(f, KeyAction::Fit), Some(KeyAction::ZoomIn));
     }
 
-    /// Tooltip labels follow the live bindings.
     #[test]
-    fn labels_track_rebinds() {
+    fn labels_follow_the_primary_chord() {
         let mut kb = Keybinds::defaults();
-        assert_eq!(kb.labels().suffix(KeyAction::Fit), "  (F)");
-        assert_eq!(kb.labels().get(KeyAction::PrevImage), Some("\u{2190}"));
-        assert_eq!(kb.labels().suffix(KeyAction::ExposureReset), "");
+        let l = kb.labels();
+        assert_eq!(l.get(KeyAction::Fit), Some("F"));
+        assert_eq!(l.get(KeyAction::PrevImage), Some("\u{2190}"));
+        assert_eq!(l.suffix(KeyAction::Fit), "  (F)");
+        assert_eq!(l.get(KeyAction::ExposureReset), None);
+        assert_eq!(l.suffix(KeyAction::ExposureReset), "");
+        kb.rebind(KeyAction::Fit, KeyChord::plain(KeyCode::KeyQ));
+        assert_eq!(kb.labels().get(KeyAction::Fit), Some("Q"));
+    }
 
-        kb.rebind(
-            KeyAction::Fit,
-            KeyChord {
-                vk: 0x5A,
-                ctrl: true,
-                alt: false,
-                shift: false,
-            },
-        );
-        assert_eq!(kb.labels().suffix(KeyAction::Fit), "  (Ctrl+Z)");
+    #[test]
+    fn reserved_keys_are_not_chords() {
+        assert!(KeyChord::plain(KeyCode::ShiftLeft).is_reserved());
+        assert!(KeyChord::plain(KeyCode::SuperLeft).is_reserved());
+        assert!(!KeyChord::plain(KeyCode::KeyF).is_reserved());
     }
 }

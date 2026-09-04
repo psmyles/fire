@@ -1,16 +1,17 @@
-//! Build steps for `fire.exe`:
-//!   1. Precompile the viewport HLSL to DXBC with `fxc` (the Windows SDK offline shader
-//!      compiler), so the bytecode is embedded at build time instead of compiled at startup
-//!      via `D3DCompile`. This drops the runtime `d3dcompiler` dependency, shaves the cold-start
-//!      path, and turns a broken shader into a build error rather than a launch-time panic.
-//!   2. Read the canonical product metadata from `product.json` (repo root) and (a) embed it into
-//!      the exe's Windows version resource + app icon — so Explorer shows the flame and Task
+//! Build steps for the `fire` executable:
+//!   1. Rasterize the toolbar SVGs and decode the logo PNG into raw pixels, so no SVG/PNG decoder
+//!      ships in the exe and a malformed asset is a build error rather than a launch panic.
+//!   2. Read the canonical product metadata from `product.json` (repo root) and (a) on Windows,
+//!      embed it into the exe's version resource + app icon — so Explorer shows the flame and Task
 //!      Manager / file properties read the product name/version — and (b) re-export the same
 //!      strings as `FIRE_*` compile-time env vars the app reads via `env!` (window title, etc.).
 //!      `product.json` is the single source of truth: editing it there flows into the binary, and
-//!      the installer build script reads the same file, so a version bump lives in exactly one place.
+//!      the installer build scripts read the same file, so a version bump lives in exactly one place.
+//!
+//! There is no shader step any more: the viewport shader is WGSL (`src/render/shader.wgsl`),
+//! which wgpu validates and compiles at pipeline creation on every OS.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Product metadata read from `product.json`. Only the fields the build consumes are pulled.
 struct Product {
@@ -23,14 +24,10 @@ struct Product {
 }
 
 fn main() {
-    // The crate is Windows-only; both steps need a Windows target and the Windows SDK.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
     let product = read_product();
-    compile_shaders();
     rasterize_icons();
     decode_logo();
+    #[cfg(windows)]
     embed_resources(&product);
     export_env(&product);
 }
@@ -184,74 +181,11 @@ fn read_product() -> Product {
     }
 }
 
-/// Compile each entry point of `src/render/shader.hlsl` to a `.dxbc` in `OUT_DIR`, which
-/// `render::gpu` embeds via `include_bytes!`. fxc targets shader model 5.x (`vs_5_0`/`ps_5_0`).
-fn compile_shaders() {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let hlsl = Path::new(&manifest).join("src/render/shader.hlsl");
-    println!("cargo:rerun-if-changed={}", hlsl.display());
-    println!("cargo:rerun-if-env-changed=FXC");
-
-    let fxc = find_fxc();
-    for (entry, target) in [("vs_main", "vs_5_0"), ("ps_main", "ps_5_0")] {
-        let out = Path::new(&out_dir).join(format!("{entry}.dxbc"));
-        let output = std::process::Command::new(&fxc)
-            .args(["/nologo", "/O3", "/T", target, "/E", entry, "/Fo"])
-            .arg(&out)
-            .arg(&hlsl)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to run fxc ({}): {e}", fxc.display()));
-        if !output.status.success() {
-            panic!(
-                "fxc failed to compile {entry} ({target}):\n{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-    }
-}
-
-/// Locate `fxc.exe`. Honors an explicit `FXC` override, then the SDK bin path exported inside a
-/// Developer Command Prompt (`WindowsSdkVerBinPath`), then the newest installed Windows 10/11 SDK
-/// bin, and finally falls back to `fxc.exe` on `PATH`.
-fn find_fxc() -> PathBuf {
-    if let Ok(p) = std::env::var("FXC") {
-        return PathBuf::from(p);
-    }
-    if let Ok(bin) = std::env::var("WindowsSdkVerBinPath") {
-        let p = PathBuf::from(bin).join("x64").join("fxc.exe");
-        if p.exists() {
-            return p;
-        }
-    }
-    // Search every installed SDK version under each Program Files root; pick the newest.
-    let mut candidates: Vec<(std::ffi::OsString, PathBuf)> = Vec::new();
-    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
-        let Ok(pf) = std::env::var(var) else { continue };
-        let bin = PathBuf::from(pf)
-            .join("Windows Kits")
-            .join("10")
-            .join("bin");
-        let Ok(entries) = std::fs::read_dir(&bin) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            let p = e.path().join("x64").join("fxc.exe");
-            if p.exists() {
-                candidates.push((e.file_name(), p)); // key on the version dir name
-            }
-        }
-    }
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
-    candidates
-        .pop()
-        .map_or_else(|| PathBuf::from("fxc.exe"), |(_, p)| p)
-}
-
 /// Embed the Fire `.ico` + product metadata into the exe (Explorer file icon, Task Manager name,
 /// file-properties version tab). Every string comes from `product.json` so the binary's metadata
-/// can never drift from the installer's.
+/// can never drift from the installer's. Windows only: the macOS bundle carries the same data in
+/// its `Info.plist` (see `scripts/build-mac.sh`).
+#[cfg(windows)]
 fn embed_resources(p: &Product) {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let ico = Path::new(&manifest).join("../../assets/fire.ico");
@@ -283,6 +217,7 @@ fn embed_resources(p: &Product) {
 /// (`major<<48 | minor<<32 | patch<<16 | build`). Missing components default to 0; each field
 /// is 16 bits, so a component above 65535 is clamped rather than silently bleeding into its
 /// neighbour.
+#[cfg(windows)]
 fn packed_version(version: &str) -> u64 {
     let mut fields = [0u64; 4];
     for (field, part) in fields.iter_mut().zip(version.split('.')) {

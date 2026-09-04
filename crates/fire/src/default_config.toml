@@ -14,14 +14,14 @@
 # Format:   TOML (https://toml.io)
 
 # ----------------------------------------------------------------------------------------------
-# instance-mode — how a newly launched Fire relates to one that is already open.
+# open-in — where an image opened while Fire is already running lands. Fire is always one
+#           process: a second launch hands its path to the running one and exits.
 #
-#   "new-window"      (default) Every image you open gets its own independent window. Nothing
-#                     stays resident in the background.
-#   "single-instance" Keep a single Fire window; opening another image reuses that window
-#                     (the picture swaps in) instead of spawning a new one.
+#   "new-window"    (default) Every image you open gets its own window.
+#   "reuse-window"  Keep a single Fire window; opening another image swaps the picture into it
+#                   instead of opening a new one.
 #
-# instance-mode = "new-window"
+# open-in = "new-window"
 
 # ----------------------------------------------------------------------------------------------
 # esc-closes-window — whether Esc closes the window. Esc does two jobs: in full screen it always

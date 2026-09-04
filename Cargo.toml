@@ -42,11 +42,24 @@ unimplemented = "warn"
 # versions into Cargo.lock and proves the set is compatible.
 [workspace.dependencies]
 # --- windowing / render ---
-# GPU presentation (D3D11 + a DXGI flip-model swapchain on a raw Win32 HWND, HLSL color
-# pipeline compiled at startup) is provided by the typed `windows` crate; see its entry
-# under "Windows platform APIs" below.
-# POD casts in the decode path (slice reinterpretation of 16-bit pixels).
+# One shared shell on every OS: `winit` owns the window, the event loop and input; `wgpu` owns the
+# GPU (DX12 on Windows, Metal on macOS) with one WGSL shader; Dear ImGui draws the chrome through
+# its maintained winit + wgpu backends. The three `dear-imgui-*` crates and `wgpu` are pinned to
+# exact versions because they move together (see mac-port-plan.md §6).
+winit = "=0.30.13"
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "dx12", "metal", "wgsl"] }
+dear-imgui-rs = { version = "=0.17.0", default-features = false }
+dear-imgui-winit = "=0.17.0"
+dear-imgui-wgpu = { version = "=0.17.0", default-features = false, features = ["wgpu-30"] }
+# POD casts: the shader's uniform block and 16-bit pixel reinterpretation in the decode path.
 bytemuck = { version = "1", features = ["derive"] }
+# Instance coordination: one named pipe (Windows) / Unix socket (macOS) behind one API. The bind
+# *is* the single-instance lock — no mutex.
+interprocess = "2.4"
+# Per-OS config directory (`%APPDATA%\fire`, `~/Library/Application Support/fire`).
+dirs = "6"
+# The native open-file dialog (Ctrl+O, the empty-window double-click, Settings ▸ Browse…).
+rfd = { version = "0.17", default-features = false }
 
 # --- decode ---
 # zune is the hot-path decoder for the common formats. Its default feature is `all`, which is
@@ -103,8 +116,7 @@ serde_json = "1"
 # --- worker messaging ---
 crossbeam-channel = "0.5"
 
-# --- Windows platform APIs (pipes, mutex, foreground, registry, shell) ---
-windows = "0.61"
+# --- Windows platform leaves (foreground handoff, clipboard, launcher show-state) ---
 windows-sys = "0.60"
 
 # --- internal crates ---

@@ -10,9 +10,7 @@
 //!   indented row list the Context Menu tab paints, and the edit operations (add / remove / move /
 //!   indent / outdent) work on the `Vec<MenuEntry>` by *path* (the index chain from the root).
 
-use crate::config::{
-    BackgroundCfg, Config, FitCfg, InstanceMode, MenuEntry, TonemapCfg, WheelActionCfg,
-};
+use crate::config::{BackgroundCfg, Config, FitCfg, MenuEntry, OpenIn, TonemapCfg, WheelActionCfg};
 use crate::flipbook::{FPS_MAX, FPS_MIN};
 
 // ---------------------------------------------------------------------------------------------
@@ -76,7 +74,7 @@ impl BoolField {
 /// [`Self::set`] writes for N, so the two must be kept in step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChoiceField {
-    InstanceMode,
+    OpenIn,
     Background,
     DefaultTonemap,
     DefaultFit,
@@ -86,7 +84,7 @@ pub(crate) enum ChoiceField {
 impl ChoiceField {
     pub(crate) fn options(self) -> &'static [&'static str] {
         match self {
-            ChoiceField::InstanceMode => &["New window", "Single instance"],
+            ChoiceField::OpenIn => &["New window", "Reuse window"],
             ChoiceField::Background => &["Automatic", "Black", "White", "Grey", "Checkerboard"],
             ChoiceField::DefaultTonemap => &["Reinhard", "ACES"],
             ChoiceField::DefaultFit => &["Fit to window", "Actual size (1:1)"],
@@ -96,9 +94,9 @@ impl ChoiceField {
 
     pub(crate) fn get(self, c: &Config) -> usize {
         match self {
-            ChoiceField::InstanceMode => match c.instance_mode {
-                InstanceMode::NewWindow => 0,
-                InstanceMode::SingleInstance => 1,
+            ChoiceField::OpenIn => match c.open_in {
+                OpenIn::NewWindow => 0,
+                OpenIn::ReuseWindow => 1,
             },
             ChoiceField::Background => match c.background {
                 BackgroundCfg::Auto => 0,
@@ -125,8 +123,8 @@ impl ChoiceField {
     /// Out-of-range indices are ignored rather than clamped — they can only come from a bug.
     pub(crate) fn set(self, c: &mut Config, i: usize) {
         match (self, i) {
-            (ChoiceField::InstanceMode, 0) => c.instance_mode = InstanceMode::NewWindow,
-            (ChoiceField::InstanceMode, 1) => c.instance_mode = InstanceMode::SingleInstance,
+            (ChoiceField::OpenIn, 0) => c.open_in = OpenIn::NewWindow,
+            (ChoiceField::OpenIn, 1) => c.open_in = OpenIn::ReuseWindow,
             (ChoiceField::Background, 0) => c.background = BackgroundCfg::Auto,
             (ChoiceField::Background, 1) => c.background = BackgroundCfg::Black,
             (ChoiceField::Background, 2) => c.background = BackgroundCfg::White,
@@ -679,7 +677,7 @@ mod tests {
     #[test]
     fn dropdown_indices_round_trip() {
         let fields = [
-            ChoiceField::InstanceMode,
+            ChoiceField::OpenIn,
             ChoiceField::Background,
             ChoiceField::DefaultTonemap,
             ChoiceField::DefaultFit,

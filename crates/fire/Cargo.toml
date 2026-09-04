@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Builds `fire.exe` — the whole viewer (window, render, decode pool, optional pipe). The
-# default bin (package name + src/main.rs) needs no [[bin]] section.
+# Builds the `fire` executable — the whole viewer (window, render, decode pool, instance socket).
+# The default bin (package name + src/main.rs) needs no [[bin]] section.
 
 # Pass-throughs to `fire-decode`'s native decoders, on by default — the shipped exe reads PSD
 # and HEIF/AVIF. `--no-default-features` builds the viewer without the vendored native trees,
@@ -16,8 +16,6 @@ default = ["psd", "heif"]
 psd = ["fire-decode/psd"]
 heif = ["fire-decode/heif"]
 
-# crossbeam-channel carries decode results from the worker pool; serde/toml read the
-# startup config.
 [dependencies]
 fire-ipc.workspace = true
 fire-decode.workspace = true
@@ -29,64 +27,46 @@ toml.workspace = true
 crossbeam-channel.workspace = true
 
 # notify watches the open image's directory so it hot-reloads when the file changes on disk
-# (ReadDirectoryChangesW on Windows); see watcher.rs.
+# (ReadDirectoryChangesW on Windows, FSEvents on macOS); see watcher.rs.
 notify.workspace = true
 
-# Raw Win32: native window/message loop, named-pipe server, single-instance mutex,
-# foreground raise, and the GDI-painted chrome (toolbar/status bar). windows-sys (vs the
-# typed `windows` crate) keeps these calls predictable.
+# The shared shell: winit (window, event loop, input, DPI, drag-and-drop, theme), wgpu (one
+# device, one surface per window, one WGSL shader), Dear ImGui through its winit + wgpu backends.
+winit.workspace = true
+wgpu.workspace = true
+dear-imgui-rs.workspace = true
+dear-imgui-winit.workspace = true
+dear-imgui-wgpu.workspace = true
+bytemuck.workspace = true
+
+# Instance coordination (named pipe / Unix socket), the config directory, the open-file dialog.
+interprocess.workspace = true
+dirs.workspace = true
+rfd.workspace = true
+
+# The remaining Win32 leaves (see `platform.rs`): the one-shot foreground grant on the forward
+# path, the clipboard (Copy File / Path / Name), and the launcher's Run = Maximized/Minimized.
+[target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-    "Win32_System_Pipes",
-    "Win32_System_Threading",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Registry",            # read the dark-mode preference (AppsUseLightTheme)
     "Win32_System_DataExchange",        # clipboard (Copy File / Path / Name from the actions menu)
     "Win32_System_Memory",              # GlobalAlloc/Lock for the clipboard payloads
-    "Win32_Graphics_Gdi",               # GDI painting of the toolbar/status chrome
-    "Win32_Graphics_Dwm",               # dark title bar (DwmSetWindowAttribute)
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_HiDpi",                   # Per-Monitor-V2 awareness + GetDpiForWindow
-    "Win32_UI_Shell",                   # drag-and-drop file opening (WM_DROPFILES / HDROP)
-    "Win32_UI_Controls_Dialogs",        # GetOpenFileNameW (empty-viewport double-click → Open)
-] }
-
-# Typed COM bindings for the GPU viewport (D3D11 + DXGI flip-model swapchain). The shader is
-# precompiled to DXBC at build time by `fxc` (see build.rs), so no runtime D3DCompile / Fxc
-# feature is needed. The typed `windows` crate (vs raw windows-sys) makes the COM
-# device/swapchain/resource calls tractable; it's only used by render::gpu.
-windows = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_Graphics_Direct3D",          # D3D_DRIVER_TYPE / feature levels / topology
-    "Win32_Graphics_Direct3D11",        # ID3D11Device / context / resources
-    "Win32_Graphics_Dxgi",              # IDXGIFactory2 / swapchain / device / adapter
-    "Win32_Graphics_Dxgi_Common",       # DXGI_FORMAT / sample desc / swap enums
-] }
-
-# Dear ImGui: the whole UI (toolbar, status bar, transport, popups, settings). `dear-imgui-rs` is
-# the safe Rust API; `dear-imgui-sys` is named directly *only* to enable the two backend-shim
-# features, which compile ocornut's own imgui_impl_win32.cpp / imgui_impl_dx11.cpp. We own no
-# backend code — that is the entire reason this dependency is acceptable (see architecture.md §5.2).
-dear-imgui-rs = { version = "0.15.1", default-features = false }
-dear-imgui-sys = { version = "0.15.1", features = [
-    "backend-shim-win32",
-    "backend-shim-dx11",
+    "Win32_System_Threading",           # GetStartupInfoW (the launcher's Run setting)
+    "Win32_UI_Shell",                   # DROPFILES for the CF_HDROP clipboard payload
+    "Win32_UI_WindowsAndMessaging",     # AllowSetForegroundWindow, SW_* show commands
 ] }
 
 [build-dependencies]
-# build.rs precompiles the viewport HLSL with `fxc` (Windows SDK) and embeds the Fire .ico +
-# product metadata into the exe (Explorer file icon).
-winresource.workspace = true
 # build.rs reads the canonical product metadata from ../../product.json so a single edit there
 # flows into the exe's version resource and the FIRE_* compile-time strings the app displays.
 serde_json.workspace = true
 # build.rs rasterizes the toolbar SVGs (../../assets/icons/) to A8 coverage masks (one master
 # per icon, embedded via include_bytes!); the icon module downsamples them per-DPI at runtime.
 resvg.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+# Embeds the Fire .ico + product metadata into the exe (Explorer file icon, file properties).
+winresource.workspace = true
 
 [lints]
 workspace = true

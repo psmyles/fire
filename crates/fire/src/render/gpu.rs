@@ -1,74 +1,65 @@
-//! GPU viewport: a Direct3D 11 renderer that presents the decoded image through a DXGI
-//! flip-model swapchain covering the whole window's client area, drawing the image into a
-//! *sub-rect* of it (`App::image_rect`) with the ImGui chrome over the rest. The image lives as a
-//! GPU texture (with a hardware mip chain), and pan/zoom/exposure/channel/tonemap are just
-//! constant-buffer values, so each frame is one textured fullscreen triangle: the per-frame CPU
-//! cost is a 128-byte [`Params`] upload + a draw call, and the GPU does the sampling and the whole
-//! color pipeline.
+//! GPU viewport: a wgpu renderer that presents the decoded image through a surface covering the
+//! whole window's client area, drawing the image into a *sub-rect* of it (`Viewer::image_rect`)
+//! with the ImGui chrome over the rest. The image lives as a GPU texture (with a mip chain), and
+//! pan/zoom/exposure/channel/tonemap are just uniform values, so each frame is one textured
+//! fullscreen triangle: the per-frame CPU cost is a 128-byte [`Params`] upload + a draw call, and
+//! the GPU does the sampling and the whole color pipeline.
 //!
 //! Panning changes a transform and the GPU re-samples the texture rather than re-running a
-//! per-pixel pipeline on the CPU. Presentation is vsync-paced through the flip-model swapchain
-//! (tear-free at high refresh), so interaction stays smooth while the CPU sits near idle.
+//! per-pixel pipeline on the CPU. Presentation is vsync-paced (`PresentMode::Fifo`), so
+//! interaction stays smooth while the CPU sits near idle.
 //!
-//! Color: 8-bit sources upload as `*_UNORM_SRGB` (hardware sRGB→linear on sample), float
-//! sources are already linear, 16-bit unorm is sRGB-decoded in the shader. The pixel shader
-//! outputs **linear** and the render-target view is `*_SRGB`, so the hardware sRGB-encodes on
-//! write. The whole pipeline is linear.
+//! Color: 8-bit sources upload as `*Srgb` (hardware sRGB→linear on sample), float sources are
+//! already linear, 16-bit unorm is sRGB-decoded in the shader. The fragment shader outputs
+//! **linear** and the image pass writes through an `*Srgb` *view* of the swapchain texture, so the
+//! hardware sRGB-encodes on write. The whole pipeline is linear.
 //!
-//! [`GpuSurface`] is the window's whole render state, grouped by *lifetime* rather than by
-//! subsystem, because that is what makes it readable: [`DeviceObjects`] is built once at startup
-//! and never changes (bar the two lazily-recreated views); [`ImageContent`] and [`AnimState`] are
-//! replaced wholesale on every adopt; [`SessionPrefs`] deliberately outlives the image so a chosen
-//! backdrop survives folder navigation; [`GestureState`] lives only between a button-down and its
-//! up. The view core (`origin`/`viewport`/`view`/`display`/`flipbook`) stays flat on the surface —
-//! nearly every method touches it, and its math already lives in [`crate::render::view`].
+//! Two structs, by lifetime. [`Gpu`] is the process's one device: instance, adapter, device,
+//! queue, the image pipeline and its samplers, and the mip blit — built once, shared by every
+//! window. [`GpuSurface`] is one window's render state: its surface and uniform buffer, then the
+//! same view/session/gesture state the D3D11 version carried, grouped the same way ([`ImageContent`]
+//! and [`AnimState`] are replaced wholesale on every adopt; [`SessionPrefs`] deliberately outlives
+//! the image so a chosen backdrop survives folder navigation; [`GestureState`] lives only between a
+//! button-down and its up). The view core (`origin`/`viewport`/`view`/`display`/`flipbook`) stays
+//! flat on the surface — nearly every method touches it, and its math already lives in
+//! [`crate::render::view`].
 //!
-//! One rule for the sub-structs: `refresh`/`invalidate` never move onto them. Scheduling a repaint
-//! needs the `hwnd`, so mutate-then-refresh stays a [`GpuSurface`] method.
+//! One rule for the sub-structs: `invalidate` never moves onto them. Scheduling a repaint needs
+//! the window, so mutate-then-invalidate stays a [`GpuSurface`] method.
 
-use std::ffi::c_void;
+use std::future::Future;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
+use std::time::{Duration, Instant};
 
 use fire_decode::{AnimationFrame, DecodedImage, PixelFormat};
+use winit::window::Window;
 
-use windows::core::Interface;
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Direct3D::{
-    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
-    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-};
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
-    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
-    ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_WRITE,
-    D3D11_CREATE_DEVICE_FLAG, D3D11_FILTER_ANISOTROPIC, D3D11_FILTER_MIN_MAG_MIP_POINT,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD, D3D11_RENDER_TARGET_VIEW_DESC,
-    D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RESOURCE_MISC_GENERATE_MIPS,
-    D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_TEX2D_RTV,
-    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC,
-    D3D11_VIEWPORT,
-};
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UNORM,
-    DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-    DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
-};
-use windows::Win32::Graphics::Dxgi::{
-    IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT,
-};
-// Lives in Foundation, not Dxgi: it is an HRESULT, and a *success* one — `Present` returning it
-// means "the frame was accepted but nobody is looking", not that anything failed.
-use windows::Win32::Foundation::DXGI_STATUS_OCCLUDED;
-
-use windows_sys::Win32::Foundation::HWND as SysHwnd;
-use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
-
+use crate::render::mipgen::MipGen;
 use crate::render::view::{
     Background, Channel, DisplayState, Tonemap, ViewState, Viewport, ZoomDetent,
 };
+
+/// The swapchain texture format. Plain UNORM — the ImGui pass writes through it directly (its
+/// colors are already sRGB) — with an sRGB *view* ([`SURFACE_VIEW_SRGB`]) for the image pass.
+pub const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+/// The image pass's view of the same pixels: the shader emits linear, the view encodes on write.
+pub const SURFACE_VIEW_SRGB: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
+
+/// The GPU backend, pinned per OS (mac-port-plan.md D14): no enumeration of backends we would
+/// never pick, no Vulkan loader on Windows.
+const BACKENDS: wgpu::Backends = if cfg!(windows) {
+    wgpu::Backends::DX12
+} else if cfg!(target_os = "macos") {
+    wgpu::Backends::METAL
+} else {
+    wgpu::Backends::VULKAN
+};
+
+/// The largest texture edge the viewer will ask the device for. Matches the decode-side cap
+/// (`MAX_CPU_DIM`): anything bigger was downscaled before it got here.
+const MAX_TEXTURE_DIM: u32 = 16384;
 
 /// Scrubby-zoom sensitivity: an RMB vertical drag multiplies zoom by `exp(dy * this)` per pixel
 /// (~2.7× per 100 px). Exponential-in-pixels so the gesture feels uniform across the zoom range;
@@ -80,11 +71,11 @@ const ZOOM_DRAG_SENSITIVITY: f32 = 0.01;
 /// jiggle would apply (~exp(slop·sensitivity), a couple percent) is imperceptible.
 const ZOOM_DRAG_CLICK_SLOP: f32 = 5.0;
 
-/// Per-frame shader constants. Layout matches the HLSL `cbuffer` (16-byte float4 registers);
-/// keep the field order/padding in lockstep with the `Params` cbuffer in `render/shader.hlsl`.
-/// 128 bytes = 8 float4 registers — asserted below, so this comment cannot drift from the struct.
+/// Per-frame shader constants. Layout matches the WGSL `Params` uniform block; keep the field
+/// order/padding in lockstep with `render/shader.wgsl`. 128 bytes — asserted below, so this
+/// comment cannot drift from the struct.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
     img_w: f32,
     img_h: f32,
@@ -123,11 +114,11 @@ struct Params {
     fb_max_lod: f32,
     /// The image sub-rect's top-left in **render-target** px — i.e. [`GpuSurface::origin`].
     ///
-    /// The pixel shader's `SV_Position` is in render-target space, *not* viewport space: D3D applies
-    /// the viewport transform before the fragment stage, so a viewport at `y = toolbar_h` still hands
-    /// the shader absolute client coordinates. Without this the shader centres the image on
-    /// `surf_size * 0.5` measured from the *client's* origin rather than the viewport's, and every
-    /// image opens exactly `toolbar_h` px too high, its top clipped away by the viewport.
+    /// The fragment shader's `position` is in render-target space, *not* viewport space: the
+    /// viewport transform is applied before the fragment stage, so a viewport at `y = toolbar_h`
+    /// still hands the shader absolute client coordinates. Without this the shader centres the
+    /// image on `surf_size * 0.5` measured from the *client's* origin rather than the viewport's,
+    /// and every image opens exactly `toolbar_h` px too high, its top clipped away.
     surf_origin_x: f32,
     surf_origin_y: f32,
     /// Octagon overlay: the crop factor (0 = quad, 0.5 = diamond) and how much the image outside
@@ -136,14 +127,14 @@ struct Params {
     oct_hide: f32,
 }
 
-// The cbuffer layout is kept in lockstep with the HLSL `cbuffer Params` in `render/shader.hlsl`
-// by hand (there is no reflection); these guard the size so a field added on only one side is a
-// build error rather than silent visual corruption. 128 bytes = 8 × 16-byte float4 registers.
+// The uniform layout is kept in lockstep with the WGSL `Params` struct by hand (there is no
+// reflection); these guard the size so a field added on only one side is a build error rather
+// than silent visual corruption.
 const _: () = assert!(std::mem::size_of::<Params>() == 128);
 const _: () = assert!(std::mem::size_of::<Params>().is_multiple_of(16));
 
 /// Flipbook render parameters mirrored onto the surface from the active per-path state (the
-/// surface never owns durable flipbook state — the win shell does). `None` = not in flipbook mode.
+/// surface never owns durable flipbook state — the viewer does). `None` = not in flipbook mode.
 #[derive(Debug, Clone, Copy)]
 pub struct FlipbookParams {
     pub grid: crate::flipbook::Grid,
@@ -157,7 +148,7 @@ pub struct FlipbookParams {
 /// `tex.current` and the decode worker) and indexing its frames in place is the point —
 /// cloning the frame list here used to duplicate every composited canvas, i.e. the whole
 /// animation, in RAM. `None` for a still image, the common case. The playback timer lives in
-/// the win shell and advances this through [`GpuSurface::advance_frame`].
+/// the viewer and advances this through [`GpuSurface::advance_frame`].
 #[derive(Default)]
 struct AnimState {
     img: Option<Arc<DecodedImage>>,
@@ -191,114 +182,318 @@ impl AnimState {
     }
 }
 
-/// The D3D11 objects: the device and its swapchain, the two views over the backbuffer, and the
-/// pipeline state built once at startup. Everything here is created together in
-/// [`DeviceObjects::new`] and, apart from the two lazily-recreated views, never changes again —
-/// which is what separates it from the view/session state it renders.
-struct DeviceObjects {
-    device: ID3D11Device,
-    context: ID3D11DeviceContext,
-    swapchain: IDXGISwapChain1,
-    /// The image pass's view: `*_SRGB`, so the shader's linear output is encoded on write.
-    /// Recreated lazily after a resize (the backbuffer changes).
-    rtv: Option<ID3D11RenderTargetView>,
-    /// The UI pass's view of the *same* backbuffer: plain `UNORM`, because ImGui's colors are
-    /// already sRGB and must not be encoded a second time. See [`DeviceObjects::ensure_rtv`].
-    rtv_ui: Option<ID3D11RenderTargetView>,
-
-    vs: ID3D11VertexShader,
-    ps: ID3D11PixelShader,
-    samp_aniso: ID3D11SamplerState,
-    samp_point: ID3D11SamplerState,
-    cbuffer: ID3D11Buffer,
+/// How long the phases of GPU bring-up took, for the time-to-first-pixel work (mac-port-plan.md
+/// §7.2, D17). Printed to stderr when `FIRE_TIMING` is set in the environment.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GpuTiming {
+    pub instance: Duration,
+    pub adapter: Duration,
+    pub device: Duration,
+    pub pipeline: Duration,
 }
 
-impl DeviceObjects {
-    fn new(hwnd: HWND, width: u32, height: u32) -> windows::core::Result<Self> {
-        let (device, context) = create_device()?;
-        let swapchain = create_swapchain(&device, hwnd, width, height)?;
-        let (vs, ps) = create_shaders(&device)?;
-        let (samp_aniso, samp_point) = create_samplers(&device)?;
-        let cbuffer = create_const_buffer(&device)?;
-        Ok(Self {
+/// The process's one GPU: instance, adapter, device and queue, plus the image pipeline and the
+/// objects every window's surface shares. Built with the first window (the adapter is chosen
+/// against its surface) and handed to every later one.
+pub struct Gpu {
+    instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    samp_aniso: wgpu::Sampler,
+    samp_point: wgpu::Sampler,
+    /// A 1×1 texture bound while no image is loaded, so a bind group always exists (the shader
+    /// never reads it: `has_image == 0` returns the clear color).
+    placeholder: wgpu::TextureView,
+    mipgen: MipGen,
+    /// Whether 32-bit float textures may be linearly filtered on this device (`FLOAT32_FILTERABLE`).
+    /// Without it a float32 source is uploaded as float16 instead.
+    float32_filterable: bool,
+    /// Whether 16-bit unorm textures exist on this device (`TEXTURE_FORMAT_16BIT_NORM`). Without
+    /// it a 16-bit source is uploaded as float16 (still sRGB-decoded in the shader).
+    norm16: bool,
+}
+
+/// Append a startup-timing line to wherever `FIRE_TIMING` points: `1` prints to stderr, a path
+/// appends to that file (for a release build, which has no console on Windows). A cheap no-op
+/// when the variable is unset.
+pub fn report_timing(line: &str) {
+    let Some(sink) = std::env::var_os("FIRE_TIMING") else {
+        return;
+    };
+    if sink == "1" {
+        eprintln!("fire: {line}");
+    } else {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sink)
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+impl Gpu {
+    /// Start bringing the GPU up on a worker thread, right now — the instance, the adapter, the
+    /// device and the image pipeline need no window, and together they are the longest single
+    /// item on the launch path, so they run alongside the window creation, the ImGui setup and
+    /// the decode instead of after them. The first window joins the handle (`Fire::gpu`).
+    pub fn start() -> std::thread::JoinHandle<Result<Gpu, String>> {
+        std::thread::Builder::new()
+            .name("fire-gpu-init".into())
+            .spawn(Self::bring_up)
+            .expect("the GPU bring-up thread must start")
+    }
+
+    /// Bring the GPU up. Errors are strings for the caller to show: this runs at startup in a
+    /// process that may have no console, where a panic is an invisible abort.
+    pub fn bring_up() -> Result<Gpu, String> {
+        let mut timing = GpuTiming::default();
+        let t = Instant::now();
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = BACKENDS;
+        // No debug layers, ever: validation is pure startup cost and the shader is validated by
+        // wgpu itself. The `from_env` constructors would turn them on in debug builds.
+        desc.flags = wgpu::InstanceFlags::empty();
+        desc.backend_options = wgpu::BackendOptions {
+            dx12: wgpu::Dx12BackendOptions {
+                // FXC ships with Windows; DXC would have to be shipped by us, and the shader is
+                // ~100 lines, so there is nothing for a better optimizer to find.
+                shader_compiler: wgpu::Dx12Compiler::Fxc,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let instance = wgpu::Instance::new(desc);
+        timing.instance = t.elapsed();
+
+        // No `compatible_surface`: there is no window yet, and on the backends this app pins
+        // (DX12, Metal) every adapter can present to every window.
+        let t = Instant::now();
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            ..Default::default()
+        }))
+        .map_err(|e| format!("no usable GPU adapter: {e}"))?;
+        timing.adapter = t.elapsed();
+
+        let t = Instant::now();
+        let supported = adapter.features();
+        let mut features = wgpu::Features::empty();
+        for f in [
+            wgpu::Features::FLOAT32_FILTERABLE,
+            wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+        ] {
+            if supported.contains(f) {
+                features |= f;
+            }
+        }
+        let mut limits = wgpu::Limits::default();
+        limits.max_texture_dimension_2d = adapter
+            .limits()
+            .max_texture_dimension_2d
+            .clamp(limits.max_texture_dimension_2d, MAX_TEXTURE_DIM);
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("fire"),
+            required_features: features,
+            required_limits: limits,
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+            ..Default::default()
+        }))
+        .map_err(|e| format!("request_device: {e}"))?;
+        // wgpu's default for an uncaptured error is to panic; a bad upload must not take the
+        // viewer down. The paths that can fail (texture creation) capture their errors with
+        // scopes and report them; anything else is logged.
+        device.on_uncaptured_error(std::sync::Arc::new(|e| eprintln!("fire: wgpu error: {e}")));
+        timing.device = t.elapsed();
+
+        let t = Instant::now();
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fire viewport"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fire viewport"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<Params>() as u64
+                        ),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fire viewport"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fire viewport"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: SURFACE_VIEW_SRGB,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        // Two samplers: anisotropic+mips for minify, point for crisp magnify/1:1. Both clamp at
+        // edges.
+        let samp_aniso = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("fire aniso"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: 8,
+            ..Default::default()
+        });
+        let samp_point = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("fire point"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let placeholder_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fire placeholder"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let placeholder = placeholder_tex.create_view(&Default::default());
+        let mipgen = MipGen::new(&device);
+        timing.pipeline = t.elapsed();
+
+        report_timing(&format!(
+            "gpu init — instance {:.2} ms, adapter {:.2} ms, device {:.2} ms, pipeline {:.2} ms ({:?})",
+            timing.instance.as_secs_f64() * 1e3,
+            timing.adapter.as_secs_f64() * 1e3,
+            timing.device.as_secs_f64() * 1e3,
+            timing.pipeline.as_secs_f64() * 1e3,
+            adapter.get_info().name,
+        ));
+
+        Ok(Gpu {
+            instance,
+            adapter,
             device,
-            context,
-            swapchain,
-            rtv: None,
-            rtv_ui: None,
-            vs,
-            ps,
+            queue,
+            pipeline,
+            layout,
             samp_aniso,
             samp_point,
-            cbuffer,
+            placeholder,
+            mipgen,
+            float32_filterable: features.contains(wgpu::Features::FLOAT32_FILTERABLE),
+            norm16: features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM),
         })
     }
 
-    /// (Re)create the two render-target views over the current backbuffer.
-    ///
-    /// **Two views of the same pixels, deliberately.** The image shader emits *linear* light, so it
-    /// writes through an `*_SRGB` view and the hardware encodes on write. Dear ImGui's colors are
-    /// *already* sRGB, so it must write through a plain `UNORM` view — pushing it through the sRGB
-    /// view would encode twice and visibly wash the whole UI out. The flip-model swapchain's
-    /// backbuffer is typeless-compatible `R8G8B8A8_UNORM`, which is exactly why both views are legal.
-    ///
-    /// On failure (e.g. a device-removed / TDR reset) the views stay `None` and the frame is skipped
-    /// rather than panicking inside the paint wndproc.
-    fn ensure_rtv(&mut self) {
-        if self.rtv.is_some() && self.rtv_ui.is_some() {
-            return;
-        }
-        unsafe {
-            let back: ID3D11Texture2D = match self.swapchain.GetBuffer(0) {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("fire: swapchain GetBuffer failed: {e}");
-                    return;
-                }
-            };
-            let make = |format| {
-                let desc = D3D11_RENDER_TARGET_VIEW_DESC {
-                    Format: format,
-                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
-                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
-                        Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
-                    },
-                };
-                let mut rtv: Option<ID3D11RenderTargetView> = None;
-                match self
-                    .device
-                    .CreateRenderTargetView(&back, Some(&desc), Some(&mut rtv))
-                {
-                    Ok(()) => rtv,
-                    Err(e) => {
-                        eprintln!("fire: CreateRenderTargetView failed: {e}");
-                        None
-                    }
-                }
-            };
-            self.rtv = make(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
-            self.rtv_ui = make(DXGI_FORMAT_R8G8B8A8_UNORM);
-        }
+    /// A surface for a window on this device.
+    pub fn create_surface(&self, window: &Arc<Window>) -> Result<wgpu::Surface<'static>, String> {
+        let t = Instant::now();
+        let surface = self
+            .instance
+            .create_surface(Arc::clone(window))
+            .map_err(|e| format!("create_surface: {e}"))?;
+        report_timing(&format!(
+            "surface — {:.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        ));
+        Ok(surface)
     }
 
-    /// Drop the views and resize the backbuffer. The views come back on the next
-    /// [`Self::ensure_rtv`], sized from whatever the swapchain then reports.
-    fn resize(&mut self, width: u32, height: u32) {
-        self.rtv = None;
-        self.rtv_ui = None;
-        unsafe {
-            if let Err(e) = self.swapchain.ResizeBuffers(
-                0,
-                width,
-                height,
-                DXGI_FORMAT_UNKNOWN,
-                DXGI_SWAP_CHAIN_FLAG(0),
-            ) {
-                // A failed resize leaves the backbuffer at its old size; log it (ensure_rtv will
-                // recreate the views from whatever the swapchain reports next paint).
-                eprintln!("fire: swapchain ResizeBuffers failed: {e}");
-            }
+    /// Run `f` with wgpu's error scopes open and turn whatever they caught into an `Err`. The
+    /// texture-creation path uses this so an out-of-memory upload is reported to the user rather
+    /// than becoming an uncaptured error.
+    fn scoped<T>(&self, f: impl FnOnce() -> T) -> Result<T, String> {
+        let oom_scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let value = f();
+        let validation = block_on(validation_scope.pop());
+        let oom = block_on(oom_scope.pop());
+        match oom.or(validation) {
+            Some(e) => Err(e.to_string()),
+            None => Ok(value),
         }
+    }
+}
+
+/// Drive a wgpu future to completion on this thread. On the native backends every future wgpu
+/// hands out is already resolved (the work happened synchronously inside the call), so this
+/// never actually spins; it exists because the API is `async` for the web's sake.
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+            return v;
+        }
+        std::thread::yield_now();
     }
 }
 
@@ -308,14 +503,14 @@ impl DeviceObjects {
 type FlipbookCells = Option<((u32, u32), (f32, f32), (f32, f32), f32, f32)>;
 
 /// What the GPU currently holds for the displayed image: the texture, how to sample it, and the
-/// decoded source it came from. All four are replaced together on every adopt and cleared
-/// together when the image goes away.
+/// decoded source it came from. All are replaced together on every adopt and cleared together
+/// when the image goes away.
 #[derive(Default)]
 struct ImageContent {
     /// Current image texture + its sampling view (None until the first image lands).
-    _tex: Option<ID3D11Texture2D>,
-    srv: Option<ID3D11ShaderResourceView>,
-    /// 1 if the texture samples already-linear (8-bit `*_SRGB` / float), 0 if the shader must
+    _tex: Option<wgpu::Texture>,
+    view: Option<wgpu::TextureView>,
+    /// 1 if the texture samples already-linear (8-bit `*Srgb` / float), 0 if the shader must
     /// sRGB-decode (16-bit unorm).
     linear_sample: i32,
     /// The displayed image — retained for the pixel inspector (#16) and for re-fit on resize.
@@ -331,7 +526,7 @@ struct ImageContent {
 /// deliberately survive navigating to the next image (which is the behaviour that makes flipping
 /// through a folder with a chosen backdrop and outline usable at all).
 struct SessionPrefs {
-    /// No-image backdrop (empty window), packed sRGB and its linear form (for the `*_SRGB` RTV).
+    /// No-image backdrop (empty window), packed sRGB and its linear form (for the `*Srgb` view).
     /// Once an image is loaded the [`Background`] mode owns the viewport instead.
     clear: u32,
     clear_lin: [f32; 4],
@@ -418,23 +613,43 @@ impl GestureState {
     }
 }
 
-/// GPU render state for the view window: the D3D11 device/swapchain plus the same pan/zoom/fit
-/// and channel/exposure/tonemap state the CPU surface carried (so the window shell and chrome
-/// drive it through an identical API).
-pub struct GpuSurface {
-    hwnd: isize,
+/// What [`GpuSurface::render_frame`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presented {
+    /// No frame was drawn: the window has no area, the surface was lost (it has been
+    /// reconfigured; ask again), or the window is occluded.
+    Skipped,
+    /// A frame was presented. `waited` says whether acquiring it blocked on the display — normally
+    /// it does (Fifo, latency 1), and that wait is what playback is paced on; a present that did not
+    /// wait (the swapchain was not yet full, or nobody is looking) must not be, or pacing on it
+    /// would spin.
+    Yes { waited: bool },
+}
 
-    gfx: DeviceObjects,
+/// One window's GPU render state: its surface and per-frame uniforms on the shared [`Gpu`], plus
+/// the same pan/zoom/fit and channel/exposure/tonemap state the D3D11 surface carried, so the
+/// viewer and chrome drive it through an identical API.
+pub struct GpuSurface {
+    gpu: Rc<Gpu>,
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    /// The 128-byte [`Params`] block, rewritten every frame.
+    ubuf: wgpu::Buffer,
+    /// Uniforms + the image texture + the two samplers. Rebuilt whenever the texture changes.
+    bind_group: wgpu::BindGroup,
 
     /// The image sub-rect's origin within the client (the chrome occupies the rest).
     origin: (f32, f32),
-    /// What the non-image parts of the backbuffer are cleared to before the UI draws over them.
-    chrome_clear: [f32; 4],
+    /// What the non-image parts of the frame are cleared to before the UI draws over them, as
+    /// sRGB (the theme's value) and as the linear the `*Srgb` view's clear wants.
+    chrome_clear_lin: [f32; 4],
 
     /// The displayed image's GPU residency.
     tex: ImageContent,
 
-    /// Monotonic per-window decode generation; a `DecodeDone` older than this is stale.
+    /// This window's current decode generation; a `DecodeDone` older than this is stale. Values
+    /// come from the process-wide counter (see [`crate::decode_pool::fresh_generation`]).
     generation: u64,
 
     anim: AnimState,
@@ -444,7 +659,7 @@ pub struct GpuSurface {
 
     viewport: Viewport,
     view: ViewState,
-    /// Active flipbook render parameters, mirrored from the win shell's per-path state. `Some`
+    /// Active flipbook render parameters, mirrored from the viewer's per-path state. `Some`
     /// makes pan/zoom/fit operate on the frame rect and the shader sample a single cell. The
     /// surface never persists this — it is (re)applied on every adopt via [`Self::set_flipbook`].
     flipbook: Option<FlipbookParams>,
@@ -453,23 +668,55 @@ pub struct GpuSurface {
 }
 
 impl GpuSurface {
-    /// Build the D3D11 device + flip-model swapchain on the window. Returns the D3D/DXGI error
-    /// instead of panicking — startup runs in a `windows_subsystem = "windows"` process, where a
-    /// panic is an invisible abort; the caller owns telling the user. `width`/`height` are the whole
-    /// client: the swapchain covers it all, and the image is drawn into a sub-rect of it (see
-    /// [`Self::set_image_rect`]) with the chrome painted over the remainder.
+    /// Configure `surface` for the window and build the per-window objects. `width`/`height` are
+    /// the whole client: the surface covers it all, and the image is drawn into a sub-rect of it
+    /// (see [`Self::set_image_rect`]) with the chrome painted over the remainder.
     pub fn new(
-        hwnd: isize,
+        gpu: Rc<Gpu>,
+        window: Arc<Window>,
+        surface: wgpu::Surface<'static>,
         width: u32,
         height: u32,
         fit_upscale: bool,
-    ) -> windows::core::Result<Self> {
-        let win_hwnd = HWND(hwnd as *mut c_void);
+    ) -> Result<Self, String> {
+        let caps = surface.get_capabilities(&gpu.adapter);
+        if !caps.formats.contains(&SURFACE_FORMAT) {
+            return Err(format!(
+                "the surface does not support {SURFACE_FORMAT:?} (offers {:?})",
+                caps.formats
+            ));
+        }
+        let mut config = surface
+            .get_default_config(&gpu.adapter, width.max(1), height.max(1))
+            .ok_or("the adapter cannot present to this window")?;
+        config.format = SURFACE_FORMAT;
+        // Vsync-paced, one frame in flight: acquiring the next frame blocks until the display has
+        // taken the previous one, which is what playback is paced on (see `Presented`).
+        config.present_mode = wgpu::PresentMode::Fifo;
+        config.desired_maximum_frame_latency = 1;
+        config.view_formats = vec![SURFACE_VIEW_SRGB];
+        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
+        }
+        surface.configure(&gpu.device, &config);
+
+        let ubuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fire params"),
+            size: std::mem::size_of::<Params>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = make_bind_group(&gpu, &ubuf, &gpu.placeholder);
+
         Ok(Self {
-            hwnd,
-            gfx: DeviceObjects::new(win_hwnd, width.max(1), height.max(1))?,
+            gpu,
+            window,
+            surface,
+            config,
+            ubuf,
+            bind_group,
             origin: (0.0, 0.0),
-            chrome_clear: [0.0, 0.0, 0.0, 1.0],
+            chrome_clear_lin: [0.0, 0.0, 0.0, 1.0],
             tex: ImageContent {
                 linear_sample: 1,
                 ..ImageContent::default()
@@ -500,20 +747,27 @@ impl GpuSurface {
     }
 
     /// Set the letterbox / no-image backdrop color (packed `0x00RRGGBB`); stored both packed and
-    /// as linear floats so the `*_SRGB` render target re-encodes it to the intended sRGB.
+    /// as linear floats so the `*Srgb` render target re-encodes it to the intended sRGB.
     pub fn set_clear(&mut self, packed: u32) {
         self.prefs.clear = packed;
         let dec = |b: u32| srgb_to_linear((b & 0xff) as f32 / 255.0);
         self.prefs.clear_lin = [dec(packed >> 16), dec(packed >> 8), dec(packed), 1.0];
     }
 
+    /// Take a fresh decode generation for this window and return it.
     pub fn next_generation(&mut self) -> u64 {
-        self.generation += 1;
+        self.generation = crate::decode_pool::fresh_generation();
         self.generation
     }
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Adopt a generation issued elsewhere (the launch path's decode, submitted before this
+    /// window existed).
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
     }
 
     pub fn current_image(&self) -> Option<&DecodedImage> {
@@ -563,7 +817,7 @@ impl GpuSurface {
     }
 
     /// Set the viewport backdrop (toolbar override) and repaint. Records the pick so it persists
-    /// across image navigation for the rest of the session (see [`Self::background_override`]).
+    /// across image navigation for the rest of the session (see `background_override`).
     pub fn set_background(&mut self, bg: Background) {
         self.prefs.background = bg;
         self.prefs.background_override = Some(bg);
@@ -700,26 +954,27 @@ impl GpuSurface {
     }
 
     /// Drop the displayed image so the next paint shows the placeholder. Also drops any animation
-    /// frames so the win shell's next `frame_delay_ms()` returns `None` and the playback timer stops.
+    /// frames so the viewer's next `frame_delay_ms()` returns `None` and the playback timer stops.
     pub fn clear_image(&mut self) {
         self.tex.current = None;
         self.tex._tex = None;
-        self.tex.srv = None;
+        self.tex.view = None;
+        self.bind_group = make_bind_group(&self.gpu, &self.ubuf, &self.gpu.placeholder);
         self.anim.clear();
         self.flipbook = None;
     }
 
-    /// Adopt a decoded image: upload it as a GPU texture (hardware mip chain) and reset to fit +
+    /// Adopt a decoded image: upload it as a GPU texture (with a mip chain) and reset to fit +
     /// neutral display state for the new file (#17). Returns the GPU error if the upload fails
-    /// (e.g. `E_OUTOFMEMORY` on a very large image) so the caller can report it instead of the
+    /// (e.g. out of memory on a very large image) so the caller can report it instead of the
     /// process aborting; on failure the prior display state is left untouched.
-    pub fn set_image(&mut self, img: Arc<DecodedImage>) -> windows::core::Result<()> {
+    pub fn set_image(&mut self, img: Arc<DecodedImage>) -> Result<(), String> {
         let (w, h) = (img.width, img.height);
         // Upload first: if the GPU rejects the texture we bail here, before mutating any state,
         // so a failed adopt can't leave the surface half-updated.
         self.upload_texture(&img)?;
         // Adopt any animation frames for playback and start from frame 0 (already uploaded above).
-        // The win shell arms the timer from `frame_delay_ms()` after this.
+        // The viewer arms the timer from `frame_delay_ms()` after this.
         self.anim.adopt(&img);
         // Pick the viewport backdrop: an explicit pick (the toolbar's background buttons, or the
         // `background` config key) sticks across every image; otherwise default to the image's
@@ -738,7 +993,7 @@ impl GpuSurface {
             channel: Channel::composite(self.has_alpha()),
             ..DisplayState::default()
         };
-        // A fresh image starts as a whole-image view; the win shell re-applies any per-path
+        // A fresh image starts as a whole-image view; the viewer re-applies any per-path
         // flipbook state (via `set_flipbook`) right after this adopt, which re-fits to the frame.
         self.flipbook = None;
         // Every newly opened image (including folder ←/→ navigation) fits *without* upscaling: a
@@ -758,10 +1013,10 @@ impl GpuSurface {
     /// the re-decode came back at the same dimensions (the "re-export same canvas" case), so the
     /// user's zoomed-in detail and display state survive the update. The pan is re-clamped
     /// defensively (a no-op while the dims are unchanged).
-    pub fn replace_image_keep_view(&mut self, img: Arc<DecodedImage>) -> windows::core::Result<()> {
+    pub fn replace_image_keep_view(&mut self, img: Arc<DecodedImage>) -> Result<(), String> {
         self.upload_texture(&img)?;
         // Refresh the animation frames from the re-decoded file and restart from frame 0 (the view
-        // is preserved, but the animation plays from the top). The win shell re-arms the timer.
+        // is preserved, but the animation plays from the top). The viewer re-arms the timer.
         self.anim.adopt(&img);
         self.tex.current = Some(img);
         // A re-export can drop the alpha channel. Both alpha-dependent modes stop meaning anything
@@ -781,7 +1036,7 @@ impl GpuSurface {
     }
 
     /// Delay (ms) the currently displayed animation frame should be shown before advancing, or
-    /// `None` for a still image. The win shell arms the playback timer from this after every adopt.
+    /// `None` for a still image. The viewer arms the playback timer from this after every adopt.
     pub fn frame_delay_ms(&self) -> Option<u32> {
         self.anim.delay_ms()
     }
@@ -799,18 +1054,9 @@ impl GpuSurface {
         let (w, h) = self.image_dims()?;
         let format = self.tex.current.as_ref()?.format;
         let next = (self.anim.index + 1) % n;
-        match create_image_texture(
-            &self.gfx.device,
-            &self.gfx.context,
-            &self.anim.frames()[next].pixels,
-            w,
-            h,
-            format,
-        ) {
-            Ok((tex, srv, linear)) => {
-                self.tex._tex = Some(tex);
-                self.tex.srv = Some(srv);
-                self.tex.linear_sample = linear;
+        match create_image_texture(&self.gpu, &self.anim.frames()[next].pixels, w, h, format) {
+            Ok((tex, view, linear)) => {
+                self.adopt_texture(tex, view, linear);
                 self.anim.index = next;
             }
             Err(e) => eprintln!("fire: animation frame upload failed: {e}"),
@@ -818,40 +1064,39 @@ impl GpuSurface {
         self.anim.delay_ms()
     }
 
-    /// Upload `img`'s (frame-0) pixels as a `DEFAULT` texture with a full mip chain generated on the
-    /// GPU. Returns the GPU error rather than panicking if texture/SRV creation fails — this runs
-    /// synchronously from the wndproc (via `decode_done`), where a panic would unwind across the
-    /// Win32 boundary and abort the process.
-    fn upload_texture(&mut self, img: &DecodedImage) -> windows::core::Result<()> {
-        let (tex, srv, linear_sample) = create_image_texture(
-            &self.gfx.device,
-            &self.gfx.context,
-            &img.pixels,
-            img.width,
-            img.height,
-            img.format,
-        )?;
-        self.tex._tex = Some(tex);
-        self.tex.srv = Some(srv);
-        self.tex.linear_sample = linear_sample;
+    /// Upload `img`'s (frame-0) pixels as a texture with a full mip chain. Returns the GPU error
+    /// rather than panicking if creation fails — this runs synchronously on the UI thread.
+    fn upload_texture(&mut self, img: &DecodedImage) -> Result<(), String> {
+        let (tex, view, linear_sample) =
+            create_image_texture(&self.gpu, &img.pixels, img.width, img.height, img.format)?;
+        self.adopt_texture(tex, view, linear_sample);
         Ok(())
     }
 
-    /// Resize the swapchain to a new *client* size (physical px) and drop the stale views. The
-    /// image's sub-rect within it is a separate concern — the shell calls [`Self::set_image_rect`]
-    /// right after, because only it knows how tall the chrome is.
+    /// Install a freshly created texture and rebuild the bind group around it.
+    fn adopt_texture(&mut self, tex: wgpu::Texture, view: wgpu::TextureView, linear_sample: i32) {
+        self.bind_group = make_bind_group(&self.gpu, &self.ubuf, &view);
+        self.tex._tex = Some(tex);
+        self.tex.view = Some(view);
+        self.tex.linear_sample = linear_sample;
+    }
+
+    /// Resize the surface to a new *client* size (physical px). The image's sub-rect within it is
+    /// a separate concern — the viewer calls [`Self::set_image_rect`] right after, because only it
+    /// knows how tall the chrome is. A zero size (minimized) is remembered and skipped: the
+    /// surface cannot be configured to it, and `render_frame` draws nothing until it grows back.
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
+        self.config.width = width;
+        self.config.height = height;
+        if width > 0 && height > 0 {
+            self.surface.configure(&self.gpu.device, &self.config);
         }
-        self.gfx.resize(width, height);
         self.invalidate();
     }
 
-    /// Schedule a repaint (delivered as `WM_PAINT`).
+    /// Schedule a repaint (delivered as `RedrawRequested`).
     pub fn invalidate(&self) {
-        // SAFETY: hwnd is a live window; null rect invalidates the whole client area.
-        unsafe { InvalidateRect(self.hwnd as SysHwnd, std::ptr::null(), 0) };
+        self.window.request_redraw();
     }
 
     /// The image's sub-rect of the client, in physical px. The chrome owns the rest.
@@ -859,7 +1104,7 @@ impl GpuSurface {
         // The early-out must compare against what `Viewport::new` will actually store — it
         // clamps each axis to at least 1 px — or a legitimately zero-size region never matches
         // the stored 1.0 and every frame re-enters, re-running fit_to_window against a 1-px
-        // viewport and driving the zoom to its floor. Unreachable today (WM_GETMINMAXINFO
+        // viewport and driving the zoom to its floor. Unreachable today (the minimum window size
         // keeps the client big enough), which is exactly why it would go unnoticed when a
         // future layout change makes it reachable.
         let (w, h) = (
@@ -887,86 +1132,144 @@ impl GpuSurface {
         self.origin
     }
 
-    pub fn device(&self) -> &ID3D11Device {
-        &self.gfx.device
-    }
-
-    pub fn device_context(&self) -> &ID3D11DeviceContext {
-        &self.gfx.context
-    }
-
-    /// The chrome fill: what the parts of the window the image doesn't cover get cleared to.
+    /// The chrome fill (sRGB): what the parts of the frame the image doesn't cover get cleared to.
     pub fn set_chrome_clear(&mut self, rgba: [f32; 4]) {
-        self.chrome_clear = rgba;
+        // The clear goes through the `*Srgb` view, which encodes on write, so it wants linear.
+        self.chrome_clear_lin = [
+            srgb_to_linear(rgba[0]),
+            srgb_to_linear(rgba[1]),
+            srgb_to_linear(rgba[2]),
+            1.0,
+        ];
     }
 
-    /// Clear the backbuffer and draw the image into its sub-rect, leaving the **UI** render target
-    /// bound so the caller can draw the chrome over it and then [`Self::present`].
+    /// Draw one frame: clear to the chrome fill, the image into its sub-rect through the `*Srgb`
+    /// view, then `ui` through the plain UNORM view of the same pixels, then present.
     ///
-    /// This is the front half of what used to be `render()`. The split exists because the chrome is
-    /// now GPU-drawn too: the frame is `clear → image pass (sRGB view, viewport = image sub-rect) →
-    /// ImGui pass (UNORM view, whole client) → Present`. Returns `false` if the device has no usable
-    /// render target this frame, in which case the caller must skip the frame entirely.
+    /// **Two views of the same pixels, deliberately.** The image shader emits linear light and
+    /// writes through the `*Srgb` view, so the hardware encodes on write. Dear ImGui's colors are
+    /// *already* sRGB, so it must write through the plain `Unorm` view — pushing it through the
+    /// sRGB view would encode twice and visibly wash the entire UI out. Both views are legal on the
+    /// one texture precisely because the surface format is plain `Bgra8Unorm` with
+    /// `Bgra8UnormSrgb` declared as a view format.
     ///
-    /// The image is still **one fullscreen triangle**: `RSSetViewports` maps NDC onto the sub-rect
-    /// and clips to it, so the shader (background, checkerboard, letterbox and all) fills exactly the
-    /// image region and nothing else. No per-pixel CPU work, no extra draws.
-    #[must_use]
-    pub fn begin_frame(&mut self) -> bool {
-        self.gfx.ensure_rtv();
-        let (Some(rtv), Some(rtv_ui)) = (self.gfx.rtv.clone(), self.gfx.rtv_ui.clone()) else {
-            return false;
-        };
-
-        unsafe {
-            // The chrome fill, through the UNORM view (the color is already sRGB).
-            self.gfx
-                .context
-                .ClearRenderTargetView(&rtv_ui, &self.chrome_clear);
+    /// The image is still **one fullscreen triangle**: the viewport (and scissor) map NDC onto the
+    /// sub-rect and clip to it, so the shader (background, checkerboard, letterbox and all) fills
+    /// exactly the image region and nothing else. No per-pixel CPU work, no extra draws.
+    pub fn render_frame(
+        &mut self,
+        ui: impl FnOnce(&mut wgpu::RenderPass<'_>, dear_imgui_wgpu::FramebufferExtent),
+    ) -> Presented {
+        if self.config.width == 0 || self.config.height == 0 {
+            return Presented::Skipped;
         }
-
-        let w = self.viewport.width as u32;
-        let h = self.viewport.height as u32;
-        if w == 0 || h == 0 {
-            // No image region (e.g. the window is collapsed to just chrome). Still a valid frame.
-            unsafe {
-                self.gfx
-                    .context
-                    .OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
+        let t0 = Instant::now();
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            // The swapchain no longer matches the window (a resize raced us) or the device was
+            // reset under it: rebuild it and let the next request draw.
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.gpu.device, &self.config);
+                self.invalidate();
+                return Presented::Skipped;
             }
-            return true;
-        }
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => return Presented::Skipped,
+        };
+        // Did the acquire block on the display? A vblank is ≥4 ms even at 240 Hz; an acquire that
+        // did not wait returns in microseconds.
+        let waited = t0.elapsed() >= Duration::from_micros(500);
 
-        self.draw_image(&rtv, w, h);
+        let view_srgb = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("fire frame (srgb)"),
+            format: Some(SURFACE_VIEW_SRGB),
+            ..Default::default()
+        });
+        let view_ui = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("fire frame (ui)"),
+            ..Default::default()
+        });
 
-        unsafe {
-            self.gfx
-                .context
-                .OMSetRenderTargets(Some(&[Some(rtv_ui)]), None);
-        }
-        true
-    }
-
-    /// Present the completed frame, vsync-paced.
-    ///
-    /// Returns whether the present actually **waited on the display**. Normally it does — sync
-    /// interval 1 blocks until vblank — and that wait is what the win shell paces continuous
-    /// playback on, in place of a Win32 timer it cannot clock fast enough (see
-    /// [`FLIPBOOK_TICK_MS`](crate::win::FLIPBOOK_TICK_MS)). But DXGI returns
-    /// `DXGI_STATUS_OCCLUDED` *immediately* when the window is hidden or fully covered, and a
-    /// caller pacing itself on a present that no longer blocks would spin as fast as it could
-    /// render. Saying so lets it fall back to the timer.
-    pub fn present(&mut self) -> bool {
-        unsafe {
-            // Sync interval 1 → vsync-paced (tear-free); event-driven, so no idle frames.
-            self.gfx.swapchain.Present(1, DXGI_PRESENT(0)) != DXGI_STATUS_OCCLUDED
-        }
-    }
-
-    /// The image pass: the fullscreen triangle, scoped to the image sub-rect.
-    fn draw_image(&self, rtv: &ID3D11RenderTargetView, w: u32, h: u32) {
         let params = self.build_params();
-        self.submit_image_pass(rtv, &params, w, h);
+        self.gpu
+            .queue
+            .write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&params));
+
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fire frame"),
+            });
+        {
+            let c = self.chrome_clear_lin;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fire image"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view_srgb,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: c[0] as f64,
+                            g: c[1] as f64,
+                            b: c[2] as f64,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            // The viewport *is* the image's sub-rect, clamped to the surface (a mid-resize frame
+            // can briefly disagree with it; wgpu validates the rect strictly).
+            let (cw, ch) = (self.config.width as f32, self.config.height as f32);
+            let x = self.origin.0.clamp(0.0, cw);
+            let y = self.origin.1.clamp(0.0, ch);
+            let w = self.viewport.width.min(cw - x);
+            let h = self.viewport.height.min(ch - y);
+            if w >= 1.0 && h >= 1.0 {
+                pass.set_viewport(x, y, w, h, 0.0, 1.0);
+                pass.set_scissor_rect(x as u32, y as u32, w as u32, h as u32);
+                pass.set_pipeline(&self.gpu.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("fire ui"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view_ui,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            ui(
+                &mut pass,
+                dear_imgui_wgpu::FramebufferExtent::from_texture(&frame.texture),
+            );
+        }
+        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu.queue.present(frame);
+        if self.tex.current.is_some() {
+            // Measurement hook: inert unless `FIRE_TTFP_OUT` is set (see `crate::ttfp`).
+            crate::ttfp::stamp_first_pixel();
+        }
+        Presented::Yes { waited }
     }
 
     /// Resolve what the shader should sample: the (possibly fractional) source rect, whether
@@ -998,7 +1301,7 @@ impl GpuSurface {
         (img_w, img_h, has_image, fbf)
     }
 
-    /// Build the frame's 128-byte constant buffer from the current view, display and session
+    /// Build the frame's 128-byte uniform block from the current view, display and session
     /// state. Pure reads — everything the shader needs for one frame, and nothing else.
     fn build_params(&self) -> Params {
         let is_hdr = self.is_hdr();
@@ -1058,67 +1361,7 @@ impl GpuSurface {
         }
     }
 
-    /// Upload the constants and issue the one draw: viewport → bind → `Draw(3, 0)`.
-    fn submit_image_pass(&self, rtv: &ID3D11RenderTargetView, params: &Params, w: u32, h: u32) {
-        unsafe {
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            if self
-                .gfx
-                .context
-                .Map(
-                    &self.gfx.cbuffer,
-                    0,
-                    D3D11_MAP_WRITE_DISCARD,
-                    0,
-                    Some(&mut mapped),
-                )
-                .is_ok()
-            {
-                std::ptr::copy_nonoverlapping(
-                    params as *const Params as *const u8,
-                    mapped.pData as *mut u8,
-                    std::mem::size_of::<Params>(),
-                );
-                self.gfx.context.Unmap(&self.gfx.cbuffer, 0);
-            }
-
-            // The viewport *is* the image's sub-rect: NDC maps onto it and clips to it, so the one
-            // triangle covers the image region exactly and never bleeds under the chrome.
-            let vp = D3D11_VIEWPORT {
-                TopLeftX: self.origin.0,
-                TopLeftY: self.origin.1,
-                Width: w as f32,
-                Height: h as f32,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-            };
-            self.gfx.context.RSSetViewports(Some(&[vp]));
-            self.gfx
-                .context
-                .OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-            self.gfx
-                .context
-                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            self.gfx.context.VSSetShader(&self.gfx.vs, None);
-            self.gfx.context.PSSetShader(&self.gfx.ps, None);
-            self.gfx
-                .context
-                .PSSetConstantBuffers(0, Some(&[Some(self.gfx.cbuffer.clone())]));
-            self.gfx
-                .context
-                .PSSetShaderResources(0, Some(std::slice::from_ref(&self.tex.srv)));
-            self.gfx.context.PSSetSamplers(
-                0,
-                Some(&[
-                    Some(self.gfx.samp_aniso.clone()),
-                    Some(self.gfx.samp_point.clone()),
-                ]),
-            );
-            self.gfx.context.Draw(3, 0);
-        }
-    }
-
-    // --- input-driven view controls (called from the win shell) ----------------
+    // --- input-driven view controls (called from the viewer) ----------------
 
     pub fn on_cursor_moved(&mut self, pos: (f32, f32)) {
         let delta = (pos.0 - self.gesture.cursor.0, pos.1 - self.gesture.cursor.1);
@@ -1294,6 +1537,32 @@ impl GpuSurface {
     }
 }
 
+/// The frame's bind group: uniforms, the image texture (or the placeholder), both samplers.
+fn make_bind_group(gpu: &Gpu, ubuf: &wgpu::Buffer, view: &wgpu::TextureView) -> wgpu::BindGroup {
+    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("fire viewport"),
+        layout: &gpu.layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ubuf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&gpu.samp_aniso),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&gpu.samp_point),
+            },
+        ],
+    })
+}
+
 fn channel_code(ch: Channel) -> i32 {
     match ch {
         Channel::Rgba => 0,
@@ -1320,7 +1589,7 @@ fn default_background(img: &DecodedImage) -> Background {
     }
 }
 
-/// Backdrop mode → shader code (must match the `background` branch in `shader.hlsl`).
+/// Backdrop mode → shader code (must match the `background` branch in `shader.wgsl`).
 fn background_code(bg: Background) -> i32 {
     match bg {
         Background::Black => 0,
@@ -1330,7 +1599,7 @@ fn background_code(bg: Background) -> i32 {
     }
 }
 
-/// sRGB→linear for a single component (matches the former CPU shader), used for the clear color.
+/// sRGB→linear for a single component (matches the shader), used for the clear colors.
 fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 {
         c / 12.92
@@ -1339,215 +1608,253 @@ fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
-/// Create a hardware D3D11 device, falling back to the WARP software rasterizer (RDP/headless).
-/// Errors (both drivers refused) propagate instead of panicking: this runs at startup in a
-/// `windows_subsystem = "windows"` process, where a panic is an *invisible* abort — the caller
-/// owns telling the user.
-fn create_device() -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
-    let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
-    let mut last_err = windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL);
-    for (driver, is_warp) in [
-        (D3D_DRIVER_TYPE_HARDWARE, false),
-        (D3D_DRIVER_TYPE_WARP, true),
-    ] {
-        let mut device: Option<ID3D11Device> = None;
-        let mut context: Option<ID3D11DeviceContext> = None;
-        let r = unsafe {
-            D3D11CreateDevice(
-                None,
-                driver,
-                Default::default(),
-                D3D11_CREATE_DEVICE_FLAG(0),
-                Some(&levels),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-        };
-        match r {
-            Ok(()) => {
-                if is_warp {
-                    eprintln!("fire: no hardware D3D11 device — using WARP software renderer");
-                }
-                // Success filled both out-params; `unwrap` here is unreachable by contract.
-                return Ok((device.unwrap(), context.unwrap()));
-            }
-            Err(e) => last_err = e,
-        }
-    }
-    Err(last_err)
+/// The number of mip levels in a full chain for a `w`×`h` texture.
+fn mip_levels(w: u32, h: u32) -> u32 {
+    32 - w.max(h).max(1).leading_zeros()
 }
 
-/// Create the DXGI flip-model swapchain on `hwnd`. Backbuffer is plain `UNORM` (flip model
-/// disallows `*_SRGB` swapchain formats); the sRGB encode is done by the `*_SRGB` RTV.
-fn create_swapchain(
-    device: &ID3D11Device,
-    hwnd: HWND,
-    w: u32,
-    h: u32,
-) -> windows::core::Result<IDXGISwapChain1> {
-    let desc = DXGI_SWAP_CHAIN_DESC1 {
-        Width: w,
-        Height: h,
-        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
-        Scaling: DXGI_SCALING_STRETCH,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-        ..Default::default()
-    };
-    unsafe {
-        let dxgi_device: IDXGIDevice = device.cast()?;
-        let adapter: IDXGIAdapter = dxgi_device.GetAdapter()?;
-        let factory: IDXGIFactory2 = adapter.GetParent()?;
-        factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None)
-    }
-}
-
-/// Create the vertex + pixel shaders from the DXBC that `fxc` precompiled at build time (see
-/// `build.rs`); the bytecode is embedded in the exe, so there is no runtime HLSL compile.
-fn create_shaders(
-    device: &ID3D11Device,
-) -> windows::core::Result<(ID3D11VertexShader, ID3D11PixelShader)> {
-    const VS_DXBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vs_main.dxbc"));
-    const PS_DXBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ps_main.dxbc"));
-    unsafe {
-        let mut vs: Option<ID3D11VertexShader> = None;
-        let mut ps: Option<ID3D11PixelShader> = None;
-        device.CreateVertexShader(VS_DXBC, None, Some(&mut vs))?;
-        device.CreatePixelShader(PS_DXBC, None, Some(&mut ps))?;
-        Ok((vs.unwrap(), ps.unwrap()))
-    }
-}
-
-/// Two samplers: anisotropic+mips for minify, point for crisp magnify/1:1. Both clamp at edges.
-fn create_samplers(
-    device: &ID3D11Device,
-) -> windows::core::Result<(ID3D11SamplerState, ID3D11SamplerState)> {
-    let base = D3D11_SAMPLER_DESC {
-        Filter: D3D11_FILTER_ANISOTROPIC,
-        AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
-        AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
-        AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
-        MipLODBias: 0.0,
-        MaxAnisotropy: 8,
-        ComparisonFunc: D3D11_COMPARISON_NEVER,
-        BorderColor: [0.0; 4],
-        MinLOD: 0.0,
-        MaxLOD: f32::MAX,
-    };
-    let point = D3D11_SAMPLER_DESC {
-        Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
-        MaxAnisotropy: 1,
-        ..base
-    };
-    unsafe {
-        let mut aniso: Option<ID3D11SamplerState> = None;
-        let mut pt: Option<ID3D11SamplerState> = None;
-        device.CreateSamplerState(&base, Some(&mut aniso))?;
-        device.CreateSamplerState(&point, Some(&mut pt))?;
-        Ok((aniso.unwrap(), pt.unwrap()))
-    }
-}
-
-/// Create the dynamic per-frame constant buffer ([`Params`], 128 bytes, 16-byte aligned).
-fn create_const_buffer(device: &ID3D11Device) -> windows::core::Result<ID3D11Buffer> {
-    let desc = D3D11_BUFFER_DESC {
-        ByteWidth: std::mem::size_of::<Params>() as u32,
-        Usage: D3D11_USAGE_DYNAMIC,
-        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-        MiscFlags: 0,
-        StructureByteStride: 0,
-    };
-    unsafe {
-        let mut buf: Option<ID3D11Buffer> = None;
-        device.CreateBuffer(&desc, None, Some(&mut buf))?;
-        Ok(buf.unwrap())
-    }
-}
-
-/// Build a `DEFAULT` texture (+ SRV, with a GPU-generated mip chain) from one RGBA frame, returning
-/// the texture, its sampling view, and the `linear_sample` flag for `format` (1 if the sample is
-/// already linear — 8-bit `*_SRGB` / float — 0 if the shader must sRGB-decode 16-bit unorm). A free
+/// Build a texture (+ its view, with a full mip chain) from one RGBA frame, returning the texture,
+/// its sampling view, and the `linear_sample` flag for `format` (1 if the sample is already
+/// linear — 8-bit `*Srgb` / float — 0 if the shader must sRGB-decode 16-bit unorm). A free
 /// function (not a method) so the per-frame animation upload can borrow pixels straight out of
 /// [`AnimState`] without aliasing the `&mut self` receiver. Returns the GPU error instead of
-/// panicking (this runs synchronously in the wndproc, where a panic would abort the process).
+/// panicking (this runs synchronously on the UI thread).
 fn create_image_texture(
-    device: &ID3D11Device,
-    context: &ID3D11DeviceContext,
+    gpu: &Gpu,
     pixels: &[u8],
     width: u32,
     height: u32,
     format: PixelFormat,
-) -> windows::core::Result<(ID3D11Texture2D, ID3D11ShaderResourceView, i32)> {
-    let (dxgi_format, bpp, linear_sample) = match format {
-        // 8-bit sources are sRGB-encoded; the `*_SRGB` view decodes to linear on sample.
-        PixelFormat::Rgba8Unorm => (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 4u32, 1i32),
-        // 16-bit unorm is treated as sRGB-encoded (matches the CPU path) → decode in shader.
-        PixelFormat::Rgba16Unorm => (DXGI_FORMAT_R16G16B16A16_UNORM, 8, 0),
-        // Float sources are already linear.
-        PixelFormat::Rgba16Float => (DXGI_FORMAT_R16G16B16A16_FLOAT, 8, 1),
-        PixelFormat::Rgba32Float => (DXGI_FORMAT_R32G32B32A32_FLOAT, 16, 1),
-    };
-
+) -> Result<(wgpu::Texture, wgpu::TextureView, i32), String> {
     // The dimensions and the buffer arrive from different producers (decode headers vs the
-    // pixel Vec — part of it native FFI), and UpdateSubresource below reads `height` rows of
-    // `width * bpp` bytes with no length of its own: a short buffer is an out-of-bounds read
-    // into the driver, not a panic. This function already returns the GPU's errors; a
-    // mismatched buffer is refused the same way.
+    // pixel Vec — part of it native FFI); a short buffer is refused here rather than read past.
+    let src_bpp = match format {
+        PixelFormat::Rgba8Unorm => 4usize,
+        PixelFormat::Rgba16Unorm | PixelFormat::Rgba16Float => 8,
+        PixelFormat::Rgba32Float => 16,
+    };
     let needed = (width as usize)
         .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(bpp as usize));
+        .and_then(|n| n.checked_mul(src_bpp));
     if needed.is_none_or(|n| pixels.len() < n) {
-        return Err(windows::core::Error::new(
-            windows::Win32::Foundation::E_INVALIDARG,
-            "pixel buffer is shorter than its dimensions declare",
-        ));
+        return Err("pixel buffer is shorter than its dimensions declare".into());
+    }
+    let needed = needed.unwrap_or(0);
+
+    // The device format, its bytes per texel, the shader's decode flag, and a converted copy of
+    // the pixels when the device lacks the feature the source format needs.
+    let (tex_format, bpp, linear_sample, converted): (
+        wgpu::TextureFormat,
+        u32,
+        i32,
+        Option<Vec<u8>>,
+    ) = match format {
+        // 8-bit sources are sRGB-encoded; the `*Srgb` format decodes to linear on sample.
+        PixelFormat::Rgba8Unorm => (wgpu::TextureFormat::Rgba8UnormSrgb, 4, 1, None),
+        // 16-bit unorm is treated as sRGB-encoded (matches the CPU path) → decode in shader.
+        // Without the 16-bit-norm feature it rides as float16 of the same 0..1 values.
+        PixelFormat::Rgba16Unorm if gpu.norm16 => (wgpu::TextureFormat::Rgba16Unorm, 8, 0, None),
+        PixelFormat::Rgba16Unorm => (
+            wgpu::TextureFormat::Rgba16Float,
+            8,
+            0,
+            Some(u16_to_f16(&pixels[..needed])),
+        ),
+        // Float sources are already linear.
+        PixelFormat::Rgba16Float => (wgpu::TextureFormat::Rgba16Float, 8, 1, None),
+        PixelFormat::Rgba32Float if gpu.float32_filterable => {
+            (wgpu::TextureFormat::Rgba32Float, 16, 1, None)
+        }
+        // No float32 filtering on this device: float16 keeps the pipeline (and the mips)
+        // filtered, at the cost of range above 65504.
+        PixelFormat::Rgba32Float => (
+            wgpu::TextureFormat::Rgba16Float,
+            8,
+            1,
+            Some(f32_to_f16(&pixels[..needed])),
+        ),
+    };
+    let data: &[u8] = match &converted {
+        Some(v) => v,
+        None => &pixels[..needed],
+    };
+    let levels = mip_levels(width, height);
+    let filterable = tex_format != wgpu::TextureFormat::Rgba32Float || gpu.float32_filterable;
+
+    gpu.scoped(|| {
+        let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fire image"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: tex_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        // Level 0 only; the rest are generated.
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * bpp),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.mipgen.generate(
+            &gpu.device,
+            &gpu.queue,
+            &tex,
+            tex_format,
+            levels,
+            filterable,
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("fire image"),
+            ..Default::default()
+        });
+        (tex, view, linear_sample)
+    })
+}
+
+/// Reinterpret 16-bit unorm samples as float16 of the same 0..1 value.
+fn u16_to_f16(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for px in bytes.as_chunks::<2>().0 {
+        let v = u16::from_le_bytes(*px) as f32 / 65535.0;
+        out.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+    }
+    out
+}
+
+/// Narrow float32 samples to float16.
+fn f32_to_f16(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for px in bytes.as_chunks::<4>().0 {
+        let v = f32::from_le_bytes(*px);
+        out.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
+    }
+    out
+}
+
+/// IEEE binary32 → binary16, round-to-nearest-even, overflow to infinity, NaN preserved.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let mant = b & 0x7f_ffff;
+    if exp == 0xff {
+        // Inf / NaN (keep a payload bit so a NaN stays a NaN).
+        return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00; // overflow → inf
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign; // too small even for a subnormal → ±0
+        }
+        // Subnormal: shift the (implicit-1) mantissa down, rounding to nearest even.
+        let m = mant | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let mut half = (m >> shift) as u16;
+        let rem = m & ((1u32 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        if rem > halfway || (rem == halfway && (half & 1) == 1) {
+            half += 1;
+        }
+        return sign | half;
+    }
+    let mut half = ((e as u32) << 10) as u16 | (mant >> 13) as u16;
+    let rem = mant & 0x1fff;
+    // Rounding up may carry into the exponent; that is the correct result (it rounds to the next
+    // binade, or to infinity at the top).
+    if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
+        half = half.wrapping_add(1);
+    }
+    sign | half
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f16_to_f32(h: u16) -> f32 {
+        let sign = ((h >> 15) & 1) as u32;
+        let exp = ((h >> 10) & 0x1f) as i32;
+        let mant = (h & 0x3ff) as u32;
+        let bits = if exp == 0 {
+            if mant == 0 {
+                sign << 31
+            } else {
+                // subnormal
+                let mut e = -1;
+                let mut m = mant;
+                while m & 0x400 == 0 {
+                    m <<= 1;
+                    e -= 1;
+                }
+                let e = (e + 1 + 127 - 15) as u32;
+                (sign << 31) | (e << 23) | ((m & 0x3ff) << 13)
+            }
+        } else if exp == 0x1f {
+            (sign << 31) | (0xff << 23) | (mant << 13)
+        } else {
+            (sign << 31) | (((exp - 15 + 127) as u32) << 23) | (mant << 13)
+        };
+        f32::from_bits(bits)
     }
 
-    let desc = D3D11_TEXTURE2D_DESC {
-        Width: width,
-        Height: height,
-        MipLevels: 0, // 0 → full chain; populated by GenerateMips below
-        ArraySize: 1,
-        Format: dxgi_format,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
-        CPUAccessFlags: 0,
-        MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
-    };
+    #[test]
+    fn f16_conversion_round_trips_representable_values() {
+        for v in [
+            0.0f32,
+            1.0,
+            -1.0,
+            0.5,
+            0.25,
+            2.0,
+            1024.0,
+            65504.0,
+            6.1035156e-5,
+            1.0 / 3.0,
+        ] {
+            let h = f32_to_f16_bits(v);
+            let back = f16_to_f32(h);
+            assert!(
+                (back - v).abs() <= v.abs() * 1e-3 + 1e-7,
+                "{v} -> {h:#06x} -> {back}"
+            );
+        }
+        assert_eq!(f32_to_f16_bits(1e6), 0x7c00); // overflow → +inf
+        assert_eq!(f32_to_f16_bits(-1e6), 0xfc00);
+        assert!(f16_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
+        assert_eq!(f32_to_f16_bits(1e-9), 0); // underflow → 0
+    }
 
-    unsafe {
-        let mut tex: Option<ID3D11Texture2D> = None;
-        device.CreateTexture2D(&desc, None, Some(&mut tex))?;
-        let tex = tex.unwrap();
-
-        // Level 0 only; the rest are generated.
-        context.UpdateSubresource(
-            &tex,
-            0,
-            None,
-            pixels.as_ptr() as *const c_void,
-            width * bpp,
-            0,
-        );
-
-        let mut srv: Option<ID3D11ShaderResourceView> = None;
-        device.CreateShaderResourceView(&tex, None, Some(&mut srv))?;
-        let srv = srv.unwrap();
-        context.GenerateMips(&srv);
-
-        Ok((tex, srv, linear_sample))
+    #[test]
+    fn mip_chain_length() {
+        assert_eq!(mip_levels(1, 1), 1);
+        assert_eq!(mip_levels(2, 1), 2);
+        assert_eq!(mip_levels(256, 128), 9);
+        assert_eq!(mip_levels(1000, 3), 10);
     }
 }
