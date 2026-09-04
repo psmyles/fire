@@ -83,7 +83,7 @@ Each is stated with the reason and what it costs, so a future revision can revis
 | D20 | **The swapchain backbuffer is plain UNORM; the pixel shader sRGB-encodes its own output** | Flip-model swapchains disallow `*_SRGB` formats, and ImGui's colors are already sRGB, so a single UNORM target is correct for both passes | The old two-RTV (`UNORM` + `UNORM_SRGB` view) trick is gone; the shader owns the encode and must not be "fixed" into a linear write. The *format* is per-OS - `R8G8B8A8_UNORM` on D3D11, `BGRA8Unorm` on Metal, because a `CAMetalLayer` does not accept RGBA8 - so `SWAPCHAIN_FORMAT` lives in the backend module. Channel order only; the shader is unchanged | Shipped |
 | D21 | **The mip chain is built on the CPU, on the decode worker** | sokol_gfx has no `GenerateMips`, and its rules forbid rendering into an image created with data | ~5 ms on an 8.9 MB image, off the UI thread; the upload is one `sg_make_image` carrying every level | Shipped |
 | D22 | **`sokol-rust` is vendored (`vendor/sokol-rust`); `sokol_imgui.h` is compiled by `fire`'s build.rs** | The crates.io `sokol` name belongs to an unrelated 2019 crate; sokol_imgui must be compiled with the *same* cimgui defines and the same `SOKOL_*` backend as its neighbours or the struct layouts differ | A vendored tree to update by hand; three sets of defines (backend, `SOKOL_IMGUI_NO_SOKOL_APP`, the cimgui five) that must stay in lockstep | Shipped |
-| D23 | **The whole dev pipeline runs on macOS**, not just the app: clippy, `cargo test`, the native decoders, the TTFP harness, the release build and packaging | A platform you cannot lint, test or measure on is a platform you cannot maintain; the alternative is mac fixes that only Windows CI can verify | The two sys crates lose their Windows-only short-circuit, the vendor layout goes per-target, CI grows a mac leg, `ttfp.ps1` gets a portable twin (§7) | Planned |
+| D23 | **The whole dev pipeline runs on macOS**, not just the app: clippy, `cargo test`, the native decoders, the TTFP harness, the release build and packaging | A platform you cannot lint, test or measure on is a platform you cannot maintain; the alternative is mac fixes that only Windows CI can verify | The two sys crates lose their Windows-only short-circuit, the vendor layout goes per-target, CI grows a mac leg, `ttfp.ps1` gets a portable twin (§7) | Shipped, except packaging (step 9) |
 | D24 | **Metal shaders are precompiled to a `.metallib` with `xcrun metal`** - so the toolchain floor on macOS is **full Xcode** (plus the separately-downloaded Metal toolchain on Xcode 16+), not Command Line Tools | Keeps D4's "no shader compile on the cold-start path" on both OSes; the wgpu branch lost ~32 ms to exactly this (A.2), and TTFP is the project's primary metric | Every dev machine and the CI runner need Xcode, not CLT; a second offline compile step in build.rs. The toolchain is an **839 MB** `xcodebuild -downloadComponent MetalToolchain`, and its absence is near-silent (§7.1) | Shipped |
 | D25 | **The arm64 HEIF stack is built with vcpkg (`arm64-osx` static), mirroring `VENDOR.txt`**, and the vendored tree goes per-target - one directory per target holding *both* its `include/` and `lib/` | One vendoring story on both OSes, one dav1d port patch, a self-contained `.app` with no dylib embedding or per-dylib signing | A one-time `brew install cmake ninja meson nasm pkg-config` + vcpkg bootstrap on the Mac; `heif-sys`'s hardcoded `lib/` path and `.lib` names become target-aware. Headers turned out to need the split too (the two targets landed on different libheif versions), and the mac build needs a third port patch, `ENABLE_PLUGIN_LOADING=OFF` (§7.2) | Shipped |
 
@@ -440,16 +440,32 @@ an error, so a launch reaches the window and then stops there. Phase 2 step 4 is
 
 ### 7.4 CI and the harness
 
-CI gains a `macos-latest` leg mirroring the two Windows jobs - `check` with
-`--no-default-features` (no vendored input, no libclang needed) and `full` gated on a restored
-vendor tree. The `full` leg's cache key must include the target, or the arm64 `.a`s and the x64
-`.lib`s collide in one cache entry. Per D11, CI stops there: it never signs, notarizes or
-packages a `.dmg` - that only runs on the dev Mac via `scripts/build-mac.sh`, so the Developer ID
-cert and App Store Connect key never need to exist as CI secrets.
+Both existing jobs became a two-host matrix (`windows-latest`, `macos-latest`, `fail-fast: false`
+so one host's failure cannot hide the other's): `check` with `--no-default-features` (no vendored
+input, no libclang needed) and `full` gated on a restored vendor tree. The vendor cache key now
+carries `runner.os`/`runner.arch`, or the arm64 `.a`s and the x64 `.lib`s would collide in one
+entry and each host would restore the other's and fail to link. Per D11, CI stops at
+build-and-test: it never signs, notarizes or packages a `.dmg` - that only runs on the dev Mac via
+`scripts/build-mac.sh`, so the Developer ID cert and App Store Connect key never need to exist as
+CI secrets.
 
-Both legs are mandatory rather than nice-to-have: clippy on Windows never sees `render/metal.rs`
-and clippy on macOS never sees `render/d3d11.rs`, so a single-host CI cannot keep the workspace
-lint-clean once the second leaf exists.
+Both legs are mandatory rather than nice-to-have: clippy on Windows never sees `render/metal.rs`,
+`openfiles.rs` or `menubar.rs`, and clippy on macOS never sees `render/d3d11.rs` or the
+`windows-sys` leaves, so a single-host CI cannot keep the workspace lint-clean once the second
+leaf exists.
+
+Two things the mac leg needs that the Windows one does not. **The Metal toolchain is not
+guaranteed on the runner**: since Xcode 26 it is an optional ~700 MB component, present on some
+images and not others, and `fire`'s build.rs needs it for *any* build including the decoder-free
+one (D24). The job tests for it by **running** `xcrun -sdk macosx metal --version` - `xcrun --find
+metal` succeeds either way, because what it finds without the toolchain is a stub that fails at
+use (§7.1) - and downloads it only if that fails. **libclang needs no install**: macOS ships one
+inside Xcode and `clang-sys` finds it unaided, so the `choco install llvm` step is Windows-only.
+
+Neither leg populates the vendor cache (there is no `cache/save` step, and there never was); on a
+GitHub-hosted runner `full` reports that it skipped unless something else has filled the cache.
+That is unchanged from the Windows-only version - the split exists so a fork's first push gets a
+green badge over real coverage rather than a link error.
 
 `scripts/ttfp.ps1` has a shell twin, `scripts/ttfp.sh` - same method, same interleaving, so a
 number taken with either was taken the same way. It is written for the bash macOS actually ships
@@ -662,6 +678,23 @@ nothing after them can be checked without it.
    an outlier well beyond the loader cost (pipeline 58 ms vs 0.9 ms warm, ImGui 9.8 vs 2.2), so a
    warm-up launch before measuring is not optional.
 8. CI (§7.4): the `macos-latest` matrix leg, with the vendor cache keyed per target.
+   **Done** (2026-09-04), and one assumption in this document was wrong.
+
+   `cargo clippy --workspace -- -D warnings` failed on the *vendored* `sokol` tree
+   (`vendor/sokol-rust/build.rs:93`, upstream's own style, on both hosts). The fix was supposed to
+   be CI scoping, but **`--exclude sokol` does not work**: cargo only caps lints on crates it does
+   not consider local, and *every* path dependency is local, member or not - so the vendored build
+   script is linted no matter how the command line is scoped. What does work is
+   `exclude = ["vendor/sokol-rust"]` in the root manifest. `sokol` sat inside the workspace
+   directory and cargo makes any path dependency there a member automatically; saying it is not
+   one takes it out of `--workspace` while leaving it built exactly as before, and needs no patch
+   to the pinned tree (which was the thing to avoid). Verified: `cargo clippy --workspace
+   --all-targets -- -D warnings` exits 0.
+
+   Every command the workflow runs was run on this Mac first - both clippy invocations, all four
+   test steps and the release build, all green. **The workflow file itself is unverified** until it
+   runs on GitHub: whether `macos-latest` ships the Metal toolchain is the one thing that cannot be
+   checked from here, which is why the job tests for it and downloads it rather than assuming.
 9. `build-mac.sh`: `.app` layout, `Info.plist` from `product.json` (every extension from the
    installer's list, `LSHandlerRank = Alternate`, `CFBundleIconFile`), `codesign --options
    runtime --timestamp`, `notarytool submit --wait`, `stapler`, `hdiutil` → `dist/Fire-<ver>.dmg`;

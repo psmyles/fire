@@ -7,6 +7,13 @@ members = [
     "crates/psd-sdk-sys",
     "crates/heif-sys",
 ]
+# `vendor/sokol-rust` is a pinned upstream copy (D22), not our code, but it sits inside the
+# workspace directory and cargo makes any path dependency there a member automatically — which
+# puts it in `--workspace` and so under CI's `-D warnings`, failing the lint on upstream's own
+# style. Cargo only caps lints for crates it did not consider local, and `--exclude` on the
+# command line does not change that; declaring it excluded here does. It is still built exactly
+# as before, being a path dependency of `fire`.
+exclude = ["vendor/sokol-rust"]
 
 [workspace.package]
 version = "0.3.1"
