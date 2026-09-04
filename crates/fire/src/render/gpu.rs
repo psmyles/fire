@@ -47,6 +47,10 @@ use crate::render::{backend, generated_shader};
 /// Scrubby-zoom sensitivity: an RMB vertical drag multiplies zoom by `exp(dy * this)` per pixel
 /// (~2.7× per 100 px). Exponential-in-pixels so the gesture feels uniform across the zoom range;
 /// drag down (dy > 0) zooms in, up zooms out.
+///
+/// The pixels are **logical**, not the physical ones the cursor arrives in — see
+/// [`GpuSurface::drag_px`]. A gesture is a hand movement, and the hand does not know the display's
+/// backing scale.
 const ZOOM_DRAG_SENSITIVITY: f32 = 0.01;
 
 /// How far (surface px) the cursor may move during an RMB press before it counts as a zoom-drag
@@ -555,6 +559,9 @@ pub enum Presented {
 pub struct GpuSurface {
     gpu: Rc<Gpu>,
     window: Arc<Window>,
+    /// The window's backing scale (physical px per logical px), tracked so the gesture math can
+    /// speak in logical px while everything else stays physical. Updated on a DPI change.
+    scale: f32,
     /// The window's swapchain, sized to its client.
     swapchain: backend::Swapchain,
     /// The image texture + the two samplers, ready to apply. Rebuilt whenever the texture changes.
@@ -601,9 +608,11 @@ impl GpuSurface {
     ) -> Result<Self, String> {
         let swapchain = gpu.create_swapchain(&window, width, height)?;
         let bindings = make_bindings(&gpu, gpu.placeholder_view);
+        let scale = window.scale_factor() as f32;
         Ok(Self {
             gpu,
             window,
+            scale,
             swapchain,
             bindings,
             origin: (0.0, 0.0),
@@ -635,6 +644,20 @@ impl GpuSurface {
             display: DisplayState::default(),
             gesture: GestureState::default(),
         })
+    }
+
+    /// A drag distance in logical px, from the physical one the cursor reports.
+    ///
+    /// The two zoom-drag knobs — the sensitivity and the configured detent width — describe how
+    /// far the *hand* moves, so they cannot be measured in physical pixels: a Retina display would
+    /// silently double the zoom rate and halve the detent, and every Mac is Retina. Dividing here
+    /// leaves a 1× display (every Windows box at 100 %) working exactly as before.
+    ///
+    /// Only the gesture knobs get this treatment. Everything else — the viewport, the zoom, the
+    /// cursor, the image rect — is physical on purpose, because that is what makes 1:1 one texel
+    /// per screen pixel (D15).
+    fn drag_px(&self, physical: f32) -> f32 {
+        physical / self.scale.max(0.1)
     }
 
     /// Set the letterbox / no-image backdrop color (packed `0x00RRGGBB`); stored both packed and
@@ -999,6 +1022,15 @@ impl GpuSurface {
         self.invalidate();
     }
 
+    /// The window moved to a display with a different backing scale. Only the swapchain needs
+    /// telling: everything above it — the viewport, the zoom, the cursor — is already in physical
+    /// px, so a scale change reaches it as the `Resized` that follows and nothing has to be
+    /// converted.
+    pub fn set_scale_factor(&mut self, scale: f64) {
+        self.scale = scale as f32;
+        self.swapchain.set_scale_factor(scale);
+    }
+
     /// Schedule a repaint (delivered as `RedrawRequested`).
     pub fn invalidate(&self) {
         self.window.request_redraw();
@@ -1221,7 +1253,7 @@ impl GpuSurface {
                     pos.0 - self.gesture.zoom_anchor.0,
                     pos.1 - self.gesture.zoom_anchor.1,
                 );
-                if (ax * ax + ay * ay).sqrt() > ZOOM_DRAG_CLICK_SLOP {
+                if self.drag_px((ax * ax + ay * ay).sqrt()) > ZOOM_DRAG_CLICK_SLOP {
                     self.gesture.zoom_dragged = true;
                 }
             }
@@ -1234,9 +1266,10 @@ impl GpuSurface {
                     // The break-out distance is configured in drag px; the detent works in the same
                     // log-zoom units the drag accumulates in, so it converts the same way dy does.
                     let release = self.zoom_release();
+                    let step = self.drag_px(dy) * ZOOM_DRAG_SENSITIVITY;
                     let zoom = self.gesture.zoom_detent.step(
                         self.view.zoom,
-                        dy * ZOOM_DRAG_SENSITIVITY,
+                        step,
                         &self.prefs.zoom_snaps,
                         release,
                     );

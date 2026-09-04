@@ -9,8 +9,8 @@
 //! [`backend`] is whichever of the two platform modules this build has. They are twins, not a
 //! trait: the set of targets is closed and known, so an alias costs nothing at runtime and keeps
 //! [`gpu`] free of `cfg`. Anything added to one must be added to the other — the contract is
-//! `Device` (`create`, `fill_environment`), `Swapchain` (`new`, `size`, `resize`, `acquire`,
-//! `present`) and `SWAPCHAIN_FORMAT`.
+//! `Device` (`create`, `fill_environment`), `Swapchain` (`new`, `size`, `resize`,
+//! `set_scale_factor`, `acquire`, `present`) and `SWAPCHAIN_FORMAT`.
 
 #[cfg(windows)]
 pub mod d3d11;

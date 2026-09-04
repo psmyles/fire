@@ -75,7 +75,7 @@ Each is stated with the reason and what it costs, so a future revision can revis
 | D12 | **Packaging: `scripts/build-mac.sh` + `Info.plist` template from `product.json`, signed + notarized `.dmg`** | Mirrors `build-installer.ps1`; plist is hand-tuned anyway (cargo-bundle would hide it) | `.dmg` is more script than `.zip`; accepted for polish | Planned |
 | D13 | **Windows first, then macOS** | The shared code and the TTFP risk were the Windows migration; mac is leaves + packaging | Colleagues wait one extra phase | Done |
 | D14 | *(wgpu-era: pinned backend, no debug layers, decode kicked off before device creation)* | - | - | Superseded (A.2); the surviving idea is D18 |
-| D15 | **Pinch-to-zoom mapped to the wheel zoom; 1:1 = one texel per *physical* pixel** | Crisp on Retina, matches what artists mean by 100 %, zoom-snap ladder stays in image space | `scale_factor` enters the fit/1:1 math | Shipped (pinch maps `WindowEvent::PinchGesture`'s incremental magnification to the wheel's about-cursor zoom; NaN filtered, as winit permits one) |
+| D15 | **Pinch-to-zoom mapped to the wheel zoom; 1:1 = one texel per *physical* pixel** | Crisp on Retina, matches what artists mean by 100 %, zoom-snap ladder stays in image space | `scale_factor` enters the fit/1:1 math | Shipped. Pinch maps `WindowEvent::PinchGesture`'s incremental magnification to the wheel's about-cursor zoom (NaN filtered, as winit permits one). The cost line proved wrong: fit and 1:1 are already in physical px end to end, so `scale_factor` enters nothing there — 1:1 is one texel per physical pixel by construction, measured exact on a 2× display (§ Phase 2 step 6). It enters the *gesture* math instead, which is the opposite conversion |
 | D16 | **Minimal macOS menu bar via `muda`; fullscreen via winit** | A Mac app without a menu bar reads as broken; native fullscreen gives the space transition | ~180 lines in `menubar.rs`, all `cfg(target_os = "macos")`, plus two crates (`muda`, `keyboard-types`) that reuse winit's objc2 family. Two corrections to the premise: winit *already* installs a default menu bar carrying ⌘Q, so it had to be disabled (`with_default_menu(false)`) or it replaced ours wholesale — and it means the app was never actually unquittable. Fullscreen needed no code: winit's `Fullscreen::Borderless` is `toggleFullScreen:` on macOS, the native space transition already | Shipped |
 | D17 | *(wgpu-era: measure `request_adapter`, then decide on a DXGI hal leaf)* | - | - | Superseded (A.2): the ~140 ms was D3D12 driver init, not enumeration |
 | D18 | **GPU bring-up on its own thread, started on the first line of `main`; the window is created *before* the join** | Device creation is the longest single item on the launch path and needs no window - but neither does the window need to wait for it | `Viewer::new` takes the GPU as a closure; get the order wrong and the window's 9-13 ms serialize after the device (§8) | Shipped |
@@ -565,6 +565,35 @@ nothing after them can be checked without it.
    the first fix, which computed the path itself, silently did nothing; `try_overwrite` lets the
    crate do the deleting, since it is the one that knows where the socket is.
 6. Retina: `scale_factor` into fit/1:1; verify the zoom-snap ladder lands on true 100 %.
+   **Done** (2026-09-04), and the premise turned out to be half wrong: fit and 1:1 needed *no*
+   `scale_factor` at all. `Viewport`, the zoom factor, the cursor and the image rect are already
+   in physical px throughout, so `zoom = 1.0` is one texel per physical pixel by construction —
+   which is exactly what D15 asks for. Measured rather than assumed: a synthetic 400×260 ruler
+   image opened at actual size occupies **exactly 400 × 260 pixels** in a 5120×2880 screen
+   capture, its 1 px border resolves to exactly one row of 400 red pixels, and its 8 px marker
+   grid comes back at a spacing of exactly 8 with all 1568 markers present — no resampling
+   anywhere on a 2× display. The chrome measures exact too: `status_h = 24` renders as 48 physical
+   px and `toolbar_h = 38` as 76, so `Metrics::new(dpi)` is right.
+
+   Where the scale factor *was* missing is the **gesture** math, which is the opposite case — it
+   describes how far the hand moves, so it must not be in physical px. The scrubby-zoom
+   sensitivity and the configured `zoom-snap` detent width were being compared against physical
+   drag pixels, which on any Retina display made the zoom-drag twice as fast and the detent half
+   as wide as configured; the double-click slop (4 px, a Windows `SM_CXDOUBLECLK` value, i.e.
+   logical) was likewise halved. Both now convert through the window's backing scale, which leaves
+   a 1× display — every Windows box at 100 % — behaving exactly as before.
+
+   Also fixed: the Metal layer's **`contentsScale` was set once at creation and never updated**.
+   `resize` alone is not enough, because Core Animation uses `contentsScale` to map the layer's
+   point bounds onto the drawable's pixels; a window dragged from a Retina display to a 1× one
+   would have had its drawable rescaled to fit and gone soft. The backend contract gained
+   `set_scale_factor`, empty on D3D11 (DXGI has no scale between the swapchain and the window).
+   **Not verified on hardware** — it needs a second display with a different backing scale.
+
+   The zoom-snap ladder's exactness is a unit test, not a new finding: `snap_step` returns the
+   ladder value verbatim rather than an `exp(ln(x))` round-trip of it, and
+   `a_caught_snap_is_the_ladder_value_verbatim` asserts `assert_eq!` on every rung including 1.0.
+   The config states the ladder in percent, so the 100 rung is `100.0 / 100.0` — exactly 1.0.
 7. Measure: the mac twin of `scripts/ttfp.ps1` (§7.4) and a launch-path breakdown, so the Metal
    bring-up gets the same scrutiny the D3D11 one did. There is no cross-OS budget - the number
    to beat is the next mac build's.

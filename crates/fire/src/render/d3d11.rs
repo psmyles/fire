@@ -198,6 +198,13 @@ impl Swapchain {
         }
     }
 
+    /// The twin of the Metal swapchain's `set_scale_factor`, and deliberately empty: a DXGI
+    /// swapchain's buffers *are* the window's pixels, with no scale between the two for a DPI
+    /// change to invalidate. The call still exists on both so the caller stays free of `cfg`.
+    pub fn set_scale_factor(&mut self, scale: f64) {
+        let _ = scale;
+    }
+
     /// Acquire this frame's render target and point `sc` at it, returning whether there is a
     /// frame to draw. `false` (logged) means the device refused — a device-removed reset — and
     /// the frame is skipped rather than drawn into nothing.

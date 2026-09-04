@@ -75,6 +75,10 @@ const CARET_BLINK_MS: u64 = 33;
 /// Two presses closer than this in time and space are a double-click (winit reports presses only;
 /// the OS's own double-click synthesis is a Win32 class flag winit does not set). 500 ms is the
 /// Windows default; the distance is the default 4 px in each direction.
+///
+/// The slop is in **logical** px and is scaled by the display's DPI at the comparison, because the
+/// cursor arrives in physical ones: unscaled, a Retina display would halve the tolerance and make
+/// double-clicks harder to land the steadier the hand needs to be.
 const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 const DOUBLE_CLICK_SLOP: f32 = 4.0;
 
@@ -1555,6 +1559,9 @@ impl Viewer {
                 // re-bakes glyphs lazily, so this is a style rescale plus one icon-atlas
                 // re-raster — no font atlas to rebuild.
                 self.dpi = ((scale_factor * 96.0).round() as u32).max(96);
+                // The swapchain has to follow the display's backing scale, not just the client
+                // size the `Resized` after this carries; see the backend's `set_scale_factor`.
+                self.surface.set_scale_factor(*scale_factor);
                 self.imgui.set_dpi(self.dpi);
                 self.imgui.handle_event(event);
                 self.restyle();
@@ -1729,10 +1736,11 @@ impl Viewer {
                 // A second press right after the first is a double-click: over the empty viewport
                 // it opens the file picker (matching the on-screen hint).
                 let now = Instant::now();
+                let slop = DOUBLE_CLICK_SLOP * self.metrics.scale;
                 let double = self.last_click.is_some_and(|(t, p)| {
                     now.duration_since(t) <= DOUBLE_CLICK
-                        && (p.0 - self.cursor.0).abs() <= DOUBLE_CLICK_SLOP
-                        && (p.1 - self.cursor.1).abs() <= DOUBLE_CLICK_SLOP
+                        && (p.0 - self.cursor.0).abs() <= slop
+                        && (p.1 - self.cursor.1).abs() <= slop
                 });
                 self.last_click = if double {
                     None

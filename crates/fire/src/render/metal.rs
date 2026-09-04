@@ -170,6 +170,21 @@ impl Swapchain {
         }
     }
 
+    /// Follow the window onto a display with a different backing scale.
+    ///
+    /// `contentsScale` is how Core Animation maps the layer's *point* bounds — which AppKit sets
+    /// from the view — onto the drawable's pixels. `resize` keeps the drawable itself right, but
+    /// on its own that is not enough: left at the old display's scale, CA would believe the layer
+    /// needs twice (or half) the pixels the drawable actually has and rescale it to fit, so a
+    /// window dragged from a Retina display to a 1× one would go soft rather than sharp. The two
+    /// have to move together, and winit reports them as two events.
+    ///
+    /// The D3D11 twin has no counterpart: DXGI has no notion of a scale between the swapchain and
+    /// the window, so its buffer size is the whole story.
+    pub fn set_scale_factor(&mut self, scale: f64) {
+        self.layer.setContentsScale(scale);
+    }
+
     /// Acquire this frame's drawable and point `sc` at it, returning whether there is a frame to
     /// draw. `false` (the drawable timed out, or the window is off-screen) means skip the frame
     /// rather than draw into nothing.
