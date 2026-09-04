@@ -20,6 +20,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// launch with another instance up just exits).
 pub fn forward(path: Option<PathBuf>) -> io::Result<()> {
     let Some(path) = path else {
+        // Nothing to send — but the caller exits on `Ok`, so "an owner is already running" has to
+        // be *true* here, not merely implied by the failed bind that got us here. Where the socket
+        // is a file it outlives a crashed owner, so connect to find out: a refusal means the name
+        // is stale and the caller must open a window instead of vanishing with no UI at all.
+        connect_retry(CONNECT_TIMEOUT)?;
         return Ok(());
     };
     let req = OpenRequest::new(path);

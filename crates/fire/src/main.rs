@@ -66,8 +66,14 @@ fn main() {
         Err(e) if ipc_server::is_taken(&e) => match forward::forward(path.clone()) {
             Ok(()) => return,
             Err(e) => {
+                // Nobody answered a name that bind said was taken. The owner either exited as we
+                // launched, or never cleaned up after being killed — either way the name is free
+                // now, so reclaim it and serve, rather than running un-coordinated forever and
+                // leaving every later launch to pay the same failed connect.
                 eprintln!("fire: forward to running instance failed ({e}); opening here");
-                None
+                ipc_server::reclaim_stale()
+                    .then(ipc_server::bind)
+                    .and_then(Result::ok)
             }
         },
         // The OS refused the socket outright. Run anyway, un-coordinated: refusing to open an

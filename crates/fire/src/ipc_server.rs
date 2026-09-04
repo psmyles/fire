@@ -22,17 +22,59 @@ use fire_ipc::{read_message, SOCKET_NAME};
 
 use crate::app::AppEvent;
 
+/// Where the socket lives as a *file*, on the OSes that put it in the filesystem (macOS and other
+/// Unixes without abstract sockets). `None` where the name lives in an OS namespace instead
+/// (Windows named pipes, Linux abstract sockets) — there the kernel reclaims the name when the
+/// owner dies, so there is nothing to clean up and nothing to go stale.
+fn socket_file_path() -> Option<std::path::PathBuf> {
+    if GenericNamespaced::is_supported() {
+        return None;
+    }
+    let dir = dirs::runtime_dir()
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    Some(dir.join(SOCKET_NAME))
+}
+
 /// The socket's name on this OS: a namespaced name where the OS has a namespace for them
 /// (Windows named pipes, Linux abstract sockets), else a socket file under the user's runtime
 /// directory (macOS).
 pub fn socket_name() -> io::Result<Name<'static>> {
-    if GenericNamespaced::is_supported() {
-        SOCKET_NAME.to_ns_name::<GenericNamespaced>()
-    } else {
-        let dir = dirs::runtime_dir()
-            .or_else(dirs::cache_dir)
-            .unwrap_or_else(std::env::temp_dir);
-        dir.join(SOCKET_NAME).to_fs_name::<GenericFilePath>()
+    match socket_file_path() {
+        None => SOCKET_NAME.to_ns_name::<GenericNamespaced>(),
+        Some(path) => path.to_fs_name::<GenericFilePath>(),
+    }
+}
+
+/// Delete a socket file whose owner is gone, so this launch can bind the name instead. Returns
+/// whether anything was removed.
+///
+/// Only ever called once a forward has already *failed* to reach anyone, which is the proof that
+/// the name is unowned — a live owner answers, so its socket is never removed here. This matters
+/// only where the socket is a file: a Unix socket outlives the process that bound it, so an owner
+/// killed with `SIGKILL` (or crashed, D7) leaves a file that no longer accepts connections but
+/// still fails every future `bind` with `AddrInUse`. Left alone, that makes every later launch
+/// stall on the connect timeout, and one with no path to forward exit without ever showing a
+/// window. Windows has no equivalent: its named pipe disappears with its process.
+///
+/// Two launches can race here — both find the socket dead, both unlink, both bind. One wins; the
+/// loser sees `AddrInUse` again and forwards to the winner, which is the ordinary path.
+pub fn reclaim_stale() -> bool {
+    let Some(path) = socket_file_path() else {
+        return false;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            eprintln!(
+                "fire: removed a stale instance socket at {} (its owner exited without cleaning \
+                 up); taking ownership",
+                path.display()
+            );
+            true
+        }
+        // Someone else got there first, or it was never a file we may remove. Either way this
+        // launch simply runs without serving the socket.
+        Err(_) => false,
     }
 }
 

@@ -137,6 +137,21 @@ On macOS the socket is only reached by a bare binary invocation; Finder, Dock an
 deliver files as Apple Events to the running `.app`, which the delegate hook (§5) routes to
 the same open path. Cold start with no running instance is identical on both.
 
+**A Unix socket outlives its owner, and that had to be handled.** Where the name lives in an OS
+namespace (Windows named pipes, Linux abstract sockets) the kernel frees it when the owner dies;
+a socket *file* just stays. An owner killed with `SIGKILL` — or crashed, which D7 accepts as a
+real outcome — therefore left a file that answered no connection but still failed every future
+`bind` with `AddrInUse`, and the fallback path treated that as "an owner exists". Two
+consequences, both found by running the bundled app from Finder: every later launch stalled for
+the two-second connect timeout, and a launch *with no path to forward* exited immediately with no
+window at all — `forward(None)` returned `Ok` without ever connecting, and `Ok` means "forwarded,
+now exit". A double-clicked Fire flashed in the Dock and vanished, permanently, until the file
+was deleted by hand. The fix is in three places: `forward(None)` now connects, so it can fail;
+`ipc_server::reclaim_stale` unlinks a socket only once a forward has already proved nobody
+answers; and `main` then re-binds and serves, so the first launch after a crash repairs the state
+instead of running un-coordinated. Windows cannot reach any of it — there is no file to go
+stale — but the no-path probe makes it honest there too.
+
 The Windows foreground handoff (`AllowSetForegroundWindow` on the forwarding side,
 `focus_window()` on the owner) stays exactly as in `architecture.md` §4.1, as a `cfg(windows)`
 leaf in `platform.rs` called from the forward path.
@@ -331,6 +346,12 @@ checkout must do too. What that needs, and what is in the way.
   use; make the list host-conditional or add `aarch64-apple-darwin` beside it.
 * **Homebrew: `cmake ninja meson nasm pkg-config`**, and a bootstrapped **vcpkg** - for the
   one-time HEIF build of D25 only. A normal `cargo build` needs none of them.
+
+`scripts/dev-app.sh` wraps the built binary in a minimal `.app` so the shell can be exercised the
+way it will actually be run. That is not cosmetic: a bare executable gets no Dock presence, no
+proper activation, and is not what `open` delivers file arguments to, so the leaves in step 5 -
+the Apple-Event open path above all - cannot be tested without a bundle. It is the *dev* bundle
+(no icon, no document types, unsigned); `build-mac.sh` (D12) remains the shipping one.
 
 Everything else, clang and the macOS SDK already provide: bindgen's libclang (the sys crates'
 "check that `libclang.dll` is on PATH" message is Windows-shaped, but it is the same dylib -
