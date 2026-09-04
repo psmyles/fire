@@ -1,17 +1,19 @@
 //! Build steps for the `fire` executable:
-//!   1. Rasterize the toolbar SVGs and decode the logo PNG into raw pixels, so no SVG/PNG decoder
-//!      ships in the exe and a malformed asset is a build error rather than a launch panic.
-//!   2. Read the canonical product metadata from `product.json` (repo root) and (a) on Windows,
-//!      embed it into the exe's version resource + app icon — so Explorer shows the flame and Task
-//!      Manager / file properties read the product name/version — and (b) re-export the same
-//!      strings as `FIRE_*` compile-time env vars the app reads via `env!` (window title, etc.).
-//!      `product.json` is the single source of truth: editing it there flows into the binary, and
-//!      the installer build scripts read the same file, so a version bump lives in exactly one place.
-//!
-//! There is no shader step any more: the viewport shader is WGSL (`src/render/shader.wgsl`),
-//! which wgpu validates and compiles at pipeline creation on every OS.
+//!   1. Precompile the viewport HLSL to DXBC with `fxc` (the Windows SDK offline shader compiler),
+//!      so the bytecode is embedded at build time instead of compiled at startup: no runtime
+//!      `d3dcompiler` dependency, nothing on the cold-start path, and a broken shader is a build
+//!      error rather than a launch-time failure. Windows only — the D3D11 backend is the one that
+//!      takes DXBC; a Metal build will want the MSL twin compiled here the same way.
+//!   2. Compile `simgui/simgui.c` — sokol_imgui.h, Dear ImGui's sokol backend — as C, against the
+//!      vendored sokol headers and the cimgui header `dear-imgui-sys` links. The Rust side calls it
+//!      through a handful of `extern "C"` declarations in `render::imgui`.
+//!   3. Rasterize the toolbar icons and decode the logo, and read the canonical product metadata
+//!      from `product.json` (repo root): (a) embed it into the exe's Windows version resource + app
+//!      icon, and (b) re-export the same strings as `FIRE_*` compile-time env vars the app reads
+//!      via `env!`. `product.json` is the single source of truth.
 
-use std::path::Path;
+use std::env;
+use std::path::{Path, PathBuf};
 
 /// Product metadata read from `product.json`. Only the fields the build consumes are pulled.
 struct Product {
@@ -25,23 +27,76 @@ struct Product {
 
 fn main() {
     let product = read_product();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        compile_shaders();
+    }
+    compile_simgui(&target_os);
     rasterize_icons();
     decode_logo();
-    #[cfg(windows)]
-    embed_resources(&product);
+    if target_os == "windows" {
+        embed_resources(&product);
+    }
     export_env(&product);
+}
+
+/// Compile sokol_imgui.h (see `simgui/simgui.c`). The sokol backend define must match the one
+/// the vendored `sokol` crate's build picks — the same `SOKOL_BACKEND` override, the same per-OS
+/// default — because the two translation units share sokol_gfx's structs.
+fn compile_simgui(target_os: &str) {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let simgui = manifest.join("simgui");
+    let sokol_c = manifest.join("../../vendor/sokol-rust/src/sokol/c");
+    for f in ["simgui.c", "sokol_imgui.h", "cimgui.h"] {
+        println!("cargo:rerun-if-changed={}", simgui.join(f).display());
+    }
+    println!("cargo:rerun-if-env-changed=SOKOL_BACKEND");
+
+    let backend = match env::var("SOKOL_BACKEND").as_deref() {
+        Ok("D3D11") => "SOKOL_D3D11",
+        Ok("METAL") => "SOKOL_METAL",
+        Ok("GL") => "SOKOL_GLCORE",
+        Ok("GLES3") => "SOKOL_GLES3",
+        Ok("WGPU") => "SOKOL_WGPU",
+        _ => match target_os {
+            "windows" => "SOKOL_D3D11",
+            "macos" => "SOKOL_METAL",
+            _ => "SOKOL_GLCORE",
+        },
+    };
+
+    let mut build = cc::Build::new();
+    build
+        .file(simgui.join("simgui.c"))
+        .include(&simgui)
+        .include(&sokol_c)
+        .define(backend, None)
+        // Renderer only: the window and its input are winit's (see render::imgui).
+        .define("SOKOL_IMGUI_NO_SOKOL_APP", None)
+        // Must match dear-imgui-sys's own compile of cimgui/imgui, or the struct layouts differ.
+        .define("CIMGUI_DEFINE_ENUMS_AND_STRUCTS", None)
+        .define("CIMGUI_NO_EXPORT", None)
+        .define("IMGUI_USE_WCHAR32", None)
+        .define("IMGUI_DISABLE_OBSOLETE_FUNCTIONS", None)
+        .warnings(false);
+    if env::var("PROFILE").as_deref() == Ok("release") {
+        build.define("NDEBUG", None);
+        build.opt_level(2);
+    }
+    build.compile("fire_simgui");
 }
 
 /// Edge (px) of the empty-window logo raster. Keep in sync with `render::imgui::LOGO_EDGE`.
 const LOGO_EDGE: u32 = 256;
 
 /// Decode the logo PNG (`assets/icon-256.png`, pre-sized from the 1024 px master) to raw
-/// straight-alpha RGBA in `OUT_DIR`, which `render::imgui` embeds for the empty-window card.
-/// Decoded here so no PNG decoder ships in the exe and a malformed asset is a build error,
-/// not a launch panic — the same posture as the icons and the shaders.
+/// straight-alpha RGBA in `OUT_DIR`, which `render::imgui` embeds for the empty-window card and
+/// the shell uses as the window icon. Decoded here so no PNG decoder ships in the exe and a
+/// malformed asset is a build error, not a launch panic — the same posture as the icons and the
+/// shaders.
 fn decode_logo() {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").unwrap();
     let png = Path::new(&manifest).join("../../assets/icon-256.png");
     println!("cargo:rerun-if-changed={}", png.display());
 
@@ -115,8 +170,8 @@ const ICON_STEMS: &[&str] = &[
 /// button state. Done at build time (resvg is a build-dep only) so no SVG rasterizer ships in the
 /// exe and a malformed icon is a build error, not a launch panic — the same posture as the shaders.
 fn rasterize_icons() {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").unwrap();
     let icons = Path::new(&manifest).join("../../assets/icons");
     println!("cargo:rerun-if-changed={}", icons.display());
 
@@ -155,7 +210,7 @@ fn rasterize_icons() {
 /// Parse `../../product.json` (repo root) into [`Product`]. Panics with a clear message on a
 /// missing/malformed file or absent field — the metadata is mandatory, not best-effort.
 fn read_product() -> Product {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
     let path = Path::new(&manifest).join("../../product.json");
     println!("cargo:rerun-if-changed={}", path.display());
 
@@ -181,19 +236,83 @@ fn read_product() -> Product {
     }
 }
 
+/// Compile each entry point of `src/render/shader.hlsl` to a `.dxbc` in `OUT_DIR`, which
+/// `render::gpu` embeds via `include_bytes!` and hands to sokol_gfx as shader bytecode. fxc
+/// targets shader model 5.0 (`vs_5_0`/`ps_5_0`), which is what sokol's D3D11 backend expects.
+fn compile_shaders() {
+    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let hlsl = Path::new(&manifest).join("src/render/shader.hlsl");
+    println!("cargo:rerun-if-changed={}", hlsl.display());
+    println!("cargo:rerun-if-env-changed=FXC");
+
+    let fxc = find_fxc();
+    for (entry, target) in [("vs_main", "vs_5_0"), ("ps_main", "ps_5_0")] {
+        let out = Path::new(&out_dir).join(format!("{entry}.dxbc"));
+        let output = std::process::Command::new(&fxc)
+            .args(["/nologo", "/O3", "/T", target, "/E", entry, "/Fo"])
+            .arg(&out)
+            .arg(&hlsl)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run fxc ({}): {e}", fxc.display()));
+        if !output.status.success() {
+            panic!(
+                "fxc failed to compile {entry} ({target}):\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+}
+
+/// Locate `fxc.exe`. Honors an explicit `FXC` override, then the SDK bin path exported inside a
+/// Developer Command Prompt (`WindowsSdkVerBinPath`), then the newest installed Windows 10/11 SDK
+/// bin, and finally falls back to `fxc.exe` on `PATH`.
+fn find_fxc() -> PathBuf {
+    if let Ok(p) = env::var("FXC") {
+        return PathBuf::from(p);
+    }
+    if let Ok(bin) = env::var("WindowsSdkVerBinPath") {
+        let p = PathBuf::from(bin).join("x64").join("fxc.exe");
+        if p.exists() {
+            return p;
+        }
+    }
+    // Search every installed SDK version under each Program Files root; pick the newest.
+    let mut candidates: Vec<(std::ffi::OsString, PathBuf)> = Vec::new();
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+        let Ok(pf) = env::var(var) else { continue };
+        let bin = PathBuf::from(pf)
+            .join("Windows Kits")
+            .join("10")
+            .join("bin");
+        let Ok(entries) = std::fs::read_dir(&bin) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path().join("x64").join("fxc.exe");
+            if p.exists() {
+                candidates.push((e.file_name(), p)); // key on the version dir name
+            }
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    candidates
+        .pop()
+        .map_or_else(|| PathBuf::from("fxc.exe"), |(_, p)| p)
+}
+
 /// Embed the Fire `.ico` + product metadata into the exe (Explorer file icon, Task Manager name,
 /// file-properties version tab). Every string comes from `product.json` so the binary's metadata
-/// can never drift from the installer's. Windows only: the macOS bundle carries the same data in
-/// its `Info.plist` (see `scripts/build-mac.sh`).
-#[cfg(windows)]
+/// can never drift from the installer's.
 fn embed_resources(p: &Product) {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
     let ico = Path::new(&manifest).join("../../assets/fire.ico");
     println!("cargo:rerun-if-changed={}", ico.display());
 
     let mut res = winresource::WindowsResource::new();
     // set_icon embeds the .ico with resource id "1" (winresource's DEFAULT_APPLICATION_ICON_ID),
-    // which the app loads via LoadIconW(.., MAKEINTRESOURCE(1)) for the window/taskbar icon.
+    // which Explorer shows for the file; the window/taskbar icon is the logo raster, set at runtime.
     res.set_icon(ico.to_str().expect("icon path is valid UTF-8"));
     // ProductName is the product family; FileDescription is the friendly name Task Manager shows.
     res.set("ProductName", &p.name);
@@ -217,7 +336,6 @@ fn embed_resources(p: &Product) {
 /// (`major<<48 | minor<<32 | patch<<16 | build`). Missing components default to 0; each field
 /// is 16 bits, so a component above 65535 is clamped rather than silently bleeding into its
 /// neighbour.
-#[cfg(windows)]
 fn packed_version(version: &str) -> u64 {
     let mut fields = [0u64; 4];
     for (field, part) in fields.iter_mut().zip(version.split('.')) {

@@ -1,71 +1,143 @@
-//! The Dear ImGui layer: one context per window, its winit platform backend and wgpu renderer,
-//! and the two textures the UI draws from (the icon atlas, the empty-window logo).
+//! The Dear ImGui layer: one context per window, its winit platform backend for input, sokol_imgui
+//! as its renderer, and the two textures the UI draws from (the icon atlas, the empty-window logo).
 //!
-//! Lives in `render/` because it is the *other* place that legitimately names `wgpu` — it builds
-//! the textures and hands the renderer a render pass. Everything above it (`crate::ui`) is pure
-//! immediate-mode UI code with no GPU API in sight.
+//! Lives in `render/` because it is the *other* place that legitimately names `sokol::gfx` — it
+//! builds the textures and draws the UI into the frame's pass. Everything above it (`crate::ui`)
+//! is pure immediate-mode UI code with no GPU API in sight.
 //!
-//! **We own no backend code.** `dear-imgui-winit` and `dear-imgui-wgpu` are the maintained
-//! backends of the same crate family as `dear-imgui-rs` itself, released in step with it. That is
-//! the whole reason this dependency is acceptable: the platform/renderer glue — historically the
-//! part that rots — is upstream's problem, and it is the same glue on every OS.
+//! **We own no backend code.** Input comes through `dear-imgui-winit`, the maintained winit
+//! backend of the same crate family as `dear-imgui-rs`, released in step with it. Drawing is
+//! `sokol_imgui.h` (compiled by build.rs, see `simgui/`) in its `SOKOL_IMGUI_NO_SOKOL_APP` mode —
+//! a renderer only: it uploads ImGui's textures (fonts included, through the 1.92 texture
+//! protocol) as sokol_gfx images and draws the draw lists into the current pass. It is the same
+//! header on every OS, maintained next to sokol_gfx by its author.
 //!
 //! **One context per window, and only one is ever current.** Dear ImGui has a single current
 //! context; `dear-imgui-rs` models that as an active [`Context`] or a [`SuspendedContext`]. Every
 //! window's context lives here *suspended*, and each operation activates it for exactly the
-//! duration of a closure ([`Imgui::with`]) — so N windows in one process never race over the global,
-//! and there is no ordering rule for the caller to remember.
+//! duration of a closure ([`Imgui::with`]) — so N windows in one process never race over the
+//! global, and there is no ordering rule for the caller to remember. sokol_imgui keeps no context
+//! of its own: `simgui_setup` runs once per process (it creates a throwaway context, destroyed on
+//! the spot) and every call of its goes through `igGetIO()`, i.e. whatever is current — so it
+//! draws whichever window's context is active, and tracks each context's textures through the
+//! `ImTextureData` objects in that context's draw data. The one thing `dear-imgui-rs` does *not*
+//! do here is render: its `render()` insists on one of its own renderer backends, so the frame is
+//! opened through it (`Context::frame`, which is `igNewFrame`) and closed by `simgui_render`
+//! (`igRender` + upload + draw). Its lifecycle bookkeeping reads ImGui's own frame state, so it
+//! stays consistent.
 //!
 //! Three things here are load-bearing and easy to get wrong:
 //!
-//! * **sRGB.** The image pass renders through an `*Srgb` view (the shader emits linear light).
-//!   ImGui's colors are *already* sRGB, so drawing it through that same view would double-encode and
-//!   wash the entire UI out. The UI pass therefore draws through the plain `Unorm` view of the very
-//!   same texture — see [`crate::render::gpu::GpuSurface::render_frame`] — and the renderer is told
-//!   that UNORM format so it does not gamma-correct either.
+//! * **sRGB.** The swapchain is written through a UNORM view, and ImGui's colors are already
+//!   sRGB, so nothing here gamma-corrects; the image pass encodes its own output (see
+//!   `shader.hlsl`). sokol_imgui picks its gamma from the swapchain format, which says UNORM.
 //! * **DPI.** ImGui 1.92's dynamic font system rasterizes glyphs on first use, so a DPI change is
 //!   just `set_font_scale_dpi` — there is no atlas to rebuild. Only the icon texture (a real
 //!   raster) gets rebuilt, in [`Imgui::refresh_icons`]. The platform backend runs with its DPI
-//!   handling *locked to 1.0*: the whole UI lays out in physical pixels (`ui::theme::Metrics` scales
-//!   from the DPI itself), so ImGui's coordinate space must be the framebuffer's, not winit's logical
-//!   one.
+//!   handling *locked to 1.0*: the whole UI lays out in physical pixels (`ui::theme::Metrics`
+//!   scales from the DPI itself), so ImGui's coordinate space must be the framebuffer's, not
+//!   winit's logical one.
 //! * **The frame closes even if the UI panics.** A panic mid-frame would leave the context between
 //!   `NewFrame` and `Render`, and the next frame would assert. The build closure runs under
 //!   `catch_unwind`; whatever it managed to build is rendered, the panic is logged, and the app
-//!   carries on — the same recovery the Win32 shell's wndproc firewall used to give.
+//!   carries on.
 
+use std::ffi::c_void;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use dear_imgui_rs::{sys, Context, FontSource, Style, SuspendedContext, TextureId, Ui};
-use dear_imgui_wgpu::{ExternalTextureId, FramebufferExtent, WgpuInitInfo, WgpuRenderer};
+use dear_imgui_rs::{
+    render::SynchronousRendererConsumer, sys, BackendFlags, Context, FontSource, Style,
+    SuspendedContext, TextureId, Ui,
+};
 use dear_imgui_winit::{HiDpiMode, WinitPlatform};
+use sokol::gfx as sg;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::icons;
-use crate::render::gpu::{Gpu, SURFACE_FORMAT};
 
 /// The empty-window logo: `assets/icon-256.png`, decoded to raw straight-alpha RGBA at build
 /// time by build.rs (no PNG decoder ships in the exe). Edge kept in sync with build.rs's
-/// `LOGO_EDGE`.
+/// `LOGO_EDGE`. Also the window icon (see `app`).
 pub const LOGO_EDGE: u32 = 256;
 pub static LOGO_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logo.rgba"));
 
-/// A texture the UI draws from, owned here: the GPU texture and the renderer's handle to it. Both
-/// must outlive every frame that references the handle, so they are only ever replaced wholesale.
+// --- sokol_imgui, as compiled by build.rs (see simgui/) ---------------------------------------
+
+#[repr(C)]
+struct SimguiAllocator {
+    alloc_fn: Option<unsafe extern "C" fn(usize, *mut c_void) -> *mut c_void>,
+    free_fn: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>,
+    user_data: *mut c_void,
+}
+
+#[repr(C)]
+struct SimguiLogger {
+    func: Option<
+        extern "C" fn(
+            *const std::ffi::c_char,
+            u32,
+            u32,
+            *const std::ffi::c_char,
+            u32,
+            *const std::ffi::c_char,
+            *mut c_void,
+        ),
+    >,
+    user_data: *mut c_void,
+}
+
+/// `simgui_desc_t`. Field order and types mirror sokol_imgui.h exactly.
+#[repr(C)]
+struct SimguiDesc {
+    max_vertices: i32,
+    color_format: sg::PixelFormat,
+    depth_format: sg::PixelFormat,
+    sample_count: i32,
+    ini_filename: *const std::ffi::c_char,
+    no_default_font: bool,
+    disable_paste_override: bool,
+    disable_set_mouse_cursor: bool,
+    disable_windows_resize_from_edges: bool,
+    write_alpha_channel: bool,
+    allocator: SimguiAllocator,
+    logger: SimguiLogger,
+}
+
+extern "C" {
+    fn simgui_setup(desc: *const SimguiDesc);
+    fn simgui_render();
+    fn simgui_imtextureid(tex_view: sg::View) -> u64;
+}
+
+/// Whether `simgui_setup` has run: its sokol_gfx resources are process-wide, created by the first
+/// window and shared by every later one.
+static SIMGUI_UP: AtomicBool = AtomicBool::new(false);
+
+/// A texture the UI draws from, owned here: the sokol image and the view its `TextureId` names.
+/// Both must outlive every frame that references the id, so they are only ever replaced wholesale.
 struct UiTexture {
-    _tex: wgpu::Texture,
-    handle: ExternalTextureId,
+    image: sg::Image,
+    view: sg::View,
+}
+
+impl UiTexture {
+    fn destroy(self) {
+        if sg::isvalid() {
+            sg::destroy_view(self.view);
+            sg::destroy_image(self.image);
+        }
+    }
 }
 
 pub struct Imgui {
     ctx: SuspendedContext,
     platform: WinitPlatform,
-    renderer: WgpuRenderer,
-    gpu: Rc<Gpu>,
     window: Arc<Window>,
+    /// The font-atlas claim `dear-imgui-rs` requires of a managed renderer (see [`Imgui::new`]).
+    _consumer: SynchronousRendererConsumer,
     /// The icon atlas.
     icon: Option<UiTexture>,
     icon_id: TextureId,
@@ -86,8 +158,8 @@ pub struct Imgui {
     /// The settings window is drawn with this — see [`FormStyle`].
     stock: sys::ImGuiStyle,
     /// ImGui's ownership booleans, cached after every event and frame so the shell can route
-    /// input without activating the context: does a widget own the pointer, do the keys belong to
-    /// ImGui, is a text field being typed into.
+    /// input without reaching into the context: does a widget own the pointer, do the keys belong
+    /// to ImGui, is a text field being typed into.
     want_mouse: bool,
     want_keyboard: bool,
     want_text: bool,
@@ -122,7 +194,7 @@ impl FormStyle {
     /// are untouched.
     #[must_use]
     pub fn push(self) -> StyleGuard {
-        // SAFETY: called from inside a frame, where this window's context is current.
+        // SAFETY: called from inside a frame, where the context is current.
         unsafe {
             let live = sys::igGetStyle();
             let saved = *live;
@@ -224,12 +296,12 @@ pub fn size_next_window(size: (f32, f32)) {
 }
 
 impl Imgui {
-    /// Build the context, attach the winit platform to `window`, and bind the wgpu renderer to the
-    /// shared device. Errors are strings for the caller to show.
-    pub fn new(gpu: Rc<Gpu>, window: Arc<Window>, dpi: u32) -> Result<Self, String> {
+    /// Build the context, attach the winit platform to `window`, and bind sokol_imgui to it (see
+    /// the module notes on how the two share it). Must run after `sg_setup`. Errors are strings
+    /// for the caller to show.
+    pub fn new(window: Arc<Window>, dpi: u32) -> Result<Self, String> {
         let mut ctx = SuspendedContext::create();
         let window_for_platform = Arc::clone(&window);
-        let gpu_for_renderer = Rc::clone(&gpu);
         let built = ctx.try_with_active(|c| -> Result<_, String> {
             // No imgui.ini: fire has no dockspaces or user-arranged windows to persist, and a
             // settings file that rewrites itself on a timer would break the "an idle window costs
@@ -257,22 +329,32 @@ impl Imgui {
                 .attach_window(window_for_platform, HiDpiMode::Locked(1.0), c)
                 .map_err(|e| format!("winit backend: {e}"))?;
 
-            // Told the *UNORM* surface format: the UI pass draws through that view, and the
-            // renderer must not gamma-correct colors that are already sRGB.
-            let init = WgpuInitInfo::new(
-                gpu_for_renderer.device.clone(),
-                gpu_for_renderer.queue.clone(),
-                SURFACE_FORMAT,
-            )
-            .with_adapter(gpu_for_renderer.adapter.clone());
-            let renderer = WgpuRenderer::new(init, c).map_err(|e| format!("wgpu backend: {e}"))?;
-
             // Snapshot the factory style *now*, before `ui::theme::apply` runs over it — this is
             // the only moment it exists. SAFETY: this context is current inside the closure.
             let stock = unsafe { *sys::igGetStyle() };
-            Ok((platform, renderer, stock))
+
+            // sokol_imgui, once per process: its sokol_gfx resources, and a context we do not keep
+            // (module notes).
+            if !SIMGUI_UP.swap(true, Ordering::AcqRel) {
+                simgui_setup_once(c);
+            }
+            // What `simgui_setup` told *its* context: the renderer takes ImGui's textures (fonts
+            // are built through the texture protocol) and honours `vtx_offset`.
+            let io = c.io_mut();
+            io.set_backend_flags(
+                io.backend_flags()
+                    | BackendFlags::RENDERER_HAS_TEXTURES
+                    | BackendFlags::RENDERER_HAS_VTX_OFFSET,
+            );
+            // `dear-imgui-rs` will not open a frame on a `RENDERER_HAS_TEXTURES` context unless a
+            // renderer has claimed the font atlas through its own API. The claim is all that is
+            // used of it: sokol_imgui does the actual uploads, and `ctx.render()` is never called.
+            let consumer = c
+                .create_synchronous_renderer_consumer()
+                .map_err(|e| format!("renderer consumer: {e}"))?;
+            Ok((platform, stock, consumer))
         });
-        let (platform, renderer, stock) = match built {
+        let (platform, stock, consumer) = match built {
             Ok(v) => v,
             Err(e) => return Err(format!("ImGui: {e}")),
         };
@@ -280,9 +362,8 @@ impl Imgui {
         let mut me = Imgui {
             ctx,
             platform,
-            renderer,
-            gpu,
             window,
+            _consumer: consumer,
             icon: None,
             icon_id: TextureId::new(0),
             icon_built_px: 0.0,
@@ -380,7 +461,7 @@ impl Imgui {
         let scales = self.icon_scales();
         let (pixels, w) = icons::atlas(n, &scales);
         let old = self.icon.take();
-        let (texture, id) = self.register_texture(old, &pixels, w as u32, n as u32, "icon atlas");
+        let (texture, id) = register_texture(old, &pixels, w as u32, n as u32, c"icon atlas");
         self.icon = texture;
         self.icon_id = id;
         self.icon_built_px = px;
@@ -393,44 +474,11 @@ impl Imgui {
     pub fn logo(&mut self) -> TextureId {
         if !self.logo_built {
             self.logo_built = true;
-            let (texture, id) =
-                self.register_texture(None, LOGO_RGBA, LOGO_EDGE, LOGO_EDGE, "logo");
+            let (texture, id) = register_texture(None, LOGO_RGBA, LOGO_EDGE, LOGO_EDGE, c"logo");
             self.logo = texture;
             self.logo_id = id;
         }
         self.logo_id
-    }
-
-    /// Upload an RGBA8 texture and register it with the renderer (unregistering `old` first). On
-    /// failure the missing pieces come back `None` / zero id (logged) and the caller draws without
-    /// the texture rather than the app failing.
-    fn register_texture(
-        &mut self,
-        old: Option<UiTexture>,
-        pixels: &[u8],
-        w: u32,
-        h: u32,
-        what: &str,
-    ) -> (Option<UiTexture>, TextureId) {
-        let tex = rgba_texture(&self.gpu, pixels, w, h, what);
-        let view = tex.create_view(&Default::default());
-        let renderer = &mut self.renderer;
-        let registered = self.ctx.with_active_or_panic(|_c| {
-            if let Some(old) = old {
-                let _ = renderer.unregister_external_texture(old.handle);
-            }
-            renderer.register_external_texture(&view)
-        });
-        match registered {
-            Ok(handle) => {
-                let id = handle.texture_id();
-                (Some(UiTexture { _tex: tex, handle }), id)
-            }
-            Err(e) => {
-                eprintln!("fire: {what} could not be registered with the UI renderer: {e}");
-                (None, TextureId::new(0))
-            }
-        }
     }
 
     /// Feed a window event to ImGui. The ownership booleans are refreshed afterwards for the
@@ -441,12 +489,7 @@ impl Imgui {
             if let Err(e) = platform.handle_window_event(c, window, event) {
                 eprintln!("fire: ImGui platform rejected an event: {e}");
             }
-            let io = c.io();
-            (
-                io.want_capture_mouse(),
-                io.want_capture_keyboard(),
-                io.want_text_input(),
-            )
+            wants(c)
         });
         (self.want_mouse, self.want_keyboard, self.want_text) = want;
     }
@@ -468,20 +511,14 @@ impl Imgui {
         self.want_text
     }
 
-    /// Build and render one UI frame into `pass` (the UNORM view of the frame — see the sRGB
-    /// note above). Returns what `build` produced, or `None` if it panicked (logged; the frame is
-    /// still closed and whatever was built is drawn).
-    pub fn frame<R>(
-        &mut self,
-        pass: &mut wgpu::RenderPass<'_>,
-        extent: FramebufferExtent,
-        build: impl FnOnce(&Ui, TextureId) -> R,
-    ) -> Option<R> {
+    /// Build and render one UI frame into the current sokol_gfx pass (the surface's contract).
+    /// Returns what `build` produced, or `None` if it panicked (logged; the frame is still closed
+    /// and whatever was built is drawn).
+    pub fn frame<R>(&mut self, build: impl FnOnce(&Ui, TextureId) -> R) -> Option<R> {
         let icon_id = self.icon_id;
         let Self {
             ctx,
             platform,
-            renderer,
             window,
             ..
         } = self;
@@ -495,21 +532,11 @@ impl Imgui {
             if let Err(e) = platform.prepare_render(ui, window) {
                 eprintln!("fire: ImGui platform prepare_render failed: {e}");
             }
-            let io = c.io();
-            let want = (
-                io.want_capture_mouse(),
-                io.want_capture_keyboard(),
-                io.want_text_input(),
-            );
-            // Close the frame and draw it — even after a panic in `build`, so the context is
-            // never left mid-frame.
-            let consumer = renderer
-                .renderer_consumer()
-                .expect("the ImGui renderer is bound to this context");
-            let pending = c.render(consumer);
-            if let Err(e) = renderer.render(pending, pass, extent) {
-                eprintln!("fire: ImGui render failed: {e}");
-            }
+            let want = wants(c);
+            // Close the frame and draw it — even after a panic in `build`, so the context is never
+            // left mid-frame. SAFETY: a frame is open on the current context; a sokol_gfx pass is
+            // open (the surface's contract).
+            unsafe { simgui_render() };
             (out, want)
         });
         (self.want_mouse, self.want_keyboard, self.want_text) = want;
@@ -525,58 +552,114 @@ impl Imgui {
 
 impl Drop for Imgui {
     fn drop(&mut self) {
-        // Release the backends in order (renderer, then platform) with the context current, so
-        // their teardown transactions are honored; the context itself goes with the struct. Errors
-        // are ignored — there is nothing left to draw with.
-        let icon = self.icon.take();
-        let logo = self.logo.take();
-        let (renderer, platform) = (&mut self.renderer, &mut self.platform);
+        // Release our textures while sokol_gfx is still up, and the platform backend with the
+        // context current so its teardown is honored; the context itself goes with the struct.
+        // sokol_imgui's own resources go with the process: `simgui_shutdown` would destroy the
+        // *current* ImGui context, which is one of ours.
+        if let Some(t) = self.icon.take() {
+            t.destroy();
+        }
+        if let Some(t) = self.logo.take() {
+            t.destroy();
+        }
+        let platform = &mut self.platform;
         let _ = self.ctx.try_with_active(|c| -> Result<(), ()> {
-            for t in [icon, logo].into_iter().flatten() {
-                let _ = renderer.unregister_external_texture(t.handle);
-            }
-            let _ = renderer.shutdown(c);
             let _ = platform.shutdown(c);
             Ok(())
         });
     }
 }
 
-/// Create an RGBA8 texture from CPU pixels (the icon atlas, the logo). Straight sRGB bytes: the
-/// UI pass writes through the UNORM view, so nothing is decoded on the way through.
-fn rgba_texture(gpu: &Gpu, pixels: &[u8], w: u32, h: u32, what: &str) -> wgpu::Texture {
-    let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(what),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
+/// ImGui's input-ownership booleans, read off the current context.
+fn wants(c: &Context) -> (bool, bool, bool) {
+    let io = c.io();
+    (
+        io.want_capture_mouse(),
+        io.want_capture_keyboard(),
+        io.want_text_input(),
+    )
+}
+
+/// `simgui_setup`, run once with the first window's context `c` current: sokol_imgui creates its
+/// sokol_gfx resources and a context of its own, which is destroyed on the spot — sokol_imgui
+/// holds no reference to it, and every window's context carries the backend flags it would have
+/// set (see [`Imgui::new`]).
+fn simgui_setup_once(c: &mut Context) {
+    let desc = SimguiDesc {
+        max_vertices: 0,
+        color_format: sg::PixelFormat::Default,
+        depth_format: sg::PixelFormat::Default,
+        sample_count: 0,
+        ini_filename: std::ptr::null(),
+        // Our font is registered by the caller; the built-in ProggyClean would only cost an atlas.
+        no_default_font: true,
+        disable_paste_override: false,
+        // The OS cursor is the winit backend's job (`prepare_render`).
+        disable_set_mouse_cursor: true,
+        disable_windows_resize_from_edges: false,
+        write_alpha_channel: false,
+        allocator: SimguiAllocator {
+            alloc_fn: None,
+            free_fn: None,
+            user_data: std::ptr::null_mut(),
         },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    gpu.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
+        logger: SimguiLogger {
+            func: Some(sokol::log::slog_func),
+            user_data: std::ptr::null_mut(),
         },
-        pixels,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(w * 4),
-            rows_per_image: Some(h),
-        },
-        wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-    );
-    tex
+    };
+    // SAFETY: `desc` is fully initialized; sokol_gfx is set up (the caller's contract). The
+    // context sokol_imgui creates is destroyed here, and `c` made current again, before anything
+    // else runs — sokol_imgui holds no reference to it.
+    unsafe {
+        simgui_setup(&desc);
+        let theirs = sys::igGetCurrentContext();
+        if theirs != c.as_raw() {
+            sys::igDestroyContext(theirs);
+            sys::igSetCurrentContext(c.as_raw());
+        }
+    }
+}
+
+/// Upload an RGBA8 texture and name it for ImGui (destroying `old` first). On failure the missing
+/// pieces come back `None` / zero id (logged) and the caller draws without the texture rather than
+/// the app failing. Straight sRGB bytes in a UNORM image: the UI pass writes through the UNORM
+/// swapchain view, so nothing is decoded on the way through.
+fn register_texture(
+    old: Option<UiTexture>,
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    what: &std::ffi::CStr,
+) -> (Option<UiTexture>, TextureId) {
+    if let Some(old) = old {
+        old.destroy();
+    }
+    let mut desc = sg::ImageDesc::new();
+    desc._type = sg::ImageType::Dim2;
+    desc.width = w as i32;
+    desc.height = h as i32;
+    desc.num_mipmaps = 1;
+    desc.pixel_format = sg::PixelFormat::Rgba8;
+    desc.data.mip_levels[0] = sg::slice_as_range(pixels);
+    desc.label = what.as_ptr();
+    let image = sg::make_image(&desc);
+    let mut vd = sg::ViewDesc::new();
+    vd.texture.image = image;
+    vd.label = what.as_ptr();
+    let view = sg::make_view(&vd);
+    if sg::query_image_state(image) != sg::ResourceState::Valid
+        || sg::query_view_state(view) != sg::ResourceState::Valid
+    {
+        eprintln!(
+            "fire: {} could not be uploaded for the UI",
+            what.to_string_lossy()
+        );
+        sg::destroy_view(view);
+        sg::destroy_image(image);
+        return (None, TextureId::new(0));
+    }
+    // SAFETY: a plain id computation over two valid handles.
+    let id = unsafe { simgui_imtextureid(view) };
+    (Some(UiTexture { image, view }), TextureId::new(id))
 }

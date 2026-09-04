@@ -30,14 +30,13 @@ crossbeam-channel.workspace = true
 # (ReadDirectoryChangesW on Windows, FSEvents on macOS); see watcher.rs.
 notify.workspace = true
 
-# The shared shell: winit (window, event loop, input, DPI, drag-and-drop, theme), wgpu (one
-# device, one surface per window, one WGSL shader), Dear ImGui through its winit + wgpu backends.
+# The shared shell: winit (window, event loop, input, DPI, drag-and-drop, theme), sokol_gfx (one
+# drawing API over the D3D11 device and swapchain `render::d3d11` creates), Dear ImGui through
+# dear-imgui-winit (input) and sokol_imgui (rendering, compiled in build.rs).
 winit.workspace = true
-wgpu.workspace = true
+sokol.workspace = true
 dear-imgui-rs.workspace = true
 dear-imgui-winit.workspace = true
-dear-imgui-wgpu.workspace = true
-bytemuck.workspace = true
 
 # Instance coordination (named pipe / Unix socket), the config directory, the open-file dialog.
 interprocess.workspace = true
@@ -55,6 +54,15 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Shell",                   # DROPFILES for the CF_HDROP clipboard payload
     "Win32_UI_WindowsAndMessaging",     # AllowSetForegroundWindow, SW_* show commands
 ] }
+# The D3D11 device and DXGI flip-model swapchain sokol_gfx draws through (render::d3d11). The
+# typed crate (vs raw windows-sys) makes the COM calls tractable; nothing else names it.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",          # D3D_DRIVER_TYPE / feature levels
+    "Win32_Graphics_Direct3D11",        # ID3D11Device / context / render-target view
+    "Win32_Graphics_Dxgi",              # IDXGIFactory2 / swapchain / device / adapter
+    "Win32_Graphics_Dxgi_Common",       # DXGI_FORMAT / sample desc
+] }
 
 [build-dependencies]
 # build.rs reads the canonical product metadata from ../../product.json so a single edit there
@@ -63,6 +71,8 @@ serde_json.workspace = true
 # build.rs rasterizes the toolbar SVGs (../../assets/icons/) to A8 coverage masks (one master
 # per icon, embedded via include_bytes!); the icon module downsamples them per-DPI at runtime.
 resvg.workspace = true
+# build.rs compiles sokol_imgui.h (simgui/) as C against the vendored sokol headers and cimgui.
+cc.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 # Embeds the Fire .ico + product metadata into the exe (Explorer file icon, file properties).

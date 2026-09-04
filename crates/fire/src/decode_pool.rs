@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use crossbeam_channel::{unbounded, Sender};
 use fire_decode::{decode_path, DecodeError, DecodeOptions, DecodedImage};
@@ -68,6 +69,9 @@ pub struct DecodeOutcome {
     pub generation: u64,
     pub path: PathBuf,
     pub result: Result<Arc<DecodedImage>, DecodeError>,
+    /// Levels `1..` of the image's mip chain (see [`crate::render::mips`]), built here on the
+    /// worker so the UI thread's adopt is one upload; empty on failure.
+    pub mips: Vec<Vec<u8>>,
     /// Echoed from the job; see [`DecodeJob::reload`].
     pub reload: bool,
 }
@@ -116,6 +120,27 @@ impl DecodePool {
                             continue;
                         }
                         let result = decode(&job).map(Arc::new);
+                        // The mip chain, built here so the UI thread's adopt is one upload.
+                        let mips = match &result {
+                            Ok(img) => {
+                                let t = Instant::now();
+                                let chain = crate::render::mips::build(
+                                    &img.pixels,
+                                    img.width,
+                                    img.height,
+                                    img.format,
+                                );
+                                crate::render::gpu::report_timing(&format!(
+                                    "mips — {:.2} ms ({} levels, {}×{})",
+                                    t.elapsed().as_secs_f64() * 1e3,
+                                    chain.len() + 1,
+                                    img.width,
+                                    img.height
+                                ));
+                                chain
+                            }
+                            Err(_) => Vec::new(),
+                        };
                         // Keep a clone to run flipbook detection *after* the image is posted, so a
                         // large sheet reaches the screen without waiting on the per-pixel scan.
                         // Skipped for animated sources (a GIF is not a sprite sheet), and when the
@@ -135,6 +160,7 @@ impl DecodePool {
                             generation,
                             path: job.path,
                             result,
+                            mips,
                             reload: job.reload,
                         });
                         // The only way a send fails is a closed event loop: the app is exiting.

@@ -42,15 +42,17 @@ unimplemented = "warn"
 # versions into Cargo.lock and proves the set is compatible.
 [workspace.dependencies]
 # --- windowing / render ---
-# One shared shell on every OS: `winit` owns the window, the event loop and input; `wgpu` owns the
-# GPU (DX12 on Windows, Metal on macOS) with one WGSL shader; Dear ImGui draws the chrome through
-# its maintained winit + wgpu backends. The three `dear-imgui-*` crates and `wgpu` are pinned to
-# exact versions because they move together (see mac-port-plan.md §6).
+# One shared shell on every OS: `winit` owns the window, the event loop and input; `sokol_gfx`
+# owns the GPU (D3D11 on Windows, Metal on macOS) behind one drawing API, on a device and
+# swapchain the shell creates (`render::d3d11`); Dear ImGui draws the chrome through
+# `dear-imgui-winit` (input) and sokol_imgui (rendering; fire's build.rs compiles it against the
+# same cimgui `dear-imgui-sys` links). sokol-rust is vendored (`vendor/sokol-rust`,
+# floooh/sokol-rust @ b22a545, 2026-08-30): the crates.io `sokol` name belongs to an unrelated
+# crate from 2019. The `dear-imgui-*` crates are pinned to exact versions and move together.
 winit = "=0.30.13"
-wgpu = { version = "=30.0.1", default-features = false, features = ["std", "dx12", "metal", "wgsl"] }
+sokol = { path = "vendor/sokol-rust" }
 dear-imgui-rs = { version = "=0.17.0", default-features = false }
 dear-imgui-winit = "=0.17.0"
-dear-imgui-wgpu = { version = "=0.17.0", default-features = false, features = ["wgpu-30"] }
 # POD casts: the shader's uniform block and 16-bit pixel reinterpretation in the decode path.
 bytemuck = { version = "1", features = ["derive"] }
 # Instance coordination: one named pipe (Windows) / Unix socket (macOS) behind one API. The bind
@@ -118,6 +120,8 @@ crossbeam-channel = "0.5"
 
 # --- Windows platform leaves (foreground handoff, clipboard, launcher show-state) ---
 windows-sys = "0.60"
+# The typed `windows` crate for the COM-heavy D3D11 device / DXGI swapchain glue (render::d3d11).
+windows = "0.61"
 
 # --- internal crates ---
 fire-ipc = { path = "crates/fire-ipc" }

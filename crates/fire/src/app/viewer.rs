@@ -226,7 +226,7 @@ impl Viewer {
     /// `Err` is a startup failure the caller owns telling the user about.
     pub fn new(
         el: &ActiveEventLoop,
-        gpu: Rc<Gpu>,
+        gpu: impl FnOnce() -> Result<Rc<Gpu>, String>,
         cfg: Config,
         pool: DecodePool,
         timers: Timers,
@@ -274,21 +274,23 @@ impl Viewer {
             t_window.elapsed().as_secs_f64() * 1e3
         ));
 
+        // The GPU, joined only now: the window above came up while the bring-up thread was
+        // still creating the device, instead of after it.
+        let gpu = gpu().map_err(|e| format!("the GPU could not be initialized: {e}"))?;
+
         // The surface covers the whole client; the image is drawn into a sub-rect of it,
         // recomputed every frame (see `Viewer::image_rect`).
         let t = Instant::now();
-        let wgpu_surface = gpu.create_surface(&window)?;
         let size = window.inner_size();
         let mut surface = GpuSurface::new(
-            Rc::clone(&gpu),
+            gpu,
             Arc::clone(&window),
-            wgpu_surface,
             size.width.max(1),
             size.height.max(1),
             cfg.fit_upscale,
         )?;
         crate::render::gpu::report_timing(&format!(
-            "surface configured — {:.2} ms",
+            "swapchain — {:.2} ms",
             t.elapsed().as_secs_f64() * 1e3
         ));
         surface.set_clear(crate::ui::theme::view_clear_packed(dark));
@@ -300,7 +302,7 @@ impl Viewer {
         surface.set_octagon(cfg.octagon.initial_state());
 
         let t = Instant::now();
-        let mut imgui = Imgui::new(gpu, Arc::clone(&window), dpi)?;
+        let mut imgui = Imgui::new(Arc::clone(&window), dpi)?;
         let scale = metrics.scale;
         imgui.restyle(|style| crate::ui::theme::apply(style, dark, scale));
         crate::render::gpu::report_timing(&format!(
@@ -583,9 +585,9 @@ impl Viewer {
                 let same_dims =
                     self.surface.current_image().map(|i| (i.width, i.height)) == Some((w, h));
                 let upload = if outcome.reload && same_dims {
-                    self.surface.replace_image_keep_view(img)
+                    self.surface.replace_image_keep_view(img, &outcome.mips)
                 } else {
-                    self.surface.set_image(img)
+                    self.surface.set_image(img, &outcome.mips)
                 };
                 // The image decoded fine but the GPU may still reject the upload (e.g. out of
                 // memory on a very large texture). Treat that like a decode failure rather than
@@ -1890,8 +1892,8 @@ impl Viewer {
         let cfg = &self.cfg;
         let imgui = &mut self.imgui;
         let mut frame = None;
-        let presented = self.surface.render_frame(|pass, extent| {
-            frame = imgui.frame(pass, extent, |ui, tex| {
+        let presented = self.surface.render_frame(|| {
+            frame = imgui.frame(|ui, tex| {
                 crate::ui::build(
                     ui,
                     tex,

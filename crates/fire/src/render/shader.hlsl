@@ -2,13 +2,20 @@
 // shader that is a direct port of the former CPU per-pixel pipeline: inverse-map the surface
 // pixel into image space, sample (point when magnifying for crisp texels, anisotropic+mips when
 // minifying), then exposure -> tonemap -> channel isolation -> checker composite, all in linear
-// light. The *_SRGB render target handles the final sRGB encode.
+// light, and sRGB-encode on the way out.
+//
+// The encode is the shader's, not the render target's: sokol_gfx draws into the swapchain through
+// the one (UNORM) view sokol_app hands it, and Dear ImGui's colors are already sRGB, so the image
+// pass cannot borrow an `*_SRGB` view of the same pixels the way the D3D11 shell did. Encoding the
+// final linear color here gives the same bytes for the same pixels: nothing blends in this pass.
 //
 // Precompiled to DXBC at build time by `fxc` (see build.rs) into vs_main.dxbc / ps_main.dxbc,
-// which gpu.rs embeds via include_bytes!. There is no runtime HLSL compile.
+// which gpu.rs embeds via include_bytes! and hands to sokol_gfx as bytecode. There is no runtime
+// HLSL compile.
 //
 // The `cbuffer` layout must stay in lockstep with the `Params` struct in gpu.rs (16-byte
-// float4 registers, same field order/padding).
+// float4 registers, same field order/padding). Register assignments (t0, s0, s1, b0) are what
+// gpu.rs declares to sokol_gfx in the shader description.
 
 Texture2D tex : register(t0);
 SamplerState samp_aniso : register(s0);
@@ -34,7 +41,7 @@ cbuffer Params : register(b0) {
     float2 cell_b;         // frame-B cell origin (== cell_a when not blending)
     float  fb_blend;       // 0..1 crossfade toward frame B (0 = hard cut)
     float  fb_max_lod;     // mip clamp so minified samples can't bleed across cells
-    float2 surf_origin;    // image sub-rect's top-left in RENDER-TARGET px (see ps_main)
+    float2 surf_origin;    // image sub-rect's top-left in RENDER-TARGET px (see shade)
     float  oct_crop;       // octagon overlay crop factor (0 = quad, 0.5 = diamond)
     float  oct_hide;       // 0..1 fade of the image outside the octagon (0 = overlay off)
 };
@@ -52,6 +59,11 @@ float3 srgb_to_linear(float3 c) {
     float3 lo = c / 12.92;
     float3 hi = pow(max((c + 0.055) / 1.055, 0.0), 2.4);
     return lerp(hi, lo, step(c, 0.04045));
+}
+float3 linear_to_srgb(float3 c) {
+    float3 lo = c * 12.92;
+    float3 hi = 1.055 * pow(max(c, 0.0), 1.0 / 2.4) - 0.055;
+    return lerp(hi, lo, step(c, 0.0031308));
 }
 float3 reinhard(float3 c) { return c / (1.0 + c); }
 
@@ -105,7 +117,8 @@ float4 sample_cell(float2 f, float2 cell) {
     return s;
 }
 
-float4 ps_main(float4 pos : SV_Position) : SV_Target {
+// The whole pipeline, in linear light. `ps_main` encodes what this returns.
+float4 shade(float4 pos) {
     if (has_image == 0) return clear_lin;
     // SV_Position is in RENDER-TARGET space, not viewport space: D3D applies the viewport transform
     // before the fragment stage, so a viewport parked below the toolbar still hands us absolute
@@ -184,4 +197,9 @@ float4 ps_main(float4 pos : SV_Position) : SV_Target {
             outc = lerp(outc, backdrop(sp), oct_hide);
     }
     return float4(outc, 1.0);
+}
+
+float4 ps_main(float4 pos : SV_Position) : SV_Target {
+    float4 c = shade(pos);
+    return float4(linear_to_srgb(saturate(c.rgb)), c.a);
 }

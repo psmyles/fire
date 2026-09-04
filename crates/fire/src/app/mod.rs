@@ -177,32 +177,16 @@ impl Fire {
         initial: Option<Initial>,
         open: Option<OpenRequest>,
     ) {
-        let gpu = match self.gpu() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("fire: {e}");
-                if self.viewers.is_empty() {
-                    rfd::MessageDialog::new()
-                        .set_title(crate::product::NAME)
-                        .set_level(rfd::MessageLevel::Error)
-                        .set_description(format!(
-                            "{} could not initialize the GPU and cannot draw.\n\n{e}",
-                            crate::product::NAME
-                        ))
-                        .show();
-                    el.exit();
-                }
-                return;
-            }
-        };
-        match Viewer::new(
-            el,
-            gpu,
+        // Everything the viewer needs, gathered before the call: the GPU is handed over as a
+        // closure so the window comes up *alongside* the bring-up thread and the join happens
+        // only once there is a window to draw into (see `Viewer::new`).
+        let (cfg, pool, timers, proxy) = (
             self.cfg.clone(),
             self.pool.clone(),
             Rc::clone(&self.timers),
             self.proxy.clone(),
-        ) {
+        );
+        match Viewer::new(el, || self.gpu(), cfg, pool, timers, proxy) {
             Ok(mut viewer) => {
                 if let Some(init) = initial {
                     viewer.adopt_initial(init);

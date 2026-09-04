@@ -1,65 +1,48 @@
-//! GPU viewport: a wgpu renderer that presents the decoded image through a surface covering the
-//! whole window's client area, drawing the image into a *sub-rect* of it (`Viewer::image_rect`)
-//! with the ImGui chrome over the rest. The image lives as a GPU texture (with a mip chain), and
-//! pan/zoom/exposure/channel/tonemap are just uniform values, so each frame is one textured
-//! fullscreen triangle: the per-frame CPU cost is a 128-byte [`Params`] upload + a draw call, and
-//! the GPU does the sampling and the whole color pipeline.
+//! GPU viewport: the decoded image drawn through sokol_gfx into the window's swapchain (the
+//! shell's — see [`crate::render::d3d11`]), into a *sub-rect* of the window (`Viewer::image_rect`)
+//! with the ImGui chrome over the rest.
+//! The image lives as a GPU texture with a full mip chain, and pan/zoom/exposure/channel/tonemap
+//! are just uniform values, so each frame is one textured fullscreen triangle: the per-frame CPU
+//! cost is a 128-byte [`Params`] upload + a draw call, and the GPU does the sampling and the whole
+//! color pipeline.
 //!
 //! Panning changes a transform and the GPU re-samples the texture rather than re-running a
-//! per-pixel pipeline on the CPU. Presentation is vsync-paced (`PresentMode::Fifo`), so
-//! interaction stays smooth while the CPU sits near idle.
+//! per-pixel pipeline on the CPU. Presentation is the swapchain's, vsync-paced, and event-driven:
+//! a frame is drawn only when the shell asks for one.
 //!
-//! Color: 8-bit sources upload as `*Srgb` (hardware sRGB→linear on sample), float sources are
-//! already linear, 16-bit unorm is sRGB-decoded in the shader. The fragment shader outputs
-//! **linear** and the image pass writes through an `*Srgb` *view* of the swapchain texture, so the
-//! hardware sRGB-encodes on write. The whole pipeline is linear.
+//! Color: 8-bit sources upload as `SRGB8A8` (hardware sRGB→linear on sample), float sources are
+//! already linear, 16-bit unorm is sRGB-decoded in the shader. The pixel shader works in linear
+//! light and sRGB-encodes its output itself (see `shader.hlsl`): the swapchain is drawn through a
+//! UNORM view, which is also what lets Dear ImGui's already-sRGB colors land in the same pass
+//! untouched.
 //!
-//! Two structs, by lifetime. [`Gpu`] is the process's one device: instance, adapter, device,
-//! queue, the image pipeline and its samplers, and the mip blit — built once, shared by every
-//! window. [`GpuSurface`] is one window's render state: its surface and uniform buffer, then the
-//! same view/session/gesture state the D3D11 version carried, grouped the same way ([`ImageContent`]
-//! and [`AnimState`] are replaced wholesale on every adopt; [`SessionPrefs`] deliberately outlives
-//! the image so a chosen backdrop survives folder navigation; [`GestureState`] lives only between a
-//! button-down and its up). The view core (`origin`/`viewport`/`view`/`display`/`flipbook`) stays
-//! flat on the surface — nearly every method touches it, and its math already lives in
-//! [`crate::render::view`].
+//! Two structs, by lifetime. [`Gpu`] is the process's device and pipeline state: the D3D11 device,
+//! sokol_gfx on it, the shader, the pipeline, the samplers and a placeholder texture — built once,
+//! on the bring-up thread. [`GpuSurface`] is the window's render state: its swapchain, the image
+//! texture and the same view/session/gesture state the earlier
+//! shells carried, grouped the same way ([`ImageContent`] and [`AnimState`] are replaced wholesale
+//! on every adopt; [`SessionPrefs`] deliberately outlives the image so a chosen backdrop survives
+//! folder navigation; [`GestureState`] lives only between a button-down and its up). The view core
+//! (`origin`/`viewport`/`view`/`display`/`flipbook`) stays flat on the surface — nearly every
+//! method touches it, and its math already lives in [`crate::render::view`].
 //!
-//! One rule for the sub-structs: `invalidate` never moves onto them. Scheduling a repaint needs
-//! the window, so mutate-then-invalidate stays a [`GpuSurface`] method.
+//! The mip chain is the app's to supply (sokol_gfx has no `GenerateMips` and its rules rule out
+//! building one in place); [`crate::render::mips`] builds it on the decode worker and the adopt
+//! uploads every level in one `sg_make_image`.
 
-use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use fire_decode::{AnimationFrame, DecodedImage, PixelFormat};
+use sokol::gfx as sg;
 use winit::window::Window;
 
-use crate::render::mipgen::MipGen;
+use crate::render::d3d11;
+use crate::render::mips;
 use crate::render::view::{
     Background, Channel, DisplayState, Tonemap, ViewState, Viewport, ZoomDetent,
 };
-
-/// The swapchain texture format. Plain UNORM — the ImGui pass writes through it directly (its
-/// colors are already sRGB) — with an sRGB *view* ([`SURFACE_VIEW_SRGB`]) for the image pass.
-pub const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
-/// The image pass's view of the same pixels: the shader emits linear, the view encodes on write.
-pub const SURFACE_VIEW_SRGB: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
-
-/// The GPU backend, pinned per OS (mac-port-plan.md D14): no enumeration of backends we would
-/// never pick, no Vulkan loader on Windows.
-const BACKENDS: wgpu::Backends = if cfg!(windows) {
-    wgpu::Backends::DX12
-} else if cfg!(target_os = "macos") {
-    wgpu::Backends::METAL
-} else {
-    wgpu::Backends::VULKAN
-};
-
-/// The largest texture edge the viewer will ask the device for. Matches the decode-side cap
-/// (`MAX_CPU_DIM`): anything bigger was downscaled before it got here.
-const MAX_TEXTURE_DIM: u32 = 16384;
 
 /// Scrubby-zoom sensitivity: an RMB vertical drag multiplies zoom by `exp(dy * this)` per pixel
 /// (~2.7× per 100 px). Exponential-in-pixels so the gesture feels uniform across the zoom range;
@@ -71,11 +54,12 @@ const ZOOM_DRAG_SENSITIVITY: f32 = 0.01;
 /// jiggle would apply (~exp(slop·sensitivity), a couple percent) is imperceptible.
 const ZOOM_DRAG_CLICK_SLOP: f32 = 5.0;
 
-/// Per-frame shader constants. Layout matches the WGSL `Params` uniform block; keep the field
-/// order/padding in lockstep with `render/shader.wgsl`. 128 bytes — asserted below, so this
-/// comment cannot drift from the struct.
+/// Per-frame shader constants. Layout matches the HLSL `cbuffer Params` (16-byte float4
+/// registers); keep the field order/padding in lockstep with `render/shader.hlsl`. 128 bytes —
+/// asserted below, so this comment cannot drift from the struct, and declared to sokol_gfx as the
+/// uniform block's size.
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy)]
 struct Params {
     img_w: f32,
     img_h: f32,
@@ -114,7 +98,7 @@ struct Params {
     fb_max_lod: f32,
     /// The image sub-rect's top-left in **render-target** px — i.e. [`GpuSurface::origin`].
     ///
-    /// The fragment shader's `position` is in render-target space, *not* viewport space: the
+    /// The pixel shader's `SV_Position` is in render-target space, *not* viewport space: the
     /// viewport transform is applied before the fragment stage, so a viewport at `y = toolbar_h`
     /// still hands the shader absolute client coordinates. Without this the shader centres the
     /// image on `surf_size * 0.5` measured from the *client's* origin rather than the viewport's,
@@ -127,11 +111,9 @@ struct Params {
     oct_hide: f32,
 }
 
-// The uniform layout is kept in lockstep with the WGSL `Params` struct by hand (there is no
-// reflection); these guard the size so a field added on only one side is a build error rather
-// than silent visual corruption.
-const _: () = assert!(std::mem::size_of::<Params>() == 128);
-const _: () = assert!(std::mem::size_of::<Params>().is_multiple_of(16));
+const PARAMS_SIZE: usize = std::mem::size_of::<Params>();
+const _: () = assert!(PARAMS_SIZE == 128);
+const _: () = assert!(PARAMS_SIZE.is_multiple_of(16));
 
 /// Flipbook render parameters mirrored onto the surface from the active per-path state (the
 /// surface never owns durable flipbook state — the viewer does). `None` = not in flipbook mode.
@@ -182,40 +164,6 @@ impl AnimState {
     }
 }
 
-/// How long the phases of GPU bring-up took, for the time-to-first-pixel work (mac-port-plan.md
-/// §7.2, D17). Printed to stderr when `FIRE_TIMING` is set in the environment.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GpuTiming {
-    pub instance: Duration,
-    pub adapter: Duration,
-    pub device: Duration,
-    pub pipeline: Duration,
-}
-
-/// The process's one GPU: instance, adapter, device and queue, plus the image pipeline and the
-/// objects every window's surface shares. Built with the first window (the adapter is chosen
-/// against its surface) and handed to every later one.
-pub struct Gpu {
-    instance: wgpu::Instance,
-    pub adapter: wgpu::Adapter,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pipeline: wgpu::RenderPipeline,
-    layout: wgpu::BindGroupLayout,
-    samp_aniso: wgpu::Sampler,
-    samp_point: wgpu::Sampler,
-    /// A 1×1 texture bound while no image is loaded, so a bind group always exists (the shader
-    /// never reads it: `has_image == 0` returns the clear color).
-    placeholder: wgpu::TextureView,
-    mipgen: MipGen,
-    /// Whether 32-bit float textures may be linearly filtered on this device (`FLOAT32_FILTERABLE`).
-    /// Without it a float32 source is uploaded as float16 instead.
-    float32_filterable: bool,
-    /// Whether 16-bit unorm textures exist on this device (`TEXTURE_FORMAT_16BIT_NORM`). Without
-    /// it a 16-bit source is uploaded as float16 (still sRGB-decoded in the shader).
-    norm16: bool,
-}
-
 /// Append a startup-timing line to wherever `FIRE_TIMING` points: `1` prints to stderr, a path
 /// appends to that file (for a release build, which has no console on Windows). A cheap no-op
 /// when the variable is unset.
@@ -237,11 +185,37 @@ pub fn report_timing(line: &str) {
     }
 }
 
+/// The swapchain's format: what every window's backbuffer is created as (see [`d3d11`]) and what
+/// sokol_gfx is told to expect of a swapchain pass, so the viewport and ImGui pipelines match it.
+const SWAPCHAIN_FORMAT: sg::PixelFormat = sg::PixelFormat::Rgba8;
+
+/// The process's GPU: the device sokol_gfx runs on and the pipeline state on it — the viewport
+/// shader and pipeline, the two samplers and a placeholder texture. Built once, on the bring-up
+/// thread ([`Gpu::start`]), and shared by every window's surface.
+pub struct Gpu {
+    /// The D3D11 device; every window's swapchain is created on it.
+    device: d3d11::Device,
+    _shader: sg::Shader,
+    pipeline: sg::Pipeline,
+    samp_aniso: sg::Sampler,
+    samp_point: sg::Sampler,
+    /// A 1×1 texture bound while no image is loaded, so the bindings are always complete (the
+    /// shader never reads it: `has_image == 0` returns the clear color).
+    _placeholder: sg::Image,
+    placeholder_view: sg::View,
+    /// Whether 32-bit float textures may be linearly filtered on this device. Without it a
+    /// float32 source is uploaded as float16 instead.
+    float32_filterable: bool,
+    /// Whether 16-bit unorm textures exist on this device. Without it a 16-bit source is uploaded
+    /// as float16 (still sRGB-decoded in the shader).
+    norm16: bool,
+}
+
 impl Gpu {
-    /// Start bringing the GPU up on a worker thread, right now — the instance, the adapter, the
-    /// device and the image pipeline need no window, and together they are the longest single
-    /// item on the launch path, so they run alongside the window creation, the ImGui setup and
-    /// the decode instead of after them. The first window joins the handle (`Fire::gpu`).
+    /// Start bringing the GPU up on a worker thread, right now — the device, `sg_setup` and the
+    /// pipeline state need no window, and together they are the longest single item on the
+    /// launch path, so they run alongside the window creation, the ImGui setup and the decode
+    /// instead of after them. The first window joins the handle (`Fire::gpu`).
     pub fn start() -> std::thread::JoinHandle<Result<Gpu, String>> {
         std::thread::Builder::new()
             .name("fire-gpu-init".into())
@@ -249,253 +223,222 @@ impl Gpu {
             .expect("the GPU bring-up thread must start")
     }
 
-    /// Bring the GPU up. Errors are strings for the caller to show: this runs at startup in a
-    /// process that may have no console, where a panic is an invisible abort.
+    /// Bring the GPU up: the device, sokol_gfx on it, then the pipeline state. Errors are strings
+    /// for the caller to show: this runs at startup in a process that may have no console.
+    ///
+    /// sokol_gfx is a process-wide singleton and not thread-safe, but it has no thread affinity:
+    /// set up here and used from the main thread after the join, which is the synchronization.
     pub fn bring_up() -> Result<Gpu, String> {
-        let mut timing = GpuTiming::default();
         let t = Instant::now();
-        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        desc.backends = BACKENDS;
-        // No debug layers, ever: validation is pure startup cost and the shader is validated by
-        // wgpu itself. The `from_env` constructors would turn them on in debug builds.
-        desc.flags = wgpu::InstanceFlags::empty();
-        desc.backend_options = wgpu::BackendOptions {
-            dx12: wgpu::Dx12BackendOptions {
-                // FXC ships with Windows; DXC would have to be shipped by us, and the shader is
-                // ~100 lines, so there is nothing for a better optimizer to find.
-                shader_compiler: wgpu::Dx12Compiler::Fxc,
-                ..Default::default()
-            },
-            ..Default::default()
+        let device = d3d11::Device::create()?;
+        report_timing(&format!(
+            "d3d11 device — {:.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        ));
+
+        let t = Instant::now();
+        let mut desc = sg::Desc::new();
+        desc.environment.defaults = sg::EnvironmentDefaults {
+            color_format: SWAPCHAIN_FORMAT,
+            depth_format: sg::PixelFormat::None,
+            sample_count: 1,
         };
-        let instance = wgpu::Instance::new(desc);
-        timing.instance = t.elapsed();
-
-        // No `compatible_surface`: there is no window yet, and on the backends this app pins
-        // (DX12, Metal) every adapter can present to every window.
-        let t = Instant::now();
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            ..Default::default()
-        }))
-        .map_err(|e| format!("no usable GPU adapter: {e}"))?;
-        timing.adapter = t.elapsed();
-
-        let t = Instant::now();
-        let supported = adapter.features();
-        let mut features = wgpu::Features::empty();
-        for f in [
-            wgpu::Features::FLOAT32_FILTERABLE,
-            wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
-        ] {
-            if supported.contains(f) {
-                features |= f;
-            }
+        desc.environment.d3d11 = sg::D3d11Environment {
+            device: device.raw_device(),
+            device_context: device.raw_context(),
+        };
+        desc.logger = sg::Logger {
+            func: Some(sokol::log::slog_func),
+            user_data: std::ptr::null_mut(),
+        };
+        sg::setup(&desc);
+        if !sg::isvalid() {
+            return Err("sokol_gfx could not be set up on the D3D11 device".into());
         }
-        let mut limits = wgpu::Limits::default();
-        limits.max_texture_dimension_2d = adapter
-            .limits()
-            .max_texture_dimension_2d
-            .clamp(limits.max_texture_dimension_2d, MAX_TEXTURE_DIM);
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("fire"),
-            required_features: features,
-            required_limits: limits,
-            memory_hints: wgpu::MemoryHints::Performance,
-            trace: wgpu::Trace::Off,
-            ..Default::default()
-        }))
-        .map_err(|e| format!("request_device: {e}"))?;
-        // wgpu's default for an uncaptured error is to panic; a bad upload must not take the
-        // viewer down. The paths that can fail (texture creation) capture their errors with
-        // scopes and report them; anything else is logged.
-        device.on_uncaptured_error(std::sync::Arc::new(|e| eprintln!("fire: wgpu error: {e}")));
-        timing.device = t.elapsed();
+        report_timing(&format!(
+            "sg setup — {:.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        ));
 
+        Self::pipeline_state(device)
+    }
+
+    /// A flip-model swapchain on `window`'s client, for a [`GpuSurface`].
+    fn create_swapchain(
+        &self,
+        window: &Window,
+        width: u32,
+        height: u32,
+    ) -> Result<d3d11::Swapchain, String> {
+        d3d11::Swapchain::new(&self.device, window, width, height)
+    }
+
+    /// Build the pipeline state on the (set-up) sokol_gfx.
+    fn pipeline_state(device: d3d11::Device) -> Result<Gpu, String> {
         let t = Instant::now();
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("fire viewport"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("fire viewport"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(
-                            std::mem::size_of::<Params>() as u64
-                        ),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("fire viewport"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("fire viewport"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: SURFACE_VIEW_SRGB,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let shader = make_shader()?;
+
+        let mut pd = sg::PipelineDesc::new();
+        pd.shader = shader;
+        pd.primitive_type = sg::PrimitiveType::Triangles;
+        pd.cull_mode = sg::CullMode::None;
+        pd.label = c"fire viewport".as_ptr();
+        let pipeline = sg::make_pipeline(&pd);
+        if sg::query_pipeline_state(pipeline) != sg::ResourceState::Valid {
+            return Err("the viewport pipeline could not be created".into());
+        }
+
         // Two samplers: anisotropic+mips for minify, point for crisp magnify/1:1. Both clamp at
         // edges.
-        let samp_aniso = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("fire aniso"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: 8,
-            ..Default::default()
-        });
-        let samp_point = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("fire point"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        let placeholder_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("fire placeholder"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let placeholder = placeholder_tex.create_view(&Default::default());
-        let mipgen = MipGen::new(&device);
-        timing.pipeline = t.elapsed();
+        let mut sd = sg::SamplerDesc::new();
+        sd.min_filter = sg::Filter::Linear;
+        sd.mag_filter = sg::Filter::Linear;
+        sd.mipmap_filter = sg::Filter::Linear;
+        sd.wrap_u = sg::Wrap::ClampToEdge;
+        sd.wrap_v = sg::Wrap::ClampToEdge;
+        sd.wrap_w = sg::Wrap::ClampToEdge;
+        sd.max_anisotropy = 8;
+        sd.label = c"fire aniso".as_ptr();
+        let samp_aniso = sg::make_sampler(&sd);
+        let mut sd = sg::SamplerDesc::new();
+        sd.min_filter = sg::Filter::Nearest;
+        sd.mag_filter = sg::Filter::Nearest;
+        sd.mipmap_filter = sg::Filter::Nearest;
+        sd.wrap_u = sg::Wrap::ClampToEdge;
+        sd.wrap_v = sg::Wrap::ClampToEdge;
+        sd.wrap_w = sg::Wrap::ClampToEdge;
+        sd.label = c"fire point".as_ptr();
+        let samp_point = sg::make_sampler(&sd);
+        for s in [samp_aniso, samp_point] {
+            if sg::query_sampler_state(s) != sg::ResourceState::Valid {
+                return Err("the viewport samplers could not be created".into());
+            }
+        }
+
+        let texel = [0u8, 0, 0, 255];
+        let mut id = sg::ImageDesc::new();
+        id._type = sg::ImageType::Dim2;
+        id.width = 1;
+        id.height = 1;
+        id.num_mipmaps = 1;
+        id.pixel_format = sg::PixelFormat::Srgb8a8;
+        id.data.mip_levels[0] = sg::slice_as_range(&texel);
+        id.label = c"fire placeholder".as_ptr();
+        let placeholder = sg::make_image(&id);
+        let mut vd = sg::ViewDesc::new();
+        vd.texture.image = placeholder;
+        vd.label = c"fire placeholder".as_ptr();
+        let placeholder_view = sg::make_view(&vd);
+        if sg::query_image_state(placeholder) != sg::ResourceState::Valid
+            || sg::query_view_state(placeholder_view) != sg::ResourceState::Valid
+        {
+            return Err("the placeholder texture could not be created".into());
+        }
+
+        let norm16 = sg::query_pixelformat(sg::PixelFormat::Rgba16).sample;
+        let float32_filterable = sg::query_pixelformat(sg::PixelFormat::Rgba32f).filter;
 
         report_timing(&format!(
-            "gpu init — instance {:.2} ms, adapter {:.2} ms, device {:.2} ms, pipeline {:.2} ms ({:?})",
-            timing.instance.as_secs_f64() * 1e3,
-            timing.adapter.as_secs_f64() * 1e3,
-            timing.device.as_secs_f64() * 1e3,
-            timing.pipeline.as_secs_f64() * 1e3,
-            adapter.get_info().name,
+            "gpu pipeline — {:.2} ms ({:?})",
+            t.elapsed().as_secs_f64() * 1e3,
+            sg::query_backend()
         ));
 
         Ok(Gpu {
-            instance,
-            adapter,
             device,
-            queue,
+            _shader: shader,
             pipeline,
-            layout,
             samp_aniso,
             samp_point,
-            placeholder,
-            mipgen,
-            float32_filterable: features.contains(wgpu::Features::FLOAT32_FILTERABLE),
-            norm16: features.contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM),
+            _placeholder: placeholder,
+            placeholder_view,
+            float32_filterable,
+            norm16,
         })
     }
+}
 
-    /// A surface for a window on this device.
-    pub fn create_surface(&self, window: &Arc<Window>) -> Result<wgpu::Surface<'static>, String> {
-        let t = Instant::now();
-        let surface = self
-            .instance
-            .create_surface(Arc::clone(window))
-            .map_err(|e| format!("create_surface: {e}"))?;
-        report_timing(&format!(
-            "surface — {:.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
-        ));
-        Ok(surface)
-    }
-
-    /// Run `f` with wgpu's error scopes open and turn whatever they caught into an `Err`. The
-    /// texture-creation path uses this so an out-of-memory upload is reported to the user rather
-    /// than becoming an uncaptured error.
-    fn scoped<T>(&self, f: impl FnOnce() -> T) -> Result<T, String> {
-        let oom_scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let validation_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let value = f();
-        let validation = block_on(validation_scope.pop());
-        let oom = block_on(oom_scope.pop());
-        match oom.or(validation) {
-            Some(e) => Err(e.to_string()),
-            None => Ok(value),
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        // Only while sokol_gfx is still up; the shell shuts it down after the viewer is gone.
+        if sg::isvalid() {
+            sg::destroy_view(self.placeholder_view);
+            sg::destroy_image(self._placeholder);
+            sg::destroy_sampler(self.samp_aniso);
+            sg::destroy_sampler(self.samp_point);
+            sg::destroy_pipeline(self.pipeline);
+            sg::destroy_shader(self._shader);
         }
     }
 }
 
-/// Drive a wgpu future to completion on this thread. On the native backends every future wgpu
-/// hands out is already resolved (the work happened synchronously inside the call), so this
-/// never actually spins; it exists because the API is `async` for the web's sake.
-fn block_on<F: Future>(fut: F) -> F::Output {
-    let mut fut = std::pin::pin!(fut);
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    loop {
-        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
-            return v;
-        }
-        std::thread::yield_now();
+/// The viewport shader, from the DXBC `fxc` precompiled at build time (see `build.rs`). The
+/// description is the reflection sokol_gfx cannot do for us: the one 128-byte uniform block at
+/// `b0` (fragment stage), the texture at `t0`, the anisotropic sampler at `s0` and the point
+/// sampler at `s1`, and which sampler pairs with the texture.
+#[cfg(windows)]
+fn make_shader() -> Result<sg::Shader, String> {
+    static VS_DXBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vs_main.dxbc"));
+    static PS_DXBC: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ps_main.dxbc"));
+
+    let mut d = sg::ShaderDesc::new();
+    d.vertex_func.bytecode = sg::slice_as_range(VS_DXBC);
+    d.fragment_func.bytecode = sg::slice_as_range(PS_DXBC);
+    d.uniform_blocks[0] = sg::ShaderUniformBlock {
+        stage: sg::ShaderStage::Fragment,
+        size: PARAMS_SIZE as u32,
+        hlsl_register_b_n: 0,
+        ..sg::ShaderUniformBlock::new()
+    };
+    d.views[0].texture = sg::ShaderTextureView {
+        stage: sg::ShaderStage::Fragment,
+        image_type: sg::ImageType::Dim2,
+        sample_type: sg::ImageSampleType::Float,
+        multisampled: false,
+        hlsl_register_t_n: 0,
+        ..sg::ShaderTextureView::new()
+    };
+    d.samplers[0] = sg::ShaderSampler {
+        stage: sg::ShaderStage::Fragment,
+        sampler_type: sg::SamplerType::Filtering,
+        hlsl_register_s_n: 0,
+        ..sg::ShaderSampler::new()
+    };
+    d.samplers[1] = sg::ShaderSampler {
+        stage: sg::ShaderStage::Fragment,
+        sampler_type: sg::SamplerType::Nonfiltering,
+        hlsl_register_s_n: 1,
+        ..sg::ShaderSampler::new()
+    };
+    d.texture_sampler_pairs[0] = sg::ShaderTextureSamplerPair {
+        stage: sg::ShaderStage::Fragment,
+        view_slot: 0,
+        sampler_slot: 0,
+        ..sg::ShaderTextureSamplerPair::new()
+    };
+    d.texture_sampler_pairs[1] = sg::ShaderTextureSamplerPair {
+        stage: sg::ShaderStage::Fragment,
+        view_slot: 0,
+        sampler_slot: 1,
+        ..sg::ShaderTextureSamplerPair::new()
+    };
+    d.label = c"fire viewport".as_ptr();
+    let shader = sg::make_shader(&d);
+    if sg::query_shader_state(shader) != sg::ResourceState::Valid {
+        return Err("the viewport shader could not be created".into());
     }
+    Ok(shader)
 }
+
+/// The Metal (MSL) twin of the viewport shader is not compiled yet; this prototype measures the
+/// Windows shell.
+#[cfg(not(windows))]
+fn make_shader() -> Result<sg::Shader, String> {
+    Err("the viewport shader is only built for D3D11 in this prototype".into())
+}
+
+/// A pixel conversion applied to every level when the device lacks the source format.
+type Convert = fn(&[u8]) -> Vec<u8>;
 
 /// The flipbook cells one frame samples: the sheet size (texels), the two cell origins to blend
 /// between, the blend factor, and the mip-LOD clamp that stops a minified sample bleeding across
@@ -508,9 +451,9 @@ type FlipbookCells = Option<((u32, u32), (f32, f32), (f32, f32), f32, f32)>;
 #[derive(Default)]
 struct ImageContent {
     /// Current image texture + its sampling view (None until the first image lands).
-    _tex: Option<wgpu::Texture>,
-    view: Option<wgpu::TextureView>,
-    /// 1 if the texture samples already-linear (8-bit `*Srgb` / float), 0 if the shader must
+    image: Option<sg::Image>,
+    view: Option<sg::View>,
+    /// 1 if the texture samples already-linear (8-bit sRGB / float), 0 if the shader must
     /// sRGB-decode (16-bit unorm).
     linear_sample: i32,
     /// The displayed image — retained for the pixel inspector (#16) and for re-fit on resize.
@@ -521,13 +464,24 @@ struct ImageContent {
     current: Option<Arc<DecodedImage>>,
 }
 
+impl ImageContent {
+    /// Release the GPU texture, if any.
+    fn release(&mut self) {
+        if let Some(v) = self.view.take() {
+            sg::destroy_view(v);
+        }
+        if let Some(i) = self.image.take() {
+            sg::destroy_image(i);
+        }
+    }
+}
+
 /// Preferences and toggles that belong to the *session* rather than to any one image: they are
 /// seeded from the config, may be changed from the toolbar or the settings window, and
 /// deliberately survive navigating to the next image (which is the behaviour that makes flipping
 /// through a folder with a chosen backdrop and outline usable at all).
 struct SessionPrefs {
-    /// No-image backdrop (empty window), packed sRGB and its linear form (for the `*Srgb` view).
-    /// Once an image is loaded the [`Background`] mode owns the viewport instead.
+    /// No-image backdrop (empty window), packed sRGB and its linear form (the shader encodes).
     clear: u32,
     clear_lin: [f32; 4],
 
@@ -616,34 +570,31 @@ impl GestureState {
 /// What [`GpuSurface::render_frame`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presented {
-    /// No frame was drawn: the window has no area, the surface was lost (it has been
-    /// reconfigured; ask again), or the window is occluded.
+    /// No frame was drawn: the window has no area, or its backbuffer is unavailable.
     Skipped,
-    /// A frame was presented. `waited` says whether acquiring it blocked on the display — normally
-    /// it does (Fifo, latency 1), and that wait is what playback is paced on; a present that did not
-    /// wait (the swapchain was not yet full, or nobody is looking) must not be, or pacing on it
-    /// would spin.
+    /// A frame was presented. `waited` says whether the present blocked on the display —
+    /// normally it does (sync interval 1, two buffers), and that wait is what playback is paced
+    /// on; a present that did not wait (the swapchain was not yet full, or nobody is looking)
+    /// must not be, or pacing on it would spin.
     Yes { waited: bool },
 }
 
-/// One window's GPU render state: its surface and per-frame uniforms on the shared [`Gpu`], plus
-/// the same pan/zoom/fit and channel/exposure/tonemap state the D3D11 surface carried, so the
-/// viewer and chrome drive it through an identical API.
+/// The window's GPU render state: its image texture on the shared [`Gpu`], plus the same
+/// pan/zoom/fit and channel/exposure/tonemap state the earlier shells carried, so the viewer and
+/// chrome drive it through an identical API.
 pub struct GpuSurface {
     gpu: Rc<Gpu>,
     window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
-    /// The 128-byte [`Params`] block, rewritten every frame.
-    ubuf: wgpu::Buffer,
-    /// Uniforms + the image texture + the two samplers. Rebuilt whenever the texture changes.
-    bind_group: wgpu::BindGroup,
+    /// The window's swapchain, sized to its client.
+    swapchain: d3d11::Swapchain,
+    /// The image texture + the two samplers, ready to apply. Rebuilt whenever the texture changes.
+    bindings: sg::Bindings,
 
     /// The image sub-rect's origin within the client (the chrome occupies the rest).
     origin: (f32, f32),
     /// What the non-image parts of the frame are cleared to before the UI draws over them, as
-    /// sRGB (the theme's value) and as the linear the `*Srgb` view's clear wants.
-    chrome_clear_lin: [f32; 4],
+    /// sRGB (the theme's value; the swapchain is written unencoded).
+    chrome_clear: [f32; 4],
 
     /// The displayed image's GPU residency.
     tex: ImageContent,
@@ -668,55 +619,25 @@ pub struct GpuSurface {
 }
 
 impl GpuSurface {
-    /// Configure `surface` for the window and build the per-window objects. `width`/`height` are
-    /// the whole client: the surface covers it all, and the image is drawn into a sub-rect of it
-    /// (see [`Self::set_image_rect`]) with the chrome painted over the remainder.
+    /// Create the window's swapchain and build the surface state for its `width`×`height`
+    /// client (the image is drawn into a sub-rect of it — see [`Self::set_image_rect`] — with
+    /// the chrome over the remainder).
     pub fn new(
         gpu: Rc<Gpu>,
         window: Arc<Window>,
-        surface: wgpu::Surface<'static>,
         width: u32,
         height: u32,
         fit_upscale: bool,
     ) -> Result<Self, String> {
-        let caps = surface.get_capabilities(&gpu.adapter);
-        if !caps.formats.contains(&SURFACE_FORMAT) {
-            return Err(format!(
-                "the surface does not support {SURFACE_FORMAT:?} (offers {:?})",
-                caps.formats
-            ));
-        }
-        let mut config = surface
-            .get_default_config(&gpu.adapter, width.max(1), height.max(1))
-            .ok_or("the adapter cannot present to this window")?;
-        config.format = SURFACE_FORMAT;
-        // Vsync-paced, one frame in flight: acquiring the next frame blocks until the display has
-        // taken the previous one, which is what playback is paced on (see `Presented`).
-        config.present_mode = wgpu::PresentMode::Fifo;
-        config.desired_maximum_frame_latency = 1;
-        config.view_formats = vec![SURFACE_VIEW_SRGB];
-        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
-            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
-        }
-        surface.configure(&gpu.device, &config);
-
-        let ubuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("fire params"),
-            size: std::mem::size_of::<Params>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind_group = make_bind_group(&gpu, &ubuf, &gpu.placeholder);
-
+        let swapchain = gpu.create_swapchain(&window, width, height)?;
+        let bindings = make_bindings(&gpu, gpu.placeholder_view);
         Ok(Self {
             gpu,
             window,
-            surface,
-            config,
-            ubuf,
-            bind_group,
+            swapchain,
+            bindings,
             origin: (0.0, 0.0),
-            chrome_clear_lin: [0.0, 0.0, 0.0, 1.0],
+            chrome_clear: [0.0, 0.0, 0.0, 1.0],
             tex: ImageContent {
                 linear_sample: 1,
                 ..ImageContent::default()
@@ -738,7 +659,7 @@ impl GpuSurface {
             },
             generation: 0,
             anim: AnimState::default(),
-            viewport: Viewport::new(width, height),
+            viewport: Viewport::new(width.max(1), height.max(1)),
             view: ViewState::default(),
             flipbook: None,
             display: DisplayState::default(),
@@ -747,7 +668,7 @@ impl GpuSurface {
     }
 
     /// Set the letterbox / no-image backdrop color (packed `0x00RRGGBB`); stored both packed and
-    /// as linear floats so the `*Srgb` render target re-encodes it to the intended sRGB.
+    /// as linear floats so the shader's encode brings it back to the intended sRGB.
     pub fn set_clear(&mut self, packed: u32) {
         self.prefs.clear = packed;
         let dec = |b: u32| srgb_to_linear((b & 0xff) as f32 / 255.0);
@@ -957,22 +878,22 @@ impl GpuSurface {
     /// frames so the viewer's next `frame_delay_ms()` returns `None` and the playback timer stops.
     pub fn clear_image(&mut self) {
         self.tex.current = None;
-        self.tex._tex = None;
-        self.tex.view = None;
-        self.bind_group = make_bind_group(&self.gpu, &self.ubuf, &self.gpu.placeholder);
+        self.tex.release();
+        self.bindings = make_bindings(&self.gpu, self.gpu.placeholder_view);
         self.anim.clear();
         self.flipbook = None;
     }
 
-    /// Adopt a decoded image: upload it as a GPU texture (with a mip chain) and reset to fit +
-    /// neutral display state for the new file (#17). Returns the GPU error if the upload fails
-    /// (e.g. out of memory on a very large image) so the caller can report it instead of the
-    /// process aborting; on failure the prior display state is left untouched.
-    pub fn set_image(&mut self, img: Arc<DecodedImage>) -> Result<(), String> {
+    /// Adopt a decoded image: upload it (level 0 plus `mips`, the chain the decode worker built)
+    /// as a GPU texture and reset to fit + neutral display state for the new file (#17). Returns
+    /// the GPU error if the upload fails (e.g. out of memory on a very large image) so the caller
+    /// can report it instead of the process aborting; on failure the prior display state is left
+    /// untouched.
+    pub fn set_image(&mut self, img: Arc<DecodedImage>, mips: &[Vec<u8>]) -> Result<(), String> {
         let (w, h) = (img.width, img.height);
         // Upload first: if the GPU rejects the texture we bail here, before mutating any state,
         // so a failed adopt can't leave the surface half-updated.
-        self.upload_texture(&img)?;
+        self.upload_texture(&img, mips)?;
         // Adopt any animation frames for playback and start from frame 0 (already uploaded above).
         // The viewer arms the timer from `frame_delay_ms()` after this.
         self.anim.adopt(&img);
@@ -1013,8 +934,12 @@ impl GpuSurface {
     /// the re-decode came back at the same dimensions (the "re-export same canvas" case), so the
     /// user's zoomed-in detail and display state survive the update. The pan is re-clamped
     /// defensively (a no-op while the dims are unchanged).
-    pub fn replace_image_keep_view(&mut self, img: Arc<DecodedImage>) -> Result<(), String> {
-        self.upload_texture(&img)?;
+    pub fn replace_image_keep_view(
+        &mut self,
+        img: Arc<DecodedImage>,
+        mips: &[Vec<u8>],
+    ) -> Result<(), String> {
+        self.upload_texture(&img, mips)?;
         // Refresh the animation frames from the re-decoded file and restart from frame 0 (the view
         // is preserved, but the animation plays from the top). The viewer re-arms the timer.
         self.anim.adopt(&img);
@@ -1045,7 +970,8 @@ impl GpuSurface {
     /// now-current frame's delay (ms) so the caller can reschedule the timer (GIF frame delays
     /// vary). Returns `None` and does nothing for a still image. On a GPU upload error the visible
     /// frame is left unchanged and the current frame's delay is returned, so a transient failure
-    /// paces the retry rather than wedging playback.
+    /// paces the retry rather than wedging playback. The frame's mip chain is built here, on the
+    /// UI thread: GIF frames are small.
     pub fn advance_frame(&mut self) -> Option<u32> {
         let n = self.anim.frames().len();
         if n <= 1 {
@@ -1054,9 +980,16 @@ impl GpuSurface {
         let (w, h) = self.image_dims()?;
         let format = self.tex.current.as_ref()?.format;
         let next = (self.anim.index + 1) % n;
-        match create_image_texture(&self.gpu, &self.anim.frames()[next].pixels, w, h, format) {
-            Ok((tex, view, linear)) => {
-                self.adopt_texture(tex, view, linear);
+        match create_image_texture(
+            &self.gpu,
+            &self.anim.frames()[next].pixels,
+            w,
+            h,
+            format,
+            None,
+        ) {
+            Ok((image, view, linear)) => {
+                self.adopt_texture(image, view, linear);
                 self.anim.index = next;
             }
             Err(e) => eprintln!("fire: animation frame upload failed: {e}"),
@@ -1064,33 +997,35 @@ impl GpuSurface {
         self.anim.delay_ms()
     }
 
-    /// Upload `img`'s (frame-0) pixels as a texture with a full mip chain. Returns the GPU error
-    /// rather than panicking if creation fails — this runs synchronously on the UI thread.
-    fn upload_texture(&mut self, img: &DecodedImage) -> Result<(), String> {
-        let (tex, view, linear_sample) =
-            create_image_texture(&self.gpu, &img.pixels, img.width, img.height, img.format)?;
-        self.adopt_texture(tex, view, linear_sample);
+    /// Upload `img`'s (frame-0) pixels as a texture with its full mip chain. Returns the GPU
+    /// error rather than panicking if creation fails — this runs synchronously on the UI thread.
+    fn upload_texture(&mut self, img: &DecodedImage, mips: &[Vec<u8>]) -> Result<(), String> {
+        let (image, view, linear_sample) = create_image_texture(
+            &self.gpu,
+            &img.pixels,
+            img.width,
+            img.height,
+            img.format,
+            Some(mips),
+        )?;
+        self.adopt_texture(image, view, linear_sample);
         Ok(())
     }
 
-    /// Install a freshly created texture and rebuild the bind group around it.
-    fn adopt_texture(&mut self, tex: wgpu::Texture, view: wgpu::TextureView, linear_sample: i32) {
-        self.bind_group = make_bind_group(&self.gpu, &self.ubuf, &view);
-        self.tex._tex = Some(tex);
+    /// Install a freshly created texture and rebuild the bindings around it.
+    fn adopt_texture(&mut self, image: sg::Image, view: sg::View, linear_sample: i32) {
+        self.tex.release();
+        self.bindings = make_bindings(&self.gpu, view);
+        self.tex.image = Some(image);
         self.tex.view = Some(view);
         self.tex.linear_sample = linear_sample;
     }
 
-    /// Resize the surface to a new *client* size (physical px). The image's sub-rect within it is
-    /// a separate concern — the viewer calls [`Self::set_image_rect`] right after, because only it
-    /// knows how tall the chrome is. A zero size (minimized) is remembered and skipped: the
-    /// surface cannot be configured to it, and `render_frame` draws nothing until it grows back.
+    /// The client changed size (physical px): resize the swapchain to match. The image's sub-rect
+    /// within it is a separate concern — the viewer calls [`Self::set_image_rect`] right after,
+    /// because only it knows how tall the chrome is.
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.config.width = width;
-        self.config.height = height;
-        if width > 0 && height > 0 {
-            self.surface.configure(&self.gpu.device, &self.config);
-        }
+        self.swapchain.resize(width, height);
         self.invalidate();
     }
 
@@ -1134,137 +1069,78 @@ impl GpuSurface {
 
     /// The chrome fill (sRGB): what the parts of the frame the image doesn't cover get cleared to.
     pub fn set_chrome_clear(&mut self, rgba: [f32; 4]) {
-        // The clear goes through the `*Srgb` view, which encodes on write, so it wants linear.
-        self.chrome_clear_lin = [
-            srgb_to_linear(rgba[0]),
-            srgb_to_linear(rgba[1]),
-            srgb_to_linear(rgba[2]),
-            1.0,
-        ];
+        self.chrome_clear = [rgba[0], rgba[1], rgba[2], 1.0];
     }
 
-    /// Draw one frame: clear to the chrome fill, the image into its sub-rect through the `*Srgb`
-    /// view, then `ui` through the plain UNORM view of the same pixels, then present.
+    /// Draw one frame: clear to the chrome fill, the image into its sub-rect, then `ui` over the
+    /// whole client, all in one swapchain pass, and present it.
     ///
-    /// **Two views of the same pixels, deliberately.** The image shader emits linear light and
-    /// writes through the `*Srgb` view, so the hardware encodes on write. Dear ImGui's colors are
-    /// *already* sRGB, so it must write through the plain `Unorm` view — pushing it through the
-    /// sRGB view would encode twice and visibly wash the entire UI out. Both views are legal on the
-    /// one texture precisely because the surface format is plain `Bgra8Unorm` with
-    /// `Bgra8UnormSrgb` declared as a view format.
-    ///
-    /// The image is still **one fullscreen triangle**: the viewport (and scissor) map NDC onto the
-    /// sub-rect and clip to it, so the shader (background, checkerboard, letterbox and all) fills
-    /// exactly the image region and nothing else. No per-pixel CPU work, no extra draws.
-    pub fn render_frame(
-        &mut self,
-        ui: impl FnOnce(&mut wgpu::RenderPass<'_>, dear_imgui_wgpu::FramebufferExtent),
-    ) -> Presented {
-        if self.config.width == 0 || self.config.height == 0 {
+    /// The image is **one fullscreen triangle**: the viewport and scissor map NDC onto the sub-rect
+    /// and clip to it, so the shader (background, checkerboard, letterbox and all) fills exactly
+    /// the image region and nothing else. No per-pixel CPU work, no extra draws.
+    pub fn render_frame(&mut self, ui: impl FnOnce()) -> Presented {
+        let (sw, sh) = self.swapchain.size();
+        if sw == 0 || sh == 0 {
             return Presented::Skipped;
         }
-        let t0 = Instant::now();
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            // The swapchain no longer matches the window (a resize raced us) or the device was
-            // reset under it: rebuild it and let the next request draw.
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.gpu.device, &self.config);
-                self.invalidate();
-                return Presented::Skipped;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Validation => return Presented::Skipped,
+        let Some(render_view) = self.swapchain.render_view() else {
+            return Presented::Skipped;
         };
-        // Did the acquire block on the display? A vblank is ≥4 ms even at 240 Hz; an acquire that
+        let mut swapchain = sg::Swapchain::new();
+        swapchain.width = sw as i32;
+        swapchain.height = sh as i32;
+        swapchain.sample_count = 1;
+        swapchain.color_format = SWAPCHAIN_FORMAT;
+        swapchain.depth_format = sg::PixelFormat::None;
+        swapchain.d3d11.render_view = render_view;
+        let mut pass = sg::Pass::new();
+        pass.swapchain = swapchain;
+        let c = self.chrome_clear;
+        pass.action.colors[0] = sg::ColorAttachmentAction {
+            load_action: sg::LoadAction::Clear,
+            store_action: sg::StoreAction::Store,
+            clear_value: sg::Color {
+                r: c[0],
+                g: c[1],
+                b: c[2],
+                a: 1.0,
+            },
+        };
+        pass.label = c"fire frame".as_ptr();
+        sg::begin_pass(&pass);
+
+        // The viewport *is* the image's sub-rect, clamped to the framebuffer (a mid-resize frame
+        // can briefly disagree with it).
+        let (cw, ch) = (swapchain.width as f32, swapchain.height as f32);
+        let x = self.origin.0.clamp(0.0, cw);
+        let y = self.origin.1.clamp(0.0, ch);
+        let w = self.viewport.width.min(cw - x);
+        let h = self.viewport.height.min(ch - y);
+        if w >= 1.0 && h >= 1.0 {
+            sg::apply_viewportf(x, y, w, h, true);
+            sg::apply_scissor_rectf(x, y, w, h, true);
+            sg::apply_pipeline(self.gpu.pipeline);
+            sg::apply_bindings(&self.bindings);
+            let params = self.build_params();
+            sg::apply_uniforms(0, &sg::value_as_range(&params));
+            sg::draw(0, 3, 1);
+            sg::apply_viewportf(0.0, 0.0, cw, ch, true);
+            sg::apply_scissor_rectf(0.0, 0.0, cw, ch, true);
+        }
+
+        // The pass must close whatever happens inside the UI: a panic that escaped here would
+        // leave sokol_gfx mid-pass and assert on the next frame.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(ui)).is_err() {
+            eprintln!("fire: recovered from a panic while drawing the UI");
+        }
+
+        sg::end_pass();
+        sg::commit();
+        let t0 = Instant::now();
+        let looking = self.swapchain.present();
+        // Did the present block on the display? A vblank is ≥4 ms even at 240 Hz; a present that
         // did not wait returns in microseconds.
-        let waited = t0.elapsed() >= Duration::from_micros(500);
-
-        let view_srgb = frame.texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("fire frame (srgb)"),
-            format: Some(SURFACE_VIEW_SRGB),
-            ..Default::default()
-        });
-        let view_ui = frame.texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("fire frame (ui)"),
-            ..Default::default()
-        });
-
-        let params = self.build_params();
-        self.gpu
-            .queue
-            .write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&params));
-
-        let mut encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("fire frame"),
-            });
-        {
-            let c = self.chrome_clear_lin;
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("fire image"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view_srgb,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: c[0] as f64,
-                            g: c[1] as f64,
-                            b: c[2] as f64,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            // The viewport *is* the image's sub-rect, clamped to the surface (a mid-resize frame
-            // can briefly disagree with it; wgpu validates the rect strictly).
-            let (cw, ch) = (self.config.width as f32, self.config.height as f32);
-            let x = self.origin.0.clamp(0.0, cw);
-            let y = self.origin.1.clamp(0.0, ch);
-            let w = self.viewport.width.min(cw - x);
-            let h = self.viewport.height.min(ch - y);
-            if w >= 1.0 && h >= 1.0 {
-                pass.set_viewport(x, y, w, h, 0.0, 1.0);
-                pass.set_scissor_rect(x as u32, y as u32, w as u32, h as u32);
-                pass.set_pipeline(&self.gpu.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
-        }
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("fire ui"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view_ui,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            ui(
-                &mut pass,
-                dear_imgui_wgpu::FramebufferExtent::from_texture(&frame.texture),
-            );
-        }
-        self.gpu.queue.submit([encoder.finish()]);
-        self.gpu.queue.present(frame);
+        let waited = looking && t0.elapsed() >= Duration::from_micros(500);
         if self.tex.current.is_some() {
             // Measurement hook: inert unless `FIRE_TTFP_OUT` is set (see `crate::ttfp`).
             crate::ttfp::stamp_first_pixel();
@@ -1537,30 +1413,21 @@ impl GpuSurface {
     }
 }
 
-/// The frame's bind group: uniforms, the image texture (or the placeholder), both samplers.
-fn make_bind_group(gpu: &Gpu, ubuf: &wgpu::Buffer, view: &wgpu::TextureView) -> wgpu::BindGroup {
-    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("fire viewport"),
-        layout: &gpu.layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: ubuf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::Sampler(&gpu.samp_aniso),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: wgpu::BindingResource::Sampler(&gpu.samp_point),
-            },
-        ],
-    })
+impl Drop for GpuSurface {
+    fn drop(&mut self) {
+        if sg::isvalid() {
+            self.tex.release();
+        }
+    }
+}
+
+/// The frame's bindings: the image texture (or the placeholder) at view slot 0, the two samplers.
+fn make_bindings(gpu: &Gpu, view: sg::View) -> sg::Bindings {
+    let mut b = sg::Bindings::new();
+    b.views[0] = view;
+    b.samplers[0] = gpu.samp_aniso;
+    b.samplers[1] = gpu.samp_point;
+    b
 }
 
 fn channel_code(ch: Channel) -> i32 {
@@ -1589,7 +1456,7 @@ fn default_background(img: &DecodedImage) -> Background {
     }
 }
 
-/// Backdrop mode → shader code (must match the `background` branch in `shader.wgsl`).
+/// Backdrop mode → shader code (must match the `background` branch in `shader.hlsl`).
 fn background_code(bg: Background) -> i32 {
     match bg {
         Background::Black => 0,
@@ -1608,253 +1475,102 @@ fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
-/// The number of mip levels in a full chain for a `w`×`h` texture.
-fn mip_levels(w: u32, h: u32) -> u32 {
-    32 - w.max(h).max(1).leading_zeros()
-}
-
-/// Build a texture (+ its view, with a full mip chain) from one RGBA frame, returning the texture,
-/// its sampling view, and the `linear_sample` flag for `format` (1 if the sample is already
-/// linear — 8-bit `*Srgb` / float — 0 if the shader must sRGB-decode 16-bit unorm). A free
-/// function (not a method) so the per-frame animation upload can borrow pixels straight out of
-/// [`AnimState`] without aliasing the `&mut self` receiver. Returns the GPU error instead of
-/// panicking (this runs synchronously on the UI thread).
+/// Build an immutable image (+ its texture view) from one RGBA frame and its mip chain — `mips`
+/// as [`crate::render::mips::build`] makes it, or `None` to build it here — returning the image,
+/// its view, and the `linear_sample` flag for `format` (1 if the sample is already linear — 8-bit
+/// sRGB / float — 0 if the shader must sRGB-decode 16-bit unorm). A free function (not a method)
+/// so the per-frame animation upload can borrow pixels straight out of [`AnimState`] without
+/// aliasing the `&mut self` receiver. Returns the GPU error instead of panicking (this runs
+/// synchronously on the UI thread).
 fn create_image_texture(
     gpu: &Gpu,
     pixels: &[u8],
     width: u32,
     height: u32,
     format: PixelFormat,
-) -> Result<(wgpu::Texture, wgpu::TextureView, i32), String> {
+    mips: Option<&[Vec<u8>]>,
+) -> Result<(sg::Image, sg::View, i32), String> {
     // The dimensions and the buffer arrive from different producers (decode headers vs the
     // pixel Vec — part of it native FFI); a short buffer is refused here rather than read past.
-    let src_bpp = match format {
-        PixelFormat::Rgba8Unorm => 4usize,
-        PixelFormat::Rgba16Unorm | PixelFormat::Rgba16Float => 8,
-        PixelFormat::Rgba32Float => 16,
-    };
+    let src_bpp = mips::bytes_per_texel(format);
     let needed = (width as usize)
         .checked_mul(height as usize)
         .and_then(|n| n.checked_mul(src_bpp));
     if needed.is_none_or(|n| pixels.len() < n) {
         return Err("pixel buffer is shorter than its dimensions declare".into());
     }
-    let needed = needed.unwrap_or(0);
-
-    // The device format, its bytes per texel, the shader's decode flag, and a converted copy of
-    // the pixels when the device lacks the feature the source format needs.
-    let (tex_format, bpp, linear_sample, converted): (
-        wgpu::TextureFormat,
-        u32,
-        i32,
-        Option<Vec<u8>>,
-    ) = match format {
-        // 8-bit sources are sRGB-encoded; the `*Srgb` format decodes to linear on sample.
-        PixelFormat::Rgba8Unorm => (wgpu::TextureFormat::Rgba8UnormSrgb, 4, 1, None),
-        // 16-bit unorm is treated as sRGB-encoded (matches the CPU path) → decode in shader.
-        // Without the 16-bit-norm feature it rides as float16 of the same 0..1 values.
-        PixelFormat::Rgba16Unorm if gpu.norm16 => (wgpu::TextureFormat::Rgba16Unorm, 8, 0, None),
-        PixelFormat::Rgba16Unorm => (
-            wgpu::TextureFormat::Rgba16Float,
-            8,
-            0,
-            Some(u16_to_f16(&pixels[..needed])),
-        ),
-        // Float sources are already linear.
-        PixelFormat::Rgba16Float => (wgpu::TextureFormat::Rgba16Float, 8, 1, None),
-        PixelFormat::Rgba32Float if gpu.float32_filterable => {
-            (wgpu::TextureFormat::Rgba32Float, 16, 1, None)
+    let level0 = &pixels[..needed.unwrap_or(0)];
+    let levels = mips::level_count(width, height) as usize;
+    let built;
+    let chain: &[Vec<u8>] = match mips {
+        Some(m) if m.len() + 1 == levels => m,
+        // No chain (an animation frame), or one that does not match this image: build it now.
+        _ => {
+            built = mips::build(level0, width, height, format);
+            &built
         }
+    };
+    if chain.len() + 1 != levels {
+        return Err("the mip chain is incomplete".into());
+    }
+
+    // The device format, the shader's decode flag, and a conversion for the pixels when the
+    // device lacks the feature the source format needs.
+    let (tex_format, linear_sample, convert): (sg::PixelFormat, i32, Option<Convert>) = match format
+    {
+        // 8-bit sources are sRGB-encoded; the sRGB format decodes to linear on sample.
+        PixelFormat::Rgba8Unorm => (sg::PixelFormat::Srgb8a8, 1, None),
+        // 16-bit unorm is treated as sRGB-encoded (matches the CPU path) → decode in shader.
+        // Without a 16-bit-norm format it rides as float16 of the same 0..1 values.
+        PixelFormat::Rgba16Unorm if gpu.norm16 => (sg::PixelFormat::Rgba16, 0, None),
+        PixelFormat::Rgba16Unorm => (sg::PixelFormat::Rgba16f, 0, Some(mips::u16_to_f16)),
+        // Float sources are already linear.
+        PixelFormat::Rgba16Float => (sg::PixelFormat::Rgba16f, 1, None),
+        PixelFormat::Rgba32Float if gpu.float32_filterable => (sg::PixelFormat::Rgba32f, 1, None),
         // No float32 filtering on this device: float16 keeps the pipeline (and the mips)
         // filtered, at the cost of range above 65504.
-        PixelFormat::Rgba32Float => (
-            wgpu::TextureFormat::Rgba16Float,
-            8,
-            1,
-            Some(f32_to_f16(&pixels[..needed])),
-        ),
+        PixelFormat::Rgba32Float => (sg::PixelFormat::Rgba16f, 1, Some(mips::f32_to_f16)),
     };
-    let data: &[u8] = match &converted {
-        Some(v) => v,
-        None => &pixels[..needed],
+    let converted: Vec<Vec<u8>> = match convert {
+        Some(f) => std::iter::once(level0)
+            .chain(chain.iter().map(Vec::as_slice))
+            .map(f)
+            .collect(),
+        None => Vec::new(),
     };
-    let levels = mip_levels(width, height);
-    let filterable = tex_format != wgpu::TextureFormat::Rgba32Float || gpu.float32_filterable;
 
-    gpu.scoped(|| {
-        let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("fire image"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: levels,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: tex_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        // Level 0 only; the rest are generated.
-        gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * bpp),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        gpu.mipgen.generate(
-            &gpu.device,
-            &gpu.queue,
-            &tex,
-            tex_format,
-            levels,
-            filterable,
-        );
-        let view = tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("fire image"),
-            ..Default::default()
-        });
-        (tex, view, linear_sample)
-    })
-}
-
-/// Reinterpret 16-bit unorm samples as float16 of the same 0..1 value.
-fn u16_to_f16(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
-    for px in bytes.as_chunks::<2>().0 {
-        let v = u16::from_le_bytes(*px) as f32 / 65535.0;
-        out.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
-    }
-    out
-}
-
-/// Narrow float32 samples to float16.
-fn f32_to_f16(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for px in bytes.as_chunks::<4>().0 {
-        let v = f32::from_le_bytes(*px);
-        out.extend_from_slice(&f32_to_f16_bits(v).to_le_bytes());
-    }
-    out
-}
-
-/// IEEE binary32 → binary16, round-to-nearest-even, overflow to infinity, NaN preserved.
-fn f32_to_f16_bits(x: f32) -> u16 {
-    let b = x.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let exp = ((b >> 23) & 0xff) as i32;
-    let mant = b & 0x7f_ffff;
-    if exp == 0xff {
-        // Inf / NaN (keep a payload bit so a NaN stays a NaN).
-        return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
-    }
-    let e = exp - 127 + 15;
-    if e >= 0x1f {
-        return sign | 0x7c00; // overflow → inf
-    }
-    if e <= 0 {
-        if e < -10 {
-            return sign; // too small even for a subnormal → ±0
+    let mut desc = sg::ImageDesc::new();
+    desc._type = sg::ImageType::Dim2;
+    desc.width = width as i32;
+    desc.height = height as i32;
+    desc.num_mipmaps = levels as i32;
+    desc.pixel_format = tex_format;
+    desc.label = c"fire image".as_ptr();
+    if convert.is_some() {
+        for (i, lvl) in converted.iter().enumerate() {
+            desc.data.mip_levels[i] = sg::slice_as_range(lvl);
         }
-        // Subnormal: shift the (implicit-1) mantissa down, rounding to nearest even.
-        let m = mant | 0x80_0000;
-        let shift = (14 - e) as u32;
-        let mut half = (m >> shift) as u16;
-        let rem = m & ((1u32 << shift) - 1);
-        let halfway = 1u32 << (shift - 1);
-        if rem > halfway || (rem == halfway && (half & 1) == 1) {
-            half += 1;
+    } else {
+        desc.data.mip_levels[0] = sg::slice_as_range(level0);
+        for (i, lvl) in chain.iter().enumerate() {
+            desc.data.mip_levels[i + 1] = sg::slice_as_range(lvl);
         }
-        return sign | half;
     }
-    let mut half = ((e as u32) << 10) as u16 | (mant >> 13) as u16;
-    let rem = mant & 0x1fff;
-    // Rounding up may carry into the exponent; that is the correct result (it rounds to the next
-    // binade, or to infinity at the top).
-    if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
-        half = half.wrapping_add(1);
+    let image = sg::make_image(&desc);
+    if sg::query_image_state(image) != sg::ResourceState::Valid {
+        sg::destroy_image(image);
+        return Err(format!(
+            "the GPU refused a {width}×{height} {tex_format:?} texture with {levels} mip levels"
+        ));
     }
-    sign | half
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn f16_to_f32(h: u16) -> f32 {
-        let sign = ((h >> 15) & 1) as u32;
-        let exp = ((h >> 10) & 0x1f) as i32;
-        let mant = (h & 0x3ff) as u32;
-        let bits = if exp == 0 {
-            if mant == 0 {
-                sign << 31
-            } else {
-                // subnormal
-                let mut e = -1;
-                let mut m = mant;
-                while m & 0x400 == 0 {
-                    m <<= 1;
-                    e -= 1;
-                }
-                let e = (e + 1 + 127 - 15) as u32;
-                (sign << 31) | (e << 23) | ((m & 0x3ff) << 13)
-            }
-        } else if exp == 0x1f {
-            (sign << 31) | (0xff << 23) | (mant << 13)
-        } else {
-            (sign << 31) | (((exp - 15 + 127) as u32) << 23) | (mant << 13)
-        };
-        f32::from_bits(bits)
+    let mut vd = sg::ViewDesc::new();
+    vd.texture.image = image;
+    vd.label = c"fire image".as_ptr();
+    let view = sg::make_view(&vd);
+    if sg::query_view_state(view) != sg::ResourceState::Valid {
+        sg::destroy_view(view);
+        sg::destroy_image(image);
+        return Err("the image's texture view could not be created".into());
     }
-
-    #[test]
-    fn f16_conversion_round_trips_representable_values() {
-        for v in [
-            0.0f32,
-            1.0,
-            -1.0,
-            0.5,
-            0.25,
-            2.0,
-            1024.0,
-            65504.0,
-            6.1035156e-5,
-            1.0 / 3.0,
-        ] {
-            let h = f32_to_f16_bits(v);
-            let back = f16_to_f32(h);
-            assert!(
-                (back - v).abs() <= v.abs() * 1e-3 + 1e-7,
-                "{v} -> {h:#06x} -> {back}"
-            );
-        }
-        assert_eq!(f32_to_f16_bits(1e6), 0x7c00); // overflow → +inf
-        assert_eq!(f32_to_f16_bits(-1e6), 0xfc00);
-        assert!(f16_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
-        assert_eq!(f32_to_f16_bits(1e-9), 0); // underflow → 0
-    }
-
-    #[test]
-    fn mip_chain_length() {
-        assert_eq!(mip_levels(1, 1), 1);
-        assert_eq!(mip_levels(2, 1), 2);
-        assert_eq!(mip_levels(256, 128), 9);
-        assert_eq!(mip_levels(1000, 3), 10);
-    }
+    Ok((image, view, linear_sample))
 }
