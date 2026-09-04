@@ -2,12 +2,11 @@
 # Wrap the built binary in a minimal .app bundle so Fire can be run from Finder / the Dock like a
 # real macOS app, and optionally launch it.
 #
-# This is the *development* bundle, not the shipping one. `scripts/build-mac.sh` (Phase 2 step 9)
-# is what produces the real thing: the .icns, the document types that make Finder open images with
-# Fire, `codesign --options runtime`, notarization and the .dmg. This script exists because steps
-# 5, 6 and 10 all need a bundled app to test against long before any of that is written — a bare
-# executable gets no Dock presence, no proper activation, and is not what `open` hands file
-# arguments to.
+# This is the *development* bundle, not the shipping one. `scripts/build-mac.sh` produces the real
+# thing: the .icns, the document types that make Finder offer Fire for an image, `codesign
+# --options runtime`, notarization and the .dmg. This one exists because it is far faster — no
+# icon, no signing, and it takes a debug build — and because a bare executable gets no Dock
+# presence, no proper activation, and is not what `open` hands file arguments to.
 #
 #   scripts/dev-app.sh                    build release, bundle, print the path
 #   scripts/dev-app.sh some/image.png     ... and launch it on that image
@@ -29,7 +28,7 @@ while [[ $# -gt 0 ]]; do
         --debug)    profile=debug; shift ;;
         --release)  profile=release; shift ;;
         --no-build) build=0; shift ;;
-        -h|--help)  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)  sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)          args+=("$1"); shift ;;
     esac
 done
