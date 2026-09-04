@@ -79,13 +79,13 @@ Each is stated with the reason and what it costs, so a future revision can revis
 | D16 | **Minimal macOS menu bar via `muda`; F11 / Ctrl-Cmd-F → winit native fullscreen** | A Mac app without a menu bar can't Cmd-Q and reads as broken; native fullscreen gives the space transition | ~40 lines, all `cfg(target_os = "macos")` | Planned |
 | D17 | *(wgpu-era: measure `request_adapter`, then decide on a DXGI hal leaf)* | - | - | Superseded (A.2): the ~140 ms was D3D12 driver init, not enumeration |
 | D18 | **GPU bring-up on its own thread, started on the first line of `main`; the window is created *before* the join** | Device creation is the longest single item on the launch path and needs no window - but neither does the window need to wait for it | `Viewer::new` takes the GPU as a closure; get the order wrong and the window's 9-13 ms serialize after the device (§8) | Shipped |
-| D19 | **The shell owns the device and the swapchain; sokol_gfx is handed them** (`sg_environment` / `sg_swapchain`) | sokol_app's window model was a dealbreaker (A.3); this keeps winit's window *and* sokol's one drawing API | ~230 lines per OS - the only GPU-API-specific code left | Windows shipped; Metal planned |
-| D20 | **The swapchain backbuffer is plain `R8G8B8A8_UNORM`; the pixel shader sRGB-encodes its own output** | Flip-model swapchains disallow `*_SRGB` formats, and ImGui's colors are already sRGB, so a single UNORM target is correct for both passes | The old two-RTV (`UNORM` + `UNORM_SRGB` view) trick is gone; the shader owns the encode and must not be "fixed" into a linear write | Shipped |
+| D19 | **The shell owns the device and the swapchain; sokol_gfx is handed them** (`sg_environment` / `sg_swapchain`) | sokol_app's window model was a dealbreaker (A.3); this keeps winit's window *and* sokol's one drawing API | ~230 lines per OS - the only GPU-API-specific code left; `render/mod.rs` aliases one of them as `backend` so `gpu.rs` carries no `cfg` | Shipped both (Metal's swapchain half unexercised until the shader lands) |
+| D20 | **The swapchain backbuffer is plain UNORM; the pixel shader sRGB-encodes its own output** | Flip-model swapchains disallow `*_SRGB` formats, and ImGui's colors are already sRGB, so a single UNORM target is correct for both passes | The old two-RTV (`UNORM` + `UNORM_SRGB` view) trick is gone; the shader owns the encode and must not be "fixed" into a linear write. The *format* is per-OS - `R8G8B8A8_UNORM` on D3D11, `BGRA8Unorm` on Metal, because a `CAMetalLayer` does not accept RGBA8 - so `SWAPCHAIN_FORMAT` lives in the backend module. Channel order only; the shader is unchanged | Shipped |
 | D21 | **The mip chain is built on the CPU, on the decode worker** | sokol_gfx has no `GenerateMips`, and its rules forbid rendering into an image created with data | ~5 ms on an 8.9 MB image, off the UI thread; the upload is one `sg_make_image` carrying every level | Shipped |
 | D22 | **`sokol-rust` is vendored (`vendor/sokol-rust`); `sokol_imgui.h` is compiled by `fire`'s build.rs** | The crates.io `sokol` name belongs to an unrelated 2019 crate; sokol_imgui must be compiled with the *same* cimgui defines and the same `SOKOL_*` backend as its neighbours or the struct layouts differ | A vendored tree to update by hand; three sets of defines (backend, `SOKOL_IMGUI_NO_SOKOL_APP`, the cimgui five) that must stay in lockstep | Shipped |
 | D23 | **The whole dev pipeline runs on macOS**, not just the app: clippy, `cargo test`, the native decoders, the TTFP harness, the release build and packaging | A platform you cannot lint, test or measure on is a platform you cannot maintain; the alternative is mac fixes that only Windows CI can verify | The two sys crates lose their Windows-only short-circuit, the vendor layout goes per-target, CI grows a mac leg, `ttfp.ps1` gets a portable twin (§7) | Planned |
 | D24 | **Metal shaders are precompiled to a `.metallib` with `xcrun metal`** - so the toolchain floor on macOS is **full Xcode** (plus the separately-downloaded Metal toolchain on Xcode 16+), not Command Line Tools | Keeps D4's "no shader compile on the cold-start path" on both OSes; the wgpu branch lost ~32 ms to exactly this (A.2), and TTFP is the project's primary metric | Every dev machine and the CI runner need Xcode, not CLT; a second offline compile step in build.rs | Planned |
-| D25 | **The arm64 HEIF stack is built with vcpkg (`arm64-osx` static), mirroring `VENDOR.txt`**, and the vendored libs move to per-target subdirectories | One vendoring story on both OSes, one dav1d port patch, a self-contained `.app` with no dylib embedding or per-dylib signing | A one-time `brew install cmake ninja meson nasm pkg-config` + vcpkg bootstrap on the Mac; `heif-sys`'s hardcoded `lib/` path and `.lib` names become target-aware | Planned |
+| D25 | **The arm64 HEIF stack is built with vcpkg (`arm64-osx` static), mirroring `VENDOR.txt`**, and the vendored tree goes per-target - one directory per target holding *both* its `include/` and `lib/` | One vendoring story on both OSes, one dav1d port patch, a self-contained `.app` with no dylib embedding or per-dylib signing | A one-time `brew install cmake ninja meson nasm pkg-config` + vcpkg bootstrap on the Mac; `heif-sys`'s hardcoded `lib/` path and `.lib` names become target-aware. Headers turned out to need the split too (the two targets landed on different libheif versions), and the mac build needs a third port patch, `ENABLE_PLUGIN_LOADING=OFF` (§7.2) | Shipped |
 
 ---
 
@@ -249,7 +249,7 @@ and this table is what it is pointing at.
 | Concern | Windows | macOS | Shared via |
 | --- | --- | --- | --- |
 | Window, loop, DPI, DnD, theme change, fullscreen, placement | - | - | `winit` |
-| GPU device + swapchain | `render/d3d11.rs` (~230 lines): D3D11 device + DXGI flip-model swapchain | `render/metal.rs` (planned): a `CAMetalLayer` on the winit window, handing sokol_gfx its `MTLDevice` and per-frame drawable | `sokol_gfx` above them |
+| GPU device + swapchain | `render/d3d11.rs` (~230 lines): D3D11 device + DXGI flip-model swapchain | `render/metal.rs` (~210 lines): a `CAMetalLayer` on the winit window, handing sokol_gfx its `MTLDevice` and per-frame drawable | `sokol_gfx` above them |
 | Shader bytecode | HLSL → DXBC (`fxc`, build.rs) | MSL → `.metallib` (`xcrun metal`, build.rs; planned - D4, D24) | one `sokol-shdc` source once it lands |
 | Config dir | `%APPDATA%\fire` | `~/Library/Application Support/fire` | `dirs` |
 | Dark mode | - | - | `winit` `Window::theme()` / `ThemeChanged` (registry read removed) |
@@ -322,40 +322,80 @@ checkout must do too. What that needs, and what is in the way.
   one-time HEIF build of D25 only. A normal `cargo build` needs none of them.
 
 Everything else, clang and the macOS SDK already provide: bindgen's libclang (the sys crates'
-"check that `libclang.dll` is on PATH" message is Windows-shaped, but it is the same dylib),
+"check that `libclang.dll` is on PATH" message is Windows-shaped, but it is the same dylib -
+clang-sys finds it by itself inside `xcode-select -p`'s toolchain, so nothing needs setting; what
+*did* need removing was `.cargo/config.toml`'s `LIBCLANG_PATH` pin at `C:\Program Files\LLVM\bin`,
+a **global** override - cargo's `[env]` cannot be made host-conditional - that short-circuited that
+search on every Mac build. clang-sys globs the same Windows location on its own, so the pin was
+redundant there too),
 `lcms2`'s static Little-CMS, `dear-imgui-sys`'s cimgui, and the vendored sokol tree - which
 compiles itself as Objective-C and links `Cocoa` / `QuartzCore` / `Metal` on its own
 (`vendor/sokol-rust/build.rs`), so the Metal backend costs nothing at the tooling level.
 
 ### 7.2 The Windows-only short-circuits
 
-`heif-sys` and `psd-sdk-sys` both write a `compile_error!` stub and return early when
-`CARGO_CFG_TARGET_OS != "windows"`, so `fire`'s default features cannot build on a Mac at all
-until they are ported. They are very different amounts of work:
+`heif-sys` and `psd-sdk-sys` both wrote a `compile_error!` stub and returned early when
+`CARGO_CFG_TARGET_OS != "windows"`, so `fire`'s default features could not build on a Mac at all.
+**Done** (2026-09-04); both were as sized, with three findings that were not in the plan:
 
-* **`psd-sdk-sys` is nearly free.** The vendored psd_sdk is already clang-aware (`PsdPch.h` sets
-  `PSD_USE_CLANG`; `PsdPlatform.h` gates `<windows.h>` on `_WIN32`), and `wrapper.cpp` reads
-  through its own `MemoryFile : psd::File`, so `NativeFile` is never instantiated. The mac build
-  drops the short-circuit, excludes `PsdNativeFile.cpp` (Win32 `CreateFileW` + overlapped IO)
-  alongside the `_Linux` / `_Mac` files already excluded, keeps `-std=c++17`, and links `c++`.
-  No new tooling.
-* **`heif-sys` needs the libs built first (D25).** `vendor/lib/` holds `heif.lib`,
-  `libde265.lib` and `dav1d.lib` - MSVC x64, committed, and useless on arm64 - under a path
-  build.rs hardcodes. So the layout goes per-target (`lib/x64-windows/`, `lib/arm64-macos/`)
-  with build.rs selecting one, and the mac arm links `c++` explicitly: Mach-O objects carry no
-  `/DEFAULTLIB` directives, so the C++ runtime libheif and libde265 need will not link itself.
+* **`psd-sdk-sys` was nearly free**, as expected. The vendored psd_sdk is already clang-aware
+  (`PsdPch.h` sets `PSD_USE_CLANG`; `PsdPlatform.h` gates `<windows.h>` on `_WIN32`), and
+  `wrapper.cpp` reads through its own `MemoryFile : psd::File`, so `NativeFile` is never
+  instantiated. The short-circuit is gone, `PsdNativeFile.cpp` (Win32 `CreateFileW` + overlapped
+  IO) is excluded off Windows alongside the `_Linux` / `_Mac` files, `-std=c++17` stays, and `cc`
+  emits the `c++` link flag itself for a `cpp(true)` build. No new tooling.
+* **`heif-sys` needed the libs built first (D25).** The vendored tree is now one directory per
+  target (`vendor/x64-windows/`, `vendor/arm64-macos/`), each holding its *own* `include/` as well
+  as `lib/`, and build.rs picks one from `CARGO_CFG_TARGET_OS`/`_ARCH` and names `c++` explicitly
+  on macOS - Mach-O objects carry no `/DEFAULTLIB` directives, so the C++ runtime libheif and
+  libde265 need will not link itself.
+* **Headers had to go per-target too.** vcpkg's current baseline is libheif 1.23.2 against the
+  vendored Windows 1.23.0, so one shared `include/` would have had bindgen parse one version's
+  headers and link the other's libs. The drift is additive today and harmless to `wrapper.c`'s
+  subset, but the split makes that a structural guarantee rather than a standing inspection.
+* **The mac build needs a third port patch: `-DENABLE_PLUGIN_LOADING=OFF`.** libheif defaults it
+  ON, and where the platform supports plugins dav1d is then built as a *separate dynamic plugin*
+  (`plugins/libheif/libheif-dav1d.so`) instead of being compiled in. In a static build that
+  plugin is unreachable and the failure is silent - `libheif.a` links cleanly and simply has no
+  dav1d references, so every AVIF fails to decode at runtime. Windows never hit this. The
+  acceptance check is now in `VENDOR.txt`: `nm -u lib/libheif.a | grep -c dav1d` must be > 0.
 
 ### 7.3 What builds today, and what does not
 
-`cargo test -p fire-ipc` and `cargo test -p fire-decode --no-default-features` should pass on a
-Mac as soon as rustup is installed - that is the "the toolchain works" signal, and the first
-Phase 2 milestone.
+`cargo test -p fire-ipc`, `cargo test -p fire-decode` (default features, so through both native
+decoders), `heif-sys` and `psd-sdk-sys` all pass on the Mac: **109 tests**, `cargo fmt --check` and
+clippy clean. The libheif fixtures are real `.avif` / `.heic` files asserted per-pixel, so the
+static dav1d and libde265 links are proven, not merely resolved.
 
-`fire` itself will not compile, and it is not a tooling gap: `render/gpu.rs` has an
-unconditional `use crate::render::d3d11;` and calls `d3d11::Device::create()` in `bring_up`,
-while `render/mod.rs` gates that module to `cfg(windows)`; only `make_shader` has a
-non-Windows arm, and it is a stub that returns an error. `render/metal.rs` (Phase 2 step 2) is
-what unblocks it.
+`fire` now compiles and `cargo test --workspace` passes: **206 tests**, `cargo fmt --check`
+clean. Its build script needed one fix - `winresource` was guarded by a runtime
+`if target_os == "windows"` rather than a `#[cfg]`, which still has to compile on a host where
+that `cfg(windows)` build-dependency is absent, so `embed_resources` and `packed_version` are now
+`#[cfg(windows)]` with no-op twins, gated on the *host* because that is what a build script is
+compiled for.
+
+`render/gpu.rs`'s unconditional `use crate::render::d3d11;` is gone: `render/mod.rs` now aliases
+whichever platform module this build has as `backend`, and `gpu.rs` names only that. The two are
+twins rather than a trait - the target set is closed, so an alias costs nothing at runtime and
+keeps `cfg` out of the shared file - which makes the contract (`Device::create`,
+`fill_environment`, `Swapchain::{new,size,resize,acquire,present}`, `SWAPCHAIN_FORMAT`) a thing
+that must be kept in step by hand. `render/mod.rs`'s header says so.
+
+Three things the Metal side does not share with D3D11, each load-bearing:
+
+* **The backbuffer is `BGRA8Unorm`.** A `CAMetalLayer` accepts only a short list of formats and
+  RGBA8 is not among them, so `SWAPCHAIN_FORMAT` moved into the backend module. Storage order
+  only - the shader still writes float4 RGBA - so D20 is unchanged.
+* **sokol presents the drawable, not the shell.** `sg_end_pass` calls `presentDrawable:` on
+  whatever `sg_swapchain` pointed at, and `sg_commit` commits; `Swapchain::present` only releases
+  the drawable. Presenting again there would be a double present.
+* **The frame blocks at acquire, not at present.** `nextDrawable` waits for the display; D3D11
+  waits inside `Present(1, 0)`. Both are "the handoff blocked", which is what playback is paced
+  on (`viewer.rs`'s `Presented::Yes { waited }`), so `present` now *returns* that verdict and each
+  backend measures it where its own wait happens. The 500 µs threshold moved with it.
+
+What is left is the shader: `make_shader` still has only a `cfg(not(windows))` stub that returns
+an error, so a launch reaches the window and then stops there. Phase 2 step 4 is what unblocks it.
 
 ### 7.4 CI and the harness
 
@@ -421,16 +461,25 @@ nothing after them can be checked without it.
 
 1. Set the Mac up per §7.1, then get `cargo test -p fire-ipc` and
    `cargo test -p fire-decode --no-default-features` green. That is first light: it proves the
-   toolchain without needing a single line of new code.
+   toolchain without needing a single line of new code. **Done** (2026-09-04): arm64 dev Mac,
+   Xcode-beta 27.0 (27A5218g) as the active developer directory, rustup/cmake/ninja/meson/nasm/
+   pkg-config via Homebrew, vcpkg bootstrapped - both test crates pass.
 2. Native decoders (§7.2): drop the Windows-only short-circuit in `psd-sdk-sys` and exclude
    `PsdNativeFile.cpp`; build the arm64 HEIF stack with vcpkg (D25), move the vendored libs to
    per-target subdirectories, teach `heif-sys` to pick one and to link `c++`. Ends with
-   `cargo test --workspace` passing everything that does not need a window.
+   `cargo test --workspace` passing everything that does not need a window. **Done**
+   (2026-09-04): 109 tests green, fmt and clippy clean; headers went per-target too and the mac
+   libheif needed `ENABLE_PLUGIN_LOADING=OFF` (§7.2). Not yet re-verified on Windows - the
+   vendor-path move and the `cfg` gates are the parts to watch (§7.4).
 3. `render/metal.rs`: a `CAMetalLayer` on the winit window, handing sokol_gfx its `MTLDevice` at
    setup and its per-frame drawable + render-pass descriptor through `sg_swapchain` - the twin
    of `render/d3d11.rs`, same shape, same rough size. `SOKOL_BACKEND=METAL` already flows
    through both the vendored sokol build and `simgui.c` (build.rs picks `SOKOL_METAL` from the
-   target OS).
+   target OS). **Done** (2026-09-04): `fire` compiles and `cargo test --workspace` passes on the
+   Mac (206 tests), and a launch gets as far as the step-4 shader stub - proving the *device*
+   half, since `sg_setup` succeeds on the `MTLDevice` (0.83 ms) and the device itself costs
+   33 ms against D3D11's ~135 ms on Windows. The *swapchain* half is compiled but unexercised:
+   nothing reaches a frame until the shader lands. Three things the plan did not say (§7.3).
 4. Shader: adopt `sokol-shdc` (D4) so one source produces both DXBC and MSL plus the reflection,
    and compile the MSL to a `.metallib` with `xcrun metal` in build.rs (D24); verify the Windows
    output is unchanged before deleting the hand-written path. First `cargo run -p fire`.
@@ -489,6 +538,9 @@ now reports).
   `vendor/`, produced by two runs of the same recipe, cached by CI under keys that must not
   collide. The failure mode is a silently stale or wrong-arch lib, which surfaces as a link
   error at best and a mismatched ABI at worst. Keep `VENDOR.txt` the single recipe for both.
+  The sharpest instance is already known: with libheif's default `ENABLE_PLUGIN_LOADING=ON` the
+  mac build links cleanly and drops dav1d on the floor (§7.2), so re-vendoring must re-run
+  `nm -u lib/libheif.a | grep -c dav1d` rather than trust a green build.
 - **Notarization** - hardened runtime + a statically linked LGPL libheif is fine, but the
   first submission will find an entitlement or signing gap; budget an afternoon.
 - **Single-process crash exposure (D7)** - accepted; if it bites, the decode-subprocess

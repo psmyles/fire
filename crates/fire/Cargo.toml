@@ -64,6 +64,30 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Dxgi_Common",       # DXGI_FORMAT / sample desc
 ] }
 
+# The CAMetalLayer sokol_gfx draws through (render::metal) — the twin of the `windows` block
+# above, and the only place on macOS that names Metal or Core Animation. Versions match winit's
+# own objc2 family, so none of this is an extra compile.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true, features = ["NSGeometry"] }   # CGSize for drawableSize
+objc2-metal = { workspace = true, features = [
+    "MTLDevice",                        # MTLCreateSystemDefaultDevice, the device sokol runs on
+    "MTLPixelFormat",                   # the layer's BGRA8Unorm backbuffer format
+    "MTLDrawable",                      # CAMetalDrawable's base protocol
+    "MTLTexture",                       # the drawable's texture (sokol reads it, we don't)
+    "MTLResource",
+] }
+objc2-quartz-core = { workspace = true, features = [
+    "CALayer",                          # contentsScale, the layer the view hosts
+    "CAMetalLayer",                     # the layer itself: device, format, nextDrawable
+    "objc2-metal",                      # enables CAMetalLayer's MTLDevice-typed accessors
+] }
+objc2-app-kit = { workspace = true, features = [
+    "NSView",                           # setLayer:/setWantsLayer: on winit's view
+    "NSResponder",                      # NSView's superclass chain
+    "objc2-quartz-core",                # setLayer: takes a CALayer, so NSView needs the type
+] }
+
 [build-dependencies]
 # build.rs reads the canonical product metadata from ../../product.json so a single edit there
 # flows into the exe's version resource and the FIRE_* compile-time strings the app displays.

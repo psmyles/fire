@@ -95,7 +95,7 @@ fn downsample<const E: usize>(
             let y1 = (2 * y + 1).min(sh - 1);
             let r0 = &src[y0 * src_row..y0 * src_row + src_row];
             let r1 = &src[y1 * src_row..y1 * src_row + src_row];
-            for (x, dst) in drow.chunks_exact_mut(E).enumerate() {
+            for (x, dst) in drow.as_chunks_mut::<E>().0.iter_mut().enumerate() {
                 let x0 = (2 * x).min(sw - 1) * E;
                 let x1 = (2 * x + 1).min(sw - 1) * E;
                 let a = load(&r0[x0..x0 + E]);
@@ -352,7 +352,7 @@ mod tests {
         let px = vec![0u8; (w * h * 4) as usize];
         let chain = build(&px, w, h, PixelFormat::Rgba8Unorm);
         assert_eq!(chain.len(), 2); // 5×3 → 2×1 → 1×1
-        assert_eq!(chain[0].len(), 2 * 1 * 4);
+        assert_eq!(chain[0].len(), 2 * 4); // 2×1 px, 4 bytes each
         assert_eq!(chain[1].len(), 4);
         assert!(build(&px[..8], w, h, PixelFormat::Rgba8Unorm).is_empty());
     }

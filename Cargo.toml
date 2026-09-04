@@ -123,6 +123,18 @@ windows-sys = "0.60"
 # The typed `windows` crate for the COM-heavy D3D11 device / DXGI swapchain glue (render::d3d11).
 windows = "0.61"
 
+# --- macOS platform leaves (the CAMetalLayer sokol_gfx draws through: render::metal) ---
+# Pinned to the versions winit 0.30 already pulls, so the mac build compiles no extra crates.
+# `rfd` pulls a second, newer objc2 family (0.6); the two coexist because nothing passes objc2
+# types between them — this glue only hands sokol_gfx raw pointers.
+# Their default feature is only `std`; every class is opt-in, so `fire` names just the handful
+# it needs and nothing else is generated.
+objc2 = "0.5"
+objc2-foundation = "0.2"
+objc2-metal = "0.2"
+objc2-quartz-core = "0.2"
+objc2-app-kit = "0.2"
+
 # --- internal crates ---
 fire-ipc = { path = "crates/fire-ipc" }
 # `default-features = false` here is load-bearing, not tidiness: without it cargo ignores a

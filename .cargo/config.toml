@@ -1,6 +1,9 @@
-# bindgen (used only by psd-sdk-sys) loads libclang at build time. LLVM is installed
-# at C:\Program Files\LLVM and is on PATH, so bindgen normally finds libclang.dll on
-# its own. This pins the location explicitly so the FFI build is robust even if PATH
-# changes. Adjust if LLVM is installed elsewhere.
-[env]
-LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+# No LIBCLANG_PATH pin here on purpose.
+#
+# bindgen (psd-sdk-sys, heif-sys) loads libclang at build time through clang-sys, which
+# already finds it on both platforms: on Windows it globs `C:\Program Files*\LLVM\lib` and
+# the sibling `bin` (so an off-PATH LLVM still resolves), on macOS it looks inside
+# `xcode-select -p`'s XcodeDefault toolchain. An absolute path pinned here would be a
+# *global* override — `[env]` cannot be made host-conditional — so a Windows path set here
+# breaks every Mac build by short-circuiting that search. Set LIBCLANG_PATH in your own
+# environment if you need to point at a specific libclang.

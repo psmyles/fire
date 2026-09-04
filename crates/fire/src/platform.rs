@@ -13,6 +13,12 @@
 use std::path::Path;
 
 /// How the launcher asked the window to be shown.
+///
+/// Every variant is matched by the viewer on both OSes, but only [`launcher_show`]'s Windows arm
+/// ever *constructs* one — off Windows it always answers `None`, which is what the dead-code
+/// allowance is for. The alternative, `cfg`-ing the variants themselves, would make the viewer's
+/// match arms platform-specific too, which is the opposite of what this module is for.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchShow {
     Normal,

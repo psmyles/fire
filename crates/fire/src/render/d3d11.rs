@@ -14,7 +14,9 @@
 //! devices are free-threaded, and only the main thread ever touches the immediate context.
 
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
+use sokol::gfx as sg;
 use windows::core::Interface;
 use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, HWND};
 use windows::Win32::Graphics::Direct3D::{
@@ -34,6 +36,11 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
+
+/// What every window's backbuffer is created as, and what sokol_gfx is told to expect of a
+/// swapchain pass, so the viewport and ImGui pipelines match it. Plain `RGBA8`: flip-model chains
+/// disallow `*_SRGB` swapchain formats, and the image shader encodes sRGB itself (D20).
+pub const SWAPCHAIN_FORMAT: sg::PixelFormat = sg::PixelFormat::Rgba8;
 
 /// The process's D3D11 device and its immediate context — what sokol_gfx runs on.
 pub struct Device {
@@ -92,13 +99,21 @@ impl Device {
 
     /// The raw `ID3D11Device` pointer, for `sg_environment`. Not retained by the caller beyond the
     /// device's own lifetime: sokol_gfx AddRefs what it keeps.
-    pub fn raw_device(&self) -> *const c_void {
+    fn raw_device(&self) -> *const c_void {
         self.device.as_raw()
     }
 
     /// The raw immediate-context pointer, for `sg_environment`.
-    pub fn raw_context(&self) -> *const c_void {
+    fn raw_context(&self) -> *const c_void {
         self.context.as_raw()
+    }
+
+    /// Point `env` at this device and its immediate context, so `sg_setup` runs on them.
+    pub fn fill_environment(&self, env: &mut sg::Environment) {
+        env.d3d11 = sg::D3d11Environment {
+            device: self.raw_device(),
+            device_context: self.raw_context(),
+        };
     }
 }
 
@@ -183,10 +198,25 @@ impl Swapchain {
         }
     }
 
+    /// Acquire this frame's render target and point `sc` at it, returning whether there is a
+    /// frame to draw. `false` (logged) means the device refused — a device-removed reset — and
+    /// the frame is skipped rather than drawn into nothing.
+    ///
+    /// Nothing here waits on the display; a D3D11 frame blocks in [`Self::present`] instead.
+    pub fn acquire(&mut self, sc: &mut sg::Swapchain) -> bool {
+        match self.render_view() {
+            Some(view) => {
+                sc.d3d11.render_view = view;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The render-target view of the current backbuffer, as the raw pointer `sg_swapchain`
     /// takes, creating it if a resize dropped it. `None` (logged) if the device refuses — a
-    /// device-removed reset — in which case the frame is skipped rather than drawn into nothing.
-    pub fn render_view(&mut self) -> Option<*const c_void> {
+    /// device-removed reset.
+    fn render_view(&mut self) -> Option<*const c_void> {
         if self.rtv.is_none() {
             // SAFETY: buffer 0 of a live flip-model swapchain; the out-pointer is a live local.
             let made = unsafe {
@@ -217,11 +247,17 @@ impl Swapchain {
             .map(|p| p as *const c_void)
     }
 
-    /// Present the completed frame, vsync-paced (sync interval 1). Returns whether anyone is
-    /// looking: DXGI answers `DXGI_STATUS_OCCLUDED` *immediately* when the window is hidden or
-    /// fully covered, and a caller pacing playback on a present that no longer blocks would spin.
-    pub fn present(&self) -> bool {
+    /// Present the completed frame, vsync-paced (sync interval 1), and report whether its handoff
+    /// blocked on the display — the signal playback is paced on.
+    ///
+    /// Two ways it may not have blocked, and both must read as "did not wait" or a caller pacing
+    /// on it would spin: DXGI answers `DXGI_STATUS_OCCLUDED` *immediately* when the window is
+    /// hidden or fully covered, and a not-yet-full swapchain returns without waiting.
+    pub fn present(&mut self) -> bool {
+        let t0 = Instant::now();
         // SAFETY: a live swapchain; sync interval 1 with no flags is always valid.
-        unsafe { self.swapchain.Present(1, DXGI_PRESENT(0)) != DXGI_STATUS_OCCLUDED }
+        let looking = unsafe { self.swapchain.Present(1, DXGI_PRESENT(0)) != DXGI_STATUS_OCCLUDED };
+        // A vblank is >= 4 ms even at 240 Hz; a present that did not wait returns in microseconds.
+        looking && t0.elapsed() >= Duration::from_micros(500)
     }
 }

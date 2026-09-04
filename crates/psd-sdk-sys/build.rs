@@ -3,8 +3,12 @@
 //! - bindgen generates Rust FFI declarations from the C-ABI `wrapper.h`. The header is
 //!   C-style (`<stdint.h>` only) so clang-18's parse never touches the MSVC STL (avoids
 //!   STL1000); `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` is passed as belt-and-suspenders.
-//! - cc compiles the vendored psd_sdk C++ plus `wrapper.cpp` with MSVC into a static lib.
-//!   `cl.exe` (not clang) compiles the C++, so the STL constraint does not apply there.
+//! - cc compiles the vendored psd_sdk C++ plus `wrapper.cpp` into a static lib: MSVC on
+//!   Windows (`cl.exe`, not clang, so the STL constraint does not apply there), clang on
+//!   macOS. psd_sdk is already clang-aware (`PsdPch.h` sets `PSD_USE_CLANG`, `PsdPlatform.h`
+//!   gates `<windows.h>` on `_WIN32`), and `wrapper.cpp` reads through its own
+//!   `MemoryFile : psd::File`, so the per-platform `NativeFile` is never instantiated and
+//!   every platform file can be excluded from the build.
 
 use std::env;
 use std::path::PathBuf;
@@ -15,39 +19,28 @@ fn main() {
     let wrapper_h = crate_dir.join("wrapper.h");
     let wrapper_cpp = crate_dir.join("wrapper.cpp");
     let psd_dir = crate_dir.join("vendor").join("Psd");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let windows = target_os == "windows";
 
     println!("cargo:rerun-if-changed={}", wrapper_h.display());
     println!("cargo:rerun-if-changed={}", wrapper_cpp.display());
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor");
 
-    // Windows-only, like the rest of the workspace: psd_sdk and `wrapper.cpp` are compiled by MSVC
-    // (the vendored sources exclude the POSIX/Obj-C++ platform files). Short-circuit on any other
-    // host rather than failing deep inside bindgen or cl.exe with something unrecognisable.
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        // Returning with no bindings.rs would defeat the point: lib.rs's `include!` then fails
-        // with a missing-file error from inside a macro, which is *less* recognisable than the
-        // failure this short-circuit exists to avoid. Leave a stub that states the constraint.
-        std::fs::write(
-            out_dir.join("bindings.rs"),
-            "compile_error!(\"psd-sdk-sys builds only on Windows: the vendored psd_sdk and \
-             wrapper.cpp are compiled with MSVC\");\n",
-        )
-        .expect("failed to write stub bindings.rs");
-        return;
-    }
-
     // --- bindgen: C-ABI wrapper header -> Rust FFI declarations ------------------
-    let bindings = bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .header(wrapper_h.to_string_lossy())
         .clang_arg("-x")
         .clang_arg("c++")
-        .clang_arg("-std=c++17")
-        .clang_arg("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
+        .clang_arg("-std=c++17");
+    if windows {
+        builder = builder.clang_arg("-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH");
+    }
+    let bindings = builder
         .allowlist_function("fire_psd_.*")
         .allowlist_type("fire_psd.*")
         .generate()
-        .expect("bindgen failed — check that libclang.dll is on PATH / LIBCLANG_PATH is set");
+        .expect("bindgen failed — check that libclang is on PATH / LIBCLANG_PATH is set");
     bindings
         .write_to_file(out_dir.join("bindings.rs"))
         .expect("failed to write generated bindings.rs");
@@ -70,7 +63,7 @@ fn main() {
     // MSVC C++17 + exceptions. /MD (the cc default) matches Rust's default CRT.
     build.flag_if_supported("/std:c++17");
     build.flag_if_supported("/EHsc");
-    // For non-MSVC toolchains (not our target, but keeps the script honest):
+    // clang/gcc C++17 (macOS and any other non-MSVC toolchain).
     build.flag_if_supported("-std=c++17");
 
     for entry in std::fs::read_dir(&psd_dir).expect("read vendor/Psd") {
@@ -79,12 +72,20 @@ fn main() {
             continue;
         }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        // Exclude non-Windows platform sources (POSIX aio / Objective-C++).
+        // Exclude the platform `NativeFile` sources. `_Linux.cpp` is POSIX aio and `_Mac.mm`
+        // is Objective-C++ (never matched here — not a .cpp); `PsdNativeFile.cpp` is the Win32
+        // `CreateFileW` + overlapped-IO one, which only compiles under MSVC. None are reachable:
+        // `wrapper.cpp` reads through its own `MemoryFile`.
         if name.ends_with("_Linux.cpp") || name.ends_with("_Mac.cpp") {
+            continue;
+        }
+        if !windows && name == "PsdNativeFile.cpp" {
             continue;
         }
         build.file(&path);
     }
 
+    // cc emits the C++ stdlib link flag itself for a `cpp(true)` build (`c++` on macOS), so
+    // there is nothing to name here.
     build.compile("fire_psd");
 }

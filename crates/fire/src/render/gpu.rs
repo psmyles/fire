@@ -1,5 +1,5 @@
 //! GPU viewport: the decoded image drawn through sokol_gfx into the window's swapchain (the
-//! shell's — see [`crate::render::d3d11`]), into a *sub-rect* of the window (`Viewer::image_rect`)
+//! shell's — see [`crate::render::backend`]), into a *sub-rect* of the window (`Viewer::image_rect`)
 //! with the ImGui chrome over the rest.
 //! The image lives as a GPU texture with a full mip chain, and pan/zoom/exposure/channel/tonemap
 //! are just uniform values, so each frame is one textured fullscreen triangle: the per-frame CPU
@@ -32,13 +32,13 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use fire_decode::{AnimationFrame, DecodedImage, PixelFormat};
 use sokol::gfx as sg;
 use winit::window::Window;
 
-use crate::render::d3d11;
+use crate::render::backend;
 use crate::render::mips;
 use crate::render::view::{
     Background, Channel, DisplayState, Tonemap, ViewState, Viewport, ZoomDetent,
@@ -185,16 +185,17 @@ pub fn report_timing(line: &str) {
     }
 }
 
-/// The swapchain's format: what every window's backbuffer is created as (see [`d3d11`]) and what
-/// sokol_gfx is told to expect of a swapchain pass, so the viewport and ImGui pipelines match it.
-const SWAPCHAIN_FORMAT: sg::PixelFormat = sg::PixelFormat::Rgba8;
+/// The swapchain's format: what every window's backbuffer is created as and what sokol_gfx is
+/// told to expect of a swapchain pass, so the viewport and ImGui pipelines match it. The backend
+/// owns the choice — the two platforms cannot agree on one (see [`backend`]).
+use backend::SWAPCHAIN_FORMAT;
 
 /// The process's GPU: the device sokol_gfx runs on and the pipeline state on it — the viewport
 /// shader and pipeline, the two samplers and a placeholder texture. Built once, on the bring-up
 /// thread ([`Gpu::start`]), and shared by every window's surface.
 pub struct Gpu {
-    /// The D3D11 device; every window's swapchain is created on it.
-    device: d3d11::Device,
+    /// The GPU device; every window's swapchain is created on it.
+    device: backend::Device,
     _shader: sg::Shader,
     pipeline: sg::Pipeline,
     samp_aniso: sg::Sampler,
@@ -230,9 +231,9 @@ impl Gpu {
     /// set up here and used from the main thread after the join, which is the synchronization.
     pub fn bring_up() -> Result<Gpu, String> {
         let t = Instant::now();
-        let device = d3d11::Device::create()?;
+        let device = backend::Device::create()?;
         report_timing(&format!(
-            "d3d11 device — {:.2} ms",
+            "gpu device — {:.2} ms",
             t.elapsed().as_secs_f64() * 1e3
         ));
 
@@ -243,17 +244,14 @@ impl Gpu {
             depth_format: sg::PixelFormat::None,
             sample_count: 1,
         };
-        desc.environment.d3d11 = sg::D3d11Environment {
-            device: device.raw_device(),
-            device_context: device.raw_context(),
-        };
+        device.fill_environment(&mut desc.environment);
         desc.logger = sg::Logger {
             func: Some(sokol::log::slog_func),
             user_data: std::ptr::null_mut(),
         };
         sg::setup(&desc);
         if !sg::isvalid() {
-            return Err("sokol_gfx could not be set up on the D3D11 device".into());
+            return Err("sokol_gfx could not be set up on the GPU device".into());
         }
         report_timing(&format!(
             "sg setup — {:.2} ms",
@@ -269,12 +267,12 @@ impl Gpu {
         window: &Window,
         width: u32,
         height: u32,
-    ) -> Result<d3d11::Swapchain, String> {
-        d3d11::Swapchain::new(&self.device, window, width, height)
+    ) -> Result<backend::Swapchain, String> {
+        backend::Swapchain::new(&self.device, window, width, height)
     }
 
     /// Build the pipeline state on the (set-up) sokol_gfx.
-    fn pipeline_state(device: d3d11::Device) -> Result<Gpu, String> {
+    fn pipeline_state(device: backend::Device) -> Result<Gpu, String> {
         let t = Instant::now();
         let shader = make_shader()?;
 
@@ -586,7 +584,7 @@ pub struct GpuSurface {
     gpu: Rc<Gpu>,
     window: Arc<Window>,
     /// The window's swapchain, sized to its client.
-    swapchain: d3d11::Swapchain,
+    swapchain: backend::Swapchain,
     /// The image texture + the two samplers, ready to apply. Rebuilt whenever the texture changes.
     bindings: sg::Bindings,
 
@@ -1083,16 +1081,15 @@ impl GpuSurface {
         if sw == 0 || sh == 0 {
             return Presented::Skipped;
         }
-        let Some(render_view) = self.swapchain.render_view() else {
-            return Presented::Skipped;
-        };
         let mut swapchain = sg::Swapchain::new();
         swapchain.width = sw as i32;
         swapchain.height = sh as i32;
         swapchain.sample_count = 1;
         swapchain.color_format = SWAPCHAIN_FORMAT;
         swapchain.depth_format = sg::PixelFormat::None;
-        swapchain.d3d11.render_view = render_view;
+        if !self.swapchain.acquire(&mut swapchain) {
+            return Presented::Skipped;
+        }
         let mut pass = sg::Pass::new();
         pass.swapchain = swapchain;
         let c = self.chrome_clear;
@@ -1136,11 +1133,9 @@ impl GpuSurface {
 
         sg::end_pass();
         sg::commit();
-        let t0 = Instant::now();
-        let looking = self.swapchain.present();
-        // Did the present block on the display? A vblank is ≥4 ms even at 240 Hz; a present that
-        // did not wait returns in microseconds.
-        let waited = looking && t0.elapsed() >= Duration::from_micros(500);
+        // Whether the frame's handoff blocked on the display. Which call that was is the
+        // backend's business: `Present(1, 0)` on D3D11, `nextDrawable` on Metal.
+        let waited = self.swapchain.present();
         if self.tex.current.is_some() {
             // Measurement hook: inert unless `FIRE_TTFP_OUT` is set (see `crate::ttfp`).
             crate::ttfp::stamp_first_pixel();

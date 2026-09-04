@@ -25,6 +25,9 @@ struct Product {
     homepage: String,
 }
 
+#[cfg(not(windows))]
+fn embed_resources(_p: &Product) {}
+
 fn main() {
     let product = read_product();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -305,6 +308,13 @@ fn find_fxc() -> PathBuf {
 /// Embed the Fire `.ico` + product metadata into the exe (Explorer file icon, Task Manager name,
 /// file-properties version tab). Every string comes from `product.json` so the binary's metadata
 /// can never drift from the installer's.
+///
+/// Gated on `cfg(windows)` — the *host* — not on `target_os`: a build script is compiled for the
+/// host, so `winresource` (a `cfg(windows)` build-dependency) is only in scope on a Windows host
+/// and a runtime `if` around this call would still have to compile off it. The caller keeps its
+/// `target_os` check, so the pair reads as "Windows target, built on Windows"; a cross-build from
+/// another host would no-op rather than embed, which is the honest outcome — the tool isn't there.
+#[cfg(windows)]
 fn embed_resources(p: &Product) {
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
     let ico = Path::new(&manifest).join("../../assets/fire.ico");
@@ -336,6 +346,9 @@ fn embed_resources(p: &Product) {
 /// (`major<<48 | minor<<32 | patch<<16 | build`). Missing components default to 0; each field
 /// is 16 bits, so a component above 65535 is clamped rather than silently bleeding into its
 /// neighbour.
+///
+/// `cfg(windows)` for the same reason as [`embed_resources`], its only caller.
+#[cfg(windows)]
 fn packed_version(version: &str) -> u64 {
     let mut fields = [0u64; 4];
     for (field, part) in fields.iter_mut().zip(version.split('.')) {

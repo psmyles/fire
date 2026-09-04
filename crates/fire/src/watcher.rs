@@ -230,23 +230,30 @@ mod tests {
     use super::*;
     use notify::event::{CreateKind, RemoveKind};
 
-    fn ev(kind: EventKind, path: &str) -> Event {
+    fn ev(kind: EventKind, path: PathBuf) -> Event {
         Event {
             kind,
-            paths: vec![PathBuf::from(path)],
+            paths: vec![path],
             attrs: Default::default(),
         }
+    }
+
+    /// A platform-native `d/<name>`. Built through `join` rather than written as a literal:
+    /// a `r"C:\d\photo.png"` reads as a directory and a file on Windows but as one long
+    /// file name with no parent on macOS, which would test something different on each OS.
+    fn at(name: &str) -> PathBuf {
+        Path::new("d").join(name)
     }
 
     #[test]
     fn relevant_matches_target_name_case_insensitively() {
         let name = "photo.png".to_string(); // stored lowercased by retarget
         assert!(event_is_relevant(
-            &ev(EventKind::Modify(ModifyKind::Any), r"C:\d\PHOTO.PNG"),
+            &ev(EventKind::Modify(ModifyKind::Any), at("PHOTO.PNG")),
             &name
         ));
         assert!(event_is_relevant(
-            &ev(EventKind::Create(CreateKind::Any), r"C:\d\photo.png"),
+            &ev(EventKind::Create(CreateKind::Any), at("photo.png")),
             &name
         ));
     }
@@ -256,12 +263,12 @@ mod tests {
         let name = "photo.png".to_string();
         // A different file changing in the same watched directory must not reload us.
         assert!(!event_is_relevant(
-            &ev(EventKind::Modify(ModifyKind::Any), r"C:\d\other.png"),
+            &ev(EventKind::Modify(ModifyKind::Any), at("other.png")),
             &name
         ));
         // A delete of the target is ignored — we keep showing the last good image.
         assert!(!event_is_relevant(
-            &ev(EventKind::Remove(RemoveKind::Any), r"C:\d\photo.png"),
+            &ev(EventKind::Remove(RemoveKind::Any), at("photo.png")),
             &name
         ));
     }
@@ -269,9 +276,6 @@ mod tests {
     #[test]
     fn parent_dir_uses_cwd_for_a_bare_name() {
         assert_eq!(parent_dir(Path::new("img.png")), PathBuf::from("."));
-        assert_eq!(
-            parent_dir(Path::new(r"C:\d\img.png")),
-            PathBuf::from(r"C:\d")
-        );
+        assert_eq!(parent_dir(&at("img.png")), PathBuf::from("d"));
     }
 }
