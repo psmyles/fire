@@ -146,9 +146,6 @@ impl Fire {
         }
     }
 
-    /// Open a new viewer window. `initial` is the launch path whose decode is already in flight;
-    /// `open` is a request to decode now. On failure with no window up at all, report and exit —
-    /// there is nothing to show.
     /// The GPU: the bring-up thread's result the first time, then the shared handle.
     fn gpu(&mut self) -> Result<Rc<Gpu>, String> {
         if let Some(g) = &self.gpu {
@@ -171,6 +168,9 @@ impl Fire {
         Ok(gpu)
     }
 
+    /// Open a new viewer window. `initial` is the launch path whose decode is already in flight;
+    /// `open` is a request to decode now. On failure with no window up at all, report and exit —
+    /// there is nothing to show.
     fn create_viewer(
         &mut self,
         el: &ActiveEventLoop,

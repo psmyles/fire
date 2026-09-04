@@ -36,11 +36,23 @@ pub fn socket_name() -> io::Result<Name<'static>> {
     }
 }
 
-/// Try to become the instance owner. `Err(AddrInUse)` means another Fire already is — forward to
-/// it. Any other error means the OS refused the socket outright; the caller runs without serving,
-/// which degrades to "every launch is its own process" rather than refusing to open.
+/// Try to become the instance owner. An error for which [`is_taken`] holds means another Fire
+/// already is — forward to it. Any other error means the OS refused the socket outright; the
+/// caller runs without serving, which degrades to "every launch is its own process" rather than
+/// refusing to open.
 pub fn bind() -> io::Result<Listener> {
     ListenerOptions::new().name(socket_name()?).create_sync()
+}
+
+/// Whether a [`bind`] error means "another instance holds the name". A Unix socket reports
+/// `AddrInUse`; a Windows named pipe created with `FILE_FLAG_FIRST_PIPE_INSTANCE` (which is how
+/// `interprocess` makes the first instance exclusive) fails with `ERROR_ACCESS_DENIED`, i.e.
+/// `PermissionDenied`, when the name already exists.
+pub fn is_taken(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+    )
 }
 
 /// Serve `listener` on a background thread for the life of the process, sending each forwarded

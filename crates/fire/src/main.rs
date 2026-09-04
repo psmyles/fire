@@ -59,13 +59,17 @@ fn main() {
 
     let listener = match ipc_server::bind() {
         Ok(l) => Some(l),
-        // Another Fire owns the socket: hand it the path and exit.
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            if let Err(e) = forward::forward(path) {
-                eprintln!("fire: forward to running instance failed: {e}");
+        // Another Fire owns the socket: hand it the path and exit. (`AddrInUse` is the Unix
+        // socket's answer; a Windows named pipe created with FILE_FLAG_FIRST_PIPE_INSTANCE says
+        // `PermissionDenied` instead.) If the owner cannot be reached after all — it was exiting
+        // as we launched — fall through and run un-coordinated rather than lose the open.
+        Err(e) if ipc_server::is_taken(&e) => match forward::forward(path.clone()) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("fire: forward to running instance failed ({e}); opening here");
+                None
             }
-            return;
-        }
+        },
         // The OS refused the socket outright. Run anyway, un-coordinated: refusing to open an
         // image over a missing convenience would be the wrong trade.
         Err(e) => {
