@@ -384,6 +384,15 @@ impl ApplicationHandler<AppEvent> for Fire {
             return;
         }
         self.started = true;
+        // AppKit does a great deal between `run_app` and the first `resumed` — `finishLaunching`,
+        // activation, the launch Apple event — and none of the phase timers below can see any of
+        // it, because they all start inside the window creation this is about to do. Reported from
+        // the process-creation clock so it lines up with the TTFP number rather than with an
+        // `Instant` of its own.
+        crate::render::gpu::report_timing(&format!(
+            "process start → first resumed — {:.2} ms",
+            crate::ttfp::ms_since_start()
+        ));
         firewall("startup", || {
             let initial = self.initial.take();
             // On macOS a launch-by-open arrives as an Apple event *before* this point, not as an

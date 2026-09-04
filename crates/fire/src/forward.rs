@@ -13,7 +13,19 @@ use fire_ipc::{write_message, OpenRequest};
 use crate::ipc_server::socket_name;
 
 /// The owner may still be creating its socket when we lose the bind race; retry briefly.
+///
+/// Two budgets, because the two failures mean different things. **The name is not there yet**
+/// (`NotFound`, or a Windows pipe reporting every instance busy) is a genuine "not ready" and the
+/// owner may be anywhere in its own startup, so it is worth waiting seconds for. **The name is
+/// there and refuses** (`ConnectionRefused`) is a Unix socket file whose owner is gone; nothing is
+/// ever going to start answering it. The only reason to retry that at all is the microscopic
+/// window between an owner's `bind` and its `listen` — so the budget is short rather than zero:
+/// long enough that a simultaneous launch cannot mistake a live owner for a corpse and steal the
+/// socket from under it (see [`crate::ipc_server::rebind_after_stale`]), short enough that
+/// recovering from a killed one is not a visible stall. It was the full two seconds before, which
+/// is where the +2.0 s measured after every quit went.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const REFUSED_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Forward `path` to the running owner, granting it foreground rights first (§4.1 of the
 /// architecture notes — a Windows leaf; a no-op elsewhere). No-op if there is no path (a bare
@@ -37,11 +49,11 @@ pub fn forward(path: Option<PathBuf>) -> io::Result<()> {
 }
 
 fn connect_retry(timeout: Duration) -> io::Result<Stream> {
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
     loop {
         match Stream::connect(socket_name()?) {
             Ok(s) => return Ok(s),
-            Err(e) if is_transient(&e) && Instant::now() < deadline => {
+            Err(e) if start.elapsed() < budget(&e, timeout) => {
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => return Err(e),
@@ -49,12 +61,17 @@ fn connect_retry(timeout: Duration) -> io::Result<Stream> {
     }
 }
 
-/// "Not there yet" (the owner is still binding) or "busy" (every pipe instance is mid-accept).
-fn is_transient(e: &io::Error) -> bool {
+/// How long `e` is worth retrying: the caller's full budget for "not there yet" (the owner is
+/// still binding) or "busy" (every pipe instance is mid-accept), the short one for a refusal, and
+/// none at all for anything else.
+fn budget(e: &io::Error, timeout: Duration) -> Duration {
     /// `ERROR_PIPE_BUSY`: all pipe instances are momentarily busy; retry shortly.
     const ERROR_PIPE_BUSY: i32 = 231;
-    matches!(
-        e.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-    ) || e.raw_os_error() == Some(ERROR_PIPE_BUSY)
+    if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(ERROR_PIPE_BUSY) {
+        timeout
+    } else if e.kind() == io::ErrorKind::ConnectionRefused {
+        REFUSED_TIMEOUT.min(timeout)
+    } else {
+        Duration::ZERO
+    }
 }

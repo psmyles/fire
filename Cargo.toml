@@ -129,6 +129,9 @@ windows = "0.61"
 # types between them — this glue only hands sokol_gfx raw pointers.
 # Their default feature is only `std`; every class is opt-in, so `fire` names just the handful
 # it needs and nothing else is generated.
+# The two unix leaves: the socket file's `atexit`/`unlink`, and the process-creation clock
+# behind the TTFP stamp (`proc_pidinfo`).
+libc = "0.2"
 objc2 = "0.5"
 objc2-foundation = "0.2"
 objc2-metal = "0.2"

@@ -49,6 +49,15 @@ use config::Config;
 use decode_pool::{fresh_generation, DecodeJob, DecodePool};
 
 fn main() {
+    // What it cost to reach the first line of `main`: the loader, the runtime, and nothing of
+    // ours. Every other phase below is measured from an `Instant` taken inside the process and so
+    // cannot see any of it — which is also why the TTFP stamp's origin is the kernel's
+    // process-creation time rather than a mark taken here (see `ttfp`).
+    render::gpu::report_timing(&format!(
+        "process start → main — {:.2} ms",
+        ttfp::ms_since_start()
+    ));
+
     // The file manager passes the double-clicked file as the first argument.
     let path: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);
     // Drop a commented config.toml on first run (no-op if one already exists), so the settings are
@@ -125,6 +134,12 @@ fn main() {
     });
 
     if let Some(listener) = listener {
+        // We are the owner, so we are the one that has to take the socket away again. Where the
+        // socket is a file it outlives us otherwise, and ⌘Q — AppKit's `terminate:`, which ends in
+        // `exit()` — never runs a destructor, so *every* normal quit would leave one behind and
+        // cost the next launch the whole connect timeout. Registered only here, on the owning
+        // branch: a forwarding launch deleting this file would be deleting someone else's.
+        ipc_server::unlink_on_exit();
         ipc_server::spawn(listener, proxy.clone());
     }
 

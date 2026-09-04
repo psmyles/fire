@@ -22,21 +22,41 @@ use fire_ipc::{read_message, SOCKET_NAME};
 
 use crate::app::AppEvent;
 
-/// The socket's name on this OS: a namespaced name where the OS has a namespace for them
-/// (Windows named pipes, Linux abstract sockets), else a socket file under the user's runtime
-/// directory.
+/// The socket file's path, on the OSes where the socket *is* a file. `None` where the name lives
+/// in a kernel namespace instead (Windows named pipes, Linux abstract sockets) and there is no
+/// file to speak of.
 ///
-/// macOS takes the *namespaced* branch even though it has no abstract sockets — `interprocess`
-/// emulates the namespace with a file in the temp directory. That matters below: "namespaced"
-/// does not imply "the kernel cleans it up".
+/// Under the user's cache directory rather than a shared temp dir: a socket in `/tmp` is one name
+/// for the whole machine, so two people logged into the same Mac would fight over it, and the
+/// second would be told the instance was "already running" by a process it cannot see.
+pub fn socket_file_path() -> Option<std::path::PathBuf> {
+    if namespace_is_the_kernel_s() {
+        return None;
+    }
+    let dir = dirs::runtime_dir()
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    Some(dir.join(SOCKET_NAME))
+}
+
+/// Whether this OS's local-socket namespace is the *kernel's* — so the name disappears when its
+/// owner does, with no file left behind.
+///
+/// `GenericNamespaced::is_supported()` alone is not that question. It answers "can I pass a bare
+/// name", and on macOS it says yes and then `interprocess` emulates the namespace with a file in
+/// the temp directory — a name that outlives its owner while claiming not to. Everything that
+/// follows a crashed owner ([`rebind_after_stale`], [`unlink_on_exit`]) turns on the distinction,
+/// so it is asked here rather than inferred.
+fn namespace_is_the_kernel_s() -> bool {
+    GenericNamespaced::is_supported() && !cfg!(target_vendor = "apple")
+}
+
+/// The socket's name on this OS: a namespaced name where the kernel owns the namespace, else an
+/// explicit socket file path.
 pub fn socket_name() -> io::Result<Name<'static>> {
-    if GenericNamespaced::is_supported() {
-        SOCKET_NAME.to_ns_name::<GenericNamespaced>()
-    } else {
-        let dir = dirs::runtime_dir()
-            .or_else(dirs::cache_dir)
-            .unwrap_or_else(std::env::temp_dir);
-        dir.join(SOCKET_NAME).to_fs_name::<GenericFilePath>()
+    match socket_file_path() {
+        None => SOCKET_NAME.to_ns_name::<GenericNamespaced>(),
+        Some(path) => path.to_fs_name::<GenericFilePath>(),
     }
 }
 
@@ -71,15 +91,61 @@ pub fn is_taken(e: &io::Error) -> bool {
 /// nothing but still fails every later `bind` with `AddrInUse`. Left alone, that made every launch
 /// stall on the connect timeout and, with no path to forward, exit without ever showing a window.
 ///
-/// Letting `interprocess` do the deleting is the point: it knows where the socket actually is.
-/// macOS reports namespaced names as supported and then puts the "namespace" in the filesystem,
-/// so computing the path here would have looked right and quietly done nothing.
+/// `try_overwrite` does the deleting rather than an `unlink` of our own, so the two paths that
+/// remove the socket cannot disagree about where it is.
 pub fn rebind_after_stale() -> io::Result<Listener> {
     ListenerOptions::new()
         .name(socket_name()?)
         .try_overwrite(true)
         .create_sync()
 }
+
+/// Have the socket file removed when this process exits, however it exits.
+///
+/// **Only the owner may call this**, and only after its own bind succeeded: a launch that merely
+/// *forwards* would otherwise delete the socket of the instance it just talked to.
+///
+/// Rust's `Drop` is not enough on macOS, and the gap is not an edge case. ⌘Q is AppKit's
+/// `terminate:`, which ends in `exit()` — `main` never returns, the [`Listener`] is never dropped,
+/// and the socket file survives its owner. The next launch then finds the name taken, spends the
+/// whole connect timeout discovering that nobody answers, and only then reclaims it: measured at
+/// **+2.0 s on every launch after a normal quit** (168 ms → 2196 ms) before this existed. `atexit`
+/// runs on that path, on a plain `main` return, and on the [`crate::ttfp`] stamp's `exit(0)`.
+///
+/// What it deliberately does not cover is `SIGKILL` and a hard crash, where no user code runs at
+/// all. [`rebind_after_stale`] is still the answer there — this only makes it the rare path it was
+/// meant to be.
+#[cfg(unix)]
+pub fn unlink_on_exit() {
+    let Some(path) = socket_file_path() else {
+        return; // A kernel-owned name needs no help.
+    };
+    // The handler gets no arguments, so the path has to reach it through a static. Written once,
+    // before the handler can run, and only read afterwards.
+    static PATH: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    let Ok(c_path) = std::ffi::CString::new(path.into_os_string().into_encoded_bytes()) else {
+        return; // A path with an interior NUL is not one we created.
+    };
+    if PATH.set(c_path).is_err() {
+        return; // Already registered; registering twice would unlink twice.
+    }
+    extern "C" fn unlink_socket() {
+        if let Some(path) = PATH.get() {
+            // SAFETY: a NUL-terminated path that outlives the call. `atexit` handlers run on the
+            // exiting thread with the process otherwise winding down, so this is not a signal
+            // context and an ordinary libc call is fine. A failure means it is already gone.
+            unsafe { libc::unlink(path.as_ptr()) };
+        }
+    }
+    // SAFETY: registering a plain `extern "C" fn` with no arguments, which is exactly what
+    // `atexit` takes.
+    unsafe { libc::atexit(unlink_socket) };
+}
+
+/// The twin for the OSes whose local-socket name the kernel owns — nothing to unlink, so nothing
+/// to register. Windows is the only one `fire` ships, and its named pipe dies with the process.
+#[cfg(not(unix))]
+pub fn unlink_on_exit() {}
 
 /// Serve `listener` on a background thread for the life of the process, sending each forwarded
 /// open to the event loop.

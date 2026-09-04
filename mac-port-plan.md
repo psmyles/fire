@@ -147,10 +147,18 @@ the two-second connect timeout, and a launch *with no path to forward* exited im
 window at all — `forward(None)` returned `Ok` without ever connecting, and `Ok` means "forwarded,
 now exit". A double-clicked Fire flashed in the Dock and vanished, permanently, until the file
 was deleted by hand. The fix is in three places: `forward(None)` now connects, so it can fail;
-`ipc_server::reclaim_stale` unlinks a socket only once a forward has already proved nobody
+`ipc_server::rebind_after_stale` unlinks a socket only once a forward has already proved nobody
 answers; and `main` then re-binds and serves, so the first launch after a crash repairs the state
 instead of running un-coordinated. Windows cannot reach any of it — there is no file to go
 stale — but the no-path probe makes it honest there too.
+
+**That was the recovery, not the cure**, and step 7's measurement showed how much was still being
+left to it. `SIGKILL` is not the common way a socket goes stale on macOS — **⌘Q is**. AppKit's
+`terminate:` ends in `exit()`, so `main` never returns and the `Listener` is never dropped: every
+ordinary quit left a socket, and the next launch paid the full connect timeout to rediscover that
+(168 ms → 2196 ms, measured). The owner now registers an `atexit` `unlink` of its own socket, and
+a refusal — as opposed to a name that is merely not there yet — is retried for 150 ms rather than
+two seconds. See Phase 2 step 7.
 
 The Windows foreground handoff (`AllowSetForegroundWindow` on the forwarding side,
 `focus_window()` on the owner) stays exactly as in `architecture.md` §4.1, as a `cfg(windows)`
@@ -443,12 +451,21 @@ Both legs are mandatory rather than nice-to-have: clippy on Windows never sees `
 and clippy on macOS never sees `render/d3d11.rs`, so a single-host CI cannot keep the workspace
 lint-clean once the second leaf exists.
 
-`scripts/ttfp.ps1` is PowerShell; it gets a shell twin (or runs under `pwsh`). `ttfp.rs`'s
-non-Windows arm does not yet measure anything: it initialises its `OnceLock` start instant inside
-the measurement itself, so it always reports ~0.000 ms. Step 7 has to give it a real origin -
-`kinfo_proc.kp_proc.p_starttime` via sysctl is the true equivalent of the Windows arm's kernel
-process-creation time, and unlike an `Instant` set in `main` it sees dyld. Either way mac numbers
-compare mac builds against each other; the Windows figures in §8 are not a baseline for them.
+`scripts/ttfp.ps1` has a shell twin, `scripts/ttfp.sh` - same method, same interleaving, so a
+number taken with either was taken the same way. It is written for the bash macOS actually ships
+(3.2): a measurement harness that only runs where extra tools are installed is not much of a
+harness. `ttfp.rs`'s non-Windows arm used to initialise its `OnceLock` start instant *inside* the
+measurement and so always reported ~0.000 ms; the mac arm now reads the kernel's own
+process-creation time via `proc_pidinfo(PROC_PIDTBSDINFO)` - the direct equivalent of the Windows
+arm's `GetProcessTimes`, and `libproc` rather than the `kinfo_proc` sysctl this document first
+guessed at, because `libc` exposes `proc_bsdinfo` on Apple and has no `kinfo_proc` there. Any
+remaining platform gets `f64::NAN`, which the harness rejects: "not measured here" should not look
+like a result. Mac numbers compare mac builds against each other; the Windows figures in §8 are not
+a baseline for them.
+
+Measuring it immediately proved the origin matters. On a **cold** launch `process start → main` is
+**514 ms of a 692 ms** TTFP - the loader, before a line of ours runs. An `Instant` taken at the top
+of `main` would have reported 178 ms and hidden the whole story.
 
 ---
 
@@ -596,7 +613,54 @@ nothing after them can be checked without it.
    The config states the ladder in percent, so the 100 rung is `100.0 / 100.0` — exactly 1.0.
 7. Measure: the mac twin of `scripts/ttfp.ps1` (§7.4) and a launch-path breakdown, so the Metal
    bring-up gets the same scrutiny the D3D11 one did. There is no cross-OS budget - the number
-   to beat is the next mac build's.
+   to beat is the next mac build's. **Done** (2026-09-04).
+
+   **The measurement found a 2-second bug before it could measure anything.** ⌘Q is AppKit's
+   `terminate:`, which ends in `exit()`: `main` never returns, so the instance socket's `Listener`
+   is never dropped and the socket *file* outlives its owner. The next launch then found the name
+   taken, spent the whole 2 s connect timeout discovering nobody answers, and only then reclaimed
+   it. Measured: **168 ms → 2196 ms on every launch after a normal quit**, reproducible on the
+   `terminate:` path and not a corner case at all. Two fixes, both verified:
+   * The owner - and only the owner, since a forwarding launch would be deleting someone else's -
+     registers an `atexit` `unlink` of its socket (`ipc_server::unlink_on_exit`). That covers ⌘Q, a
+     plain `main` return, and the TTFP stamp's own `exit(0)`. Eight back-to-back launches now leave
+     no socket behind and hold ~170 ms.
+   * The connect retry budget was one number for two unrelated failures. "The name is not there
+     yet" (`NotFound` / `ERROR_PIPE_BUSY`) still gets the full 2 s; "the name is there and refuses"
+     (`ConnectionRefused`) - a socket file whose owner is gone, which nothing will ever start
+     answering - gets 150 ms, enough to cover the window between a live owner's `bind` and its
+     `listen` and no more. `SIGKILL` recovery, where no `atexit` can run, went **2196 ms → 320 ms**.
+
+   Making the socket's location knowable was the enabling change: `GenericNamespaced::is_supported()`
+   answers "can I pass a bare name", not "does the kernel own the name", and on macOS it says yes
+   and then emulates the namespace with a file in `/tmp`. macOS now takes the explicit-path branch,
+   which also moves the socket out of a world-writable shared directory into the user's own - two
+   people on one Mac were sharing `/tmp/fire.sock`.
+
+   **Baseline** (`scripts/ttfp.sh`, release, 8 interleaved launches per cell, the same binary as
+   both A and B so the columns also measure the harness's own noise):
+
+   | Image | median | mean | sd | harness noise (A vs B, same binary) |
+   | --- | --- | --- | --- | --- |
+   | 130 KB JPEG (1280×853) | 170.8 ms | 172.7 ms | 8.9-11.6 | 0.0 ms |
+   | 27.5 MB PNG (4096×4096) | 224.5 ms | 222.0 ms | 3.7-5.0 | 6.0 ms |
+
+   **Warm launch-path breakdown** (`FIRE_TIMING=1`, ~172 ms total):
+
+   | Phase | ms | |
+   | --- | --- | --- |
+   | process start → `main` | ~11 | loader + runtime; nothing of ours |
+   | `main` → first `resumed` | ~75 | AppKit `finishLaunching` + activation, inside `run_app` |
+   | window creation | ~31 | |
+   | swapchain / ImGui | 0.3 / 2.2 | |
+   | **GPU join wait** | **0.01** | the 34 ms Metal device is *entirely* hidden behind the window - D18 doing exactly what it was for |
+   | first frame + vsync | ~52 | the remainder |
+
+   Two things worth carrying into any later optimisation. The largest single item is **AppKit's own
+   launch (~75 ms), which is not ours to remove**, and the second is window creation (~31 ms) -
+   which together are why the mac number sits where it does. And the first launch after a build is
+   an outlier well beyond the loader cost (pipeline 58 ms vs 0.9 ms warm, ImGui 9.8 vs 2.2), so a
+   warm-up launch before measuring is not optional.
 8. CI (§7.4): the `macos-latest` matrix leg, with the vendor cache keyed per target.
 9. `build-mac.sh`: `.app` layout, `Info.plist` from `product.json` (every extension from the
    installer's list, `LSHandlerRank = Alternate`, `CFBundleIconFile`), `codesign --options

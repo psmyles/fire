@@ -632,6 +632,7 @@ dependencies = [
  "fire-decode",
  "fire-ipc",
  "interprocess",
+ "libc",
  "muda",
  "notify",
  "objc2 0.5.2",

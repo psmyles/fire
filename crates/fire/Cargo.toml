@@ -67,6 +67,12 @@ windows = { workspace = true, features = [
 # The CAMetalLayer sokol_gfx draws through (render::metal) — the twin of the `windows` block
 # above, and the only place on macOS that names Metal or Core Animation. Versions match winit's
 # own objc2 family, so none of this is an extra compile.
+# `atexit` + `unlink`, so the owner takes its socket file with it (`ipc_server::unlink_on_exit`),
+# and — on macOS — the kernel's process-creation time behind the TTFP stamp (`ttfp.rs`), the twin
+# of the Windows arm's GetProcessTimes. Two leaves; nothing else names libc.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true, features = [
