@@ -66,7 +66,7 @@ Each is stated with the reason and what it costs, so a future revision can revis
 | D3 | **`dear-imgui-rs` Context + `dear-imgui-winit` (input) + `sokol_imgui` (renderer)** replace `dear-imgui-sys` + the C++ win32/dx11 shims | No per-OS backend code of our own; the renderer is the same header sokol_gfx's author maintains beside it | `ui/` moved from the raw 10-function ABI to the safe API; `simgui.c` must compile against the same cimgui `dear-imgui-sys` links (D22) | Shipped |
 | D4 | **Shader is precompiled to bytecode on both OSes** - HLSL → DXBC by `fxc` today; for macOS, **adopt `sokol-shdc`**: one annotated-GLSL source generating HLSL + MSL *and* the `ShaderDesc` reflection, with the MSL compiled to a `.metallib` by `xcrun metal` (D24) | Nothing on the cold-start path (no runtime shader compile) on either OS, and a broken shader is a build error; one source beats two hand-kept-in-sync twins once a second backend exists | `fxc` + the Windows SDK on Windows, the Metal toolchain on macOS (D24). The shader is now one annotated-GLSL source; `scripts/gen-shaders.sh` generates the per-backend sources *and* the `ShaderDesc` into `render/generated/`, checked in, and build.rs compiles the host's pair to bytecode. `make_shader` keeps only the bytecode swap | Shipped (HLSL half needs a Windows build to confirm) |
 | D5 | **One process, N windows** everywhere (instance mode is `open-in = new-window \| reuse-window`) | Finder never launches a second process - it sends an open-file event to the running app - so per-launch processes have no mac equivalent; winit runs N windows in one loop cleanly | Windows NewWindow users get the same UX from one process; crash isolation is per-process (D7) | Shipped |
-| D6 | **IPC via the `interprocess` crate** (named pipe / Unix socket behind one API) on both OSes | One forward path, one test | macOS also needs the Apple-Event hook (§5) feeding the same open path | Shipped (mac hook planned) |
+| D6 | **IPC via the `interprocess` crate** (named pipe / Unix socket behind one API) on both OSes | One forward path, one test | macOS also needs the Apple-Event hook (§5) feeding the same open path, which reaches it by adding `application:openURLs:` to winit's delegate class at runtime | Shipped |
 | D7 | **Accept single-process crash exposure** | FFI already runs under `catch_unwind` on a worker with validated inputs; a viewer has no unsaved state | A true segfault in libheif/psd_sdk closes every window, not one | Accepted |
 | D8 | **Timers: `ControlFlow::WaitUntil` + a deadline min-heap** | Preserves the event-driven invariant (no input, no timer → no frame) with zero threads | Small scheduler in the app; every timer (GIF, flipbook, caret) goes through it | Shipped |
 | D9 | **Keybinds: physical `KeyCode` by name + a `Primary` modifier** (Ctrl on Windows, ⌘ on macOS) | Layout-independent, one `config.toml` works on both | One-time migration of existing VK-code chords; `Ctrl+`/`Cmd+` still parse as `Primary+` | Shipped |
@@ -75,8 +75,8 @@ Each is stated with the reason and what it costs, so a future revision can revis
 | D12 | **Packaging: `scripts/build-mac.sh` + `Info.plist` template from `product.json`, signed + notarized `.dmg`** | Mirrors `build-installer.ps1`; plist is hand-tuned anyway (cargo-bundle would hide it) | `.dmg` is more script than `.zip`; accepted for polish | Planned |
 | D13 | **Windows first, then macOS** | The shared code and the TTFP risk were the Windows migration; mac is leaves + packaging | Colleagues wait one extra phase | Done |
 | D14 | *(wgpu-era: pinned backend, no debug layers, decode kicked off before device creation)* | - | - | Superseded (A.2); the surviving idea is D18 |
-| D15 | **Pinch-to-zoom mapped to the wheel zoom; 1:1 = one texel per *physical* pixel** | Crisp on Retina, matches what artists mean by 100 %, zoom-snap ladder stays in image space | `scale_factor` enters the fit/1:1 math | 1:1-in-physical-px shipped; pinch planned |
-| D16 | **Minimal macOS menu bar via `muda`; F11 / Ctrl-Cmd-F → winit native fullscreen** | A Mac app without a menu bar can't Cmd-Q and reads as broken; native fullscreen gives the space transition | ~40 lines, all `cfg(target_os = "macos")` | Planned |
+| D15 | **Pinch-to-zoom mapped to the wheel zoom; 1:1 = one texel per *physical* pixel** | Crisp on Retina, matches what artists mean by 100 %, zoom-snap ladder stays in image space | `scale_factor` enters the fit/1:1 math | Shipped (pinch maps `WindowEvent::PinchGesture`'s incremental magnification to the wheel's about-cursor zoom; NaN filtered, as winit permits one) |
+| D16 | **Minimal macOS menu bar via `muda`; fullscreen via winit** | A Mac app without a menu bar reads as broken; native fullscreen gives the space transition | ~180 lines in `menubar.rs`, all `cfg(target_os = "macos")`, plus two crates (`muda`, `keyboard-types`) that reuse winit's objc2 family. Two corrections to the premise: winit *already* installs a default menu bar carrying ⌘Q, so it had to be disabled (`with_default_menu(false)`) or it replaced ours wholesale — and it means the app was never actually unquittable. Fullscreen needed no code: winit's `Fullscreen::Borderless` is `toggleFullScreen:` on macOS, the native space transition already | Shipped |
 | D17 | *(wgpu-era: measure `request_adapter`, then decide on a DXGI hal leaf)* | - | - | Superseded (A.2): the ~140 ms was D3D12 driver init, not enumeration |
 | D18 | **GPU bring-up on its own thread, started on the first line of `main`; the window is created *before* the join** | Device creation is the longest single item on the launch path and needs no window - but neither does the window need to wait for it | `Viewer::new` takes the GPU as a closure; get the order wrong and the window's 9-13 ms serialize after the device (§8) | Shipped |
 | D19 | **The shell owns the device and the swapchain; sokol_gfx is handed them** (`sg_environment` / `sg_swapchain`) | sokol_app's window model was a dealbreaker (A.3); this keeps winit's window *and* sokol's one drawing API | ~230 lines per OS - the only GPU-API-specific code left; `render/mod.rs` aliases one of them as `backend` so `gpu.rs` carries no `cfg` | Shipped both (Metal's swapchain half unexercised until the shader lands) |
@@ -279,10 +279,10 @@ and this table is what it is pointing at.
 | IPC transport | named pipe | Unix socket file (runtime dir) | `interprocess` |
 | Foreground handoff on forward | `AllowSetForegroundWindow` leaf | not needed | - |
 | Launcher "Run" show state | `GetStartupInfoW` leaf | no equivalent (returns `None`) | `platform.rs` |
-| Clipboard (Copy File / Path / Name) | `CF_HDROP` + text leaf | planned | `platform.rs` |
+| Clipboard (Copy File / Path / Name) | `CF_HDROP` + text leaf | `NSPasteboard` file URL (Copy File) + `pbcopy` (text) | `platform.rs` |
 | Show in Explorer / Reveal in Finder | leaf | leaf | `platform.rs` |
-| Open-file events from the OS | argv | `application:openFiles:` delegate via `objc2-app-kit` (~50 lines, planned) | both call the same open path |
-| Menu bar | none | `muda` minimal (App / File / Window) dispatching `Action`s (planned) | - |
+| Open-file events from the OS | argv | `openfiles.rs` (~130 lines): `application:openURLs:` added to winit's delegate class at runtime | both call the same open path |
+| Menu bar | none | `menubar.rs`: `muda` minimal (App / File / Window) dispatching `KeyAction`s | - |
 | File association | `HKCU` ProgID (installer, unchanged) | `CFBundleDocumentTypes`, `LSHandlerRank = Alternate` (planned) | - |
 | Native decoder libs | vendored `.lib` | vendored arm64 `.a` (planned) | same `VENDOR.txt` recipe |
 | Icon / metadata | `winresource` | `Info.plist` + `.icns` (planned) | both from `product.json` |
@@ -313,9 +313,10 @@ still linked, as the crate `dear-imgui-rs` sits on and the cimgui `simgui.c` com
 the D3D11/DXGI *drawing* code that used to live behind `windows`. `bytemuck` remains a
 `fire-decode` dependency only.
 
-**Planned for macOS.** `muda` (menu bar), `objc2` + `objc2-app-kit` (the open-file delegate
-hook), and whatever `render/metal.rs` needs for a `CAMetalLayer` (`objc2-quartz-core` /
-`objc2-metal`).
+**macOS.** `muda` (0.19, `default-features = false`) for the menu bar, plus `objc2` (0.5) and
+`objc2-foundation` / `objc2-app-kit` / `objc2-quartz-core` / `objc2-metal` (0.2) for
+`render/metal.rs`, `openfiles.rs` and the pasteboard leaf. The `objc2` versions are winit's own,
+so only `muda` and its `keyboard-types` are new compiles.
 
 Pin `winit` and the two `dear-imgui-*` crates to exact versions; they move together, and
 `dear-imgui-sys`'s cimgui is what `simgui.c` is compiled against (D22), so a bump is a
@@ -525,7 +526,44 @@ nothing after them can be checked without it.
    hand-written HLSL path was deleted per the step's own instruction, so **the Windows half is
    generated but unbuilt** - that is the outstanding verification, and `git` holds the old file.
 5. Leaves: the open-file delegate hook, the `muda` menu bar, native fullscreen mapping, pinch,
-   the clipboard twin.
+   the clipboard twin. **Done** (2026-09-04). Pinch (D15) and the menu bar (D16) are in, and
+   fullscreen turned out to need nothing — winit's `Borderless` is already `toggleFullScreen:` on
+   macOS. Verified on screen: the menu bar reads Fire / File / Window, and an image with alpha
+   renders with the checkerboard, the boundary outline and true 100 % zoom, which exercises the
+   Metal shader paths a green build cannot.
+
+   **The open hook is `crates/fire/src/openfiles.rs`** (D5/D6), and it is the macOS half of the
+   single-instance story rather than a nicety: Launch Services gives a fresh launch *no arguments*
+   and gives a running app *no new process*, so without it the bundle opens blank from Finder and
+   a running Fire ignores every later open — neither `main`'s `argv[1]` nor the instance socket
+   ever sees the file. AppKit delivers it as `application:openURLs:` on the `NSApplicationDelegate`,
+   which winit owns; of the three ways in, replacing the delegate crashes (winit's
+   `ApplicationDelegate::get` panics if the app's delegate is not its own class) and registering an
+   `NSAppleEventManager` handler loses (`NSApplication` installs its own during `finishLaunching`,
+   after anything `main` could do), so the hook adds the one missing method to winit's delegate
+   class with `class_addMethod` and re-sets the delegate — `setDelegate:` caches which methods
+   exist, and winit called it before the method did. Verified end to end: `open -a` on a cold Fire
+   shows the image, a second `open -a` lands in the *same* process, and two files at once open
+   both under the `open-in` setting.
+
+   A launch-by-open arrives between `applicationWillFinishLaunching:` and
+   `applicationDidFinishLaunching:` — before winit reports `resumed`, so before any window exists.
+   Those opens are held and handed to the first window as it is created rather than sent through
+   the loop afterwards, which would have been a visible blank frame and, in `new-window` mode, a
+   stray empty window in front of the image.
+
+   **"Copy File" now puts a real file on the pasteboard**: an `NSURL` written to
+   `NSPasteboard.generalPasteboard` (`clipboard info` reports `«class furl»`), so ⌘V in Finder
+   copies the image rather than pasting its name. Unlike Copy Path / Copy File Name this could not
+   shell out to `pbcopy` — a file URL is a pasteboard *type*, not a string that starts with
+   `file:`. A non-UTF-8 path or a refused write still falls back to the path as text.
+
+   Found while testing the bundled app, and fixed: a Unix socket outlives its owner, so any crash
+   left a socket file that made every later launch stall two seconds and — with no path to
+   forward — exit with no window at all (§3.1). `interprocess` reports namespaced names as
+   *supported* on macOS and then implements the namespace with a file in the temp directory, so
+   the first fix, which computed the path itself, silently did nothing; `try_overwrite` lets the
+   crate do the deleting, since it is the one that knows where the socket is.
 6. Retina: `scale_factor` into fit/1:1; verify the zoom-snap ladder lands on true 100 %.
 7. Measure: the mac twin of `scripts/ttfp.ps1` (§7.4) and a launch-path breakdown, so the Metal
    bring-up gets the same scrutiny the D3D11 one did. There is no cross-OS budget - the number

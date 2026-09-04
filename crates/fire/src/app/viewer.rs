@@ -1076,8 +1076,9 @@ impl Viewer {
         true
     }
 
-    /// Perform a bound keyboard command.
-    fn perform_key_action(&mut self, action: KeyAction) {
+    /// Perform a bound keyboard command. Also the macOS menu bar's entry point (D16), so a menu
+    /// item and its accelerator cannot diverge.
+    pub(crate) fn perform_key_action(&mut self, action: KeyAction) {
         match action {
             // Both file commands run their own repaint (and the picker pumps a modal loop), so they
             // return without the shared invalidate below.
@@ -1612,6 +1613,7 @@ impl Viewer {
             WindowEvent::CursorMoved { .. }
                 | WindowEvent::MouseInput { .. }
                 | WindowEvent::MouseWheel { .. }
+                | WindowEvent::PinchGesture { .. }
         );
         // Key-ups and IME text matter for the settle frames even though nothing below dispatches
         // them: without them, typing into a text field wouldn't repaint it.
@@ -1695,6 +1697,19 @@ impl Viewer {
                     }
                     WheelActionCfg::NavigateFolder => self.wheel_navigate(notches),
                     WheelActionCfg::Zoom => {}
+                }
+            }
+            // Trackpad pinch (macOS): the same about-cursor zoom the wheel drives, so the
+            // zoom-snap ladder and the cursor anchoring are shared rather than reimplemented
+            // (D15). `delta` is an incremental magnification — AppKit's `NSEvent.magnification`
+            // — so the factor is `1 + delta`, not the delta itself. winit documents it as
+            // possibly NaN; a NaN reaching the zoom would poison it for the rest of the session
+            // with no way back, so it is filtered here rather than deep in the view math.
+            WindowEvent::PinchGesture { delta, .. } => {
+                let factor = 1.0 + *delta as f32;
+                if factor.is_finite() && factor > 0.0 {
+                    self.surface.zoom_at_cursor(factor);
+                    self.redraw();
                 }
             }
             WindowEvent::KeyboardInput { .. } => {

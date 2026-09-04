@@ -25,7 +25,11 @@ mod hotstyle;
 mod icons;
 mod ipc_server;
 mod keybinds;
+#[cfg(target_os = "macos")]
+mod menubar;
 mod octagon;
+#[cfg(target_os = "macos")]
+mod openfiles;
 mod platform;
 mod product;
 mod render;
@@ -71,9 +75,7 @@ fn main() {
                 // now, so reclaim it and serve, rather than running un-coordinated forever and
                 // leaving every later launch to pay the same failed connect.
                 eprintln!("fire: forward to running instance failed ({e}); opening here");
-                ipc_server::reclaim_stale()
-                    .then(ipc_server::bind)
-                    .and_then(Result::ok)
+                ipc_server::rebind_after_stale().ok()
             }
         },
         // The OS refused the socket outright. Run anyway, un-coordinated: refusing to open an
@@ -84,7 +86,17 @@ fn main() {
         }
     };
 
-    let event_loop = match EventLoop::<AppEvent>::with_user_event().build() {
+    let mut event_loop_builder = EventLoop::<AppEvent>::with_user_event();
+    // winit installs a default macOS menu bar of its own during `applicationDidFinishLaunching`,
+    // which is *after* `main` gets to build one and would replace it wholesale. Turn it off so
+    // Fire's menu (D16) is the one that survives. It is not a pure loss: winit's default is where
+    // Cmd-Q came from before, so whatever replaces it has to carry Quit itself — `menubar` does.
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::EventLoopBuilderExtMacOS as _;
+        event_loop_builder.with_default_menu(false);
+    }
+    let event_loop = match event_loop_builder.build() {
         Ok(l) => l,
         Err(e) => {
             fatal_startup_error(&format!("fire could not create its event loop.\n\n{e}"));
@@ -114,6 +126,29 @@ fn main() {
 
     if let Some(listener) = listener {
         ipc_server::spawn(listener, proxy.clone());
+    }
+
+    // The macOS menu bar (D16). Built before the loop runs but after it exists, because
+    // `NSApplication` has to be up; held to the end of `main` because dropping the menu takes the
+    // menu bar with it. A failure here is not worth refusing to show an image over — the app is
+    // merely harder to quit — so it degrades to no menu with a note.
+    #[cfg(target_os = "macos")]
+    let _menu = {
+        let binds = crate::keybinds::Keybinds::from_config(&cfg.keybinds);
+        let menu = menubar::install(proxy.clone(), &binds, product::NAME);
+        if menu.is_none() {
+            eprintln!("fire: could not build the menu bar; Cmd-Q will not work");
+        }
+        menu
+    };
+
+    // Finder opens (D5/D6). macOS delivers a double-clicked file as an Apple event rather than as
+    // an argument, so without this hook the bundle opens blank from Finder and a running Fire
+    // ignores every later open. It must go in after the event loop is built — the delegate it
+    // extends is winit's — and before the loop runs, because a launch-by-open fires early.
+    #[cfg(target_os = "macos")]
+    if !openfiles::install(proxy.clone()) {
+        eprintln!("fire: could not hook Finder opens; only command-line paths will open");
     }
 
     let mut fire = Fire::new(cfg, proxy, pool, initial, gpu);

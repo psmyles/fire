@@ -160,17 +160,65 @@ pub fn copy_text_to_clipboard(text: &str) {
     }
 }
 
-/// Put `image` on the clipboard as a *file* (the "Copy File" action), so it can be pasted into
-/// the file manager as the file itself. Windows only today (`CF_HDROP`); elsewhere it copies the
-/// path as text, which is the nearest thing a paste can do with it.
+/// Put `image` on the clipboard as a *file* (the "Copy File" action), so a paste into the file
+/// manager produces the file itself rather than its name. `CF_HDROP` on Windows, a file URL on
+/// the macOS pasteboard; on any other platform there is no such concept here and it falls back to
+/// copying the path as text, which is the nearest thing a paste can do with it.
 pub fn copy_file_to_clipboard(image: &Path) {
     #[cfg(windows)]
     {
         win_clipboard::copy_file(image);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // Text is still the right fallback: a path that is not UTF-8, or a pasteboard that
+        // refuses the write, should leave the user with *something* they can paste.
+        if !mac_clipboard::copy_file(image) {
+            copy_text_to_clipboard(&image.to_string_lossy());
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         copy_text_to_clipboard(&image.to_string_lossy());
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod mac_clipboard {
+    use std::path::Path;
+
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
+    use objc2_foundation::{NSArray, NSString, NSURL};
+
+    /// Write `image` to the general pasteboard as a file URL — the representation Finder, Mail
+    /// and the Open dialogs all read as "a file", so ⌘V in Finder copies the image rather than
+    /// pasting its name. Returns whether the pasteboard took it.
+    ///
+    /// Unlike the text path this cannot shell out: `pbcopy` writes bytes as a string, and a file
+    /// URL is a *type*, not a string that happens to start with `file:`.
+    pub fn copy_file(image: &Path) -> bool {
+        // NSString is UTF-8/UTF-16; a path that is not valid UTF-8 has no NSString form, and the
+        // caller's text fallback is the better answer than a mangled one.
+        let Some(path) = image.to_str() else {
+            return false;
+        };
+        // SAFETY: all four calls take what they are declared to take, and the pasteboard is
+        // touched from the UI thread (the actions menu runs there), which is where AppKit wants
+        // it. `writeObjects:` copies what it is given; nothing outlives this call.
+        unsafe {
+            let url: Retained<NSURL> = NSURL::fileURLWithPath(&NSString::from_str(path));
+            // `from_retained` rather than `from_ref`: an `NSArray` of protocol objects has to own
+            // its elements, because a protocol alone does not promise the object is retainable.
+            let writer: Retained<ProtocolObject<dyn NSPasteboardWriting>> =
+                ProtocolObject::from_retained(url);
+            let pasteboard = NSPasteboard::generalPasteboard();
+            // Required before every write: the pasteboard's previous owner keeps its types
+            // otherwise, and a stale text flavour would win over the file we are adding.
+            pasteboard.clearContents();
+            pasteboard.writeObjects(&NSArray::from_vec(vec![writer]))
+        }
     }
 }
 

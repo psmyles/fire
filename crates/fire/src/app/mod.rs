@@ -58,6 +58,11 @@ pub enum AppEvent {
     /// only the *watcher* that sends it is debug-gated.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     ThemeReloaded,
+    /// A macOS menu-bar item that Fire performs itself (D16). It carries a [`KeyAction`] rather
+    /// than a command of its own so the menu and the keyboard cannot drift apart: both end in
+    /// `Viewer::perform_key_action`.
+    #[cfg(target_os = "macos")]
+    MenuCommand(crate::keybinds::KeyAction),
 }
 
 impl std::fmt::Debug for AppEvent {
@@ -73,6 +78,8 @@ impl std::fmt::Debug for AppEvent {
                 write!(f, "FileChanged({window:?}, gen {generation})")
             }
             AppEvent::ThemeReloaded => write!(f, "ThemeReloaded"),
+            #[cfg(target_os = "macos")]
+            AppEvent::MenuCommand(a) => write!(f, "MenuCommand({})", a.name()),
         }
     }
 }
@@ -247,6 +254,17 @@ impl Fire {
                     None => self.create_viewer(el, None, Some(req)),
                 },
             },
+            // The menu bar acts on the focused window, the same one a keystroke would have gone
+            // to. With no window there is nothing to act on: the item is a no-op rather than a
+            // reason to make one.
+            #[cfg(target_os = "macos")]
+            AppEvent::MenuCommand(action) => {
+                if let Some(id) = self.reuse_target() {
+                    if let Some(v) = self.viewers.get_mut(&id) {
+                        v.perform_key_action(action);
+                    }
+                }
+            }
             AppEvent::DecodeDone(outcome) => {
                 if let Some(v) = self.target(outcome.window) {
                     v.decode_done(*outcome);
@@ -368,7 +386,26 @@ impl ApplicationHandler<AppEvent> for Fire {
         self.started = true;
         firewall("startup", || {
             let initial = self.initial.take();
-            self.create_viewer(el, initial, None);
+            // On macOS a launch-by-open arrives as an Apple event *before* this point, not as an
+            // argument (see `openfiles`), so the file to show may be waiting here rather than in
+            // `initial`. Give it to the first window as it is created: opening blank and loading
+            // a frame later would be a visible flash, and in `new-window` mode would strand an
+            // empty window in front of the one holding the image.
+            #[cfg(target_os = "macos")]
+            let mut opens = crate::openfiles::start().into_iter();
+            #[cfg(target_os = "macos")]
+            let first = initial.is_none().then(|| opens.next()).flatten();
+            #[cfg(not(target_os = "macos"))]
+            let first = None;
+
+            self.create_viewer(el, initial, first);
+
+            // A multi-file open (several images dropped on the Dock icon at once) obeys the
+            // `open-in` setting for the rest, exactly as forwarded launches do.
+            #[cfg(target_os = "macos")]
+            for req in opens {
+                self.handle_user_event(el, AppEvent::Open(req));
+            }
         });
     }
 

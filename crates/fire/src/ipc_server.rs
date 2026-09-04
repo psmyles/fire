@@ -22,59 +22,21 @@ use fire_ipc::{read_message, SOCKET_NAME};
 
 use crate::app::AppEvent;
 
-/// Where the socket lives as a *file*, on the OSes that put it in the filesystem (macOS and other
-/// Unixes without abstract sockets). `None` where the name lives in an OS namespace instead
-/// (Windows named pipes, Linux abstract sockets) — there the kernel reclaims the name when the
-/// owner dies, so there is nothing to clean up and nothing to go stale.
-fn socket_file_path() -> Option<std::path::PathBuf> {
-    if GenericNamespaced::is_supported() {
-        return None;
-    }
-    let dir = dirs::runtime_dir()
-        .or_else(dirs::cache_dir)
-        .unwrap_or_else(std::env::temp_dir);
-    Some(dir.join(SOCKET_NAME))
-}
-
 /// The socket's name on this OS: a namespaced name where the OS has a namespace for them
 /// (Windows named pipes, Linux abstract sockets), else a socket file under the user's runtime
-/// directory (macOS).
+/// directory.
+///
+/// macOS takes the *namespaced* branch even though it has no abstract sockets — `interprocess`
+/// emulates the namespace with a file in the temp directory. That matters below: "namespaced"
+/// does not imply "the kernel cleans it up".
 pub fn socket_name() -> io::Result<Name<'static>> {
-    match socket_file_path() {
-        None => SOCKET_NAME.to_ns_name::<GenericNamespaced>(),
-        Some(path) => path.to_fs_name::<GenericFilePath>(),
-    }
-}
-
-/// Delete a socket file whose owner is gone, so this launch can bind the name instead. Returns
-/// whether anything was removed.
-///
-/// Only ever called once a forward has already *failed* to reach anyone, which is the proof that
-/// the name is unowned — a live owner answers, so its socket is never removed here. This matters
-/// only where the socket is a file: a Unix socket outlives the process that bound it, so an owner
-/// killed with `SIGKILL` (or crashed, D7) leaves a file that no longer accepts connections but
-/// still fails every future `bind` with `AddrInUse`. Left alone, that makes every later launch
-/// stall on the connect timeout, and one with no path to forward exit without ever showing a
-/// window. Windows has no equivalent: its named pipe disappears with its process.
-///
-/// Two launches can race here — both find the socket dead, both unlink, both bind. One wins; the
-/// loser sees `AddrInUse` again and forwards to the winner, which is the ordinary path.
-pub fn reclaim_stale() -> bool {
-    let Some(path) = socket_file_path() else {
-        return false;
-    };
-    match std::fs::remove_file(&path) {
-        Ok(()) => {
-            eprintln!(
-                "fire: removed a stale instance socket at {} (its owner exited without cleaning \
-                 up); taking ownership",
-                path.display()
-            );
-            true
-        }
-        // Someone else got there first, or it was never a file we may remove. Either way this
-        // launch simply runs without serving the socket.
-        Err(_) => false,
+    if GenericNamespaced::is_supported() {
+        SOCKET_NAME.to_ns_name::<GenericNamespaced>()
+    } else {
+        let dir = dirs::runtime_dir()
+            .or_else(dirs::cache_dir)
+            .unwrap_or_else(std::env::temp_dir);
+        dir.join(SOCKET_NAME).to_fs_name::<GenericFilePath>()
     }
 }
 
@@ -95,6 +57,28 @@ pub fn is_taken(e: &io::Error) -> bool {
         e.kind(),
         io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
     )
+}
+
+/// Bind, displacing a socket whose owner is gone.
+///
+/// **Only call this once a forward has already failed to reach anyone**, which is the proof that
+/// nothing is listening. `try_overwrite` is off by default for good reason: it deletes the socket
+/// on `AddrInUse` *whether or not* someone is still accepting on it, so calling it speculatively
+/// would let a second launch steal the name from a live owner and break the one-process model.
+///
+/// Why this is needed at all: on Unix a socket is a file that outlives the process that bound it,
+/// so an owner killed with `SIGKILL` — or crashed, which D7 accepts — leaves a file that answers
+/// nothing but still fails every later `bind` with `AddrInUse`. Left alone, that made every launch
+/// stall on the connect timeout and, with no path to forward, exit without ever showing a window.
+///
+/// Letting `interprocess` do the deleting is the point: it knows where the socket actually is.
+/// macOS reports namespaced names as supported and then puts the "namespace" in the filesystem,
+/// so computing the path here would have looked right and quietly done nothing.
+pub fn rebind_after_stale() -> io::Result<Listener> {
+    ListenerOptions::new()
+        .name(socket_name()?)
+        .try_overwrite(true)
+        .create_sync()
 }
 
 /// Serve `listener` on a background thread for the life of the process, sending each forwarded

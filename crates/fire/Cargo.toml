@@ -69,7 +69,12 @@ windows = { workspace = true, features = [
 # own objc2 family, so none of this is an extra compile.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
-objc2-foundation = { workspace = true, features = ["NSGeometry"] }   # CGSize for drawableSize
+objc2-foundation = { workspace = true, features = [
+    "NSGeometry",                       # CGSize for the layer's drawableSize
+    "NSArray",                          # the openURLs: argument, and the pasteboard's
+    "NSString",
+    "NSURL",                            # a Finder open, and the file put on the pasteboard
+] }
 objc2-metal = { workspace = true, features = [
     "MTLDevice",                        # MTLCreateSystemDefaultDevice, the device sokol runs on
     "MTLPixelFormat",                   # the layer's BGRA8Unorm backbuffer format
@@ -86,7 +91,10 @@ objc2-app-kit = { workspace = true, features = [
     "NSView",                           # setLayer:/setWantsLayer: on winit's view
     "NSResponder",                      # NSView's superclass chain
     "objc2-quartz-core",                # setLayer: takes a CALayer, so NSView needs the type
+    "NSApplication",                    # the delegate `openfiles` extends with openURLs:
+    "NSPasteboard",                     # Copy File, as a file rather than as its path
 ] }
+muda = { version = "0.19.3", default-features = false }
 
 [build-dependencies]
 # build.rs reads the canonical product metadata from ../../product.json so a single edit there

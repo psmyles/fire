@@ -14,9 +14,9 @@
 #   scripts/dev-app.sh --debug img.png    bundle the debug build instead (faster iteration)
 #   scripts/dev-app.sh --no-build         re-bundle whatever is already built
 #
-# Known gaps at this stage, so they are not mistaken for bugs: no menu bar yet (D16), so **⌘Q does
-# not quit** — close the window; a generic icon; and no file associations, so a double-clicked
-# image will not route here.
+# Known gaps at this stage, so they are not mistaken for bugs: a generic icon, and no
+# `CFBundleDocumentTypes`, so Finder will not route a double-clicked image here — `open -a` and a
+# drop on the Dock icon do work, because those name the app explicitly.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,7 +29,7 @@ while [[ $# -gt 0 ]]; do
         --debug)    profile=debug; shift ;;
         --release)  profile=release; shift ;;
         --no-build) build=0; shift ;;
-        -h|--help)  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)          args+=("$1"); shift ;;
     esac
 done
