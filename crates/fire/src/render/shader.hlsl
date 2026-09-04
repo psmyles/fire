@@ -99,10 +99,22 @@ float2 texel_center(float2 t, float2 size) {
     return (floor(t) + 0.5) / size;
 }
 
+// No implicit derivatives anywhere in this shader. Every sample below is `SampleLevel` or
+// `SampleGrad`: the letterbox/outline tests above the samples are per-pixel branches, and a
+// `Sample` (or `CalculateLevelOfDetail`) inside one takes its derivatives from the 2×2 quad's
+// other lanes — which, in a quad straddling the image boundary, took the other branch and hold
+// whatever their registers last held. That is a garbage mip level on the boundary pixels, and
+// since the garbage is whatever the previous draw left behind, a flickering one. The screen→image
+// mapping is a pure uniform scale, so the true gradient is a constant: `inv_zoom` texels per
+// screen pixel on each axis, and the LOD is `log2(inv_zoom)`. Passing that is both exact and
+// immune to lane divergence.
+float2 grad_x(float2 size) { return float2(inv_zoom / size.x, 0.0); }
+float2 grad_y(float2 size) { return float2(0.0, inv_zoom / size.y); }
+
 // Sample the flipbook frame texel `f` (frame-local, 0..img_size) from the sheet cell at origin
-// `cell`. Explicit-LOD: the sheet's mip chain averages across cell boundaries, so implicit mips
-// would ghost neighbouring frames into a minified frame — clamp to `fb_max_lod`. A half-texel
-// inset keeps bilinear/aniso taps inside the cell; magnify (inv_zoom<=1) stays crisp at mip 0.
+// `cell`. Explicit-LOD: the sheet's mip chain averages across cell boundaries, so free-running
+// mips would ghost neighbouring frames into a minified frame — clamp to `fb_max_lod`. A half-texel
+// inset keeps bilinear taps inside the cell; magnify (inv_zoom<=1) stays crisp at mip 0.
 float4 sample_cell(float2 f, float2 cell) {
     float2 t  = cell + clamp(f, 0.5, img_size - 0.5);
     float2 uv = t / sheet_size;
@@ -110,7 +122,7 @@ float4 sample_cell(float2 f, float2 cell) {
     if (inv_zoom <= 1.0) {
         s = tex.SampleLevel(samp_point, texel_center(t, sheet_size), 0.0);
     } else {
-        float lod = min(tex.CalculateLevelOfDetail(samp_aniso, uv), fb_max_lod);
+        float lod = min(log2(inv_zoom), fb_max_lod);
         s = tex.SampleLevel(samp_aniso, uv, lod);
     }
     if (linear_sample == 0) s.rgb = srgb_to_linear(s.rgb);
@@ -162,8 +174,9 @@ float4 shade(float4 pos) {
         // f is inside [0, img_size) here (the letterbox branch above returned), so the point tap's
         // floor lands on a real texel and the CLAMP address mode never comes into it.
         float4 s = (inv_zoom <= 1.0)
-            ? tex.Sample(samp_point, texel_center(f, img_size))  // magnify/1:1 -> crisp texels
-            : tex.Sample(samp_aniso, f / img_size);              // minify -> mips + anisotropic
+            ? tex.SampleLevel(samp_point, texel_center(f, img_size), 0.0)  // magnify/1:1 -> crisp
+            : tex.SampleGrad(samp_aniso, f / img_size,                     // minify -> mips
+                             grad_x(img_size), grad_y(img_size));
         rgb = s.rgb;
         a = s.a;
         if (linear_sample == 0) rgb = srgb_to_linear(rgb);
