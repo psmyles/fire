@@ -19,12 +19,10 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
-/// Named pipe the running instance listens on and a forwarding launch connects to.
-pub const PIPE_NAME: &str = r"\\.\pipe\fire";
-
-/// Single-instance mutex name. `Local\` scope = per-login session (supports
-/// fast-user-switching); we explicitly do NOT want one machine-wide instance.
-pub const MUTEX_NAME: &str = r"Local\fire-singleton";
+/// The local socket every launch tries to bind (a named pipe on Windows, a Unix socket on macOS —
+/// the `interprocess` crate maps the one name onto both). The bind *is* the single-instance lock:
+/// whoever holds it is the owner and serves the others, who connect and forward their path.
+pub const SOCKET_NAME: &str = "fire.sock";
 
 /// Protocol version byte, bumped on incompatible wire changes.
 pub const PROTOCOL_VERSION: u8 = 1;

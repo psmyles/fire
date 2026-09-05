@@ -576,7 +576,8 @@ fn slider_with_field(
     ui.set_next_item_width(slider_w);
     if ui
         .slider_config(format!("{id}-slider"), 0.0f32, max)
-        .display_format("")
+        .try_display_format("")
+        .expect("an empty format is valid")
         .build(v)
     {
         // Rounded *before* the value box is drawn, so a drag shows three decimals live — rounding
@@ -593,7 +594,8 @@ fn slider_with_field(
         .input_float_config(format!("{id}-field"))
         .step(0.0)
         .step_fast(0.0)
-        .format("%g")
+        .try_display_format("%g")
+        .expect("%g is a valid float format")
         .flags(dear_imgui_rs::InputScalarFlags::CHARS_DECIMAL)
         .build(v)
     {
@@ -818,10 +820,9 @@ fn strip_width(groups: impl Iterator<Item = u8>, bw: f32, spacing: f32, div_w: f
     total
 }
 
-/// Width of a run of text in the current font. (`calc_text_size` lives on `Font`, not `Ui`.)
+/// Width of a run of text in the current font.
 fn text_w(ui: &Ui, s: &str) -> f32 {
-    ui.current_font()
-        .calc_text_size(ui.current_font_size(), f32::MAX, 0.0, s)[0]
+    ui.calc_text_size_with_opts(s, false, 0.0)[0]
 }
 
 /// The thin rule between toolbar groups. Its color is the style's `Separator` token, so it tracks
@@ -1115,7 +1116,8 @@ fn transport_band(
             // hidden label.
             let scrubbed = ui
                 .slider_config("##pos", 0.0f32, last)
-                .display_format("")
+                .try_display_format("")
+                .expect("an empty format is valid")
                 .build(&mut pos);
 
             // **Touching the bar takes playback off the clock, before anything else this frame.**
@@ -1175,7 +1177,8 @@ fn fps_field(ui: &Ui, id: &str, v: &mut f32) -> bool {
     ui.input_float_config(id)
         .step(0.0)
         .step_fast(0.0)
-        .format("%g")
+        .try_display_format("%g")
+        .expect("%g is a valid float format")
         .build(v)
 }
 

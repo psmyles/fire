@@ -1,10 +1,10 @@
 //! Hot-reload: re-decode the displayed image when its file changes on disk.
 //!
-//! A single long-lived thread per window owns an OS file watch (the `notify` crate, which on
-//! Windows is `ReadDirectoryChangesW`). The UI thread re-targets it on every open/navigate via
-//! [`FileWatcher::watch`]; when the watched file's *contents* change, the thread posts
-//! [`crate::win::WM_APP_FILE_CHANGED`] to the frame, which re-runs the decode. Like the decode
-//! pool and folder scan, this thread never touches the window or renderer — it only `PostMessage`s
+//! A single long-lived thread per window owns an OS file watch (the `notify` crate: on Windows
+//! `ReadDirectoryChangesW`, on macOS FSEvents). The UI thread re-targets it on every
+//! open/navigate via [`FileWatcher::watch`]; when the watched file's *contents* change, the thread
+//! sends [`AppEvent::FileChanged`] to the event loop, which re-runs the decode. Like the decode
+//! pool and folder scan, this thread never touches the window or renderer — it only sends an event
 //! (here with no payload; the UI re-decodes its own current path).
 //!
 //! Three things keep it well-behaved:
@@ -24,10 +24,10 @@ use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+use winit::event_loop::EventLoopProxy;
+use winit::window::WindowId;
 
-use crate::win::WM_APP_FILE_CHANGED;
+use crate::app::AppEvent;
 
 /// Quiet period after the last filesystem event before we trigger a reload. Long enough to
 /// coalesce a multi-burst save into one reload (and to let the writer finish), short enough that
@@ -52,13 +52,12 @@ pub struct FileWatcher {
 }
 
 impl FileWatcher {
-    /// Spawn the watcher thread. It posts [`WM_APP_FILE_CHANGED`] to `frame` (passed as `isize`
-    /// so the raw HWND crosses the thread boundary, like the decode pool).
-    pub fn spawn(frame: isize) -> Self {
+    /// Spawn the watcher thread for `window`. It sends [`AppEvent::FileChanged`] through `proxy`.
+    pub fn spawn(proxy: EventLoopProxy<AppEvent>, window: WindowId) -> Self {
         let (cmd_tx, cmd_rx) = unbounded::<WatchCmd>();
         let _ = std::thread::Builder::new()
             .name("fire-file-watch".into())
-            .spawn(move || run(frame, cmd_rx));
+            .spawn(move || run(proxy, window, cmd_rx));
         Self { cmd_tx }
     }
 
@@ -84,7 +83,7 @@ struct TargetState {
     baseline: Option<(SystemTime, u64)>,
 }
 
-fn run(frame: isize, cmd_rx: Receiver<WatchCmd>) {
+fn run(proxy: EventLoopProxy<AppEvent>, window: WindowId, cmd_rx: Receiver<WatchCmd>) {
     // notify delivers events to this channel; a closure (not a raw Sender) avoids needing
     // notify's optional crossbeam-channel feature.
     let (event_tx, event_rx) = unbounded::<notify::Result<Event>>();
@@ -110,7 +109,7 @@ fn run(frame: isize, cmd_rx: Receiver<WatchCmd>) {
         // pending deadline would starve forever if it were only checked in that arm.
         if let (Some(t), Some(d)) = (target.as_ref(), deadline) {
             if Instant::now() >= d {
-                post_changed(frame, t.generation);
+                post_changed(&proxy, window, t.generation);
                 deadline = None;
             }
         }
@@ -141,7 +140,7 @@ fn run(frame: isize, cmd_rx: Receiver<WatchCmd>) {
             default(timeout) => {
                 if let (Some(t), Some(d)) = (target.as_ref(), deadline) {
                     if Instant::now() >= d {
-                        post_changed(frame, t.generation);
+                        post_changed(&proxy, window, t.generation);
                         deadline = None;
                     }
                 }
@@ -219,14 +218,11 @@ fn parent_dir(path: &Path) -> PathBuf {
     }
 }
 
-/// Post the reload wakeup to the UI thread. No payload — the UI re-decodes its own current path;
-/// `generation` (in WPARAM) lets it drop the event if the user has since navigated away.
-fn post_changed(frame: isize, generation: u64) {
-    // SAFETY: posting to the frame HWND. If the window is gone the post simply fails; LPARAM is
-    // 0 so there is nothing to reclaim.
-    unsafe {
-        PostMessageW(frame as HWND, WM_APP_FILE_CHANGED, generation as usize, 0);
-    }
+/// Send the reload wakeup to the UI thread. No payload — the UI re-decodes its own current path;
+/// `generation` lets it drop the event if the user has since navigated away. A closed event loop
+/// (the app is exiting) just drops it.
+fn post_changed(proxy: &EventLoopProxy<AppEvent>, window: WindowId, generation: u64) {
+    let _ = proxy.send_event(AppEvent::FileChanged { window, generation });
 }
 
 #[cfg(test)]
@@ -234,23 +230,30 @@ mod tests {
     use super::*;
     use notify::event::{CreateKind, RemoveKind};
 
-    fn ev(kind: EventKind, path: &str) -> Event {
+    fn ev(kind: EventKind, path: PathBuf) -> Event {
         Event {
             kind,
-            paths: vec![PathBuf::from(path)],
+            paths: vec![path],
             attrs: Default::default(),
         }
+    }
+
+    /// A platform-native `d/<name>`. Built through `join` rather than written as a literal:
+    /// a `r"C:\d\photo.png"` reads as a directory and a file on Windows but as one long
+    /// file name with no parent on macOS, which would test something different on each OS.
+    fn at(name: &str) -> PathBuf {
+        Path::new("d").join(name)
     }
 
     #[test]
     fn relevant_matches_target_name_case_insensitively() {
         let name = "photo.png".to_string(); // stored lowercased by retarget
         assert!(event_is_relevant(
-            &ev(EventKind::Modify(ModifyKind::Any), r"C:\d\PHOTO.PNG"),
+            &ev(EventKind::Modify(ModifyKind::Any), at("PHOTO.PNG")),
             &name
         ));
         assert!(event_is_relevant(
-            &ev(EventKind::Create(CreateKind::Any), r"C:\d\photo.png"),
+            &ev(EventKind::Create(CreateKind::Any), at("photo.png")),
             &name
         ));
     }
@@ -260,12 +263,12 @@ mod tests {
         let name = "photo.png".to_string();
         // A different file changing in the same watched directory must not reload us.
         assert!(!event_is_relevant(
-            &ev(EventKind::Modify(ModifyKind::Any), r"C:\d\other.png"),
+            &ev(EventKind::Modify(ModifyKind::Any), at("other.png")),
             &name
         ));
         // A delete of the target is ignored — we keep showing the last good image.
         assert!(!event_is_relevant(
-            &ev(EventKind::Remove(RemoveKind::Any), r"C:\d\photo.png"),
+            &ev(EventKind::Remove(RemoveKind::Any), at("photo.png")),
             &name
         ));
     }
@@ -273,9 +276,6 @@ mod tests {
     #[test]
     fn parent_dir_uses_cwd_for_a_bare_name() {
         assert_eq!(parent_dir(Path::new("img.png")), PathBuf::from("."));
-        assert_eq!(
-            parent_dir(Path::new(r"C:\d\img.png")),
-            PathBuf::from(r"C:\d")
-        );
+        assert_eq!(parent_dir(&at("img.png")), PathBuf::from("d"));
     }
 }

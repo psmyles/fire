@@ -1,46 +1,81 @@
 Vendored static libraries for heif-sys
 =======================================
 
-This directory holds prebuilt MSVC static libraries + public headers for the HEIF/AVIF
-decode stack, so `cargo build` works with no native package manager or build tooling
-(no vcpkg / cmake / meson / nasm) on the developer's machine. Only the linked-in machine
-code reaches fire.exe; the rest is dead-stripped by the linker at release time.
+This directory holds prebuilt static libraries + public headers for the HEIF/AVIF decode
+stack, so `cargo build` works with no native package manager or build tooling (no vcpkg /
+cmake / meson / nasm) on the developer's machine. Only the linked-in machine code reaches
+the shipped binary; the rest is dead-stripped by the linker at release time.
+
+Layout: one directory per vendored target
+-----------------------------------------
+  x64-windows/     MSVC x64 static libs  (triplet x64-windows-static-md)
+  arm64-macos/     Apple Silicon static libs (triplet arm64-osx)
+
+Each holds BOTH `include/` and `lib/` from the same vcpkg run. The headers are per-target,
+not shared: the two targets are not necessarily at the same upstream libheif version, and
+bindgen must parse the headers that match the libs it will link. build.rs picks a directory
+from CARGO_CFG_TARGET_OS/ARCH and fails with a named error on any other target.
 
 Contents
 --------
-  lib/heif.lib       libheif 1.23.0   (HEIF/AVIF container + API, C++)   [LGPL-3.0-only]
-  lib/libde265.lib   libde265 1.1.1   (HEVC decoder, for HEIC/HEIF, C++) [LGPL-3.0-only]
-  lib/dav1d.lib      dav1d            (AV1 decoder, for AVIF, C)         [BSD-2-Clause]
-  include/libheif/*  libheif public C headers
+  x64-windows/lib/heif.lib        libheif  1.23.0  (HEIF/AVIF container + API, C++) [LGPL-3.0-only]
+  x64-windows/lib/libde265.lib    libde265 1.1.1   (HEVC decoder, for HEIC/HEIF, C++)[LGPL-3.0-only]
+  x64-windows/lib/dav1d.lib       dav1d            (AV1 decoder, for AVIF, C)        [BSD-2-Clause]
+  arm64-macos/lib/libheif.a       libheif  1.23.2  (same, arm64)                     [LGPL-3.0-only]
+  arm64-macos/lib/libde265.a      libde265         (same, arm64)                     [LGPL-3.0-only]
+  arm64-macos/lib/libdav1d.a      dav1d            (same, arm64)                     [BSD-2-Clause]
+  <target>/include/libheif/*      libheif public C headers for that target
 
-Triplet: x64-windows-static-md  (static libs, dynamic /MD CRT — matches Rust's MSVC ABI).
+Version drift: Windows is at libheif 1.23.0 and macOS at 1.23.2, because they were vendored
+from different vcpkg baselines. The differences are additive (new HDR-metadata APIs, mostly in
+the unused C++ header) and none touch the C API `wrapper.c` calls, but converge them on the
+next re-vendor of either side.
 
 How these were produced (one-time, on a machine with vcpkg)
 ----------------------------------------------------------
-The stock vcpkg libheif port offers AVIF only via aom (large, slower decode) and pulls
-the x265 ENCODER via its default `hevc` feature. We want AVIF via dav1d (small, fast) and
-no encoders, so patch the local port before installing:
+The stock vcpkg libheif port offers AVIF only via aom (large, slower decode) and pulls the
+x265 ENCODER via its default `hevc` feature. We want AVIF via dav1d (small, fast) and no
+encoders, so patch the local port before installing:
 
-  1. ports/libheif/vcpkg.json   : add "dav1d" to the top-level "dependencies" array.
+  1. ports/libheif/vcpkg.json    : add "dav1d" to the top-level "dependencies" array.
   2. ports/libheif/portfile.cmake: change  -DWITH_DAV1D=OFF  ->  -DWITH_DAV1D=ON
-  3. Build (the [core] feature set drops the default x265 encoder):
-       vcpkg install "libheif[core]:x64-windows-static-md"
+  3. ports/libheif/portfile.cmake: add     -DENABLE_PLUGIN_LOADING=OFF
+     REQUIRED ON macOS, harmless on Windows. libheif's CMake defaults ENABLE_PLUGIN_LOADING
+     to ON, and where the platform supports it dav1d is then built as a *separate dynamic
+     plugin* (plugins/libheif/libheif-dav1d.so) instead of being compiled into libheif. In a
+     static build that plugin is unreachable, and the failure is silent: libheif.a links fine
+     and carries no dav1d references at all, so every AVIF simply fails to decode at runtime.
+     Verify after building:  nm -u lib/libheif.a | grep -c dav1d   (must be > 0)
+  4. Build (the [core] feature set drops the default x265 encoder):
+       Windows:  vcpkg install "libheif[core]:x64-windows-static-md"
+       macOS:    vcpkg install "libheif[core]:arm64-osx"
      vcpkg auto-acquires the nasm/meson/ninja that dav1d needs.
 
-Stripping (why the libs are ~52 MB, not ~220 MB)
-------------------------------------------------
-vcpkg's release build embeds CodeView debug info (/Z7) directly in the .obj files, which
-balloons heif.lib to ~194 MB. The debug info is useless in a vendored lib (and Rust strips
-it from release binaries anyway), so it is removed with llvm-objcopy:
+Then copy `installed/<triplet>/include/libheif` and the three libs from
+`installed/<triplet>/lib` into this directory's target subdirectory.
+
+Stripping (Windows only — why those libs are ~52 MB, not ~220 MB)
+------------------------------------------------------------------
+vcpkg's release build on MSVC embeds CodeView debug info (/Z7) directly in the .obj files,
+which balloons heif.lib to ~194 MB. The debug info is useless in a vendored lib (and Rust
+strips it from release binaries anyway), so it is removed with llvm-objcopy:
 
        llvm-objcopy --strip-debug heif.lib     heif.lib
        llvm-objcopy --strip-debug dav1d.lib    dav1d.lib
        llvm-objcopy --strip-debug libde265.lib libde265.lib
 
 This only drops .debug$S/.debug$T sections; code, symbols, and the /DEFAULTLIB directives
-(which auto-link the MSVC C++ runtime for libheif/libde265) are preserved.
+(which auto-link the MSVC C++ runtime for libheif/libde265) are preserved. The arm64-osx
+release build carries no such debug info — those .a files are ~6 MB as produced.
+
+Linking
+-------
+Windows: the MSVC objects embed /DEFAULTLIB directives for the C++ runtime libheif and
+libde265 need, so it links itself and build.rs must not name it.
+macOS: Mach-O has no equivalent, so build.rs names `c++` explicitly or libheif's and
+libde265's C++ symbols go unresolved.
 
 Updating
 --------
-Re-run the recipe above against a newer vcpkg, re-strip, and replace the files here.
-Keep the triplet at x64-windows-static-md.
+Re-run the recipe above against a newer vcpkg, re-strip (Windows), and replace the files in
+that target's subdirectory. Keep the triplets at x64-windows-static-md / arm64-osx.

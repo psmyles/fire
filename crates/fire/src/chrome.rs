@@ -1,4 +1,4 @@
-//! The UI's shared model and theme tokens, plus the Win32 dark-mode plumbing.
+//! The UI's shared model: the command vocabulary and the read-only state the UI renders from.
 //!
 //! This module used to *paint* the toolbar and status bar with GDI. It no longer does: the whole UI
 //! is Dear ImGui now (see [`crate::ui`]), which owns layout, hit-testing, hover, focus and
@@ -6,21 +6,13 @@
 //!
 //! * [`Action`] and [`ViewSnapshot`] — the command vocabulary and the read-only state the UI renders
 //!   from. Pure data; [`crate::ui`] reads them, the win shell applies them.
-//! * The dark title bar plumbing, which is a window-manager concern, not a paint one — and reading
-//!   the light/dark *preference*, which is the only theme input the app still takes from the system.
-//!   Every color is the stylesheet's (`ui/theme.toml`), including the accent.
 //!
-//! Nothing here paints any more, and nothing here is GDI: the hand-painted Win32 settings dialog
-//! that the last few text helpers existed for is now an ImGui window ([`crate::ui::settings`]), and
-//! they went with it. Every Win32 API this module still calls is documented — the `uxtheme` ordinal
-//! hack left with the `TrackPopupMenu` menus.
-
-use std::ffi::c_void;
-use std::ptr;
-
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND};
-use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
-use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+//! The dark title bar and the light/dark *preference* used to live here too, as registry reads and
+//! a DWM call; `winit` now owns both (`Window::theme` / `WindowEvent::ThemeChanged`), and the
+//! preference is still the only theme input the app takes from the system. Every color is the
+//! stylesheet's (`ui/theme.toml`), including the accent.
+//!
+//! Nothing here paints, and nothing here touches a window system.
 
 use crate::icons::Icon;
 use crate::keybinds::{KeyAction, ShortcutLabels};
@@ -267,48 +259,3 @@ impl ViewSnapshot {
         }
     }
 }
-
-// --- dark mode / title bar --------------------------------------------------
-
-/// Read the system "apps use dark theme" preference (`AppsUseLightTheme == 0` → dark).
-pub fn system_uses_dark_mode() -> bool {
-    let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
-    let name = wide("AppsUseLightTheme");
-    let mut data: u32 = 1;
-    let mut size: u32 = 4;
-    let rc = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            sub.as_ptr(),
-            name.as_ptr(),
-            RRF_RT_REG_DWORD,
-            ptr::null_mut(),
-            &mut data as *mut u32 as *mut c_void,
-            &mut size,
-        )
-    };
-    rc == ERROR_SUCCESS && data == 0
-}
-
-/// Switch the title bar between the light and dark non-client themes (documented DWM path,
-/// available on Windows 10 20H1+ / 11). Best-effort: ignored on older builds.
-pub fn apply_dark_titlebar(hwnd: HWND, dark: bool) {
-    let on: i32 = dark as i32;
-    unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
-            &on as *const i32 as *const c_void,
-            4,
-        );
-    }
-}
-
-use crate::util::wide;
-
-// There used to be an `apply_dark_menus` here: three undocumented `uxtheme.dll` ordinals (133/135/136
-// — `AllowDarkModeForWindow` / `SetPreferredAppMode` / `FlushMenuThemes`), resolved by `GetProcAddress`
-// and `transmute`d into function pointers. It was the only undocumented API in the codebase, and it
-// existed for exactly one reason: a `TrackPopupMenu` menu is drawn by the system — border, gutter,
-// rounded corners and all — so nothing short of that hack could make it follow the app's dark theme.
-// The menus are ImGui popups now. We draw them; they are whatever color we say.

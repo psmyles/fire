@@ -1,5 +1,8 @@
-# CI for fire. Windows-only, because the app is: the crates don't compile anywhere else (the build
-# scripts short-circuit off-Windows) and there is nothing meaningful to check on another host.
+# CI for fire. Two hosts, because the app has two: Windows (Win32 leaves + D3D11) and macOS
+# (AppKit leaves + Metal). Both legs are mandatory rather than nice-to-have — clippy on Windows
+# never sees `render/metal.rs`, `openfiles.rs` or `menubar.rs`, and clippy on macOS never sees
+# `render/d3d11.rs` or the `windows-sys` leaves, so a single-host CI cannot keep the workspace
+# lint-clean now that both leaves exist (D23).
 #
 # The one thing that makes this workflow non-obvious is the *vendored native artifacts*. `heif-sys`
 # links prebuilt static libs (heif/libde265/dav1d) and `psd-sdk-sys` compiles the psd_sdk C++ source,
@@ -11,13 +14,17 @@
 #     or LLVM either. That covers everything else — `fire-ipc`, the pure-Rust decode core, and the
 #     whole shell including `fire`'s pure-logic modules (view/config/keybinds/flipbook/ui).
 #   * `full` runs only when the vendor tree is present (a cached restore, or a self-hosted runner
-#     with it checked out). It adds the native decoders: the real `fire.exe` and the PSD/HEIF
+#     with it checked out). It adds the native decoders: the real binary and the PSD/HEIF
 #     end-to-end tests.
 #
 # Without that split, a fork's first push would fail on a missing `heif.lib` and teach everyone to
 # ignore the badge. Without the features, `check` could only ever have covered `fire-ipc` — every
 # other crate pulls the vendored trees in transitively, so a cache miss meant a green badge over
 # code nothing had linted.
+#
+# Per D11 this workflow stops at build-and-test on macOS: it never signs, notarizes or packages a
+# `.dmg`. That runs only on the dev Mac via `scripts/build-mac.sh`, so the Developer ID certificate
+# and the App Store Connect key never need to exist as CI secrets on a public repo.
 
 name: CI
 
@@ -33,8 +40,14 @@ env:
 
 jobs:
   check:
-    name: clippy + tests (no native decoders)
-    runs-on: windows-latest
+    name: clippy + tests (no native decoders, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One host's failure should not hide the other's: the whole point of two legs is that each
+      # sees code the other cannot compile.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -45,12 +58,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `fire`'s build.rs precompiles the Metal shader offline (D24), so even the decoder-free
+      # build needs the Metal toolchain — which since Xcode 26 is an optional ~700 MB component
+      # that some runner images ship and some do not. Test it by *running* it: `xcrun --find metal`
+      # succeeds either way, because what it finds without the toolchain is a stub that fails at
+      # use (§7.1). Downloading is the slow path, taken only when the image lacks it.
+      - name: Ensure the Metal toolchain
+        if: runner.os == 'macOS'
+        run: |
+          if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            echo "Metal toolchain present: $(xcrun -sdk macosx metal --version 2>&1 | head -1)"
+          else
+            echo "::notice::Metal toolchain absent from this image — downloading it (~700 MB)."
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun -sdk macosx metal --version
+          fi
+
       # Everything except the two FFI decoders, so this needs no vendored input and no LLVM.
       - name: Clippy (no native decoders)
         run: cargo clippy -p fire-ipc -p fire-decode -p fire --no-default-features --all-targets -- -D warnings
 
-      # `fire-ipc` is dependency-free and holds the named-pipe wire format — the one place that
-      # parses bytes from outside the process. It must always be tested.
+      # `fire-ipc` is dependency-free and holds the instance-socket wire format — the one place
+      # that parses bytes from outside the process. It must always be tested.
       - name: Test (fire-ipc)
         run: cargo test -p fire-ipc
 
@@ -65,8 +94,18 @@ jobs:
         run: cargo test -p fire --no-default-features
 
   full:
-    name: clippy + tests (full workspace)
-    runs-on: windows-latest
+    name: clippy + tests (full workspace, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            # The vendored heif tree is per-target (D25); this is the subdirectory and the one
+            # library file whose presence stands for "the tree was restored".
+            heif_lib: crates/heif-sys/vendor/x64-windows/lib/heif.lib
+          - os: macos-latest
+            heif_lib: crates/heif-sys/vendor/arm64-macos/lib/libheif.a
     steps:
       - uses: actions/checkout@v4
 
@@ -77,12 +116,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Ensure the Metal toolchain
+        if: runner.os == 'macOS'
+        run: |
+          if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            echo "Metal toolchain present: $(xcrun -sdk macosx metal --version 2>&1 | head -1)"
+          else
+            echo "::notice::Metal toolchain absent from this image — downloading it (~700 MB)."
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun -sdk macosx metal --version
+          fi
+
+      # bindgen needs libclang. Windows has none by default; macOS ships one inside Xcode and
+      # `clang-sys` finds it unaided, so there is nothing to install there.
       - name: Install LLVM (libclang, for bindgen in psd-sdk-sys / heif-sys)
+        if: runner.os == 'Windows'
         run: choco install llvm --no-progress -y
 
       # The vendored artifacts are large and licence-encumbered, so they are not committed. Restore
       # them from cache if a previous run populated it; otherwise this job reports that it skipped,
       # rather than failing with a link error nobody can act on.
+      #
+      # The key carries the runner OS: the arm64 `.a`s and the x64 `.lib`s are different artifacts
+      # built from the same recipe, so one key for both would have each host restoring the other's
+      # and failing to link.
       - name: Restore vendored native artifacts
         id: vendor
         uses: actions/cache/restore@v4
@@ -90,13 +147,13 @@ jobs:
           path: |
             crates/heif-sys/vendor
             crates/psd-sdk-sys/vendor
-          key: vendor-${{ hashFiles('crates/*/vendor/VENDOR.txt') }}
+          key: vendor-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/*/vendor/VENDOR.txt') }}
 
       - name: Check the vendor tree is present
         id: have_vendor
         shell: bash
         run: |
-          if [ -f crates/heif-sys/vendor/lib/heif.lib ] && [ -d crates/psd-sdk-sys/vendor/Psd ]; then
+          if [ -f "${{ matrix.heif_lib }}" ] && [ -d crates/psd-sdk-sys/vendor/Psd ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
@@ -104,6 +161,10 @@ jobs:
             echo "::notice::Populate them per crates/*/vendor/VENDOR.txt to enable this job."
           fi
 
+      # `--workspace` covers the five crates in `[workspace] members`. `vendor/sokol-rust` is a
+      # path dependency inside the workspace directory and so was a member by default; it is
+      # excluded in the root manifest, because linting a pinned upstream tree to our standard
+      # fails on upstream's style and there is nothing to fix on our side.
       - name: Clippy (workspace)
         if: steps.have_vendor.outputs.present == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -113,6 +174,7 @@ jobs:
         if: steps.have_vendor.outputs.present == 'true'
         run: cargo test --workspace
 
-      - name: Build release exe
+      # Build only. Signing, notarization and the .dmg are the dev Mac's, not CI's (D11).
+      - name: Build release binary
         if: steps.have_vendor.outputs.present == 'true'
         run: cargo build -p fire --release

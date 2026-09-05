@@ -47,18 +47,20 @@ const ZOOM_SNAP_LEVELS: &[f32] = &[
     6400.0,
 ];
 
-/// How a launch relates to any already-running Fire window.
+/// Where an image opened while Fire is already running lands. There is always one process (the
+/// first launch owns the instance socket; later launches forward their path to it and exit — see
+/// `main.rs`); this only decides what the owner does with a forwarded path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub enum InstanceMode {
-    /// Default: each opened image gets its own independent window/process. No mutex, no
-    /// pipe — nothing listens in the background.
+pub enum OpenIn {
+    /// Default: every opened image gets its own window (in the one process).
     #[default]
     NewWindow,
-    /// One window; later opens route to it over a named pipe that lives only inside that
-    /// visible window's process. (Future: a `compare`/`tabs` single-window mode for
+    /// One window: a forwarded open swaps the picture into the window that has focus. The
+    /// pre-0.4 name `single-instance` is still accepted. (Future: a `compare`/`tabs` mode for
     /// side-by-side viewing — left room in this enum for it.)
-    SingleInstance,
+    #[serde(alias = "single-instance")]
+    ReuseWindow,
 }
 
 /// One entry in the toolbar's "Open in…" menu tree (`[[open-with]]`). An entry is either a **leaf**
@@ -324,7 +326,8 @@ pub type KeybindsCfg = std::collections::BTreeMap<String, KeyValue>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Config {
-    pub instance_mode: InstanceMode,
+    #[serde(alias = "instance-mode")]
+    pub open_in: OpenIn,
     /// Whether the `close-or-exit-fullscreen` binding (Esc, by default) closes the window. On by
     /// default. Off keeps only the other half of that binding — leaving full screen — so Esc
     /// pressed over a windowed viewer does nothing, and closing is the title bar's X / Alt+F4.
@@ -391,7 +394,7 @@ impl Default for Config {
         // (or no config file at all) leaves hot-reload enabled, fit-upscale enabled, and the
         // open-with list empty.
         Self {
-            instance_mode: InstanceMode::default(),
+            open_in: OpenIn::default(),
             esc_closes_window: true,
             hot_reload: true,
             fit_upscale: true,
@@ -647,7 +650,7 @@ mod tests {
     #[test]
     fn save_round_trip() {
         let cfg = Config {
-            instance_mode: InstanceMode::SingleInstance,
+            open_in: OpenIn::ReuseWindow,
             esc_closes_window: false,
             hot_reload: false,
             fit_upscale: false,
@@ -741,7 +744,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.instance_mode, InstanceMode::SingleInstance);
+        assert_eq!(cfg.open_in, OpenIn::ReuseWindow); // the pre-0.4 key and value still parse
         assert!(!cfg.hot_reload);
         assert!(!cfg.fit_upscale);
         // Everything the settings dialog added is defaulted.

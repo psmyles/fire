@@ -32,6 +32,7 @@ use dear_imgui_rs::{StyleColor, StyleStackToken, TabBarFlags, TabItemToken, Ui};
 use crate::config::Config;
 use crate::keybinds::{KeyAction, KeyChord, Keybinds, ALL_ACTIONS};
 use crate::render::imgui::{center_next_window, size_next_window, FormStyle};
+use winit::keyboard::KeyCode;
 
 use model::{
     BoolField, ChoiceField, NumField, TextField, {self as m},
@@ -42,9 +43,6 @@ use super::{text_w, Frame};
 
 /// The popup's ImGui id *and* its title bar.
 const TITLE: &str = "Settings";
-
-/// Esc, read raw from the wndproc during a key capture (see [`State::capture_key`]).
-const VK_ESCAPE: u32 = 0x1B;
 
 /// The Context-menu tab's text boxes, in tab order; the index is also the index into
 /// [`State::fields`].
@@ -103,25 +101,19 @@ impl State {
         self.capture.is_some()
     }
 
-    /// Take a key press for the armed row (the shell hands us the raw virtual key and the live
-    /// modifier state — this module never touches Win32).
+    /// Take a key press for the armed row (the shell hands us the physical key plus the live
+    /// modifier state as a chord — this module never touches the window system).
     ///
     /// Esc cancels, since a dialog you can't escape is a trap; that does mean Esc itself is only
     /// bindable by hand in `config.toml`. A bare modifier is ignored: we're waiting for the key it
     /// modifies.
-    pub fn capture_key(&mut self, vk: u32, ctrl: bool, alt: bool, shift: bool) {
+    pub fn capture_key(&mut self, chord: KeyChord) {
         let Some(action) = self.capture else { return };
-        if vk == VK_ESCAPE {
+        if chord.key == KeyCode::Escape {
             self.capture = None;
             self.note.clear();
             return;
         }
-        let chord = KeyChord {
-            vk,
-            ctrl,
-            alt,
-            shift,
-        };
         if chord.is_reserved() {
             return;
         }
@@ -377,7 +369,7 @@ fn general(ui: &Ui, st: &mut State) {
     );
 
     ui.separator_with_text("Window");
-    choice(ui, st, lw, ChoiceField::InstanceMode, "Opening an image");
+    choice(ui, st, lw, ChoiceField::OpenIn, "Opening an image");
     row_note(ui, lw, "Takes effect for images opened from now on.");
     // Named after the *live* chord, not a literal "Esc": the Keybinds tab can move this binding, and
     // a checkbox that keeps claiming "Esc" after you have would simply be lying.
@@ -907,7 +899,8 @@ fn num(ui: &Ui, st: &mut State, label_w: f32, f: NumField, label: &str) {
     ui.set_next_item_width(w);
     if ui
         .slider_config(format!("##{label}"), min, max)
-        .display_format(format!("%.{dp}f"))
+        .try_display_format(format!("%.{dp}f"))
+        .expect("a fixed-precision float format is valid")
         .build(&mut v)
     {
         f.set(&mut st.draft, v);
@@ -917,8 +910,7 @@ fn num(ui: &Ui, st: &mut State, label_w: f32, f: NumField, label: &str) {
 /// Height [`note`] will take for `text` once wrapped at `wrap_w` — one line or several. Used to
 /// reserve space for a note that has not been drawn yet.
 fn wrapped_h(ui: &Ui, text: &str, wrap_w: f32) -> f32 {
-    ui.current_font()
-        .calc_text_size(ui.current_font_size(), f32::MAX, wrap_w.max(1.0), text)[1]
+    ui.calc_text_size_with_opts(text, false, wrap_w.max(1.0))[1]
 }
 
 /// Dim explanatory text under a control. **Wrapped**, because the window is resizable now — a note
