@@ -4,3 +4,4 @@
 - Tiled/virtual texturing deferred to v2
 - a third mode - compare two images side-by-side in one window, or tabs
 - pixel inspector
+-
