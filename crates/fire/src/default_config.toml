@@ -5,12 +5,13 @@
 # built-in defaults, so a typo can never stop Fire from launching. Delete the file to regenerate
 # this template.
 #
-# Every key below is also editable in the app: Settings… (the gear on the toolbar, or the
-# right-click menu). NOTE that saving from the Settings dialog rewrites this file from Fire's own
-# state, which does not preserve comments — so if you hand-edit and want to keep your notes, avoid
-# saving from the dialog afterward (or keep a copy).
+# Every key below is also editable in the app: Settings… — the last entry of the toolbar's menu
+# button (far right) and of the right-click menu over the image. NOTE that saving from the Settings
+# dialog rewrites this file from Fire's own state, which does not preserve comments — so if you
+# hand-edit and want to keep your notes, avoid saving from the dialog afterward (or keep a copy).
 #
-# Location: %APPDATA%\fire\config.toml
+# Location: %APPDATA%\fire\config.toml            (Windows)
+#           ~/Library/Application Support/fire/config.toml   (macOS)
 # Format:   TOML (https://toml.io)
 
 # ----------------------------------------------------------------------------------------------
@@ -120,7 +121,8 @@
 # zoom-step / exposure-step — how far one input step moves the view.
 #
 #   zoom-step      Multiplicative zoom per wheel notch (and per = / - press). 1.15 = +15% per
-#                  notch. Range 1.01 – 4.0; larger is coarser/faster.
+#                  notch. Range 1.01 – 4.0; larger is coarser/faster. On macOS a trackpad pinch
+#                  zooms continuously and ignores this step.
 #   exposure-step  Exposure change per [ or ] press on an HDR image, in stops. Range 0.01 – 4.0.
 #
 # zoom-step = 1.15
@@ -168,7 +170,7 @@
 #                  "Open in…" entries below are separate ([[open-with]]).
 #
 # [context-menu]
-# show-in-explorer = true
+# show-in-explorer = true   # the "Show on Disk" item: Explorer on Windows, Finder on macOS
 # copy-file = true
 # copy-path = true
 # copy-file-name = true
@@ -199,11 +201,15 @@
 #              you also pick up any new defaults a future version ships).
 #
 # Write a key as "F", "F11", "Left", "Esc", "Space", "[", "Num+", or with modifiers:
-# "Ctrl+F", "Ctrl+Alt+Shift+K". Give a list to bind several keys to one action. An empty string
-# unbinds an action entirely. An unknown action name or an unreadable key is simply ignored.
+# "Primary+F", "Primary+Alt+Shift+K". Give a list to bind several keys to one action. An empty
+# string unbinds an action entirely. An unknown action name or an unreadable key is simply ignored.
+#
+# "Primary" is Ctrl on Windows and ⌘ on macOS, so one file means the same thing on both; "Ctrl+"
+# and "Cmd+" are accepted as spellings of it. Keys are PHYSICAL — "F" is the key where F sits on a
+# US keyboard, whatever your layout types there — so a config file travels between layouts too.
 #
 # Action names and their defaults:
-#   open-file = "Ctrl+O"               close-image = "Ctrl+W"
+#   open-file = "Primary+O"            close-image = "Primary+W"
 #   fit = "F"                          actual-size = "1"
 #   zoom-in = ["=", "Shift+=", "Num+"] zoom-out = ["-", "Num-"]
 #   all-channels = "C"                 red-channel = "R"
@@ -231,8 +237,12 @@
 #
 # Leaf fields:
 #   name   Required. The label shown in the menu (e.g. "Photoshop").
-#   path   Required. Full path to the program's .exe. Backslashes must be doubled in a normal
-#          TOML string ("C:\\Program Files\\..."), or use a single-quoted literal ('C:\...').
+#   path   Required. Full path to an executable. On Windows that is the program's .exe;
+#          backslashes must be doubled in a normal TOML string ("C:\\Program Files\\..."), or use
+#          a single-quoted literal ('C:\...'). On macOS a ".app" is a folder, not a program, so
+#          either point at the binary inside it
+#          ('/Applications/Preview.app/Contents/MacOS/Preview') or launch it through `open`:
+#          path = '/usr/bin/open', args = ["-a", "Preview", "{path}"].
 #   args   Optional. The command-line arguments. The token {path} is replaced with the full path
 #          of the image currently open in Fire. If you omit args, Fire passes just the image path
 #          as the single argument (args = ["{path}"]).
@@ -243,7 +253,8 @@
 #          a leaf or a submenu, so submenus can nest to any depth ([[open-with.items.items]], …).
 #          An entry with `items` is always a submenu; any `path`/`args` on it are ignored.
 #
-# Leaf examples (uncomment and edit the paths to match your machine):
+# Leaf examples (uncomment and edit the paths to match your machine). These are Windows paths;
+# on macOS write the equivalents described above:
 #
 # [[open-with]]
 # name = "Photoshop"

@@ -1,6 +1,10 @@
-# Fire installer
+# Fire installer (Windows)
 
 Unsigned [Inno Setup](https://jrsoftware.org/isinfo.php) installer for `fire.exe`.
+
+This is the **Windows** package. The macOS twin is `scripts/build-mac.sh`, which produces a signed
+and notarized `dist/Fire-<version>.dmg`; it reads the same `product.json` and, unlike the list
+below, takes its file associations straight out of `fire-decode`'s `SUPPORTED_EXTENSIONS`.
 
 ## Build
 
@@ -47,3 +51,7 @@ Flags: `-SkipBuild` (reuse the existing `target/release/fire.exe`), `-SkipIcon`.
 
 Supported formats and their extensions live in `fire.iss` (`[Tasks]` + `[Registry]`). When
 `fire-decode` gains a format, add a task and its per-extension registry rows there.
+
+This is the one copy of that list which cannot `use` the real one — an Inno Setup script imports
+nothing — so a test polices it: `fire-decode`'s `installer_associations_match_the_extension_table`
+parses `fire.iss` and fails if the two sets disagree.

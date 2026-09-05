@@ -1,13 +1,18 @@
 # Fire - Architecture
 
-A Windows source-format image viewer optimized for *time-to-first-pixel* when
-double-clicking a file in Explorer. Every design choice below traces back to one goal:
+A source-format image viewer for **Windows and macOS**, optimized for *time-to-first-pixel* when
+double-clicking a file in Explorer or Finder. Every design choice below traces back to one goal:
 the image should be on screen as close to instantly as possible.
 
-Fire is a **single, self-contained native Win32 application** that renders on the GPU via a
-lean **Direct3D 11** device created when the window opens (no warm-up). There is no resident
-background process and no separate launcher stub - the GPU device is cheap enough to create
-on launch, so nothing needs to be kept warm.
+Fire is a **single, self-contained native application** with one shared shell on both operating
+systems: `winit` owns the window, the event loop and input; `sokol_gfx` owns the GPU behind one
+drawing API, on a device and swapchain the shell creates itself (Direct3D 11 on Windows, Metal on
+macOS). There is no resident background process and no separate launcher stub - the GPU device is
+brought up on its own thread while the window is being created, so nothing needs to be kept warm.
+
+The port that produced this shape, including the alternatives that were measured and rejected, is
+recorded in [mac-port-plan.md](mac-port-plan.md); its decision table (D1-D25) is referenced from
+here where a choice needs its reasoning.
 
 ---
 
@@ -15,218 +20,347 @@ on launch, so nothing needs to be kept warm.
 
 The dominant cost of "double-click → pixels on screen" is **process cold-start plus
 decode**, not draw. A 2K PNG decodes in single-digit milliseconds; the headline cost is
-getting a process to `main()` and a window on screen. A cold launch of a small native exe is
+getting a process to `main()` and a window on screen. A cold launch of a small native binary is
 cheap enough that **no resident process is needed** to feel instant - so Fire keeps nothing
-warm and creates everything it needs on the launch path. Decode (≈392 ms for an 8192×4096
-PNG) dominates time-to-first-pixel and is the project's primary metric; everything else is
-kept off the critical path to the first pixel. (PNG itself is decoded via the `image` crate,
-not zune's own PNG path - see §6.)
+warm and creates everything it needs on the launch path, in parallel. Decode dominates
+time-to-first-pixel and is the project's primary metric; everything else is kept off the critical
+path to the first pixel. (PNG itself is decoded via the `image` crate, not zune's own PNG path -
+see §6.)
 
-Two consequences shape the whole design:
+Three consequences shape the whole design:
 
-- **No residency.** There is no background process and no launcher stub. The thing Explorer
-  launches is the whole app; it lives exactly as long as it has a window open.
+- **No residency.** There is no background process and no launcher stub. The thing the file
+  manager launches is the whole app; it lives exactly as long as it has a window open.
+- **Nothing on the launch path waits for anything it does not need.** `main` starts the GPU
+  bring-up on its own thread on its first line (D18) - device creation is the longest single item
+  and needs no window - then submits the launch path's decode *before* the event loop, the window
+  or the GPU exist. The window is created alongside the bring-up thread and joins it only when it
+  has something to draw into. On macOS this hides the entire 34 ms Metal device behind window
+  creation: the measured join wait is **0.01 ms**.
 - **Non-resident GPU presentation.** Shading every surface pixel on the CPU would re-run the
   whole per-pixel pipeline on *every* pan/zoom event; on a large window at a high refresh rate
   (a 240 Hz monitor) that pegs a CPU core during fast interaction. Instead the image is
-  uploaded **once** as a D3D11 texture with a hardware-generated mip chain, and pan / zoom /
-  exposure / channel / tonemap (and flipbook cell selection) become a **128-byte constant
-  buffer** - each frame is one
-  fullscreen-triangle draw that re-samples the texture (**~0 CPU per frame**). A **DXGI
-  flip-model swapchain** paces presentation to vsync, so interaction is tear-free and smooth at
-  the monitor's true refresh. The device is created **when the window opens**, not warmed ahead
-  of time, so it adds no residency cost; the GPU path is a few hundred lines of typed COM
-  against the `windows` crate.
+  uploaded **once** as a GPU texture with a full mip chain, and pan / zoom / exposure / channel /
+  tonemap (and flipbook cell selection) become a **128-byte uniform block** - each frame is one
+  fullscreen-triangle draw that re-samples the texture (**~0 CPU per frame**). The swapchain paces
+  presentation to vsync, so interaction is tear-free and smooth at the monitor's true refresh.
+
+**Measured.** The Windows figures below are the migration gate (D2): `scripts/ttfp.ps1`, kernel
+process creation → first image-bearing present, 12 interleaved launches per cell, release, idle
+machine.
+
+| Image | Win32 + D3D11 (the old shell) | winit + sokol_gfx | Δ | Budget |
+| --- | --- | --- | --- | --- |
+| 38 KB PNG | 133.5 / 132.4 ms | 135.4 / 131.6 ms | +1.9 / -0.8 ms | ≤ 5 ms |
+| 8.9 MB PNG | 142.6 / 144.0 ms | 142.2 / 143.3 ms | -0.4 / -0.7 ms | ≤ 10 ms |
+
+macOS has no cross-OS budget - the number to beat is the next mac build's (`scripts/ttfp.sh`,
+8 interleaved launches per cell): **170.8 ms median** on a 130 KB JPEG, **224.5 ms** on a 27.5 MB
+4096² PNG. The warm launch-path breakdown there is ~11 ms process start → `main` (the loader,
+before a line of ours runs), ~75 ms of AppKit `finishLaunching` + activation inside `run_app`,
+~31 ms window creation, 0.3 / 2.2 ms swapchain / ImGui, and the remainder in the first frame and
+its vsync. The two largest items are AppKit's and the window's, not ours.
 
 ---
 
 ## 2. High-level architecture
 
 ```
-Explorer double-click
-        │  (file association → ProgID → fire.exe "C:\path\img.png")
-        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                          fire.exe                               │
-│                                                                 │
-│  main(): Per-Monitor-V2 DPI awareness → read config →           │
-│          NewWindow: open our own window                         │
-│          SingleInstance: own the mutex+pipe, or forward & exit  │
-│                                                                 │
-│  ┌── one window (Win32) ───────────────────────────────────┐    │
-│  │  D3D11 flip-model swapchain covers the whole client     │    │
-│  │  · image drawn into a sub-rect (one fullscreen triangle)│    │
-│  │  · Dear ImGui chrome drawn over the rest, same backbuf. │    │
-│  │  owns message loop, title, size, lifecycle, theme       │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                 │
-│  decode worker pool (off-thread)  ──PostMessage──▶ UI thread    │
-│  fire-decode core (zune / image / exr / heif / psd_sdk / lcms2) │
-└─────────────────────────────────────────────────────────────────┘
+Explorer double-click                    Finder / Dock / open(1)
+  fire.exe "C:\path\img.png"             Apple Event → application:openURLs:
+        │                                          │
+        ▼                                          ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  fire — one process                                               │
+│                                                                   │
+│  main(): GPU bring-up thread starts here                          │
+│          read config → submit the launch decode                   │
+│          try to bind the instance socket                          │
+│          owner: run the event loop     │ client: forward & exit   │
+│                                                                   │
+│  winit event loop (ControlFlow::Wait / WaitUntil)                 │
+│   ├─ Window 1 ─ swapchain + Viewer (view, chrome, timers)         │
+│   ├─ Window 2 ─ …                                                 │
+│   └─ deadline heap → the next WaitUntil                           │
+│                                                                   │
+│  render:  one device + one sokol_gfx for the process              │
+│           one swapchain per window (render/d3d11.rs | metal.rs)   │
+│           image pass = one fullscreen triangle, precompiled       │
+│           UI pass    = sokol_imgui into the same pass             │
+│                                                                   │
+│  decode worker pool  ──EventLoopProxy──▶ the event loop           │
+│  fire-decode core (zune / image / exr / heif / psd_sdk / lcms2)   │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-The thing Explorer launches is the whole app. There is no warm-up to amortize, so there
+The thing the file manager launches is the whole app. There is no warm-up to amortize, so there
 is nothing to keep resident.
 
 ---
 
 ## 3. Process model and lifecycle
 
-Instance behavior is a **user setting** (`instance_mode` in the config), read *before* any
-window is created:
+**One process, one event loop, N windows** (D5). Fire is always a single process: every launch
+tries to bind the local instance socket, the first one wins and runs the loop, and every later one
+forwards its path to the owner and exits. There is no mutex - **the bind *is* the lock**.
 
-- **NewWindow (default):** every launch opens its own window in its own process. No mutex,
-  no pipe, nothing listening. The process exits when its window closes. This is the
-  simplest, lowest-latency path and the right default for "double-click opens a viewer".
-- **SingleInstance:** the first launch acquires a named mutex, opens its window, *and*
-  serves a named pipe. Later launches detect the mutex, forward their path over the pipe to
-  the running window (which reuses the one window, reset to fit per file), and exit. The
-  pipe lives only inside the running window's process - nothing stays resident.
+Where a forwarded open lands is a user setting (`open-in` in the config), applied by the owner:
 
-No autostart, no login residency in either mode. "Residency" is implicit: a process lives
-exactly as long as it has a window open.
+- **`new-window` (default):** the open gets its own window in the same process.
+- **`reuse-window`:** the open is swapped into the focused window (or, with none focused, the most
+  recently created one).
 
-The single-instance mutex is `Local\`-scoped (per-login session), so fast-user-switching
-gives each session its own instance; we explicitly do not want one machine-wide instance.
+This replaced the old `instance_mode` (NewWindow = a whole second process / SingleInstance = a
+named mutex + pipe). The reason is macOS: Finder never launches a second process - it sends an
+open-file event to the running app - so a per-launch process has no mac equivalent, and winit runs
+N windows in one loop cleanly. Windows users get the same UX from one process. The trade accepted
+with it (D7) is that crash isolation is now per-process rather than per-window: every FFI call
+already runs under `catch_unwind` on a worker with validated inputs, and a viewer has no unsaved
+state, but a true segfault in libheif/psd_sdk would close every window rather than one.
+
+No autostart, no login residency. "Residency" is implicit: the process lives exactly as long as it
+has a window open - closing the last window exits the loop.
+
+**A stale socket is a real state, and it is repaired rather than tolerated.** Where the name lives
+in an OS namespace (Windows named pipes, Linux abstract sockets) the kernel frees it when the owner
+dies. macOS has no such namespace - `interprocess` would emulate one with a file in the shared
+temp directory - so Fire takes the explicit-path branch there and puts the socket in the user's own
+runtime directory (two people on one Mac were otherwise sharing `/tmp/fire.sock`). A socket *file*
+outlives its owner, and ⌘Q is the common way that happens: AppKit's `terminate:` ends in `exit()`,
+so `main` never returns and the listener is never dropped. Measured, that cost **168 ms → 2196 ms
+on every launch after a normal quit**. Three fixes, all live:
+
+- The owner - and only the owner, since a forwarding launch would be deleting someone else's -
+  registers an `atexit` `unlink` of its socket (`ipc_server::unlink_on_exit`). That covers ⌘Q, a
+  plain `main` return, and the TTFP stamp's own `exit(0)`.
+- The connect retry budget splits by meaning. "The name is not there yet" (`NotFound` /
+  `ERROR_PIPE_BUSY`) still gets the full 2 s, because the owner may be anywhere in its own startup.
+  "The name is there and refuses" (`ConnectionRefused`) - a socket file whose owner is gone, which
+  nothing will ever start answering - gets 150 ms, enough to cover the window between a live
+  owner's `bind` and its `listen` and no more. `SIGKILL` recovery went **2196 ms → 320 ms**.
+- A launch with *no path to forward* still connects, so it can fail. `forward(None)` used to
+  return `Ok` without connecting, and `Ok` means "forwarded, now exit" - a double-clicked Fire
+  flashed in the Dock and vanished, permanently, until the socket file was deleted by hand. On a
+  proven-dead name `ipc_server::rebind_after_stale` unlinks it and `main` re-binds and serves, so
+  the first launch after a crash repairs the state instead of running un-coordinated forever.
 
 ---
 
-## 4. IPC and foreground activation
+## 4. Opening a file from the OS
 
-IPC exists only for **SingleInstance** mode.
+Two paths in, both ending at the same `Viewer::open`.
 
-- **Transport:** Windows named pipe (`\\.\pipe\fire`).
+**Windows: the argument, then the socket.** A double-click passes the path as `argv[1]`. If this
+launch is not the owner it forwards that path over the instance socket and exits.
+
+- **Transport:** the `interprocess` crate maps one name onto a named pipe on Windows and a Unix
+  socket elsewhere.
 - **Framing:** length-prefixed messages (`u32` little-endian length + payload).
-- **Payload:** protocol version + window-mode + activate flag + UTF-8 path. The wire
-  format lives in the dependency-light `fire-ipc` crate so the forward path stays cheap.
-- A forwarding launch writes one message and disconnects; the running instance routes it to
-  its window (currently a single reused window; tabs/compare are future work).
+- **Payload:** protocol version + window-mode + activate flag + UTF-8 path. The wire format lives
+  in the dependency-light `fire-ipc` crate (no serde) so the forward path stays cheap.
+- A forwarding launch writes one message and disconnects; the serving thread turns it into an
+  `AppEvent::Open` for the event loop and never touches a window or the renderer itself.
 
-### 4.1 Foreground activation (the one real trap)
+**macOS: an Apple Event, always.** Finder, `open(1)` and a drop on the Dock icon all go through
+Launch Services, which delivers the file as an Apple Event: a fresh launch gets *no arguments at
+all*, and an app that is already running gets *no new process*, so the instance socket never sees
+it either. Without a hook, Fire would open blank from Finder and ignore every later open.
 
-A process that does not currently own the foreground **cannot** raise its own window:
-Windows blocks `SetForegroundWindow` from it. When a later launch forwards a file, the
-already-running instance would swap the image in but stay behind other windows - the
-"instant open" would feel half-broken.
+`openfiles.rs` adds `application:openURLs:` to winit's own delegate class at runtime
+(`class_addMethod`) and re-sets the delegate on `NSApplication` so AppKit re-caches which methods
+exist. That is the only one of the three available routes that leaves winit's dispatch intact:
+replacing the delegate crashes winit's `ApplicationDelegate::get`, and registering our own
+`NSAppleEventManager` handler would be replaced by the one `NSApplication` installs during
+`finishLaunching`. A launch-by-open fires *before* winit reports `resumed`, so those opens are
+held and handed to the first window as it is created - it comes up showing the file rather than
+coming up blank and loading it a frame later. Everything after that goes to the loop as
+`AppEvent::Open`, exactly like a forwarded launch.
 
-The fix uses the one process that *does* hold foreground rights at the moment of the
-double-click: the forwarding launch, because Explorer started it.
+### 4.1 Foreground activation (the one real trap - Windows)
 
-1. The forwarder resolves the running instance's PID (via the connected pipe / its own
-   spawn).
-2. **As it sends the open request**, it calls `AllowSetForegroundWindow(owner_pid)`,
-   handing over its one-shot foreground grant.
-3. The running instance, on receipt (posted to its UI thread via `PostMessage`), calls
-   `ShowWindow` + `SetForegroundWindow` on the target window promptly, before the grant
-   lapses.
+A process that does not currently own the foreground **cannot** raise its own window: Windows
+blocks `SetForegroundWindow` from it. When a later launch forwards a file, the already-running
+instance would swap the image in but stay behind other windows - the "instant open" would feel
+half-broken.
 
-This path only runs in SingleInstance mode; NewWindow has nothing to forward.
+The fix uses the one process that *does* hold foreground rights at the moment of the double-click:
+the forwarding launch, because Explorer started it. As it sends the open request it calls
+`AllowSetForegroundWindow`, handing over its one-shot grant; the owner raises and focuses the
+target window on receipt, before the grant lapses. It is a `cfg(windows)` leaf in `platform.rs`,
+called from the forward path. macOS needs no equivalent - Launch Services activates the app.
 
 ---
 
 ## 5. Rendering pipeline (GPU)
 
-- **Stack:** **Direct3D 11** with a **DXGI flip-model swapchain** (`DXGI_SWAP_EFFECT_FLIP_DISCARD`)
-  on the window's HWND. The decoded image is uploaded **once** as a GPU texture; a
-  short HLSL vertex+pixel shader (precompiled to DXBC at build time by `fxc` and embedded in the
-  exe - no runtime `D3DCompile`) does the sampling and the whole color pipeline. The device is
-  created lazily at window open - hardware preferred, with
-  the **WARP** software rasterizer as a fallback for RDP/headless - so there is no warm-up step.
-- **One window.** The swapchain covers the whole client and the image is drawn into a **sub-rect**
-  of it, with the chrome (Dear ImGui - §5.2) drawn over the remainder *into the same backbuffer*.
-  There used to be a frame/child-view split, because GDI and a flip-model swapchain cannot paint the
-  same surface; with the chrome on the GPU that reason is gone, and with it `WS_CLIPCHILDREN`, the
-  second window class, and the second wndproc. `App::image_rect` is the single definition of the
-  image region; it is recomputed every frame and pushed into `GpuSurface::set_image_rect`, so there
-  is no retained layout to invalidate. `RSSetViewports` maps the fullscreen triangle onto that
-  sub-rect and clips to it, so the shader still fills the image region - background, checkerboard,
-  letterbox and all - in **one draw**.
+- **Stack: `sokol_gfx`, on a device and swapchain the shell owns** (D19). sokol_gfx does not own a
+  window: it is handed a device once at `sg_setup` (through `sg_environment`) and a render target
+  per frame (through `sg_swapchain`). That is what keeps winit's window model *and* gives one
+  drawing API above two graphics APIs. The per-OS glue is ~250 lines each and is the only
+  GPU-API-specific code in the tree:
+  - `render/d3d11.rs` - a D3D11 device (hardware preferred, **WARP** as a fallback for
+    RDP/headless) and a **DXGI flip-model swapchain** (`DXGI_SWAP_EFFECT_FLIP_DISCARD`).
+  - `render/metal.rs` - an `MTLDevice` and a `CAMetalLayer` hosted on winit's `NSView`.
+
+  `render/mod.rs` aliases whichever module this build has as `backend`, so `gpu.rs` carries no
+  `cfg`. They are twins, not a trait - the target set is closed, so an alias costs nothing at
+  runtime - which makes the contract (`Device::{create, fill_environment}`,
+  `Swapchain::{new, size, resize, set_scale_factor, acquire, present}`, `SWAPCHAIN_FORMAT`)
+  something that must be kept in step **by hand**. Anything added to one must be added to the other.
+- **One process, one device; one swapchain per window.** sokol_gfx is a process-wide singleton, so
+  `sg_setup` runs once. The device is created on the bring-up thread and used from the main thread
+  after the join (D3D11 devices are free-threaded, and only the main thread touches the immediate
+  context). The `CAMetalLayer` is the exception: Core Animation and `NSView` are main-thread-only,
+  so the *layer* is created on the main thread by `GpuSurface::new`.
+- **One window, one pass.** The swapchain covers the whole client area; the image is drawn into a
+  **sub-rect** of it and the chrome (Dear ImGui - §5.2) over the remainder, *into the same pass*.
+  `Viewer::image_rect` is the single definition of the image region; it is recomputed every frame
+  and pushed into the surface, so there is no retained layout to invalidate. `apply_viewportf` +
+  `apply_scissor_rectf` map the fullscreen triangle onto that sub-rect and clip to it, so the
+  shader still fills the image region - background, checkerboard, letterbox and all - in **one
+  draw**.
 - **The image is a texture, not a per-frame computation.** On adopt, the decoded pixels are
-  uploaded to a `USAGE_DEFAULT` texture created with a full mip chain
-  (`D3D11_RESOURCE_MISC_GENERATE_MIPS`); `GenerateMips` builds the pyramid on the GPU. Each of the
-  four `PixelFormat`s maps to a native DXGI format (see §5.1). After that, pan / zoom / exposure /
-  channel / tonemap (and the flipbook cell offsets + blend) are just values in a **128-byte
-  constant buffer**; the source texture never changes until a new image is opened (flipbook
-  playback only moves the cell offsets - never re-uploads).
-- **Per-frame work is one draw.** A frame maps the constant buffer (`MAP_WRITE_DISCARD`), writes
-  the view transform + display state, and issues a single **fullscreen-triangle** draw; the pixel
-  shader inverse-maps each output pixel into image space and samples the texture. There is no
-  vertex buffer and no CPU per-pixel work - pan/zoom change a transform, not pixels, so
-  interaction cost is independent of image resolution and of zoom-out factor.
+  uploaded as an immutable image carrying **every mip level in one `sg_make_image`**. sokol_gfx has
+  no `GenerateMips` and its rules forbid rendering into an image created with data, so the chain is
+  built on the CPU on the decode worker (`render/mips.rs`, D21) - ~5 ms on an 8.9 MB image, off the
+  UI thread. Each level is a 2×2 box filter of the level above, with 8-bit sRGB sources averaged in
+  *linear* light through two lookup tables (what hardware does for an `*_SRGB` format); rows are
+  split across threads for the big levels. After the upload, pan / zoom / exposure / channel /
+  tonemap (and the flipbook cell offsets + blend) are just values in a **128-byte uniform block**;
+  the source texture never changes until a new image is opened (flipbook playback only moves the
+  cell offsets - never re-uploads).
+- **Per-frame work is one draw.** A frame applies the pipeline and bindings, uploads `Params` with
+  `sg_apply_uniforms`, and issues a single **fullscreen-triangle** draw; the fragment shader
+  inverse-maps each output pixel into image space and samples the texture. There is no vertex
+  buffer and no CPU per-pixel work - pan/zoom change a transform, not pixels, so interaction cost
+  is independent of image resolution and of zoom-out factor.
 - **Sampling:** a **point** sampler when magnifying (crisp 1:1 texels) and an **anisotropic +
-  mipmapped** sampler when minifying. Hardware anisotropy + the GPU mip chain replace the
-  CPU-built prefiltered pyramid and the on-the-fly box average entirely, and give better
-  anti-aliasing (anisotropic > trilinear) at no per-frame CPU cost.
-- **Presentation is vsync-paced.** `Present(1, …)` on the flip swapchain blocks to the monitor's
-  refresh, so fast pan/zoom is tear-free and smooth at high refresh rates (e.g. 240 Hz) while the
-  CPU sits near idle. Rendering is **event-driven** - a frame is drawn only on `WM_PAINT` (driven
-  by `InvalidateRect` after an input or a decode), so an idle window costs nothing on either the
-  CPU or the GPU.
-- **Repaint / wakeups:** view changes call `InvalidateRect` → `WM_PAINT` → one present; decode
-  results and forwarded opens reach the UI thread by `PostMessage(frame, WM_APP_*)`.
+  mipmapped** sampler when minifying, selected per frame. Hardware anisotropy + the mip chain
+  replace the old CPU-built prefiltered pyramid and on-the-fly box average entirely, and give
+  better anti-aliasing at no per-frame CPU cost.
+- **Presentation is vsync-paced, and the wait is reported.** `render_frame` returns
+  `Presented::{Skipped, Yes { waited }}`. Where that wait happens differs by backend and each
+  measures its own: D3D11 blocks inside `Present(1, 0)`, Metal blocks earlier, in `nextDrawable`
+  at acquire. On Metal, `sg_end_pass` calls `presentDrawable:` and `sg_commit` commits, so
+  `Swapchain::present` only releases the drawable - presenting again there would be a double
+  present. The `waited` verdict matters because playback is paced on it: DXGI answers
+  `DXGI_STATUS_OCCLUDED` *immediately* when the window is hidden or fully covered, and pacing on a
+  present that no longer blocks would spin.
+- **Rendering is event-driven** - `request_redraw` only after input, a decode landing, or a timer.
+  An idle window with an image open measured **0.0 ms of CPU over 5 s**. See §5.2 and §10 for why
+  that invariant survives an immediate-mode UI and an animation timer.
+- **Resize and device loss.** A resize drops the render-target view and calls `ResizeBuffers`; a
+  zero dimension (a minimized window) is remembered but not applied - DXGI refuses it - and the
+  frame is skipped. A device-removed reset shows up as a failed `GetBuffer` /
+  `CreateRenderTargetView`, which skips the frame rather than drawing into nothing. Relaunch
+  remains the recovery story (§15).
 
-### 5.1 Per-pixel color pipeline (HLSL)
+### 5.1 Per-pixel color pipeline
 
-The pixel shader mirrors what the old CPU shader did, per output pixel, in linear light. The
-source format determines how the texture is uploaded and decoded to linear:
+The source format determines how the texture is uploaded and how it is decoded to linear. Where a
+device lacks the format a source needs, the pixels are converted on the way in rather than the
+pipeline being changed:
 
-| `PixelFormat` | DXGI texture format | → linear |
+| `PixelFormat` | sokol_gfx texture format | → linear |
 |---|---|---|
-| `Rgba8Unorm` | `R8G8B8A8_UNORM_SRGB` | hardware sRGB-decode on sample |
-| `Rgba16Unorm` | `R16G16B16A16_UNORM` | shader sRGB→linear (sample already normalized) |
-| `Rgba16Float` | `R16G16B16A16_FLOAT` | already linear |
-| `Rgba32Float` | `R32G32B32A32_FLOAT` | already linear |
+| `Rgba8Unorm` | `Srgb8a8` | hardware sRGB-decode on sample |
+| `Rgba16Unorm` | `Rgba16` (or `Rgba16f` where 16-bit norm sampling is unsupported) | shader sRGB→linear |
+| `Rgba16Float` | `Rgba16f` | already linear |
+| `Rgba32Float` | `Rgba32f` (or `Rgba16f` where float32 filtering is unsupported) | already linear |
 
-Common tail, in shader order: sample (point/aniso per §5) → **HDR only** (float formats):
-exposure `×2^stops`, then tonemap (Reinhard default / ACES toggle) → channel isolation (solo
-R/G/B/A grayscale; alpha shown literally) → checkerboard composite over transparency (linear
-0.45/0.21).
+Common tail, in shader order: outline / letterbox test (which return early on the gutter) → sample
+(point/aniso per §5) → **HDR only** (float formats): exposure `×2^stops`, then tonemap (Reinhard
+default / ACES toggle) → channel selection: solo R/G/B/A as grayscale, `RGB` as the color values on
+their own, and `RGBA` composited over the backdrop (the transparency checkerboard is linear
+0.45/0.21) → the octagon overlay's "hide outside" fade toward the backdrop → sRGB encode on the way
+out.
 
-The shader outputs **linear**; the swapchain's render-target view is created as a `*_SRGB` format
-so the hardware does the final sRGB encode on write. (The flip model disallows an `*_SRGB`
-*swapchain* format, so the backbuffer is `R8G8B8A8_UNORM` and only the **RTV** is `_UNORM_SRGB` -
-the standard trick.) The backdrop/letterbox clear color is the theme-aware chrome color, unpacked
-from its `0x00RRGGBB` value and sRGB-decoded to linear on the CPU so it matches.
+**The swapchain is a plain UNORM target and the shader sRGB-encodes its own output** (D20). Flip-
+model swapchains disallow `*_SRGB` formats, and Dear ImGui's colors are *already* sRGB, so one
+UNORM target is correct for both passes and the old two-render-target-view trick is gone. The
+shader owns the encode and must not be "fixed" into a linear write. The *format* is per-OS -
+`R8G8B8A8_UNORM` on D3D11, `BGRA8Unorm` on Metal, because a `CAMetalLayer` does not accept RGBA8 -
+so `SWAPCHAIN_FORMAT` lives in the backend module. That is a storage channel *order* difference
+only: the shader still writes `float4` RGBA and Metal swizzles on the way out.
+
+The backdrop/letterbox clear color is the theme-aware chrome color, unpacked from its `0x00RRGGBB`
+value and sRGB-decoded to linear on the CPU so it matches.
 
 ### 5.2 The UI pass (Dear ImGui)
 
-The chrome is drawn by **Dear ImGui 1.92** into the *same backbuffer*, between the image draw and
-the `Present`:
+The chrome is drawn by **Dear ImGui 1.92** into the *same pass*, between the image draw and
+`sg_end_pass`:
 
 ```
-WM_PAINT →  clear the whole backbuffer to the chrome fill   (UNORM view)
-            image pass  : viewport = image sub-rect, one fullscreen triangle   (SRGB view)
-            UI pass     : ImGui_ImplDX11_RenderDrawData, whole client          (UNORM view)
-            Present(1)  - vsync-paced
+RedrawRequested → swapchain.acquire()          (None → skip the frame)
+                  sg_begin_pass                clear to the chrome fill
+                  image pass : viewport = the image sub-rect, one triangle,
+                               128-byte uniform block via sg_apply_uniforms
+                  UI pass    : simgui_render() into the same pass
+                  sg_end_pass, sg_commit
+                  present                      vsync-paced
 ```
 
-**Two render-target views of the same pixels, deliberately.** The image shader emits linear light and
-writes through the `*_SRGB` view (above). ImGui's colors are *already* sRGB, so it must write through
-a plain `UNORM` view - pushing it through the sRGB view would encode twice and visibly wash the
-entire UI out. Both views are legal on the one backbuffer precisely because that backbuffer is plain
-`R8G8B8A8_UNORM`. `GpuSurface::begin_frame` leaves the UNORM view bound for exactly this reason;
-getting it wrong does not crash, it just looks bad.
-
-**We own no backend code.** `dear-imgui-sys`'s `backend-shim-win32` / `backend-shim-dx11` features
-compile ocornut's own `imgui_impl_win32.cpp` / `imgui_impl_dx11.cpp` and expose them over a
-~10-function C ABI (`render/imgui.rs` declares them and nothing more). That is the whole reason this
+**We own no backend code** (D3). Input comes through `dear-imgui-winit`, the maintained winit
+backend of the same crate family as `dear-imgui-rs`, released in step with it. Drawing is
+`sokol_imgui.h` in its `SOKOL_IMGUI_NO_SOKOL_APP` mode - a renderer only, compiled by `build.rs`
+from `crates/fire/simgui/` - which uploads ImGui's textures (fonts included, through the 1.92
+texture protocol) as sokol_gfx images and draws the draw lists into the current pass. It is the
+same header on every OS, maintained next to sokol_gfx by its author. That was the whole reason the
 dependency was acceptable: the platform/renderer glue - historically the part that rots - is
-upstream's problem. There is no maintained Rust D3D11 backend, and writing one would have recreated
-the very "constantly patching small issues" problem the migration existed to end.
+upstream's problem.
 
-**Rendering stays event-driven** - the invariant most at risk here, since ImGui's natural mode is to
-redraw forever. A frame is drawn only when something happened; `App::request_frames(2)` asks for the
-one or two extra frames ImGui needs to settle a hover or a click, and the count *terminates* - at
-zero, no further `WM_PAINT` is requested. No input, no timer, no message → no frame. Measured, not
-assumed: **0.16% of one core idle with the chrome up**, which is the file watcher, not ImGui.
+**One ImGui context per window, and only one is ever current.** Dear ImGui has a single current
+context; `dear-imgui-rs` models that as an active `Context` or a `SuspendedContext`. Every window's
+context lives suspended and each operation activates it for exactly the duration of a closure
+(`Imgui::with`), so N windows in one process never race over the global and there is no ordering
+rule for the caller to remember. `simgui_setup` runs once per process and every call of its goes
+through `igGetIO()`, i.e. whatever is current, so it draws whichever window's context is active.
 
-**Cost, measured** (release, median of 12 launches, from the kernel's process-creation time so the
-loader is included): time-to-first-pixel **+2.8 ms** on a 38 KB image - the unfair case, where decode
-is instant so ImGui init has nothing to hide behind - and **+0.3 ms (noise)** on a real 8.9 MB one,
-where the ~4.5 ms of ImGui init runs on the UI thread while the decode is still going and vanishes
-into its shadow. The exe grows ~1.34 MB. Of that 4.5 ms, ~2.7 ms is D3D11 device-object creation and
-under 1 ms is the first frame *including* rasterizing every glyph it draws - the fonts are not the
-cost.
+**Rendering stays event-driven** - the invariant most at risk here, since ImGui's natural mode is
+to redraw forever. A frame is drawn only when something happened; the viewer asks for the one or
+two extra frames ImGui needs to settle a hover or a click, and that count *terminates*. No input,
+no timer, no event → no frame.
+
+**The frame closes even if the UI panics.** A panic mid-frame would leave the context between
+`NewFrame` and `Render` and the next frame would assert; it would also leave sokol_gfx mid-pass.
+Both the ImGui build closure and the UI callback inside the pass run under `catch_unwind` -
+whatever was built is rendered, the panic is logged, and the app carries on.
+
+**Cost, measured** on the Win32+D3D11 shell when ImGui replaced hand-painted GDI (release, median
+of 12 launches, from the kernel's process-creation time so the loader is included):
+time-to-first-pixel **+2.8 ms** on a 38 KB image - the unfair case, where decode is instant so
+ImGui init has nothing to hide behind - and **+0.3 ms (noise)** on a real 8.9 MB one. The current
+shell's ImGui init is 1.7 ms on Windows and 2.2 ms on macOS.
+
+### 5.3 The shader, and where its bytecode comes from
+
+`render/shader.glsl` is **the one source**: sokol-shdc's annotated GLSL (Vulkan syntax, separate
+texture and sampler objects). `scripts/gen-shaders.sh` turns it into everything else, all of it
+checked in under `render/generated/`:
+
+- `shader_viewport_hlsl5_{vertex,fragment}.hlsl` and `..._metal_macos_{vertex,fragment}.metal` -
+  the per-backend sources, which **`build.rs` compiles to bytecode**: `fxc` → `.dxbc` on Windows,
+  `xcrun metal` + `metallib` → one `.metallib` *per stage* on macOS (per stage because
+  SPIRV-Cross names every entry point `main0`, and two functions cannot share a library).
+- `shader.rs` - the sokol_gfx reflection: the 128-byte uniform block, the texture, the two
+  samplers, which sampler pairs with the texture, and the per-backend entry-point names. All that
+  is left in `render::gpu::make_shader` is swapping the generated desc's `source` for `build.rs`'s
+  `bytecode`.
+
+So a plain `cargo build` never needs `sokol-shdc`, there is **no runtime shader compile on either
+OS** (D4/D24 - the wgpu branch lost ~32 ms to exactly this, and TTFP is the primary metric), and a
+broken shader is a build error. `gpu.rs` asserts `size_of::<Params>()` equals the *generated*
+uniform block's size, so an edit that changes the block fails the build rather than producing a
+wrong-looking image. The generated HLSL's `packoffset`s and its `b0`/`t0`/`s0`/`s1` registers came
+out byte-identical to the hand-written cbuffer that preceded them, and neither backend inserts a
+Y-flip: `gl_FragCoord` maps to `SV_Position` and `[[position]]`, both top-left origin, which is
+what the pixel math assumes.
+
+**One rule the shader must keep:** never sample inside a per-pixel branch without explicit
+derivatives. The letterbox and outline tests above the sampling *are* branches, and an
+implicitly-derived LOD inside a branch is undefined where the quad diverges - which produced a
+flickering 1 px line on all four image edges. Every tap is `textureLod` or `textureGrad`.
 
 ---
 
@@ -254,6 +388,11 @@ also detected by magic so a no-extension open still routes correctly.
 | Camera raw (CR2/CR3, NEF, ARW, RAF, ORF, RW2, DNG, …) | **`raw`** (pure Rust) → extract the embedded JPEG **preview**, decode via zune |
 | ICC transforms | **Little CMS** (`lcms2`) over FFI |
 
+`SUPPORTED_EXTENSIONS` in `fire-decode` is *the* table of what Fire opens - 54 extensions. The
+Windows installer keeps a second copy because an Inno Setup script can import nothing, and a test
+(`installer_associations_match_the_extension_table`) polices the two against each other; the macOS `Info.plist`
+needs no such test because `scripts/build-mac.sh` parses the const itself.
+
 Notes:
 - **Decode speed is the project's primary metric.** The common formats run through zune
   with `DecoderOptions::new_fast` (platform intrinsics + unsafe fast paths). Output is
@@ -263,6 +402,10 @@ Notes:
   that exposes the profile, then transformed with `lcms2`.
 - **FFI safety:** every C/C++ boundary (`psd_sdk`, `lcms2`) is wrapped in `catch_unwind`
   and runs on a decode worker, so a malformed file cannot take down the viewer process.
+  (This is also why `panic = "abort"` is *not* set in the release profile - `catch_unwind` only
+  works with unwinding panics.)
+- **The mip chain is built here too** (§5): on the decode worker, right after the decode and
+  before the image is posted, so the UI thread never pays for it.
 - **Camera raw = embedded preview, not develop.** A raw file is a per-vendor container
   around the sensor mosaic plus a full-size, camera-rendered **JPEG preview**. Developing
   the mosaic (demosaic + white balance + color matrices) is slow and at odds with the
@@ -280,14 +423,22 @@ Notes:
   (`Some(Animation)`); a single-frame GIF is an ordinary still (`None`), so the still path is
   untouched. Frame 0 is duplicated into `DecodedImage::pixels` so first-paint / downscale / alpha
   scanning work unchanged. Per-frame delays below 20 ms (including the common 0 = "as fast as
-  possible") are clamped to 100 ms, matching browsers. The viewer plays it back with a UI-thread
-  timer (§10). Animated WebP is *not* animated (WebP stays on the still zune hot path).
+  possible") are clamped to 100 ms, matching browsers. The viewer plays it back on a loop timer
+  (§10). Animated WebP is *not* animated (WebP stays on the still zune hot path).
 - **Oversized images:** `DecodeOptions::max_dim` is a **CPU/RAM guard**, not a GPU texture
   limit (an RGBA8 bitmap at 16384² is ~1 GiB; float HDR is 4×). It defaults to 16384, is
   configurable, and anything past it is CPU-downscaled to fit, recording the original size
   so the pixel inspector can note that a read came from the downscaled copy. Decode itself
   raises zune's internal guard well past this so large sources reach the downscale pass
   rather than being rejected outright. (Tiled/virtual texturing deferred to v2.)
+
+The pool itself (`decode_pool.rs`) is shared by every window in the process. Each job carries a
+process-wide monotonic `generation` plus the window it was issued for; a result is adopted only if
+it is still that window's latest generation, so a slow decode can never clobber a newer one. A
+superseded job is still decoded - its result is just dropped on arrival - which wastes a little
+work and keeps the pool dead simple. Workers never touch a window or the renderer; they send an
+`AppEvent` through the event loop's proxy, the same discipline the folder scan, the file watcher
+and the instance-socket server thread follow.
 
 ---
 
@@ -299,73 +450,87 @@ Notes:
   back to the sRGB assumption.
 - **HDR display:** tonemap to SDR in the shader with an exposure-stops control (works on any
   monitor). The float source is sampled and tonemapped live each frame, so exposure/operator
-  changes are free. A true HDR (scRGB / 10-bit) swapchain is now *possible* with the D3D11 flip
-  swapchain - deferred; current output is tonemap-to-SDR.
+  changes are free. A true HDR (scRGB / 10-bit, or EDR on macOS) swapchain is *possible* on both
+  backends - deferred; current output is tonemap-to-SDR.
 
 ---
 
 ## 8. UI chrome (DPI + dark mode)
 
-The UI is **Dear ImGui**, drawn on the GPU into the same backbuffer as the image (§5.2). It used to
-be hand-painted GDI - chosen because the Win32 common controls have no documented dark mode, which
-is true but led somewhere worse: we ended up owning *layout, scrolling, tab bars, text input, hover,
+The UI is **Dear ImGui**, drawn on the GPU into the same pass as the image (§5.2). It used to be
+hand-painted GDI - chosen because the Win32 common controls have no documented dark mode, which is
+true but led somewhere worse: we ended up owning *layout, scrolling, tab bars, text input, hover,
 focus and hit-testing*, and every one of those produced bugs (a scrollbar that didn't drag, a focus
 ring wiped by `EN_KILLFOCUS`). ImGui is not "more native" - it is themeable, not native - but those
-are solved, tested primitives now, so that class of defect cannot occur. `ui/` is pure immediate-mode
-code with no Win32 in it; it reads a `ViewSnapshot` and returns a `ui::Frame` of what the user asked
-for, which the win shell applies.
+are solved, tested primitives now, so that class of defect cannot occur. `ui/` is pure
+immediate-mode code with no window system and no GPU API in it; it reads a `ViewSnapshot` and
+returns a `ui::Frame` of what the user asked for, which the viewer applies.
 
 - **Toolbar:** channel isolation (R/G/B/A/RGB), fit/1:1, zoom, flipbook, HDR tonemap + exposure
-  (float sources only), and a right-docked group (outline, backdrop, full-screen, menu). Buttons
-  dispatch the same `Action`s the keybinds drive - one state path. When the window is too narrow the
-  left group sheds its lowest-priority slots into a "»" popup. There is **no gear**: Settings is the
-  last entry of the menu button's popup, which is the same menu the viewport's right-click opens - one
-  place to look, not two. That menu therefore stays enabled with no image loaded (its file entries
-  hide themselves), or Settings would be unreachable from an empty window.
+  (float sources only), and a right-docked group (outline, octagon, backdrop, full-screen, menu).
+  Buttons dispatch the same `Action`s the keybinds drive - one state path. When the window is too
+  narrow the left group sheds its lowest-priority slots into a "»" popup. There is **no gear**:
+  Settings is the last entry of the menu button's popup, which is the same menu the viewport's
+  right-click opens - one place to look, not two. That menu therefore stays enabled with no image
+  loaded (its file entries hide themselves), or Settings would be unreachable from an empty window.
 - **Status bar:** file name, format, W×H, bit depth / channel layout, ICC presence, and on the right
   the folder position and zoom % (plus `EV ±` for HDR).
-- **Popup menus** (`ui::MenuState`): the *actions* menu (right-click on the image, or the "Open in…"
-  toolbar button) and the *overflow* menu behind "»". Both are ImGui popups.
+- **Empty window:** a centred card with the logo, the product identity (long name + version, from
+  `product.json` via `build.rs`) and the drop/open hint. It degrades gracefully - the logo and then
+  the identity block drop out - when there is not enough room.
+- **Popup menus** (`ui::MenuState`): the *actions* menu (right-click on the image, or the "Open
+  in…" toolbar button) and the *overflow* menu behind "»". Both are ImGui popups.
 
-  They were `TrackPopupMenu` - and that one choice dragged in everything else: a `CreatePopupMenu` /
-  `AppendMenuW` / `DestroyMenu` rebuild on every show, a command-id numbering scheme (`OPEN_WITH_ID_BASE
-  + pre-order index`) to map a returned id back to the app to launch, a `PostMessage` deferral because
-  the menu pumps its own modal loop and must never open from inside `WM_PAINT`, and - because a Win32
-  menu is *system-drawn*, frame and gutter and all - **three undocumented `uxtheme.dll` ordinals**
-  (`AllowDarkModeForWindow` / `SetPreferredAppMode` / `FlushMenuThemes`, 133/135/136) resolved by
-  `GetProcAddress` and `transmute`d, purely to make it dark. All of that is gone. The menu is drawn in
-  the frame we were already painting; a clicked "Open in…" entry names itself by its **index path**
-  into the configured tree (`config::entry_at`), so there is no second walk to keep in step and no way
-  for the menu and the launcher to disagree; and the app now calls **no undocumented API at all**.
-- **Input routing:** ImGui sees every message first, then two booleans decide who owns it -
-  `want_capture_mouse` (the pointer is over a widget) and `want_capture_keyboard` (a text field has
-  focus, so keys are typing, not commands). That *replaces* the entire hand-rolled
-  hover/capture/hit-test/focus layer. Note this is **not** the wnd-proc handler's return value:
-  upstream returns true only for the few messages it fully consumes, never for "that click was mine"
-  - gating on it would let a click on a toolbar button also pan the image underneath. One exception:
-  a pan/zoom drag already in flight keeps the mouse to the end of the gesture even if the cursor
-  strays over the chrome (`GpuSurface::is_mouse_captured`), or the drag would stick on crossing it.
+  They were `TrackPopupMenu` - and that one choice dragged in everything else: a `CreatePopupMenu`
+  / `AppendMenuW` / `DestroyMenu` rebuild on every show, a command-id numbering scheme to map a
+  returned id back to the app to launch, a `PostMessage` deferral because the menu pumps its own
+  modal loop, and - because a Win32 menu is *system-drawn* - **three undocumented `uxtheme.dll`
+  ordinals** resolved by `GetProcAddress` and `transmute`d, purely to make it dark. All of that is
+  gone. The menu is drawn in the frame we were already painting; a clicked "Open in…" entry names
+  itself by its **index path** into the configured tree (`config::entry_at`), so the menu and the
+  launcher cannot disagree; and the app now calls **no undocumented API at all**.
+- **Input routing** (`Viewer::window_event`, three layers, and the order is the point): first the
+  lifecycle events (resize, DPI, theme, drop, close) that nothing else may intercept; then the
+  *ownership* gates - an armed keybind row, ImGui, the modal settings window, an open popup - each
+  there because the gate before it would otherwise swallow the event; only what survives reaches
+  `on_mouse` / `on_key`.
+
+  ImGui sees every event first, then two booleans decide who owns it: `want_capture_mouse` (the
+  pointer is over a widget) and `want_text_input` (a text field has focus, so keys are typing, not
+  commands). That *replaces* the entire hand-rolled hover/capture/hit-test/focus layer. One
+  exception: a pan/zoom drag already in flight keeps the mouse to the end of the gesture even if the
+  cursor strays over the chrome, or the drag would stick on crossing it.
 
   Keys need three cases ImGui's booleans don't cover, and each is a bug if you skip it. A **keybind
   capture** takes every key *before* ImGui sees it, Esc included (ImGui would read Esc as "close the
-  modal" instead of "cancel the capture"). The **settings window** is modal, so keys are its, not the
-  viewer's - but `want_capture_keyboard` can't express that, because ImGui sets it `true` for the whole
-  time *any* modal is open (`ActiveId != 0 || modal_window != NULL`); `want_text_input` is the one that
-  means "a text box has focus". And an open **popup menu** is *not* modal, so ImGui leaves the flag
-  false and every key falls straight through - Esc would close the window out from under the menu.
-- **DPI awareness:** `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` is declared before any
-  window exists, so the non-client area auto-scales and `WM_DPICHANGED` fires on monitor moves. On a
-  DPI change we adopt the OS-suggested rect, rescale the style, and re-raster the icon atlas - and
-  that is *all*: ImGui 1.92's dynamic font system rasterizes glyphs on first use, so **there is no
-  font atlas to rebuild**. (Do not build one, either: caching it would mean serializing ImGui's
-  internal glyph structures, and it would save ~1 ms - the fonts are not the cost, the D3D11 device
-  objects are.) Note `font_scale_dpi` scales *glyphs only*: every other metric is in logical px and
-  is scaled in `ui::theme::apply`, or the chrome stays 96-dpi-sized on a HiDPI monitor.
-- **Dark mode:** the system preference is read from the registry (`AppsUseLightTheme`) and the title
-  bar is darkened via `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)`. That preference is the
-  **only** theme input the app takes from the system, and all it decides is which of the stylesheet's
-  two token blocks (`[colors.dark]` / `[colors.light]`) is in force; every color, accent included, is
-  the stylesheet's. `WM_SETTINGCHANGE` re-skins live.
+  modal" instead of "cancel the capture"). The **settings window** is modal, so keys are its, not
+  the viewer's - but `want_capture_keyboard` can't express that, because ImGui sets it `true` for
+  the whole time *any* modal is open; `want_text_input` is the one that means "a text box has
+  focus". And an open **popup menu** is *not* modal, so ImGui leaves the flag false and every key
+  would fall straight through - Esc would close the window out from under the menu.
+- **Keybinds are physical and portable** (D9). A chord names a `KeyCode` - the key at the position
+  `F` has on a US keyboard - not the character it types, so one `config.toml` means the same thing
+  on every layout and every OS. The modifier is `Primary`: Ctrl on Windows, ⌘ on macOS, resolved at
+  match time (`Ctrl+` and `Cmd+` are still accepted as spellings of it, so an older file reads).
+  Chords match **exactly**, so a modifier held by accident no longer triggers the plain command;
+  the one concession is `Shift+=`, bound alongside `=`, because that is how you type `+`. Only
+  bindings that *differ* from the defaults are written back, so a user who never rebinds anything
+  keeps an empty `[keybinds]` table and inherits future default changes.
+- **DPI awareness:** winit reports the scale factor and its changes. On a DPI change the style is
+  rescaled and the icon atlas is re-rastered - and that is *all*: ImGui 1.92's dynamic font system
+  rasterizes glyphs on first use, so **there is no font atlas to rebuild**. (Do not build one,
+  either: caching it would mean serializing ImGui's internal glyph structures, and it would save
+  ~1 ms - the fonts are not the cost.) The platform backend runs with its own DPI handling **locked
+  to 1.0**: the whole UI lays out in physical pixels (`ui::theme::Metrics` scales from the DPI
+  itself), so ImGui's coordinate space must be the framebuffer's, not winit's logical one.
+- **Dark mode:** the system preference comes from winit (`Window::theme()` / `ThemeChanged`) on
+  both OSes - the registry read and the `DwmSetWindowAttribute` call are gone. That preference is
+  the **only** theme input the app takes from the system, and all it decides is which of the
+  stylesheet's two token blocks (`[colors.dark]` / `[colors.light]`) is in force; every color,
+  accent included, is the stylesheet's. A theme change re-skins live.
+- **Fonts:** the system UI font is read from the running machine (`segoeui.ttf` on Windows,
+  `SFNS.ttf` on macOS); Fire bundles none, and falls back to ImGui's built-in font if it cannot be
+  read.
 - **The stylesheet (`crates/fire/src/ui/theme.toml`):** every color, metric and spacing value the UI
   draws with, in one commented file - the two styles (chrome and settings form), both palettes, the
   bar heights, the paddings and roundings. Colors are a small grammar (`#hex`, `none`, a token name,
@@ -376,23 +541,24 @@ for, which the win shell applies.
   one thing that cannot be a style field: ImGui derives a checkbox, a tab, an input and a button all
   from `font size + 2 × frame_padding.y`, so sizing one without the others means pushing a
   `FramePadding` around that widget - `theme::push_control` does it, and every width or reserve the
-  layout measures for that control is measured under the same push. **Release builds embed it** (`include_str!`) and never touch the
-  disk; **debug builds** load it from the source tree and `hotstyle.rs` watches it - save the file and
-  the running window restyles (`WM_APP_THEME_RELOADED` → `App::restyle`: metrics, both styles, the
-  icon atlas, the clear color, repaint). A stylesheet is installed only once it parses *and* every
-  color in it resolves, so a typo prints and changes nothing rather than putting a broken window on
-  screen.
-- **Icons:** `build.rs` still rasterizes the SVGs to A8 coverage masks; they are now packed into one
-  RGBA8 **atlas strip** (white RGB, coverage in alpha) uploaded as a single D3D11 texture. ImGui's
-  shader multiplies texel by vertex color, so `(1,1,1,a) * tint` gives any tint from one texture -
-  no per-tint CPU work, which is what the old GDI path did on every repaint. The stylesheet's
-  `[icon_scale]` (a per-icon shrink, for artwork that doesn't fill its box like the rest) is **baked
-  into the atlas**, not applied at the draw call: the master is rastered into a smaller box *centred
-  in a full-size cell*, so the cell - and therefore the UV grid, the draw size and ImGui's derived
-  button size - stays a fixed `icon_px`, and the shrunk icon is a true downsample rather than a
-  re-scaled cell. `Imgui::refresh_icons` watches the scales as well as the size, since a hot reload
-  can move one without the other. An `Icon` is a *cell*, not a drawing: two variants may name the
-  same SVG (`B` and `BackdropBlack`) so that two buttons sharing artwork can still be sized apart.
+  layout measures for that control is measured under the same push. **Release builds embed it**
+  (`include_str!`) and never touch the disk; **debug builds** load it from the source tree and
+  `hotstyle.rs` watches it - save the file and every open window restyles (`AppEvent::ThemeReloaded`
+  → `Viewer::restyle`: metrics, both styles, the icon atlas, the clear color, repaint). A stylesheet
+  is installed only once it parses *and* every color in it resolves, so a typo prints and changes
+  nothing rather than putting a broken window on screen.
+- **Icons:** `build.rs` rasterizes the SVGs to A8 coverage masks; they are packed at runtime into
+  one RGBA8 **atlas strip** (white RGB, coverage in alpha) uploaded as a single sokol_gfx image.
+  ImGui's shader multiplies texel by vertex color, so `(1,1,1,a) * tint` gives any tint from one
+  texture - no per-tint CPU work, which is what the old GDI path did on every repaint. The
+  stylesheet's `[icon_scale]` (a per-icon shrink, for artwork that doesn't fill its box like the
+  rest) is **baked into the atlas**, not applied at the draw call: the master is rastered into a
+  smaller box *centred in a full-size cell*, so the cell - and therefore the UV grid, the draw size
+  and ImGui's derived button size - stays a fixed `icon_px`, and the shrunk icon is a true
+  downsample rather than a re-scaled cell. `Imgui::refresh_icons` watches the scales as well as the
+  size, since a hot reload can move one without the other. An `Icon` is a *cell*, not a drawing: two
+  variants may name the same SVG (`B` and `BackdropBlack`) so that two buttons sharing artwork can
+  still be sized apart.
 
 ---
 
@@ -401,28 +567,30 @@ for, which the win shell applies.
 - **Session model:** a window holds a current image, view state (zoom, pan, channel
   toggles, exposure, tonemap), and a folder cursor for ←/→ navigation across siblings. The
   cursor (`folder.rs`) is built off-thread: opening a file scans its directory for sibling
-  images on a background thread that posts the sorted list back (`WM_APP_FOLDER_SCANNED`), so
-  the image shows first and the count fills in after (lazy). It is a snapshot taken at open
-  time, generation-tagged for stale-drop like a decode, and re-scanned only on a fresh open.
-- **Instance mode:** NewWindow (default) or SingleInstance, per §3.
-- **Window placement:** the frame opens at the size/position it had when last closed - the
-  restored (non-maximized) rect plus a maximized flag are captured on `WM_DESTROY` with
-  `GetWindowPlacement` and persisted to `%APPDATA%\fire\window.toml` (see `window_state.rs`),
-  then re-applied next launch with `SetWindowPlacement` (workspace coordinates round-trip
-  exactly). The window is **never** resized to the image - every open lands in fit-to-window
-  mode (`set_image` fits to the current viewport). The launcher's "Run" setting (the shortcut's
-  Normal/Minimized/Maximized, read from `STARTUPINFO.wShowWindow`) overrides the show state:
-  an explicit Maximized/Minimized wins, otherwise the remembered maximized state is restored.
-- **Settings:** stored as **TOML** in `%APPDATA%\fire\config.toml`, editable directly *and* from the
-  in-app settings window (`crate::ui::settings`) - a tabbed ImGui `BeginPopupModal` (General /
-  Flipbook / Octagon Overlay / Keybinds / Context menu) with OK/Cancel/Apply.
+  images on a background thread that posts the sorted list back (`AppEvent::FolderScanned`), so
+  the image shows first and the count fills in after. It is a snapshot taken at open
+  time and re-scanned only on a fresh open.
+- **Where an open lands:** `open-in = new-window | reuse-window`, per §3.
+- **Window placement:** each window opens at the size/position it had when the last one closed -
+  the restored (non-maximized) rect plus a maximized flag, captured on close and persisted to
+  `window.toml` in the config directory (`window_state.rs`), then re-applied next launch. The
+  window is **never** resized to the image - every open lands in fit-to-window mode. On Windows the
+  launcher's "Run" setting (the shortcut's Normal/Minimized/Maximized, read from
+  `STARTUPINFO.wShowWindow`) overrides the show state; off Windows that leaf answers `None` and the
+  remembered state stands.
+- **Settings:** stored as **TOML** in the per-user config directory - `%APPDATA%\fire` on Windows,
+  `~/Library/Application Support/fire` on macOS, `$XDG_CONFIG_HOME/fire` elsewhere (one definition,
+  `util::fire_dir`, so the files cannot drift apart). Fire writes a fully commented
+  `config.toml` on first run and never rewrites it on its own; it is editable directly *and* from
+  the in-app settings window (`crate::ui::settings`) - a tabbed ImGui `BeginPopupModal`
+  (General / Flipbook / Keybinds / Context menu) with OK/Cancel/Apply. Settings are per-user rather
+  than per-window: the window that applied them tells the shell, which hands the same config to
+  every other open window (and nobody re-saves it).
 
   It is drawn **inside the frame we were already painting**, which is the whole difference from the
-  2,150-line hand-painted Win32 dialog it replaced: no second HWND, no nested `GetMessageW` pump, and
-  therefore none of the `&mut App` aliasing that pump forced (the old dialog had to edit a *cloned*
-  `Config` and post it back). The state simply lives in `App`, is edited during the paint, and the
-  shell applies what the frame returns. Scrolling, the tab bar, text input, focus and hit-testing are
-  ImGui's, not ours.
+  2,150-line hand-painted Win32 dialog it replaced: no second window, no nested message pump, and
+  therefore none of the `&mut` aliasing that pump forced. The state lives in the viewer, is edited
+  during the paint, and the shell applies what the frame returns.
 
   **It has its own style** (`ui::theme::form`), and that is a decision rather than an omission. The
   chrome's style (`ui::theme::apply`) is a *toolbar*: buttons transparent until touched, no field
@@ -430,10 +598,10 @@ for, which the win shell applies.
   inherited it has invisible buttons and inputs whose edges you cannot see. So the settings window
   starts from ImGui's *factory geometry* (`render::imgui::FormStyle` snapshots the style at context
   creation, before `ui::theme` overwrites it - the only moment it exists) and `theme::form` paints
-  the stylesheet's palette onto it. Same colours as the chrome, form shape. Two
-  ImGui-default behaviours are corrected on the way: `WindowBg`/`PopupBg` are ~94 % opaque (right for a
-  debug overlay on a 3D scene, wrong here - the viewport's empty-state hint ghosted through), and the
-  tab bar fills the *unselected* tabs while leaving the selected one to blend into the page, which
+  the stylesheet's palette onto it. Same colours as the chrome, form shape. Two ImGui-default
+  behaviours are corrected on the way: `WindowBg`/`PopupBg` are ~94 % opaque (right for a debug
+  overlay on a 3D scene, wrong here - the viewport's empty-state card ghosted through), and the tab
+  bar fills the *unselected* tabs while leaving the selected one to blend into the page, which
   reads as "this tab is disabled and those are buttons".
 
   **Its layout has no pixel constants.** It opens at a fraction of the viewport and is resizable from
@@ -446,33 +614,78 @@ for, which the win shell applies.
   image" and strands the labels in a ragged right-hand column. Nothing here to re-tune for a font, a
   DPI, or a resize.
 
-  Two things it cannot do itself, and reports to the shell instead: **"Browse…"** (`GetOpenFileNameW`
-  pumps its own modal loop, so it is posted as `WM_APP_SETTINGS_BROWSE` and runs after the paint - §5.2)
-  and **keybind capture** (a chord is a virtual-key code, which only the wndproc sees; while a row is
-  armed the shell routes every key to it, Esc included, or ImGui would read Esc as "close the modal").
-  **Esc/Enter are the shell's too** - ImGui does not close a modal on Escape, and a dialog you cannot
-  escape is a trap.
+  Two things it cannot do itself: **keybind capture** (a chord is a physical key code, which only the
+  shell's event handler sees; while a row is armed the shell routes every key to it, Esc included)
+  and **"Browse…"** (a native file dialog - see below). **Esc/Enter are the shell's too** - ImGui
+  does not close a modal on Escape, and a dialog you cannot escape is a trap.
 
   Changes apply live where that isn't hostile (watcher, backdrop, zoom/exposure steps, zoom-snap
   levels, keybinds, menu contents), on the next image where re-fitting under the user would be
-  (open-fit, tonemap, flipbook playback defaults), and on the next launch for `instance-mode`. *Not yet:* hot-reloading
-  `config.toml` when it changes on disk (only the displayed image is watched - §10).
+  (open-fit, tonemap, flipbook playback defaults), and on the next launch for `open-in`. *Not yet:*
+  hot-reloading `config.toml` when it changes on disk (only the displayed image is watched - §10).
+- **The octagon overlay's options** are a floating ImGui window over the viewport rather than a
+  settings tab, because they are adjusted *while looking at the image*. Its persisted defaults live
+  under `[octagon]` in the config, behind a `remember` flag that is off by default.
 - **Accent color:** the highlight throughout the UI (latched toolbar buttons, checkmarks, the selected
-  tab's rule) is the stylesheet's `accent` token - a color you set per mode in `ui/theme.toml`, not the
-  Windows accent. Anything drawn *on* it uses `contrast(accent)`, which picks black or white by
-  luminance, so a pale accent doesn't produce white-on-yellow. The settings window uses the same token,
-  which is what keeps the two windows recognizably one app.
-- **Future:** a third mode - compare two images side-by-side in one window, or tabs - is
-  anticipated. With the single-window collapse it would be built as extra image sub-rects (and
-  extra swapchain viewports) within the one window, not as child windows.
+  tab's rule) is the stylesheet's `accent` token - a color you set per mode in `ui/theme.toml`, not
+  the OS accent. Anything drawn *on* it uses `contrast(accent)`, which picks black or white by
+  luminance, so a pale accent doesn't produce white-on-yellow.
+
+### 9.1 No modal loop inside an event-loop handler
+
+**Nothing called from a winit callback may pump an event loop of its own.** This is a rule the
+Win32 shell did not have, and breaking it is not a glitch - it aborts the process.
+
+Found the hard way: the Open… picker crashed Fire on macOS, reliably, as soon as the mouse moved
+over the panel. `rfd`'s `pick_file` puts up an app-modal `NSOpenPanel` and calls `runModal`, which
+pumps its own loop. It was being called from the idle step - deliberately, from the Win32 days:
+"never from inside a redraw". But **every** one of our handlers, the idle step included, runs
+inside winit's dispatcher, which holds a `RefCell` borrow for the whole call. AppKit's modal loop
+then routes a mouse event through winit's `sendEvent:` override, a gesture recognizer spins a
+*third* loop, a run-loop block re-enters winit's `handle_event`, and it panics: *"tried to handle
+event while another event is currently being handled"*. The panic unwinds into a CoreFoundation
+callback, where unwinding is forbidden, so the process aborts - the panic firewall is nowhere near
+that path and could not have caught it anyway. Windows has the same guard in its runner and so is
+exposed to the same class of bug.
+
+So **every native dialog runs on a worker thread and answers with an `AppEvent`**
+(`app::viewer::Dialog` → `AppEvent::DialogDone`). `rfd` hands the panel to the main thread itself,
+so the modal loop runs from the *run loop* rather than from inside our handler and re-entrancy
+never arises. As a bonus the window behind the picker stays live: an image forwarded from a second
+launch loads and redraws *while* the picker is up, which is exactly the dispatch that used to
+abort. The same rule retired the last blocking call - the "could not open a window" message box is
+recorded and shown by `main` after `run_app` returns.
+
+### 9.2 Timers, and the event-driven invariant
+
+Timers are **deadlines the loop sleeps on**, never threads (D8). `app::timers` is a `BinaryHeap` of
+`(Instant, seq)` with a side table of `(WindowId, TimerKind)` - three kinds: animated-GIF playback,
+the flipbook pump, and the text caret's blink. Arming pushes and returns a `seq`; the idle step
+pops everything due, dispatches it to the owning window, and then sets
+`ControlFlow::WaitUntil(next)` or `Wait` if the heap is empty. Cancellation is by sequence number
+rather than removal - a popped entry whose `seq` the window no longer wants is simply dropped - so
+a re-armed timer never has to find its predecessor in the heap.
+
+That last step is the whole of the event-driven invariant's enforcement: with no timer armed the
+process sleeps in the OS until an event arrives.
+
+**Every handler runs behind a panic firewall.** A panic in a handler must not unwind into winit's
+dispatcher - the Win32 wndproc had the same rule - so each entry point catches, logs, and carries
+on with the window alive.
 
 ---
 
 ## 10. Viewer features
 
-- Channel isolation (solo R/G/B/A, alpha-as-grayscale).
+- Channel isolation (solo R/G/B/A, alpha-as-grayscale, RGB↔RGBA composite).
 - Pan / zoom / fit / 1:1; LMB drag-pan (the image can be pushed fully off any edge - Fit/1:1
-  recenters it); mouse-wheel and RMB-vertical-drag zoom, both about the cursor.
+  recenters it); mouse-wheel and RMB-vertical-drag zoom, both about the cursor; and on macOS
+  **pinch-to-zoom**, which maps `WindowEvent::PinchGesture`'s incremental magnification onto the
+  same about-cursor zoom (D15). **1:1 means one texel per *physical* pixel**, so it stays crisp on
+  a Retina display - fit and 1:1 are in physical pixels end to end, and it is the *gesture* math
+  that has to convert.
+- The wheel's job is configurable (`wheel-action`): zoom about the cursor, or step through the
+  folder. Ctrl+wheel zooms either way, so choosing navigation does not cost you wheel zoom.
 - **Zoom-snap detents** (`ZoomDetent`, `render/view.rs`): the RMB scrubby-zoom notches at the
   configured zoom levels (`zoom-snap-levels`) instead of sliding past them, which is what makes
   landing exactly on 100 % possible with a drag. Crossing a level pins the zoom there and absorbs
@@ -480,57 +693,87 @@ for, which the win shell applies.
   is continuous rather than a jump, and a held drag walks through snap after snap. A step that
   clears a level by more than the release distance - a flick - passes straight through, so the
   detents notch a deliberate drag without braking a fast one. All the math is in log-zoom units and
-  Win32-free (unit-tested); an empty ladder or a non-positive release is snapping switched off.
+  window-system-free (unit-tested); an empty ladder or a non-positive release is snapping off.
 - HDR exposure (stops) + tonemap operator (Reinhard / ACES).
 - **Animated GIF playback:** an animated GIF plays automatically at its authored per-frame delays.
-  The decode delivers all frames (§6); the frame window runs a Win32 timer (`ANIM_TIMER_ID`),
-  rescheduled each tick to the next frame's delay, whose handler advances `GpuSurface`'s frame index,
-  uploads that frame as the texture, and invalidates the view. The timer is (re)armed on every adopt
-  and stopped when a still image or a failed load takes over (`App::sync_animation`), so it follows
-  ←/→ navigation and hot-reload and never outlives the animated image. Playback is pan/zoom/channel/
-  exposure-agnostic (those still just change the constant buffer). Only GIF is animated for now.
+  The decode delivers all frames (§6); an `Anim` timer, rescheduled each tick to the next frame's
+  delay, advances the surface's frame index, uploads that frame as the texture and requests a
+  redraw. It is (re)armed on every adopt and stopped when a still image or a failed load takes over,
+  so it follows ←/→ navigation and hot-reload and never outlives the animated image. Playback is
+  pan/zoom/channel/exposure-agnostic (those still just change the uniform block). Only GIF is
+  animated for now.
 - **Flipbook (sprite-sheet) playback:** a still image laid out as a `cols × rows` grid of frames
   is played back as an animation without ever re-uploading the texture - the whole sheet stays one
-  texture and playback only moves the constant buffer's cell offsets + blend (`App::tick_flipbook`
-  on `FLIPBOOK_TIMER_ID`). The grid is **content-detected** off-thread on the decode worker
-  (`flipbook::detect`, YIN period detection over luma/alpha - *the pixels decide the grid*, since
-  filenames can be wrong or missing; a `_8x8` filename token is only a last-resort fallback), and
-  surfaced as a dismissible hint that never enters the mode on its own. Once in flipbook mode a
-  transport band (`crate::transport`, drawn in ImGui) exposes cols/rows/count, FPS, play/pause,
-  scrub and cross-frame blend; a scrub drag pauses playback for its duration. Defaults and per-path
-  overrides live in the Flipbook settings tab. Pure grid/frame math is in `flipbook.rs` (unit-tested,
-  no Win32/GPU).
-- Drag-and-drop open: the window registers with `DragAcceptFiles`, and the wndproc routes
-  `WM_DROPFILES` through the same `App::open` path as a launch/forward. With the single-window
-  collapse there is no child to also register - one client rect covers image and chrome alike. The
-  first dropped file is opened.
-- Folder navigation: ←/→ walk the sibling images in the current file's directory (wrapping at
+  texture and playback only moves the uniform block's cell offsets + blend. The grid is
+  **content-detected** off-thread on the decode worker (`flipbook::detect`, YIN period detection
+  over luma/alpha - *the pixels decide the grid*, since filenames can be wrong or missing; a `_8x8`
+  filename token is only a last-resort fallback), sent *after* the decode so the scan never delays
+  the image, and surfaced as a dismissible hint that never enters the mode on its own. Once in
+  flipbook mode a transport band (`crate::transport`, drawn in ImGui) exposes cols/rows/count, FPS,
+  play/pause, scrub and cross-frame blend; a scrub drag pauses playback for its duration. Defaults
+  and per-path overrides live in the Flipbook settings tab. Pure grid/frame math is in `flipbook.rs`
+  (unit-tested, no window system or GPU).
+
+  Its ~60 Hz timer neither paces the animation nor, normally, the frames: playback position is
+  derived from elapsed time, so the sheet plays at its own `fps` whenever it is sampled, and while
+  the window is visible each frame is asked for by the *previous* frame's present, which blocks
+  until vblank. The timer **starts** the pump and **carries** it when nothing else would.
+- **The octagon overlay:** Unity VFX Graph's octagon particle shape drawn over the image (or the
+  current flipbook frame), so an artist can see what an octagon-cropped particle would keep of the
+  texture. Eight vertices in two sets - four pinned at the quad's edge midpoints, four sliding
+  diagonally inward from the corners with the crop factor - so on a square quad all eight sides
+  stay the same length at every crop. The lines are an ImGui draw list, the "hide outside" fade is
+  two uniform-block floats in the fragment shader, and the geometry itself is pure unit-tested math
+  in `octagon.rs`. It tracks the image in full screen too.
+- **Drag-and-drop open:** winit reports the drop; it goes through the same `Viewer::open` path as a
+  launch or a forward. One client rect covers image and chrome alike, so there is no second surface
+  to register.
+- **Folder navigation:** ←/→ walk the sibling images in the current file's directory (wrapping at
   both ends), in file-manager natural order (case-insensitive, digit-runs by value so `img2`
   precedes `img10`); the status bar shows the position/count (`3 / 27`).
-- Hot-reload: the displayed image re-decodes automatically when its file changes on disk
-  (`watcher.rs`, on by default; `hot-reload = false` disables it). A per-window thread watches the
-  current image's *directory* non-recursively via the `notify` crate (`ReadDirectoryChangesW`),
-  which survives editors' atomic save-and-rename; it debounces write bursts and gates on a
-  modified-time/size change (so a pure metadata touch - or the viewer's own decode read - can't
-  trigger a reload loop), then posts `WM_APP_FILE_CHANGED` to the frame. The reload keeps the
-  current pixels on screen until the new decode lands (no blank flash) and preserves the view
-  (zoom/pan/channel/exposure) when the new image has the same dimensions, only re-fitting if the
-  dimensions changed. The watch follows ←/→ navigation (it re-targets on every open/load) and is
-  generation-tagged for stale-drop, exactly like decodes and folder scans.
-- **Open in configured editor:** the actions menu launches a user-configured external app on the
-  current file (`config` context-menu tree → `launch_external`); the tree is edited in the Context
-  menu settings tab.
+- **Hot-reload:** the displayed image re-decodes automatically when its file changes on disk
+  (`watcher.rs`, on by default; `hot-reload = false` disables it). One long-lived thread per window
+  owns an OS watch through the `notify` crate (`ReadDirectoryChangesW` on Windows, FSEvents on
+  macOS) on the current image's *directory*, non-recursively, which survives editors' atomic
+  save-and-rename; it debounces write bursts and gates on a modified-time/size change (so a pure
+  metadata touch - or the viewer's own decode read - can't trigger a reload loop), then sends
+  `AppEvent::FileChanged`. The reload keeps the current pixels on screen until the new decode lands
+  (no blank flash) and preserves the view (zoom/pan/channel/exposure) when the new image has the
+  same dimensions, only re-fitting if the dimensions changed. The watch follows ←/→ navigation and
+  is generation-tagged for stale-drop, exactly like decodes and folder scans.
+- **Full screen** (F11, or middle-click over the viewport): winit's borderless full screen, which
+  on macOS is `toggleFullScreen:` - the native space transition. Esc always leaves full screen; the
+  `esc-closes-window` setting governs whether it *also* closes an ordinary window.
+- **File actions and Open in…:** "Show on Disk" (Explorer on Windows, Finder on macOS), copy the
+  file, its path or its name, and any number of user-configured external programs (`[[open-with]]`, nestable into
+  submenus, with `{path}` substituted into the arguments). Which built-in items appear is
+  configurable (`[context-menu]`).
 
 ---
 
-## 11. Explorer integration
+## 11. OS integration
 
-- **Association only** (no thumbnail handler in v1): register an `HKCU` ProgID, declare
-  supported extensions (`.jpg .jpeg .png .tga .tif .tiff .psd .exr .hdr` …, plus camera-raw
-  `.cr2 .cr3 .nef .arw .raf .orf .rw2 .dng` … under an opt-in `assoc\raw` task), and point
-  them at `fire.exe`. Appears in "Open with".
-- Decoders are factored into the standalone `fire-decode` crate, so an `IThumbnailProvider`
-  handler can be added later as a separate `cdylib` reusing that core with no rework.
+**Windows - association only** (no thumbnail handler): the installer registers a per-format `HKCU`
+ProgID (`Fire.png`, `Fire.tga`, …) whose friendly type name is what Explorer shows in the Type
+column, an `OpenWithProgids` entry, the `.ext` default ProgID for formats the user ticked, and a
+Default-Programs `Capabilities` block so Fire appears in Settings → Default apps. Uninstall removes
+all of it. Windows protects the per-extension default with a hashed `UserChoice`, so the installer
+can claim types with no choice set but cannot silently override one the user has already assigned.
+
+**macOS - document types, volunteered not claimed.** The `.app`'s `Info.plist` declares one
+`CFBundleDocumentTypes` entry listing every extension, with **`LSHandlerRank = Alternate`**: Fire
+shows up in "Open With" and can be made the default, without taking `.png` away from Preview on
+install. One entry rather than one per format, because with `Alternate` we do not own the UTI and
+the per-type name never surfaces. The extension list is **parsed out of `fire-decode`'s
+`SUPPORTED_EXTENSIONS`** by `scripts/build-mac.sh`, so unlike the installer's copy it cannot drift;
+54 extensions in, and LaunchServices resolves them to 48 claimed UTIs (the real ones -
+`public.png`, `com.ilm.openexr-image`, `com.adobe.photoshop-image`, every camera-raw UTI - plus
+dynamic ones for formats macOS has no UTI for, like `.qoi`, `.ff`, `.x3f`). `NSSupportsSuddenTermination`
+is pointedly *not* declared: it would let the OS skip the `atexit` that removes the instance socket
+(§3).
+
+Decoders are factored into the standalone `fire-decode` crate, so an `IThumbnailProvider` (or a
+Quick Look extension) can be added later reusing that core with no rework.
 
 ---
 
@@ -539,95 +782,195 @@ for, which the win shell applies.
 ```
 fire/
 ├─ crates/
-│  ├─ fire/           # the viewer exe: Win32 shell, D3D11 render, decode pool, pipe
+│  ├─ fire/           # the viewer: winit shell, sokol_gfx render, decode pool, instance socket
+│  │  ├─ src/app/     #   the ApplicationHandler (Fire) + one Viewer per window + the timer queue
+│  │  ├─ src/render/  #   view math, gpu.rs, d3d11.rs | metal.rs, mips.rs, imgui.rs, the shader
+│  │  ├─ src/ui/      #   pure immediate-mode UI + the stylesheet (theme.toml)
+│  │  └─ simgui/      #   sokol_imgui.h + cimgui.h, compiled as C by build.rs
 │  ├─ fire-decode/    # uniform decode core (zune/image/exr/psd_sdk/libheif/lcms2)
-│  ├─ fire-ipc/       # pipe wire format for single-instance forwarding (shared)
+│  ├─ fire-ipc/       # the instance-socket wire format (shared, dependency-free)
 │  ├─ psd-sdk-sys/    # FFI bindings + cc build of psd_sdk
-│  └─ heif-sys/       # FFI bindings + cc/link of libheif (AVIF/HEIF/HEIC)
-├─ assets/            # fire.ico + icon source
+│  └─ heif-sys/       # FFI bindings + link of libheif (AVIF/HEIF/HEIC), vendored per target
+├─ vendor/sokol-rust/ # pinned upstream floooh/sokol-rust; excluded from the workspace
+├─ assets/            # app icons + the toolbar SVGs
+├─ installer/         # the Inno Setup script (Windows)
+├─ scripts/           # packaging, shader generation, the TTFP harness
 └─ Cargo.toml         # workspace
 ```
 
-Key dependencies: `windows` (typed COM for the D3D11 device + DXGI flip swapchain, used only in
-`render/gpu.rs` and `render/imgui.rs`), `windows-sys` (the rest of Win32: window/message loop, DWM,
-DPI, pipe, mutex, registry), `dear-imgui-sys` (the ImGui context + upstream's own win32/dx11
-backends, §5.2), `zune-image`/`image`/`exr`/`lcms2`/`psd_sdk`/`libheif` (decode), `serde`/`toml`/
-`notify` (config + hot-reload), `crossbeam-channel` (worker messaging). (Clipboard is planned but no
-crate is pulled in yet.)
+Key dependencies: `winit` (window, event loop, input, DPI, drag-and-drop, theme, full screen),
+`sokol` (sokol_gfx, vendored), `dear-imgui-rs` + `dear-imgui-winit` + `sokol_imgui` (the chrome),
+`interprocess` (the instance socket), `dirs` (the config directory), `rfd` (native dialogs and the
+startup error box), `zune-image`/`image`/`tiff`/`exr`/`lcms2`/`psd_sdk`/`libheif` (decode),
+`serde`/`toml`/`notify` (config + hot-reload), `crossbeam-channel` (worker messaging). Windows adds
+`windows` (typed COM for the D3D11 device and DXGI swapchain) and `windows-sys` (the five platform
+leaves); macOS adds `muda` (the menu bar) and the `objc2` family (the `CAMetalLayer`, the delegate
+hook, the pasteboard) at winit's own versions, so only `muda` is an extra compile.
+
+`winit` and the two `dear-imgui-*` crates are pinned to **exact** versions. They move together, and
+`dear-imgui-sys`'s cimgui is what `simgui.c` is compiled against (§15), so a bump is a three-place
+change: the crate versions, `simgui/cimgui.h`, and a rebuild proving the defines still match.
+
+### 12.1 The platform leaves
+
+Everything below is the platform-specific code that remains; `platform.rs` says in its header that
+nothing *else* in `fire` should mention an OS, and this is what it points at.
+
+| Concern | Windows | macOS | Shared via |
+| --- | --- | --- | --- |
+| Window, loop, DPI, DnD, theme change, full screen, placement | - | - | `winit` |
+| GPU device + swapchain | `render/d3d11.rs`: D3D11 + DXGI flip-model swapchain | `render/metal.rs`: `MTLDevice` + `CAMetalLayer` on winit's view | `sokol_gfx` above them |
+| Shader bytecode | HLSL → DXBC (`fxc`, build.rs) | MSL → `.metallib` (`xcrun metal`, build.rs) | one `sokol-shdc` source + reflection |
+| Config dir | `%APPDATA%\fire` | `~/Library/Application Support/fire` | `dirs` |
+| Dark mode | - | - | `winit` `Window::theme()` / `ThemeChanged` |
+| Open-file dialog + startup error box | - | - | `rfd` |
+| Hot-reload watch | `ReadDirectoryChangesW` | FSEvents | `notify` |
+| IPC transport | named pipe | Unix socket file (runtime dir) | `interprocess` |
+| Foreground handoff on forward | `AllowSetForegroundWindow` leaf | not needed | - |
+| Launcher "Run" show state | `GetStartupInfoW` leaf | no equivalent (`None`) | `platform.rs` |
+| Clipboard (Copy File / Path / Name) | `CF_HDROP` + text leaf | `NSPasteboard` file URL + text | `platform.rs` |
+| Show in Explorer / Reveal in Finder | leaf | leaf | `platform.rs` |
+| UI font | `segoeui.ttf` | `SFNS.ttf` | `platform.rs` |
+| Open-file events from the OS | `argv[1]` | `openfiles.rs`: `application:openURLs:` | both call `Viewer::open` |
+| Menu bar | none | `menubar.rs`: `muda`, App / File / Window | - |
+| File association | `HKCU` ProgID (installer) | `CFBundleDocumentTypes`, `LSHandlerRank = Alternate` | both from one extension table |
+| Native decoder libs | vendored `.lib` | vendored arm64 `.a` | one `VENDOR.txt` recipe |
+| Icon / metadata | `winresource` | `Info.plist` + `.icns` | both from `product.json` |
+| Packaging | Inno Setup | `build-mac.sh` → signed, notarized `.dmg` | `product.json` |
+
+**The macOS menu bar** deserves a note. A Mac app without one reads as broken and, more concretely,
+is awkward to quit - ⌘Q is the menu's, not the window's. `menubar.rs` builds the minimum that makes
+Fire behave like a Mac app (application, File, Window) and routes the two items that are *Fire's*
+back into the same `KeyAction` path a keystroke takes, so the menu and the keyboard cannot drift.
+Everything else is a `muda` **predefined** item, which maps onto AppKit's own responder-chain
+selectors (`terminate:`, `hide:`, `performMiniaturize:`) and so behaves exactly as users expect and
+cannot desynchronise from app state. winit installs a default menu bar of its own during
+`applicationDidFinishLaunching`, which would replace ours wholesale, so it is turned off
+(`with_default_menu(false)`) - and whatever replaces it must therefore carry Quit itself.
+
+Two rules there, both learned: **menu accelerators intercept keys before winit sees them**, so each
+app item is given the chord the user has actually bound to that action rather than a hardcoded
+⌘O/⌘W - a menu accelerator that disagreed with the keybind would silently shadow it. And there is
+deliberately **no "Close Window" item**, tempting as the Mac convention is: muda's predefined one
+hardcodes ⌘W, which is already Fire's *Close image* chord on both OSes, and two items claiming one
+accelerator leaves AppKit to pick. The red button still closes the window.
 
 ---
 
 ## 13. Build and distribution
 
-- `cargo build --release` produces a **single `fire.exe`**. It links only the D3D11/DXGI system
-  DLLs (present on every supported Windows; no redistributable, no bundled runtime - and with the
-  shader precompiled at build time, not even `d3dcompiler`). The viewport HLSL is compiled to DXBC
-  by `fxc` (Windows SDK) in `build.rs` and embedded via `include_bytes!`. The C++ `psd_sdk` and the
-  `libheif`/`libde265`/`dav1d` decoder stack are built/linked via `cc`/`bindgen` build scripts in
-  `psd-sdk-sys` and `heif-sys`. The Fire `.ico` + version/product metadata are embedded via
-  `winresource`.
+- `cargo build --release` produces a **single executable**. On Windows it links only system DLLs
+  (D3D11/DXGI and friends - no redistributable, no bundled runtime, and with the shader
+  precompiled, not even `d3dcompiler`); on macOS it links the system frameworks the vendored sokol
+  tree names for itself (`Cocoa` / `QuartzCore` / `Metal`). The C++ `psd_sdk` and the
+  `libheif`/`libde265`/`dav1d` decoder stack are built/linked via the `cc`/`bindgen` build scripts
+  in `psd-sdk-sys` and `heif-sys`; `fire`'s own `build.rs` compiles the shader bytecode (§5.3),
+  compiles `simgui.c`, rasterizes the toolbar SVGs, and on Windows embeds the `.ico` + version
+  resource via `winresource`.
 - **`product.json` (repo root) is the single source of product metadata** - name, version,
-  publisher, copyright, homepage, description. `fire`'s `build.rs` reads it to fill the exe's
-  version resource and to re-export the values as `FIRE_*` compile-time env vars the app reads
-  (window title, etc.); the installer build script reads the same file. Bump the version there and
-  it flows into the application and the installer alike - nothing else hardcodes it.
-- **Unsigned installer** (Inno Setup, `installer/fire.iss`): per-user install (no admin, to match
-  the `HKCU` association model), with a wizard page offering Fire as the default viewer per format
-  plus an "All supported image formats" master toggle (default off - never steals associations the
-  user didn't pick). Registers the shared `Fire.Image` ProgID + `OpenWithProgids` + a
-  Default-Programs `Capabilities` block, with clean uninstall. No `Run`/autostart entry - nothing
-  stays resident. (No code signing yet - expect a SmartScreen prompt on first run. Note: Windows
-  protects the per-extension default via a hashed `UserChoice`, so the installer can claim *unset*
-  types outright but cannot silently override a type the user has already assigned.)
-- **Build the installer** with `scripts/build-installer.ps1`: it syncs the Cargo workspace version
-  to `product.json`, regenerates `assets/fire.ico` from `assets/icon.png` (ImageMagick), builds the
-  release exe, writes `installer/product.generated.iss` (the `#define`s from `product.json`), and
-  compiles `installer/fire.iss` with ISCC into `dist/Fire-<version>-Setup.exe`.
+  publisher, copyright, homepage, description. `build.rs` reads it to fill the Windows version
+  resource and to re-export the values as `FIRE_*` compile-time env vars the app reads (window
+  title, the empty-window identity card); both packaging scripts read the same file. Bump the
+  version there and it flows into the application and the packages alike.
+- **Windows: an unsigned Inno Setup installer** (`installer/fire.iss`, built by
+  `scripts/build-installer.ps1` - see [installer/README.md](installer/README.md)). Per-user install
+  (no admin, matching the `HKCU` association model), a wizard page offering Fire as the default
+  viewer per format plus an "All supported image formats" master toggle (default off - never steals
+  associations the user didn't pick), and clean uninstall. No `Run`/autostart entry - nothing stays
+  resident. No code signing yet: expect a SmartScreen prompt on first run.
+- **macOS: a signed, notarized `.dmg`** (`scripts/build-mac.sh`). It builds the release binary,
+  makes the `.icns` from the 1024² master, writes the `Info.plist` from `product.json` and
+  `fire-decode`'s extension table (§11), signs with `codesign --options runtime --timestamp`,
+  submits to `notarytool --wait`, staples, and wraps the result in a `.dmg` with an `/Applications`
+  symlink. It runs **by hand on the dev Mac** (D11) and takes both credentials from the keychain,
+  so the Developer ID certificate and the App Store Connect key never have to exist as CI secrets
+  on a public repo. `--no-notarize` / `--no-sign` step down from that for iteration and say plainly
+  that what they produce is not shippable - macOS 15 removed the Control-click bypass, so an
+  un-notarized build needs System Settings → Privacy & Security → Open Anyway.
+- **CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is a two-host matrix, and both legs
+  are mandatory (D23): clippy on Windows never sees `render/metal.rs`, `openfiles.rs` or
+  `menubar.rs`, and clippy on macOS never sees `render/d3d11.rs` or the `windows-sys` leaves, so a
+  single-host CI cannot keep the workspace lint-clean. Each host runs two jobs: `check` with
+  `--no-default-features` (no vendored native trees, so no bindgen and no LLVM needed - it covers
+  `fire-ipc`, the pure-Rust decode core and the whole shell), and `full`, gated on a restored
+  vendor cache, which adds the PSD/HEIF FFI tests and the release build. The vendor cache key
+  carries the runner OS and arch, or the arm64 `.a`s and the x64 `.lib`s would collide. Per D11 CI
+  stops at build-and-test on macOS: it never signs, notarizes or packages.
+
+  The mac leg needs one thing the Windows leg does not: the **Metal toolchain**, which since
+  Xcode 26 is an optional ~700 MB component present on some runner images and not others, and which
+  `build.rs` needs for *any* build. The job tests for it by **running**
+  `xcrun -sdk macosx metal --version`, because `xcrun --find metal` succeeds either way - what it
+  finds without the toolchain is a stub that only fails when used - and downloads it only if that
+  fails.
 
 ---
 
-## 14. v1 scope vs. deferred
+## 14. Scope vs. deferred
 
-**In v1:** single self-contained native Win32 exe; configurable NewWindow / SingleInstance
-lifecycle with **foreground activation on the forward path (§4.1)**; GPU (D3D11) shader
-render with channel/alpha/gamma/exposure/tonemap; async worker decode; zune + image + exr +
-psd_sdk + libheif decoders; camera-raw embedded-preview decode; animated GIF playback; ICC honoring
-via lcms2; tonemap-to-SDR HDR with exposure; downscale-to-fit RAM guard; content-detected **flipbook
-(sprite-sheet) playback** with a transport band; folder ←/→ navigation; hot-reload of the displayed
-image; **DPI-aware, dark-mode-aware ImGui toolbar + status bar + settings window**; open-in-editor;
-association-only Explorer integration; unsigned installer.
+**Shipping:** a single self-contained native app on Windows and macOS; one process, N windows, with
+`open-in` deciding where a forwarded open lands, and **foreground activation on the Windows forward
+path (§4.1)**; GPU render through sokol_gfx with channel/alpha/gamma/exposure/tonemap; async worker
+decode; zune + image + tiff + exr + psd_sdk + libheif decoders; camera-raw embedded-preview decode;
+animated GIF playback; ICC honoring via lcms2; tonemap-to-SDR HDR with exposure; downscale-to-fit
+RAM guard; content-detected **flipbook (sprite-sheet) playback** with a transport band; the
+**octagon overlay**; folder ←/→ navigation; hot-reload of the displayed image; **DPI-aware,
+dark-mode-aware ImGui toolbar + status bar + settings window**; portable physical-key keybinds;
+open-in-editor and the clipboard actions; file association on both OSes; an unsigned Windows
+installer and a signed, notarized macOS `.dmg`.
 
-**In progress / deferred:** pixel inspector; clipboard copy (no crate wired in yet);
-background-color *picker* (the settings window ships the four preset backdrops; a custom color needs
-a `Params`/shader change), exposure trackbar; compare/tabs mode; Explorer `IThumbnailProvider`;
-**full raw development** (demosaic the sensor mosaic instead of showing the embedded preview - a
-separate opt-in mode, kept off the fast path); code signing.
+**In progress / deferred:** pixel inspector; a custom background-color *picker* (the settings ship
+the four preset backdrops; a custom color needs a shader/uniform change); compare/tabs mode
+(anticipated as extra image sub-rects and viewports within one window, not as child windows);
+Explorer `IThumbnailProvider` / Quick Look; **full raw development** (demosaic the sensor mosaic
+instead of showing the embedded preview - a separate opt-in mode, kept off the fast path);
+hot-reload of `config.toml`; Windows code signing; an Intel/universal macOS build; tiled/virtual
+texturing for gigapixel sources.
 
 ---
 
 ## 15. Key risks and notes
 
-- **Cold start must stay cheap.** The whole bet is that a lean native exe reaches first-pixel
-  fast. Creating the D3D11 device + flip swapchain happens on the launch path; it is cheap
-  (low-ms) but real, so keep it lean and off the critical path to the first decode where
-  possible. If a heavy dependency creeps back in, that cold-start cost reappears.
-- **GPU device loss - deliberately unhandled.** A D3D11 device can be lost (TDR, driver update,
-  GPU reset). The renderer does **not** recreate the device/swapchain on `DXGI_ERROR_DEVICE_REMOVED`,
-  by design: this is a stateless viewer (no unsaved data), so the recovery story is "relaunch."
-  Re-opening the file is one keystroke and costs nothing a user would notice. WARP remains a
-  fallback only at *creation* time (no hardware / RDP), not a mid-session failover.
-- **Foreground lock (§4.1).** Only relevant in SingleInstance mode, but the easiest thing
-  to get wrong and the most visible when it is: without the `AllowSetForegroundWindow`
-  handoff, a forwarded open silently fails to come to the front.
-- **psd_sdk is C++.** Budget time for the `-sys` crate (bindgen + `cc`) and treat every FFI
-  call as a panic boundary (`catch_unwind`, validated inputs) so a malformed file can't take
-  down the viewer process.
-- **ICC + zune tension.** Honoring profiles forces some formats off the zune hot path onto
-  the `image` decoder that exposes ICC bytes; verify which formats this affects so you know
-  where the fast path actually applies.
-- **Large-image RAM (+ VRAM).** The decoded image is retained in RAM (the texture-upload source
-  and the pixel-inspector backing) *and* lives as a GPU texture with a mip chain (~4/3× its size
-  in VRAM). The `max_dim` guard bounds the worst case; revisit if gigapixel sources become common
-  (tiled/virtual texturing, v2).
-- **First-run UX.** Unsigned installer → SmartScreen warning; document the "More info → Run
-  anyway" step until signing is added.
+- **Cold start must stay cheap.** The whole bet is that a lean native binary reaches first-pixel
+  fast. Device creation is the longest single item on the launch path; it is off the critical path
+  today only because it runs on its own thread and the window is created *before* the join (D18).
+  Get that ordering wrong and the window's 9-31 ms serialize after the device. If a heavy
+  dependency creeps back in, the cold-start cost reappears.
+- **No modal loop inside a handler** (§9.1). It is not a glitch, it is a process abort, and the
+  panic firewall cannot catch it. Every native dialog goes to a worker thread.
+- **`sokol_imgui` / `cimgui` ABI lockstep.** `simgui.c` and `dear-imgui-sys` compile the same ImGui
+  structs in two translation units. The five cimgui defines and the `SOKOL_*` backend must match
+  exactly; a mismatch is **not a link error, it is a silent layout difference**. Bump the
+  `dear-imgui-*` crates and the vendored `simgui/cimgui.h` as one change.
+- **The two backend modules are twins by hand.** `render/mod.rs` aliases one of them as `backend`;
+  nothing enforces that the other keeps up. Anything added to one must be added to the other, and
+  only CI's second host will notice if it is not.
+- **The vendored sokol tree** (`vendor/sokol-rust`) is a pinned checkout, not a registry
+  dependency; updating it is manual, and it is where `sg_swapchain` / `ShaderDesc` field changes
+  would land.
+- **GPU device loss - deliberately unhandled.** A device can be lost (TDR, driver update, GPU
+  reset). The renderer does not recreate the device or swapchain, by design: this is a stateless
+  viewer with no unsaved data, so the recovery story is "relaunch". A failed acquire skips the
+  frame rather than drawing into nothing. WARP remains a fallback only at *creation* time (no
+  hardware / RDP), not a mid-session failover.
+- **Single-process crash exposure** (D7). Accepted knowingly: FFI already runs under `catch_unwind`
+  on a worker with validated inputs, and a viewer has no unsaved state, but a true segfault in
+  libheif/psd_sdk closes every window rather than one.
+- **Foreground lock (§4.1).** Windows only, but the easiest thing to get wrong and the most visible
+  when it is: without the `AllowSetForegroundWindow` handoff, a forwarded open silently fails to
+  come to the front.
+- **`psd_sdk` is C++.** Treat every FFI call as a panic boundary (`catch_unwind`, validated inputs)
+  so a malformed file can't take down the process.
+- **ICC + zune tension.** Honoring profiles forces some formats off the zune hot path onto the
+  `image` decoder that exposes ICC bytes; verify which formats this affects so you know where the
+  fast path actually applies.
+- **Large-image RAM (+ VRAM).** The decoded image is retained in RAM (the upload source and the
+  pixel-inspector backing) *and* lives as a GPU texture with a mip chain (~4/3× its size in VRAM);
+  the chain is also built in RAM on the worker before upload. The `max_dim` guard bounds the worst
+  case; revisit if gigapixel sources become common.
+- **The dev and shipping macOS bundles share the instance socket**, because its name belongs to the
+  product rather than to the bundle id. Launching one while the other runs forwards the open to
+  whichever got there first - worth knowing while testing, not a bug.
+- **First-run UX.** The Windows installer is unsigned → SmartScreen warning; document the "More
+  info → Run anyway" step until signing is added. The macOS `.dmg` is signed *and* notarized, and
+  the stapled ticket means it opens on a Mac that is offline.

@@ -778,13 +778,20 @@ nothing after them can be checked without it.
 10. Hand the dmg to the colleagues; the first thing to test is Finder double-click on an
     already-running Fire (the Apple-Event path) and drag onto the Dock icon.
 
-### Phase 3 - cleanup
+### Phase 3 - cleanup - **done** (2026-09-05)
 
-The Win32 shell code and the old D3D11 drawing path are already gone; what remains is
-documentation. Update `architecture.md` §2-5, §8-9, §12-13 to describe the shared shell, fold
-this document's decisions into it, and sweep the stale references the migration left behind
-(e.g. `window_state.rs` still cites `crate::win` and `GetWindowPlacement` for a rectangle winit
-now reports).
+The Win32 shell code and the old D3D11 drawing path were already gone; what remained was
+documentation. `architecture.md` has been rewritten around the shared shell - the decisions in
+this document are folded into it, and it is now the current description rather than the Windows
+one - and `README.md`, `CREDITS.md`, `THIRD-PARTY-NOTICES.md` (regenerated over both targets,
+161 crates, with sokol's Zlib notice and `option-ext`'s MPL note added), `installer/README.md`,
+`TODO.md` and `product.json` follow it. The stale in-tree references the migration left behind
+were swept with them: `window_state.rs` and `flipbook.rs` no longer cite `crate::win`, and the
+`shader.hlsl` mentions in `gpu.rs`, `imgui.rs` and `build.rs` now point at `shader.glsl` and
+`render/generated/`.
+
+This document stays as the *record* of the port - why the shell was chosen, what was measured,
+and what each decision cost. `architecture.md` is what describes the program.
 
 ---
 

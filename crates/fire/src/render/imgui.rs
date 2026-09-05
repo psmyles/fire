@@ -30,7 +30,7 @@
 //!
 //! * **sRGB.** The swapchain is written through a UNORM view, and ImGui's colors are already
 //!   sRGB, so nothing here gamma-corrects; the image pass encodes its own output (see
-//!   `shader.hlsl`). sokol_imgui picks its gamma from the swapchain format, which says UNORM.
+//!   `shader.glsl`). sokol_imgui picks its gamma from the swapchain format, which says UNORM.
 //! * **DPI.** ImGui 1.92's dynamic font system rasterizes glyphs on first use, so a DPI change is
 //!   just `set_font_scale_dpi` — there is no atlas to rebuild. Only the icon texture (a real
 //!   raster) gets rebuilt, in [`Imgui::refresh_icons`]. The platform backend runs with its DPI

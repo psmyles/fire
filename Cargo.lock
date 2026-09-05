@@ -622,7 +622,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fire"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cc",
  "crossbeam-channel",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "fire-decode"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bytemuck",
  "exr",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "fire-ipc"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "flate2"
@@ -848,7 +848,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "heif-sys"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bindgen",
  "cc",
@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "psd-sdk-sys"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bindgen",
  "cc",

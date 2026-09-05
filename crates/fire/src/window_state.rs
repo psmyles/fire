@@ -1,12 +1,15 @@
 //! Persisted window placement. Fire remembers the frame's *restored* (non-maximized)
 //! position/size plus whether it was maximized, saved on close and restored on the next
 //! launch so the window reopens where the user left it — rather than resizing itself to each
-//! image. Stored as `%APPDATA%\fire\window.toml`, separate from the user-edited `config.toml`
-//! so writing this runtime state never disturbs hand-authored config.
+//! image. Stored as `window.toml` in the per-user config directory ([`crate::util::fire_dir`]),
+//! separate from the user-edited `config.toml` so writing this runtime state never disturbs
+//! hand-authored config.
 //!
-//! The rectangle is in the **workspace** coordinates that `GetWindowPlacement` reports and
-//! `SetWindowPlacement` consumes (see [`crate::win`]), so it round-trips exactly regardless of
-//! taskbar/work-area offsets.
+//! The rectangle is in **physical** pixels: winit's `outer_position` (the frame's top-left, which
+//! is what `with_position` takes back) and `inner_size` (the client area, which is what
+//! `with_inner_size` takes back). The maximized flag rides alongside because a maximized window's
+//! own rect is not the one to restore — the viewer tracks the last *normal* placement and saves
+//! that instead.
 
 use std::path::PathBuf;
 

@@ -14,6 +14,10 @@
 # the "Developer ID Application" identity, and the `notarytool` profile named below. Neither is
 # ever passed on a command line, and neither lives in the repo.
 #
+# It edits one tracked file: like build-installer.ps1, it writes `product.json`'s version into
+# Cargo.toml's [workspace.package] before building, so the manifest cannot drift from the version
+# the app and the bundle report. Everything else it writes goes to target/ and dist/.
+#
 # Options
 #   --sign-id <identity>       codesign identity; default is the "Developer ID Application" one
 #                              in the keychain, which is the only kind Gatekeeper accepts for
@@ -46,7 +50,7 @@ do_dmg=1
 do_build=1
 out_dir="$repo/dist"
 
-usage() { sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -112,7 +116,34 @@ notarize() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# 1. Build
+# 1. Sync the Cargo workspace version to product.json
+# ---------------------------------------------------------------------------------------------
+# The twin of build-installer.ps1's step 2, and here for the same reason: `product.json` is the
+# single source of the version, but nothing in a `cargo build` reads it into the manifest, so
+# `[workspace.package] version` drifts silently until something that *does* read it — a `cargo
+# package`, a crash report, `cargo tree` output pasted into an issue — disagrees with the app.
+# Only Windows was syncing it, so bumping product.json and shipping a .dmg left the tree behind.
+#
+# The only line-anchored `version = "..."` in the root manifest belongs to [workspace.package]:
+# dependency versions are either `name = "x"` or live inside inline tables, and the member
+# manifests all say `version.workspace = true`. So the anchor targets it uniquely.
+
+say "Syncing Cargo.toml [workspace.package] version to $version"
+cargo_toml="$repo/Cargo.toml"
+current="$(sed -n -E 's/^version[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$cargo_toml" | head -1)"
+[[ -n $current ]] || die "no [workspace.package] version found in $cargo_toml"
+if [[ "$current" == "$version" ]]; then
+    echo "    Cargo.toml already in sync."
+else
+    sed -i '' -E "s/^version[[:space:]]*=[[:space:]]*\"[^\"]*\"/version = \"$version\"/" "$cargo_toml"
+    echo "    Cargo.toml updated: $current -> $version."
+    # Cargo.lock records the workspace crates' versions too; the build below refreshes it. With
+    # --no-build nothing does, and the binary being wrapped was compiled at the old version.
+    [[ $do_build -eq 1 ]] || echo "    note: --no-build, so Cargo.lock and target/ still say $current."
+fi
+
+# ---------------------------------------------------------------------------------------------
+# 2. Build
 # ---------------------------------------------------------------------------------------------
 
 if [[ $do_build -eq 1 ]]; then
@@ -127,7 +158,7 @@ archs="$(lipo -archs "$bin")"
 [[ "$archs" == *arm64* ]] || die "the binary is '$archs', not arm64 (D10 is Apple Silicon only)"
 
 # ---------------------------------------------------------------------------------------------
-# 2. The icon
+# 3. The icon
 # ---------------------------------------------------------------------------------------------
 # iconutil wants an .iconset directory of exact sizes, each one the 1024² master downsampled,
 # inset by `icon_inset` and composited onto the opaque `icon_bg`. Rebuilt every run: it is well
@@ -202,7 +233,7 @@ iconutil -c icns "$iconset" -o "$icns"
 echo "  $(basename "$icns") — $(stat -f%z "$icns") bytes, on #$icon_bg, inset $icon_inset"
 
 # ---------------------------------------------------------------------------------------------
-# 3. The bundle
+# 4. The bundle
 # ---------------------------------------------------------------------------------------------
 
 app="$repo/target/$name.app"
@@ -289,7 +320,7 @@ plutil -lint "$app/Contents/Info.plist" >/dev/null || die "generated Info.plist 
 echo "  $app"
 
 # ---------------------------------------------------------------------------------------------
-# 4. Sign
+# 5. Sign
 # ---------------------------------------------------------------------------------------------
 
 if [[ $do_sign -eq 1 ]]; then
@@ -316,7 +347,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------
-# 5. Notarize the app
+# 6. Notarize the app
 # ---------------------------------------------------------------------------------------------
 # Stapling the *app* as well as the .dmg matters: a stapled ticket is what lets it launch on a Mac
 # that is offline or behind a filter. Without it Gatekeeper has to reach Apple on first launch,
@@ -334,7 +365,7 @@ if [[ $do_notarize -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------------------------
-# 6. The disk image
+# 7. The disk image
 # ---------------------------------------------------------------------------------------------
 
 if [[ $do_dmg -eq 0 ]]; then
@@ -372,7 +403,7 @@ if [[ $do_notarize -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------------------------
-# 7. The .dmg's own Finder icon
+# 8. The .dmg's own Finder icon
 # ---------------------------------------------------------------------------------------------
 # Without this the .dmg gets the generic disk-image document icon. What goes on instead is that
 # same generic icon with the flame composited over its disk graphic, so it still reads as a disk
@@ -465,7 +496,7 @@ osascript -l JavaScript -e '
 echo "  applied to $(basename "$dmg")"
 
 # ---------------------------------------------------------------------------------------------
-# 8. Verify what actually ships
+# 9. Verify what actually ships
 # ---------------------------------------------------------------------------------------------
 # Deliberately after the icon, not before: these have to be true of the bytes that leave the Mac,
 # and the icon is the last thing to touch them.

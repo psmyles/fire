@@ -1,16 +1,19 @@
 //! Build steps for the `fire` executable:
-//!   1. Precompile the viewport HLSL to DXBC with `fxc` (the Windows SDK offline shader compiler),
-//!      so the bytecode is embedded at build time instead of compiled at startup: no runtime
-//!      `d3dcompiler` dependency, nothing on the cold-start path, and a broken shader is a build
-//!      error rather than a launch-time failure. Windows only — the D3D11 backend is the one that
-//!      takes DXBC; a Metal build will want the MSL twin compiled here the same way.
+//!   1. Precompile the viewport shader to bytecode for *this host's* backend, from the per-backend
+//!      sources `scripts/gen-shaders.sh` generated into `src/render/generated/` out of the one
+//!      annotated-GLSL source `src/render/shader.glsl`: HLSL → DXBC with `fxc` (the Windows SDK
+//!      compiler) on Windows, MSL → one `.metallib` per stage with `xcrun metal` + `metallib` on
+//!      macOS. So the bytecode is embedded at build time instead of compiled at startup: nothing
+//!      on the cold-start path on either OS, and a broken shader is a build error rather than a
+//!      launch-time failure.
 //!   2. Compile `simgui/simgui.c` — sokol_imgui.h, Dear ImGui's sokol backend — as C, against the
 //!      vendored sokol headers and the cimgui header `dear-imgui-sys` links. The Rust side calls it
 //!      through a handful of `extern "C"` declarations in `render::imgui`.
 //!   3. Rasterize the toolbar icons and decode the logo, and read the canonical product metadata
-//!      from `product.json` (repo root): (a) embed it into the exe's Windows version resource + app
-//!      icon, and (b) re-export the same strings as `FIRE_*` compile-time env vars the app reads
-//!      via `env!`. `product.json` is the single source of truth.
+//!      from `product.json` (repo root): (a) on Windows embed it into the exe's version resource +
+//!      app icon, and (b) re-export the same strings as `FIRE_*` compile-time env vars the app
+//!      reads via `env!`. `product.json` is the single source of truth; the packaging scripts read
+//!      it too.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -243,7 +246,7 @@ fn read_product() -> Product {
     }
 }
 
-/// Compile each entry point of `src/render/shader.hlsl` to a `.dxbc` in `OUT_DIR`, which
+/// Compile each entry point of the generated HLSL to a `.dxbc` in `OUT_DIR`, which
 /// `render::gpu` embeds via `include_bytes!` and hands to sokol_gfx as shader bytecode. fxc
 /// targets shader model 5.0 (`vs_5_0`/`ps_5_0`), which is what sokol's D3D11 backend expects.
 fn compile_shaders() {

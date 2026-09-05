@@ -1,4 +1,4 @@
-//! Flipbook (sprite-sheet) viewer mode — pure logic, no Win32/D3D.
+//! Flipbook (sprite-sheet) viewer mode — pure logic, no window system and no GPU.
 //!
 //! A flipbook texture is a single still image laid out as a `cols × rows` grid of animation
 //! frames (row-major, left→right, top→bottom). This module holds everything that can be
@@ -14,8 +14,9 @@
 //!     for a sheet content can't resolve, never an override. The result is surfaced solely as a
 //!     dismissible hint (it never enters the mode on its own).
 //!
-//! [`crate::render::gpu`] turns the active state into constant-buffer values; [`crate::win`]
-//! owns the `HashMap<PathBuf, PerPath>` and drives playback via a timer.
+//! [`crate::render::gpu`] turns the active state into uniform-block values;
+//! [`crate::app::viewer`] owns the `HashMap<PathBuf, PerPath>` and drives playback from the event
+//! loop's timer queue ([`crate::app::timers`]).
 
 use std::path::Path;
 

@@ -12,7 +12,7 @@
 //!
 //! Color: 8-bit sources upload as `SRGB8A8` (hardware sRGB→linear on sample), float sources are
 //! already linear, 16-bit unorm is sRGB-decoded in the shader. The pixel shader works in linear
-//! light and sRGB-encodes its output itself (see `shader.hlsl`): the swapchain is drawn through a
+//! light and sRGB-encodes its output itself (see `shader.glsl`): the swapchain is drawn through a
 //! UNORM view, which is also what lets Dear ImGui's already-sRGB colors land in the same pass
 //! untouched.
 //!
@@ -59,7 +59,8 @@ const ZOOM_DRAG_SENSITIVITY: f32 = 0.01;
 const ZOOM_DRAG_CLICK_SLOP: f32 = 5.0;
 
 /// Per-frame shader constants. Layout matches the HLSL `cbuffer Params` (16-byte float4
-/// registers); keep the field order/padding in lockstep with `render/shader.hlsl`. 128 bytes —
+/// registers); keep the field order/padding in lockstep with `render/shader.glsl` and the
+/// reflection `scripts/gen-shaders.sh` generates from it. 128 bytes —
 /// asserted below, so this comment cannot drift from the struct, and declared to sokol_gfx as the
 /// uniform block's size.
 #[repr(C)]
@@ -1456,7 +1457,7 @@ fn default_background(img: &DecodedImage) -> Background {
     }
 }
 
-/// Backdrop mode → shader code (must match the `background` branch in `shader.hlsl`).
+/// Backdrop mode → shader code (must match the `background` branch in `shader.glsl`).
 fn background_code(bg: Background) -> i32 {
     match bg {
         Background::Black => 0,

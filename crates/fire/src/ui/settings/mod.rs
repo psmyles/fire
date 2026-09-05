@@ -610,7 +610,7 @@ fn keybinds(ui: &Ui, st: &mut State) {
 
 fn context_menu(ui: &Ui, st: &mut State, out: &mut Frame) {
     ui.separator_with_text("Built-in items");
-    check(ui, st, BoolField::CtxShowInExplorer, "Show in Explorer");
+    check(ui, st, BoolField::CtxShowInExplorer, "Show on Disk");
     check(ui, st, BoolField::CtxCopyFile, "Copy File");
     check(ui, st, BoolField::CtxCopyPath, "Copy Path");
     check(ui, st, BoolField::CtxCopyFileName, "Copy File Name");

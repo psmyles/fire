@@ -286,11 +286,7 @@ fn actions_menu(ui: &Ui, cfg: &Config, has_image: bool, out: &mut Frame) {
 
     if has_image {
         for (on, label, cmd) in [
-            (
-                cm.show_in_explorer,
-                "Show in Explorer",
-                Command::ShowInExplorer,
-            ),
+            (cm.show_in_explorer, "Show on Disk", Command::ShowInExplorer),
             (cm.copy_file, "Copy File", Command::CopyFile),
             (cm.copy_path, "Copy Path", Command::CopyPath),
             (cm.copy_file_name, "Copy File Name", Command::CopyFileName),
