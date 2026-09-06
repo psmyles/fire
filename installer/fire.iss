@@ -81,15 +81,16 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Source: "{#MyExeSource}"; DestDir: "{app}"; DestName: "{#MyAppExe}"; Flags: ignoreversion
 
 ; --- license notices -----------------------------------------------------------------------
-; fire.exe is statically linked, so the binary installed above contains code from ~130 other
+; fire.exe is statically linked, so the binary installed above contains code from ~160 other
 ; projects. Their licenses (MIT/BSD attribution, and LGPL-3.0 for libheif/libde265) require the
 ; notices to travel with the binary, so a user who only ever runs Setup.exe still receives them.
 ; Not optional and not behind a task: dropping these makes the installed copy non-compliant.
-; Paths are relative to this .iss file, so ".." is the repo root.
-Source: "..\LICENSE";                 DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
-Source: "..\THIRD-PARTY-NOTICES.md";  DestDir: "{app}"; Flags: ignoreversion
-Source: "..\CREDITS.md";              DestDir: "{app}"; Flags: ignoreversion
-Source: "..\licenses\*.txt";          DestDir: "{app}\licenses"; Flags: ignoreversion
+; Paths are relative to this .iss file, so ".." is the repo root; the two notice documents
+; live under docs/, the license texts under licenses/.
+Source: "..\LICENSE";                    DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "..\docs\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\docs\CREDITS.md";             DestDir: "{app}"; Flags: ignoreversion
+Source: "..\licenses\*.txt";              DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"

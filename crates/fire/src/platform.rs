@@ -1,6 +1,6 @@
 //! The platform leaves: everything in the shell that still has to name an OS.
 //!
-//! The rule (mac-port-plan.md §5) is that nothing *else* in `fire` mentions one. Each item here is
+//! The rule (architecture.md §12.1) is that nothing *else* in `fire` mentions one. Each item here is
 //! one small function behind a `cfg`, with a no-op or portable fallback for the other OS, so the
 //! shell above reads as one program:
 //!

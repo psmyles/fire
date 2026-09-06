@@ -10,9 +10,11 @@ drawing API, on a device and swapchain the shell creates itself (Direct3D 11 on 
 macOS). There is no resident background process and no separate launcher stub - the GPU device is
 brought up on its own thread while the window is being created, so nothing needs to be kept warm.
 
-The port that produced this shape, including the alternatives that were measured and rejected, is
-recorded in [mac-port-plan.md](mac-port-plan.md); its decision table (D1-D25) is referenced from
-here where a choice needs its reasoning.
+This shape is the result of a port from a Windows-only Win32 + Direct3D 11 shell. The decisions
+that produced it are recorded in [Appendix A](#appendix-a---the-decision-record) as **D1-D25**, and
+cited by number from the sections below wherever a choice needs its reasoning; the two shells that
+were built, measured and rejected on the way are in
+[Appendix B](#appendix-b---how-the-shell-was-chosen).
 
 ---
 
@@ -873,7 +875,7 @@ accelerator leaves AppKit to pick. The red button still closes the window.
   title, the empty-window identity card); both packaging scripts read the same file. Bump the
   version there and it flows into the application and the packages alike.
 - **Windows: an unsigned Inno Setup installer** (`installer/fire.iss`, built by
-  `scripts/build-installer.ps1` - see [installer/README.md](installer/README.md)). Per-user install
+  `scripts/build-installer.ps1` - see [installer/README.md](../installer/README.md)). Per-user install
   (no admin, matching the `HKCU` association model), a wizard page offering Fire as the default
   viewer per format plus an "All supported image formats" master toggle (default off - never steals
   associations the user didn't pick), and clean uninstall. No `Run`/autostart entry - nothing stays
@@ -887,7 +889,7 @@ accelerator leaves AppKit to pick. The red button still closes the window.
   on a public repo. `--no-notarize` / `--no-sign` step down from that for iteration and say plainly
   that what they produce is not shippable - macOS 15 removed the Control-click bypass, so an
   un-notarized build needs System Settings → Privacy & Security → Open Anyway.
-- **CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is a two-host matrix, and both legs
+- **CI** ([.github/workflows/ci.yml](../.github/workflows/ci.yml)) is a two-host matrix, and both legs
   are mandatory (D23): clippy on Windows never sees `render/metal.rs`, `openfiles.rs` or
   `menubar.rs`, and clippy on macOS never sees `render/d3d11.rs` or the `windows-sys` leaves, so a
   single-host CI cannot keep the workspace lint-clean. Each host runs two jobs: `check` with
@@ -974,3 +976,120 @@ texturing for gigapixel sources.
 - **First-run UX.** The Windows installer is unsigned → SmartScreen warning; document the "More
   info → Run anyway" step until signing is added. The macOS `.dmg` is signed *and* notarized, and
   the stapled ticket means it opens on a Mac that is offline.
+
+---
+
+## Appendix A - the decision record
+
+The shared shell replaced a Windows-only Win32 + Direct3D 11 one. These are the decisions that
+produced it, kept because each says what it *costs* as well as what it buys — which is what a
+future revision needs in order to revisit one. They are cited by number from the sections above.
+
+Two entries (D14, D17) belong to a branch that was measured and abandoned; they are kept as
+numbered holes rather than renumbered, so a `D18` in this document means what it has always meant.
+
+| # | Decision | Why | Status and what it cost |
+| -- | -------- | --- | ----------------------- |
+| D1 | **One shared shell — winit + sokol_gfx — on both OSes**, not AppKit+Metal beside Win32+D3D11 | Minimum platform code: the per-OS part becomes a device/swapchain module, not a whole renderer | **Shipped.** Windows was re-plumbed and its time-to-first-pixel re-measured (§1) |
+| D2 | **Windows migrates too**, gated on the TTFP benchmark | Keeping a whole D3D11 renderer behind a trait *is* the two-shell maintenance the port existed to avoid | **Met.** Budget was ≤ 10 ms median regression on the 8.9 MB case and ≤ 5 ms on the 38 KB one; measured within noise (§1) |
+| D3 | **`dear-imgui-rs` + `dear-imgui-winit` (input) + `sokol_imgui` (renderer)** replace `dear-imgui-sys` and the C++ win32/dx11 shims | No per-OS backend code of our own; the renderer is the same header sokol_gfx's author maintains beside it | **Shipped.** `ui/` moved from a raw 10-function ABI to the safe API, and `simgui.c` must compile against the same cimgui `dear-imgui-sys` links (D22) |
+| D4 | **The shader is precompiled to bytecode on both OSes**, from one annotated-GLSL source through `sokol-shdc` (§5.3) | Nothing on the cold-start path on either OS, and a broken shader is a build error; one source beats two hand-kept-in-sync twins once a second backend exists | **Shipped.** Costs `fxc` + the Windows SDK on Windows and the Metal toolchain on macOS (D24). The HLSL half wants a Windows build to confirm after any shader change |
+| D5 | **One process, N windows** everywhere; instance mode became `open-in = new-window \| reuse-window` | Finder never launches a second process — it sends an open-file event to the running app — so per-launch processes have no mac equivalent, and winit runs N windows in one loop cleanly | **Shipped.** Windows `NewWindow` users get the same UX from one process; crash isolation is now per-process (D7) |
+| D6 | **IPC through the `interprocess` crate** — named pipe / Unix socket behind one API | One forward path, one test | **Shipped.** macOS also needed the Apple-Event hook (§4) feeding the same open path |
+| D7 | **Accept single-process crash exposure** | FFI already runs under `catch_unwind` on a worker with validated inputs, and a viewer has no unsaved state | **Accepted.** A true segfault in libheif/psd_sdk closes every window, not one. If it bites, a decode subprocess is the fallback and `fire-decode`'s uniform interface makes that a bounded change |
+| D8 | **Timers are `ControlFlow::WaitUntil` + a deadline min-heap** (§9.2) | Preserves the event-driven invariant — no input, no timer → no frame — with zero threads | **Shipped.** A small scheduler in the app; every timer (GIF, flipbook, caret) goes through it |
+| D9 | **Keybinds are physical `KeyCode`s by name plus a `Primary` modifier** (Ctrl on Windows, ⌘ on macOS) | Layout-independent; one `config.toml` works on both | **Shipped.** One-time migration of the old VK-code chords; `Ctrl+` / `Cmd+` still parse as `Primary+` |
+| D10 | **macOS is Apple Silicon only**, with vendored arm64 static libs for libheif/libde265/dav1d and a `cc`-built psd_sdk | Same vendoring model as the Windows `.lib`s; no Intel users to serve | **Shipped** (see D25). A universal binary is deferred, and `build-mac.sh` checks the architecture rather than pretending |
+| D11 | **Build, sign and notarize only on the dev Mac**, via `scripts/build-mac.sh`; CI never builds a mac artifact | Keeps the Developer ID certificate and the App Store Connect key off CI entirely, on a public repo | **Shipped.** Releases are a manual step rather than CI-triggered; both credentials come from the keychain |
+| D12 | **Packaging is `build-mac.sh` + an `Info.plist` from `product.json`**, into a signed and notarized `.dmg` | Mirrors `build-installer.ps1`; the plist is hand-tuned anyway, which `cargo-bundle` would have hidden | **Shipped.** Hand-writing it paid twice: the document types are parsed out of `fire-decode`'s extension table so they cannot drift (§11), and `NSSupportsSuddenTermination` is pointedly *not* declared — it would let the OS skip the `atexit` that removes the instance socket (§3) |
+| D13 | **Windows first, then macOS** | The shared code and the whole TTFP risk *were* the Windows migration; mac is leaves plus packaging | **Done** |
+| D14 | *(belongs to the wgpu branch: a pinned backend, no debug layers, decode started before device creation)* | — | **Superseded** (Appendix B.2). The one surviving idea became D18 |
+| D15 | **Pinch-to-zoom maps onto the wheel zoom; 1:1 is one texel per *physical* pixel** | Crisp on Retina, matches what artists mean by 100 %, and keeps the zoom-snap ladder in image space | **Shipped**, with the predicted cost inverted: fit and 1:1 are already in physical px end to end, so `scale_factor` enters *nothing* there — 1:1 is one texel per physical pixel by construction, measured exact on a 2× display. It enters the *gesture* math instead |
+| D16 | **A minimal macOS menu bar via `muda`; full screen via winit** | A Mac app without a menu bar reads as broken; native full screen gives the space transition | **Shipped**, with two corrections to the premise: winit already installs a default menu bar carrying ⌘Q, so it had to be disabled or it replaced ours wholesale — which also means the app was never actually unquittable. Full screen needed no code at all: winit's `Fullscreen::Borderless` *is* `toggleFullScreen:` on macOS |
+| D17 | *(belongs to the wgpu branch: measure `request_adapter`, then decide on a DXGI hal leaf)* | — | **Superseded** (Appendix B.2): the ~140 ms turned out to be D3D12 driver init, not enumeration, so the leaf would have saved little — and could not have been built anyway |
+| D18 | **GPU bring-up on its own thread, started on the first line of `main`; the window is created *before* the join** | Device creation is the longest single item on the launch path and needs no window — but neither does the window need to wait for it | **Shipped**, and it is the one ordering that matters. `Viewer::new` takes the GPU as a closure; get it wrong and the window's 9-31 ms serialize after the device (§1) |
+| D19 | **The shell owns the device and the swapchain; sokol_gfx is handed them** (`sg_environment` / `sg_swapchain`) | sokol_app's window model was a dealbreaker (Appendix B.3); this keeps winit's window *and* sokol's one drawing API | **Shipped on both.** ~250 lines per OS — the only GPU-API-specific code left — with `render/mod.rs` aliasing one as `backend` so `gpu.rs` carries no `cfg` (§5) |
+| D20 | **The swapchain backbuffer is plain UNORM; the fragment shader sRGB-encodes its own output** | Flip-model swapchains disallow `*_SRGB` formats, and ImGui's colors are already sRGB, so one UNORM target is correct for both passes | **Shipped.** The old two-render-target-view trick is gone; the shader owns the encode and must not be "fixed" into a linear write. The *format* is per-OS (§5.1) |
+| D21 | **The mip chain is built on the CPU, on the decode worker** | sokol_gfx has no `GenerateMips`, and its rules forbid rendering into an image created with data | **Shipped.** ~5 ms on an 8.9 MB image, off the UI thread; the upload is one `sg_make_image` carrying every level |
+| D22 | **`sokol-rust` is vendored; `sokol_imgui.h` is compiled by `fire`'s `build.rs`** | The crates.io `sokol` name belongs to an unrelated 2019 crate, and sokol_imgui must be compiled with the *same* cimgui defines and `SOKOL_*` backend as its neighbours or the struct layouts differ | **Shipped.** A vendored tree to update by hand, and three sets of defines that must stay in lockstep — a mismatch is silent (§15) |
+| D23 | **The whole dev pipeline runs on macOS** — clippy, `cargo test`, the native decoders, the TTFP harness, the release build and packaging | A platform you cannot lint, test or measure on is a platform you cannot maintain; the alternative is mac fixes only Windows CI can verify | **Shipped.** The two sys crates lost their Windows-only short-circuit, the vendor layout went per-target, CI grew a mac leg (§13) and `ttfp.ps1` gained a portable twin |
+| D24 | **Metal shaders are precompiled to a `.metallib` with `xcrun metal`**, so the macOS toolchain floor is full Xcode rather than the Command Line Tools | Keeps D4's "no shader compile on the cold-start path" on *both* OSes; the wgpu branch lost ~32 ms to exactly this | **Shipped.** Every dev machine and the CI runner need Xcode plus an 839 MB `MetalToolchain` component, and its absence is near-silent: asked for bytecode without it, sokol-shdc emits shader *source* and exits 0 (§13) |
+| D25 | **The arm64 HEIF stack is built with vcpkg (`arm64-osx` static)** mirroring `VENDOR.txt`, and the vendored tree goes per-target — one directory per target holding both its `include/` and `lib/` | One vendoring story on both OSes, one dav1d port patch, and a self-contained `.app` with no dylib embedding or per-dylib signing | **Shipped.** Headers had to be split per target too (the two landed on different libheif versions), and the mac build needs a third port patch, `ENABLE_PLUGIN_LOADING=OFF` — without it dav1d becomes an unreachable dynamic plugin and *every* AVIF silently fails to decode |
+
+---
+
+## Appendix B - how the shell was chosen
+
+Three shells were built and measured against the D2 gate before this one was adopted. All numbers
+are `scripts/ttfp.ps1`: kernel process creation → first image-bearing present, 12 interleaved
+launches per cell, release, idle machine, RTX 4080.
+
+### B.1 - the risk, as assessed beforehand
+
+`wgpu::Instance::request_adapter` has historically enumerated every adapter and created a D3D12
+device per adapter to query it — reported at up to hundreds of ms on multi-GPU machines, which
+would not hide under a ~140 ms decode. The prepared fix was a `cfg(windows)` leaf that picked one
+adapter through `IDXGIFactory6` and handed it to wgpu through `wgpu_hal::dx12`. Phase 1's first
+job was to measure whether that was needed.
+
+### B.2 - attempt 1, wgpu: the gate is missed by ~135 ms
+
+| Image | Win32 + D3D11 | `shell/wgpu` | Δ | Budget (D2) |
+| --- | --- | --- | --- | --- |
+| 38 KB PNG | 126-134 ms | 264-277 ms | **+138-143 ms** | ≤ 5 ms |
+| 8.9 MB PNG | 144-145 ms | 278 ms | **+133 ms** | ≤ 10 ms |
+
+About 235 ms of that is GPU bring-up: instance ~20 ms, `request_adapter` ~140 ms, `request_device`
+~31 ms, and the viewport pipeline (naga → HLSL → FXC → PSO) ~32 ms. Moving the bring-up to a worker
+thread changed nothing — the join wait was ~230 ms, because the bring-up *is* the critical path and
+nothing on the main thread is long enough to hide it under.
+
+Both premises of B.1 were wrong, and that is what killed the branch rather than the raw number.
+The cost is **not** per-adapter enumeration: DXGI listed three adapters, but a warm second
+enumeration takes ~1 ms — the ~140 ms is the driver's one-time D3D12 initialisation, which *any*
+first device creation pays. And the leaf could not have been built against wgpu-hal 30 anyway:
+`dx12::Adapter::expose` is `pub(super)` and needs the hal instance's private fields, so it would
+have required a fork. D3D11 reaches first pixel ~100 ms sooner than D3D12-through-wgpu on this
+machine, and that is an API and driver cost, not something Fire can engineer around.
+
+What survived: the winit shell, the ImGui backends, the timer heap, the `interprocess` instance
+model and the `KeyCode` keybinds are all independent of wgpu, and carried into the next attempt.
+The pipeline compile also became D24's evidence — it is the same ~32 ms that precompiling to
+bytecode exists to avoid.
+
+### B.3 - attempt 2, sokol_app: the gate is met, the window model is lost
+
+Replacing the *whole* shell with sokol — sokol_app for the window, device, frame loop and input,
+sokol_gfx for drawing, sokol_imgui for the chrome — met the gate comfortably (both images within
+noise of `main`, sd 4-8 ms). It was rejected anyway, on what sokol_app has no API for: one window
+per process, a continuous frame loop (one frame per vsync, so the "idle costs ~0" invariant does
+not hold), window position and maximized state, the launcher's Run setting, the system light/dark
+theme, raising the window on a forwarded open, and a parent for the file dialogs. That list is
+most of §9 and §10.
+
+### B.4 - attempt 3, winit + sokol_gfx: adopted
+
+The two were recombined: winit keeps the window, the event loop and input; sokol_gfx stays the one
+drawing API; sokol_imgui stays the renderer, in its `SOKOL_IMGUI_NO_SOKOL_APP` mode with
+`dear-imgui-winit` feeding it input. The price is the swapchain glue — `render/d3d11.rs` and its
+macOS twin (D19).
+
+| Image | Win32 + D3D11 | `shell/winit-sokol` | Δ | Budget (D2) |
+| --- | --- | --- | --- | --- |
+| 38 KB PNG | 133.5 / 132.4 ms | 135.4 / 131.6 ms | +1.9 / -0.8 ms | ≤ 5 ms |
+| 8.9 MB PNG | 142.6 / 144.0 ms | 142.2 / 143.3 ms | -0.4 / -0.7 ms | ≤ 10 ms |
+
+Release phases: the D3D11 device ~135 ms on the bring-up thread, `sg_setup` 0.3 ms, pipeline 1 ms;
+on the main thread the winit window 9 ms, the swapchain 1.6 ms, ImGui 1.7 ms. The one thing that
+mattered was D18's ordering — a first run before that fix read +8 ms on the small image.
+
+Also verified on the branch: two windows in one process under `open-in = "new-window"`; an idle
+window with an image open at 0.0 ms of CPU over 5 s; and position/maximized restore, theme,
+launcher Run state and dialog parenting all intact.
+
+One defect outlived two of the three shells and is worth remembering as a shader lesson, not a
+presentation one: a flickering 1 px line on all four image edges, seen first on the sokol_app
+prototype and reproduced here. It was neither the CPU mip chain nor a swapchain/client size
+mismatch — it was an implicitly-derived LOD on a sample inside a per-pixel branch, undefined where
+the quad diverges. Fixed in `897bc7e` by making every tap explicit; see the rule at the end of
+§5.3.

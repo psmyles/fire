@@ -4,9 +4,9 @@ Fire is a single statically-linked executable — `fire.exe` on Windows, the bin
 `Fire.app` on macOS. Everything it needs at runtime is compiled into that one file, so the binary
 you receive contains code from the projects listed below. Their licenses require that their
 copyright notices and license terms travel with the binary — this document, together with the
-[`licenses/`](licenses/) directory, is how they do.
+[`../licenses/`](../licenses/) directory, is how they do.
 
-Fire's own code is MIT licensed; see [`LICENSE`](LICENSE).
+Fire's own code is MIT licensed; see [`../LICENSE`](../LICENSE).
 
 * **Section 1** covers the native C/C++ libraries. Read this one — it is short, and it contains
   the only obligation in the whole distribution that goes beyond attribution (the LGPL relink
@@ -40,8 +40,8 @@ Copyright © struktur AG and contributors — <https://github.com/strukturag/lib
 > ### Your rights under the LGPL
 >
 > libheif and libde265 are licensed under the **GNU Lesser General Public License, version 3**
-> ([`licenses/LGPL-3.0.txt`](licenses/LGPL-3.0.txt), which incorporates
-> [`licenses/GPL-3.0.txt`](licenses/GPL-3.0.txt)). Fire links them statically, so LGPL-3.0 §4
+> ([`licenses/LGPL-3.0.txt`](../licenses/LGPL-3.0.txt), which incorporates
+> [`licenses/GPL-3.0.txt`](../licenses/GPL-3.0.txt)). Fire links them statically, so LGPL-3.0 §4
 > entitles you to modify those libraries and relink Fire against your modified versions.
 >
 > Fire does not restrict that in any way:
@@ -68,27 +68,27 @@ Copyright © struktur AG and contributors — <https://github.com/strukturag/lib
 *AV1 decoder, used for `.avif`. Linked via `crates/heif-sys`.*
 Copyright © 2018-2024 VideoLAN and dav1d authors. All rights reserved.
 <https://code.videolan.org/videolan/dav1d>
-License text: [`licenses/BSD-2-Clause.txt`](licenses/BSD-2-Clause.txt)
+License text: [`licenses/BSD-2-Clause.txt`](../licenses/BSD-2-Clause.txt)
 
 ### psd_sdk — BSD-2-Clause
 
 *Photoshop `.psd` / `.psb` reader. Linked via `crates/psd-sdk-sys`; vendored at commit
 `f514495`.*
 Copyright © 2011-2020 Molecular Matters GmbH — <https://github.com/MolecularMatters/psd_sdk>
-License text: [`licenses/BSD-2-Clause.txt`](licenses/BSD-2-Clause.txt)
+License text: [`licenses/BSD-2-Clause.txt`](../licenses/BSD-2-Clause.txt)
 
 ### Little-CMS (lcms2) — MIT
 
 *ICC color management. Linked via the `lcms2-sys` crate, which vendors it.*
 Copyright © 2023 Marti Maria Saguer — <https://littlecms.com>
-License text: [`licenses/Little-CMS-MIT.txt`](licenses/Little-CMS-MIT.txt)
+License text: [`licenses/Little-CMS-MIT.txt`](../licenses/Little-CMS-MIT.txt)
 
 ### Dear ImGui — MIT
 
 *The entire user interface. Linked via the `dear-imgui-sys` crate, which vendors it through
 cimgui; drawn by sokol_imgui (below) and fed input by `dear-imgui-winit`.*
 Copyright © 2014-2026 Omar Cornut — <https://github.com/ocornut/imgui>
-License text: [`licenses/Dear-ImGui-MIT.txt`](licenses/Dear-ImGui-MIT.txt)
+License text: [`licenses/Dear-ImGui-MIT.txt`](../licenses/Dear-ImGui-MIT.txt)
 
 **cimgui** — the C API layer Dear ImGui is bound through — is MIT, copyright © 2015 Stephan Dilly
 (<https://github.com/cimgui/cimgui>). `dear-imgui-sys` additionally carries a stack-layout
@@ -104,7 +104,7 @@ ImGui renderer), compiled as C into the binary. Vendored at `vendor/sokol-rust` 
 Copyright © 2018 Andre Weissflog — <https://github.com/floooh/sokol>
 The `sokol-rust` bindings themselves are copyright © 2023 Erik Wilhelm Gren, under the same
 license — <https://github.com/floooh/sokol-rust>
-License text: [`licenses/Zlib.txt`](licenses/Zlib.txt)
+License text: [`licenses/Zlib.txt`](../licenses/Zlib.txt)
 
 ---
 
@@ -117,13 +117,13 @@ left. Full texts:
 
 | License | Text |
 |---|---|
-| MIT (146 crates) | [`licenses/MIT.txt`](licenses/MIT.txt) |
-| BSD-3-Clause (6) | [`licenses/BSD-3-Clause.txt`](licenses/BSD-3-Clause.txt) |
-| 0BSD (3) | [`licenses/0BSD.txt`](licenses/0BSD.txt) |
-| Apache-2.0 (1, plus 1 in addition to MIT) | [`licenses/Apache-2.0.txt`](licenses/Apache-2.0.txt) |
-| MPL-2.0 (1) | [`licenses/MPL-2.0.txt`](licenses/MPL-2.0.txt) — see the note below |
-| CC0-1.0 (1) | [`licenses/CC0-1.0.txt`](licenses/CC0-1.0.txt) |
-| Unicode-3.0 (1, in addition to MIT) | [`licenses/Unicode-3.0.txt`](licenses/Unicode-3.0.txt) |
+| MIT (146 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
+| BSD-3-Clause (6) | [`licenses/BSD-3-Clause.txt`](../licenses/BSD-3-Clause.txt) |
+| 0BSD (3) | [`licenses/0BSD.txt`](../licenses/0BSD.txt) |
+| Apache-2.0 (1, plus 1 in addition to MIT) | [`licenses/Apache-2.0.txt`](../licenses/Apache-2.0.txt) |
+| MPL-2.0 (1) | [`licenses/MPL-2.0.txt`](../licenses/MPL-2.0.txt) — see the note below |
+| CC0-1.0 (1) | [`licenses/CC0-1.0.txt`](../licenses/CC0-1.0.txt) |
+| Unicode-3.0 (1, in addition to MIT) | [`licenses/Unicode-3.0.txt`](../licenses/Unicode-3.0.txt) |
 | IJG (1, in addition to MIT) | see the note below the table |
 
 Some crates ship a license file with no copyright line filled in. Rather than invent one, those
@@ -305,7 +305,7 @@ reachable only through `image`'s fallback path.
 ### Note on `notify` (CC0-1.0)
 
 CC0-1.0 is a public-domain dedication and imposes no attribution requirement. It is listed here
-for completeness. Full text: [`licenses/CC0-1.0.txt`](licenses/CC0-1.0.txt).
+for completeness. Full text: [`licenses/CC0-1.0.txt`](../licenses/CC0-1.0.txt).
 
 ### Note on `option-ext` (MPL-2.0)
 
@@ -315,7 +315,7 @@ distributes a binary containing those files to make **their source** available, 
 permits linking them into a larger work under any license (§3.3). Fire uses the crate unmodified,
 so the corresponding source is the published crate itself
 (<https://github.com/soc/option-ext>, `option-ext 0.2.0` on crates.io). Nothing else in Fire is
-affected. Full text: [`licenses/MPL-2.0.txt`](licenses/MPL-2.0.txt).
+affected. Full text: [`licenses/MPL-2.0.txt`](../licenses/MPL-2.0.txt).
 
 ---
 

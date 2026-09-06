@@ -33,8 +33,9 @@ OS plus a handful of small leaves.
 - One process, as many windows as you like: a second launch hands its path to the running Fire
   (`open-in = "new-window"` gives it its own window, `"reuse-window"` swaps it into the focused one)
 
-See [architecture.md](architecture.md) for the full design, and
-[mac-port-plan.md](mac-port-plan.md) for the record of how the shared shell was chosen and built.
+See [docs/architecture.md](docs/architecture.md) for the full design; its appendices carry the
+decision record (D1-D25) and the measurements behind the two shells that were built and rejected
+before this one.
 
 ## Workspace
 
@@ -137,7 +138,7 @@ directory per target, for AVIF/HEIF/HEIC). See each crate's `vendor/VENDOR.txt` 
 Fire is MIT licensed - see [LICENSE](LICENSE).
 
 The Fire binary is statically linked, so it contains code from ~160 other projects.
-[CREDITS.md](CREDITS.md) says who wrote them; [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
+[docs/CREDITS.md](docs/CREDITS.md) says who wrote them; [docs/THIRD-PARTY-NOTICES.md](docs/THIRD-PARTY-NOTICES.md)
 carries the formal per-package copyright notices, with full license texts in [licenses/](licenses/).
 The installer and the `.dmg` ship all of it alongside the binary.
 
@@ -145,4 +146,4 @@ One dependency is copyleft: **libheif** and **libde265** are LGPL-3.0-only. Fire
 statically, so you are entitled to relink Fire against your own modified builds of those
 libraries - the exact static libraries are in `crates/heif-sys/vendor/<target>/lib/` and the recipe
 that produced them is in `crates/heif-sys/vendor/VENDOR.txt`. See the LGPL section of
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for details.
+[docs/THIRD-PARTY-NOTICES.md](docs/THIRD-PARTY-NOTICES.md) for details.

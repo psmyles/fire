@@ -1088,7 +1088,7 @@ impl Viewer {
     }
 
     /// The chord a key press makes with the modifiers currently held. `Primary` is Ctrl on
-    /// Windows and Linux and ⌘ on macOS (mac-port-plan.md D9).
+    /// Windows and Linux and ⌘ on macOS (architecture.md appendix A, D9).
     fn chord(&self, key: KeyCode) -> KeyChord {
         let primary = if cfg!(target_os = "macos") {
             self.mods.super_key()
