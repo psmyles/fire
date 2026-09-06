@@ -333,6 +333,11 @@ impl Fire {
         let Some(v) = self.viewers.get_mut(&id) else {
             return;
         };
+        // The desktop can take the window in or out of full-screen on its own (macOS's green
+        // button, ⌃⌘F, a Mission Control swipe) and there is no event for it — see
+        // `Viewer::sync_fullscreen`. This is the point every event batch and every idle step
+        // passes through, so it is where the chrome catches up.
+        v.sync_fullscreen();
         let requests = v.take_requests();
         if let Some(cfg) = requests.settings_applied {
             // Settings are per-user, not per-window: the window that applied them already has

@@ -213,8 +213,10 @@ pub struct Viewer {
     /// The keyboard table, resolved from `cfg.keybinds` over the defaults. Drives both key dispatch
     /// ([`Viewer::handle_key`]) and the toolbar tooltips' shortcut suffixes.
     keybinds: Keybinds,
-    /// True while the window is in borderless full-screen (chrome hidden, view covers the monitor).
-    fullscreen: bool,
+    /// The full-screen state as of the last check — *only* to notice a change the desktop made on
+    /// its own, which is what [`Viewer::sync_fullscreen`] repaints for. Never read as the state
+    /// itself: [`Viewer::fullscreen`] is that, and it asks the window.
+    fullscreen_seen: bool,
     /// Per-path flipbook state (fire's only per-path map; session-only). Keyed by image path so it
     /// survives folder navigation and hot-reload. `state` holds the user's settings, `hint`/`hint_
     /// dismissed` drive the chip. See [`crate::flipbook`].
@@ -383,7 +385,7 @@ impl Viewer {
             cfg,
             shortcut_labels,
             keybinds,
-            fullscreen: false,
+            fullscreen_seen: false,
             flipbook: HashMap::new(),
             flipbook_last_tick: None,
             anim_due: None,
@@ -822,7 +824,7 @@ impl Viewer {
 
     /// Whether the transport band is shown (flipbook active, windowed).
     fn transport_visible(&self) -> bool {
-        !self.fullscreen && self.flipbook_state().is_some()
+        !self.fullscreen() && self.flipbook_state().is_some()
     }
 
     /// Mirror the active per-path state onto the surface (or clear it) and re-arm the timer.
@@ -1159,7 +1161,7 @@ impl Viewer {
             // `esc-closes-window` is off, which keeps the leave-full-screen half and drops the
             // destructive one (see the config field).
             KeyAction::CloseOrExitFullscreen => {
-                if self.fullscreen {
+                if self.fullscreen() {
                     self.set_fullscreen(false);
                 } else if self.cfg.esc_closes_window {
                     self.requests.close = true;
@@ -1436,7 +1438,7 @@ impl Viewer {
     fn image_rect(&self) -> (f32, f32, f32, f32) {
         let (w, h) = self.client();
         let (w, h) = (w as f32, h as f32);
-        if self.fullscreen {
+        if self.fullscreen() {
             return (0.0, 0.0, w.max(0.0), h.max(0.0));
         }
         let top = self.metrics.toolbar_h;
@@ -1463,9 +1465,43 @@ impl Viewer {
         self.request_frames(2);
     }
 
+    /// Whether the window is full-screen — **asked of the window, never remembered**.
+    ///
+    /// The desktop has its own ways in and out that never pass through [`Self::set_fullscreen`]:
+    /// on macOS the green traffic-light button, ⌃⌘F, the Window menu and a Mission Control swipe;
+    /// on Windows the shell's own arrangements. A `bool` that only our toggle wrote goes stale the
+    /// first time one of them is used, and the failure is not subtle — the window comes back
+    /// windowed while the app still believes it is full-screen, so [`crate::ui::build`] keeps the
+    /// chrome hidden and the toolbar is simply not there to click. winit tracks the real state on
+    /// every path (its window delegate updates it from AppKit's own will-enter/did-exit
+    /// notifications, not just from our call), so that is the copy to read, and reading it costs a
+    /// borrow.
+    fn fullscreen(&self) -> bool {
+        self.window.fullscreen().is_some()
+    }
+
+    /// Repaint if the full-screen state moved without us asking.
+    ///
+    /// [`Self::fullscreen`] always reports the truth, but nothing *tells* us when the truth
+    /// changed: winit has no full-screen event, and AppKit finishes a green-button exit *after*
+    /// the last resize it generated — so the frame that resize asked for still hides the chrome,
+    /// and the window then goes idle with a toolbar that isn't drawn. Nothing is wrong with the
+    /// state by then; it is simply the last frame that is stale.
+    ///
+    /// Run at the idle point, which the loop reaches once the transition's notifications have been
+    /// delivered. It costs a bool compare on an iteration that was going to happen anyway, and
+    /// asks for nothing when nothing moved — an idle window still costs ~0.
+    pub fn sync_fullscreen(&mut self) {
+        let now = self.fullscreen();
+        if now != self.fullscreen_seen {
+            self.fullscreen_seen = now;
+            self.redraw();
+        }
+    }
+
     /// Flip in/out of borderless full-screen (toolbar button, F11, Esc, or middle-click).
     fn toggle_fullscreen(&mut self) {
-        self.set_fullscreen(!self.fullscreen);
+        self.set_fullscreen(!self.fullscreen());
     }
 
     /// Enter (`on`) or leave borderless full-screen: winit strips the decorations and covers the
@@ -1474,11 +1510,11 @@ impl Viewer {
     /// [`Self::image_rect`] hands the whole client to the image. No-op if already in the requested
     /// state.
     fn set_fullscreen(&mut self, on: bool) {
-        if on == self.fullscreen {
+        if on == self.fullscreen() {
             return;
         }
-        // Set the mode before resizing so the resize that follows sees full-screen.
-        self.fullscreen = on;
+        // winit records the new mode before it asks the OS to animate, so the resizes that follow
+        // — and the frames drawn from them — already see full-screen. Nothing to set here.
         self.window
             .set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
         self.redraw();
@@ -1569,7 +1605,7 @@ impl Viewer {
 
     /// Whether the current placement is a *normal* one worth remembering.
     fn placement_is_normal(&self) -> bool {
-        !self.fullscreen && !self.window.is_maximized() && self.window.is_minimized() != Some(true)
+        !self.fullscreen() && !self.window.is_maximized() && self.window.is_minimized() != Some(true)
     }
 
     // --- events ---------------------------------------------------------------------------------
@@ -1590,7 +1626,7 @@ impl Viewer {
                 if self.placement_is_normal() {
                     self.normal_size = Some(*size);
                 }
-                if maximized != self.maximized && !self.fullscreen {
+                if maximized != self.maximized && !self.fullscreen() {
                     // The maximize/restore button: persist as it changes, not just on close.
                     self.maximized = maximized;
                     self.save_window_state();
@@ -1919,7 +1955,7 @@ impl Viewer {
             outline: s.outline(),
             octagon,
             can_navigate: self.folder.as_ref().is_some_and(|f| f.len() > 1),
-            fullscreen: self.fullscreen,
+            fullscreen: self.fullscreen(),
             flipbook: self.flipbook_state().is_some(),
             has_animation: self.surface.frame_delay_ms().is_some(),
             shortcuts: Arc::clone(&self.shortcut_labels),
@@ -1946,7 +1982,7 @@ impl Viewer {
         let (cw, ch) = self.client();
         let metrics = self.metrics;
         let dark = self.dark;
-        let fullscreen = self.fullscreen;
+        let fullscreen = self.fullscreen();
         let icon_px = self.imgui.icon_px();
         let form = self.imgui.form_style(dark);
         // Only an empty-state frame asks for the logo — an image launch never builds it, which
