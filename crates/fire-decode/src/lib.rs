@@ -5,6 +5,7 @@
 //! extension, since the many TIFF-structured raws can't be told from plain TIFF by header):
 //!   - PSD            -> psd_sdk (C++ FFI) : merged composite, 8-bit RGBA (+ICC)
 //!   - EXR            -> `exr` crate       : 32-bit float RGBA (linear/HDR)
+//!   - DDS            -> `ddsfile` + `bcdec_rs`: BC1-BC7 and the uncompressed layouts
 //!   - HEIC/HEIF/AVIF -> libheif (C FFI)   : 8-bit RGBA, or 16-bit RGBA for HDR (+ICC)
 //!   - camera raw     -> [`raw`] preview   : extract the embedded JPEG, decode via zune
 //!   - GIF            -> `image` crate     : every frame (animated GIF plays; see [`Animation`])
@@ -39,6 +40,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+mod dds;
 mod downscale;
 mod exif;
 mod raw;
@@ -129,9 +131,9 @@ pub(crate) fn to_ne_bytes<T: bytemuck::Pod>(v: &[T]) -> Vec<u8> {
 /// bytes and will happily open a supported image with the wrong extension (or none).
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     // Still formats, in the order the module doc lists the backends.
-    "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "tif", "tiff", "webp", "ico", "tga",
-    "qoi", "ppm", "pgm", "pbm", "pnm", "ff", "jxl", "hdr", "exr", "psd", "psb", "heic", "heif",
-    "avif", //
+    "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "tif", "tiff", "tx", "webp", "ico",
+    "cur", "tga", "qoi", "ppm", "pgm", "pbm", "pnm", "pam", "ff", "jxl", "hdr", "pic", "rgbe",
+    "xyze", "exr", "dds", "psd", "psb", "heic", "heif", "avif", //
     // Camera raw (embedded-preview decode). Mirrors `raw::EXT_LABELS`, which is what actually
     // routes them — `raw_extensions_are_all_listed` keeps the two honest.
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "srw",
@@ -334,6 +336,13 @@ enum Backend {
     /// Radiance HDR (`.hdr`/`.pic`); decoded by the `image` crate, *not* zune — see
     /// [`decode_hdr`] for why zune-hdr is avoided.
     Hdr,
+    /// DDS (DirectDraw Surface); the game-development texture container, decompressed on the
+    /// CPU by [`crate::dds`].
+    Dds,
+    /// A Windows cursor (`.cur`): an ICO container with a different type word, and two of its
+    /// directory fields reused for the hotspot. The `image` crate's ICO decoder reads one
+    /// unchanged but does not recognize the magic, so it is named for it here.
+    Cur,
     /// PNG; decoded by the `image` crate, *not* zune — see [`decode_png`] for why
     /// zune-png is avoided.
     Png,
@@ -383,6 +392,15 @@ fn sniff(bytes: &[u8], ext: Option<&str>) -> Backend {
         // TIFF-structured camera raws, which share this magic, still route to the preview
         // extractor — and it falls back to `image` for the colour types it does not own.
         Backend::Tiff
+    } else if bytes.starts_with(b"DDS ") {
+        // DDS: a unique four-byte magic, and a container neither zune nor the `image` crate
+        // reads the modern formats of (BC4-BC7 and the DX10 header are all past `image`'s
+        // DXT-only decoder), so it is sniffed here and handled by our own backend.
+        Backend::Dds
+    } else if bytes.starts_with(&[0x00, 0x00, 0x02, 0x00]) {
+        // A Windows cursor: byte 2 is the ICO/CUR type word, 1 for an icon and 2 for a cursor.
+        // Nothing else claims this magic, and the ICO decoder reads the payload unchanged.
+        Backend::Cur
     } else if bytes.starts_with(b"GIF8") {
         // GIF (b"GIF87a"/b"GIF89a"): route to the dedicated multi-frame decoder so an animated
         // GIF plays. zune has no GIF decoder anyway, so this only pre-empts the `image` fallback.
@@ -432,6 +450,8 @@ pub fn decode(
             }
         }
         Backend::Hdr => decode_hdr(bytes)?,
+        Backend::Dds => dds::decode(bytes)?,
+        Backend::Cur => decode_cur(bytes)?,
         Backend::Png => decode_png(bytes)?,
         // zune is the hot path, not the only path. It has gaps the `image` crate does not —
         // zune-bmp cannot read a 24-bit BMP narrower than 3 pixels, so a 1x1 colour swatch
@@ -1050,6 +1070,16 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 /// TGA carries no start-of-file magic (only an optional end-of-file `TRUEVISION-XFILE.`
 /// footer), so `with_guessed_format` can't detect it from content. Fall back to the file
 /// extension for any format content-sniffing misses.
+/// A Windows cursor. The container is an ICO with `2` in the type word, and with the directory's
+/// "colour planes" and "bits per pixel" fields reused for the hotspot coordinates — neither of
+/// which the `image` crate's ICO decoder needs, so the payload reads unchanged. All this does is
+/// name the format for the decoder that will not sniff it, and label it honestly afterwards.
+fn decode_cur(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    let mut img = decode_image(bytes, Some("ico"))?;
+    img.source_format = "CUR";
+    Ok(img)
+}
+
 fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, DecodeError> {
     use image::DynamicImage;
 
@@ -1548,6 +1578,71 @@ mod tests {
             [out.pixels[0], out.pixels[1], out.pixels[2], out.pixels[3]],
             [200, 30, 40, 255]
         );
+    }
+
+    /// A Windows cursor is an ICO whose type word is 2 instead of 1, with two directory fields
+    /// reused for the hotspot. The `image` crate reads the payload unchanged but will not sniff
+    /// the magic, so `sniff` names the format for it — and the status bar says CUR, not ICO.
+    #[test]
+    fn cur_decodes_through_the_ico_decoder_and_is_labelled_cur() {
+        let mut src = image::RgbaImage::new(4, 4);
+        src.put_pixel(0, 0, image::Rgba([200, 30, 40, 255]));
+        let mut bytes = encode(
+            &image::DynamicImage::ImageRgba8(src),
+            image::ImageFormat::Ico,
+        );
+        // Bytes 2..4 are the ICONDIR type: 1 = icon, 2 = cursor. Everything else is identical.
+        bytes[2] = 2;
+        bytes[3] = 0;
+
+        assert!(matches!(sniff(&bytes, None), Backend::Cur));
+        let out = decode(&bytes, Some("cur"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.width, out.height), (4, 4));
+        assert_eq!(out.source_format, "CUR");
+        assert_eq!(
+            [out.pixels[0], out.pixels[1], out.pixels[2], out.pixels[3]],
+            [200, 30, 40, 255]
+        );
+    }
+
+    /// Netpbm's `P7` (Portable Arbitrary Map) is the one member of the family the extension
+    /// table did not list, though the decoders have always read it.
+    #[test]
+    fn pam_decodes() {
+        let mut bytes =
+            b"P7\nWIDTH 2\nHEIGHT 1\nDEPTH 3\nMAXVAL 255\nTUPLTYPE RGB\nENDHDR\n".to_vec();
+        bytes.extend_from_slice(&[200, 30, 40, 10, 20, 30]);
+
+        let out = decode(&bytes, Some("pam"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.width, out.height), (2, 1));
+        assert_eq!(out.format, PixelFormat::Rgba8Unorm);
+        assert_eq!(out.channels, 3);
+        assert_eq!(out.pixels[..8], [200, 30, 40, 255, 10, 20, 30, 255]);
+    }
+
+    /// The Radiance aliases carry the same magic as `.hdr`, so listing them is purely about the
+    /// extension table — nothing about the routing changes.
+    #[test]
+    fn radiance_aliases_are_listed_and_route_to_the_hdr_backend() {
+        for ext in ["hdr", "pic", "rgbe", "xyze"] {
+            assert!(is_supported_extension(ext), ".{ext} is listed");
+        }
+        let bytes = b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n\x80\x80\x80\x81".to_vec();
+        assert!(matches!(sniff(&bytes, Some("pic")), Backend::Hdr));
+    }
+
+    /// DDS is sniffed by its own magic ahead of every fallback, and `.tx` (an OpenImageIO tiled
+    /// TIFF) still reaches the TIFF backend by TIFF's magic.
+    #[test]
+    fn dds_and_tx_route_to_the_right_backends() {
+        assert!(matches!(sniff(b"DDS \x7c\x00\x00\x00", None), Backend::Dds));
+        assert!(matches!(
+            sniff(b"II\x2a\x00rest", Some("tx")),
+            Backend::Tiff
+        ));
+        for ext in ["dds", "cur", "pam", "tx"] {
+            assert!(is_supported_extension(ext), ".{ext} is listed");
+        }
     }
 
     /// A camera-raw file routes to the preview extractor: a synthetic little-endian TIFF

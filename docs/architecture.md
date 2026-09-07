@@ -383,14 +383,15 @@ also detected by magic so a no-extension open still routes correctly.
 | PNG | `image` crate → RGBA8/RGBA16 (+ICC). Deliberately **not** zune: the `png`+`fdeflate` stack measured ~1.8× faster than zune-png on large textures (the gap is in the core decode) |
 | Radiance HDR (`.hdr`/`.pic`) | `image` crate → 32-bit float RGBA. Deliberately **not** zune: zune-hdr ≤ 0.5.2 wraps RGBE exponents ≥ 32 stops from unity (dark pixels decode 2³² too bright), and the `image` decoder is ~2× faster besides |
 | TIFF | **`tiff` crate directly** → RGBA at the source depth (8/16/32f, +ICC). Going through `image` lost samples: it can only represent what `tiff`'s conservative `colortype()` names, so an unlabelled 4th sample (Photoshop's `ExtraSamples = 0`) was dropped, grey+alpha was refused outright, and 16-bit was narrowed to 8. Associated (premultiplied) alpha is straightened here. Palette/CMYK/YCbCr/Lab still fall back to `image` |
-| TGA, ICO | `image` crate (formats zune doesn't decode) |
+| TGA, ICO, CUR | `image` crate (formats zune doesn't decode). A `.cur` is an ICO with `2` in its type word and two directory fields reused for the hotspot, neither of which the ICO decoder reads - so it decodes unchanged, and is only sniffed and labelled separately |
+| DDS | **`ddsfile`** (header, incl. the DX10 extension) + **`bcdec_rs`** (blocks), both pure Rust → BC1-BC7 to RGBA8, **BC6H to RGBA16F** (the HDR path), and every uncompressed layout via the header's channel bit masks. Decompressed on the CPU rather than uploaded as blocks: `DecodedImage` is an uncompressed canvas by contract, and the mip builder, downscale guard, alpha scan and flipbook detector all read it as one |
 | AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
 | EXR | `exr` crate (pure Rust) → 32-bit float RGBA |
 | PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite, at the document's own depth (8/16/32f). `wrapper.cpp` owns the colour-mode conversion: RGB/Grey/Duotone direct, Indexed through the palette, CMYK composited **through K** (PSD stores CMYK inverted), Lab via D50 XYZ. 16-bit samples are Photoshop's 15-bit+1 range (**0…32768**, not 0…65535); 1-bit Bitmap mode is refused, since psd_sdk sizes its planes `bits/8` = 0 |
 | Camera raw (CR2/CR3, NEF, ARW, RAF, ORF, RW2, DNG, …) | **`raw`** (pure Rust) → extract the embedded JPEG **preview**, decode via zune |
 | ICC transforms | **Little CMS** (`lcms2`) over FFI |
 
-`SUPPORTED_EXTENSIONS` in `fire-decode` is *the* table of what Fire opens - 54 extensions. The
+`SUPPORTED_EXTENSIONS` in `fire-decode` is *the* table of what Fire opens - 61 extensions. The
 Windows installer keeps a second copy because an Inno Setup script can import nothing, and a test
 (`installer_associations_match_the_extension_table`) polices the two against each other; the macOS `Info.plist`
 needs no such test because `scripts/build-mac.sh` parses the const itself.
@@ -427,6 +428,12 @@ Notes:
   scanning work unchanged. Per-frame delays below 20 ms (including the common 0 = "as fast as
   possible") are clamped to 100 ms, matching browsers. The viewer plays it back on a loop timer
   (§10). Animated WebP is *not* animated (WebP stays on the still zune hot path).
+- **DDS = the first surface only, for now.** A DDS is a container: it can hold a mip chain, six
+  cubemap faces, an array of layers, or a volume's depth slices, and `dds.rs` locates all of them
+  (`Surfaces`) but currently decodes mip 0 of layer 0. Signed block formats are re-centred for
+  display (`bcdec` returns the raw -127..127 range as bytes, which would show a signed normal map
+  as noise), and `DXT2`/`DXT4` - and any DX10 header that says so - have their premultiplied alpha
+  straightened, the same fixup the TIFF path applies.
 - **Oversized images:** `DecodeOptions::max_dim` is a **CPU/RAM guard**, not a GPU texture
   limit (an RGBA8 bitmap at 16384² is ~1 GiB; float HDR is 4×). It defaults to 16384, is
   configurable, and anything past it is CPU-downscaled to fit, recording the original size
@@ -768,7 +775,7 @@ shows up in "Open With" and can be made the default, without taking `.png` away 
 install. One entry rather than one per format, because with `Alternate` we do not own the UTI and
 the per-type name never surfaces. The extension list is **parsed out of `fire-decode`'s
 `SUPPORTED_EXTENSIONS`** by `scripts/build-mac.sh`, so unlike the installer's copy it cannot drift;
-54 extensions in, and LaunchServices resolves them to 48 claimed UTIs (the real ones -
+61 extensions in, and LaunchServices resolves them to 48 claimed UTIs (the real ones -
 `public.png`, `com.ilm.openexr-image`, `com.adobe.photoshop-image`, every camera-raw UTI - plus
 dynamic ones for formats macOS has no UTI for, like `.qoi`, `.ff`, `.x3f`). `NSSupportsSuddenTermination`
 is pointedly *not* declared: it would let the OS skip the `atexit` that removes the instance socket

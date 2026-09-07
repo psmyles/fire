@@ -113,6 +113,13 @@ image = { version = "0.25", default-features = false, features = [
 tiff = "0.11"
 exr = "1"
 lcms2 = { version = "6", features = ["static"] }
+# DDS: a container parser plus a block decompressor, both pure Rust and both tiny. `ddsfile`
+# reads the header (legacy D3D9 pixel formats and the DX10 `DxgiFormat` extension, plus the
+# cubemap/array/volume flags); `bcdec_rs` is a safe port of iOrange's `bcdec` and decodes the
+# BC1-BC7 blocks, BC6H included. Deliberately not `image_dds` (it wraps both but hides the
+# format table we want to own) and not `image`'s own `dds` feature (DXT1/3/5 only, no BC6H/BC7).
+ddsfile = "0.6"
+bcdec_rs = "0.2"
 
 # --- config / fs ---
 serde = { version = "1", features = ["derive"] }

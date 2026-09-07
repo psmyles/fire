@@ -117,7 +117,7 @@ left. Full texts:
 
 | License | Text |
 |---|---|
-| MIT (146 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
+| MIT (150 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
 | BSD-3-Clause (6) | [`licenses/BSD-3-Clause.txt`](../licenses/BSD-3-Clause.txt) |
 | 0BSD (3) | [`licenses/0BSD.txt`](../licenses/0BSD.txt) |
 | Apache-2.0 (1, plus 1 in addition to MIT) | [`licenses/Apache-2.0.txt`](../licenses/Apache-2.0.txt) |
@@ -137,10 +137,12 @@ rows name the authors the crate itself declares.
 | `bit_field` | 0.10.3 | MIT | Copyright (c) 2016 Philipp Oppermann |
 | `bitflags` | 1.3.2 | MIT | Copyright (c) 2014 The Rust Project Developers |
 | `bitflags` | 2.13.0 | MIT | Copyright (c) 2014 The Rust Project Developers |
+| `bcdec_rs` | 0.2.0 | MIT | (no notice in crate; authors: ScanMountGoat) |
 | `block2` | 0.5.1 | MIT | (no notice in crate; authors: Steven Sheldon, Mads Marquart <mads@marquart.dk>) |
 | `block2` | 0.6.2 | MIT | (no notice in crate; authors: Mads Marquart <mads@marquart.dk>) |
 | `brotli-decompressor` | 5.0.3 | MIT | Copyright (c) 2016 Dropbox, Inc. |
 | `bytemuck` | 1.25.0 | MIT | Copyright (c) 2019 Daniel "Lokathor" Gee. |
+| `byteorder` | 1.5.0 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant |
 | `bytemuck_derive` | 1.10.2 | MIT | Copyright (c) 2019 Daniel "Lokathor" Gee. |
 | `byteorder-lite` | 0.1.0 | MIT | Copyright (c) 2015 Andrew Gallant |
 | `cfg-if` | 1.0.4 | MIT | Copyright (c) 2014 Alex Crichton |
@@ -158,6 +160,7 @@ rows name the authors the crate itself declares.
 | `dear-imgui-rs` | 0.17.0 | MIT | (no notice in crate; authors: Mingzhen Zhuang <superfrankie621@gmail.com>) |
 | `dear-imgui-sys` | 0.17.0 | MIT | (no notice in crate; authors: Mingzhen Zhuang <superfrankie621@gmail.com>) |
 | `dear-imgui-winit` | 0.17.0 | MIT | (no notice in crate; authors: Mingzhen Zhuang <superfrankie621@gmail.com>) |
+| `ddsfile` | 0.6.0 | MIT | Copyright (c) Michael Dilger & Connor Fitzgerald |
 | `dirs` | 6.0.0 | MIT | Copyright (c) 2018-2019 dirs-rs contributors |
 | `dirs-sys` | 0.5.0 | MIT | Copyright (c) 2018-2019 dirs-rs contributors |
 | `dispatch` | 0.2.0 | MIT | (no notice in crate; authors: Steven Sheldon) |
@@ -166,6 +169,7 @@ rows name the authors the crate itself declares.
 | `dpi` | 0.1.2 | Apache-2.0 AND MIT | Copyright (c) 2018 Jorge Aparicio |
 | `either` | 1.16.0 | MIT | Copyright (c) 2015 |
 | `equivalent` | 1.0.2 | MIT | Copyright (c) 2016--2023 |
+| `enum-primitive-derive` | 0.3.0 | MIT | Copyright (c) 2017 Doug Goldstein <cardoe@cardoe.com> |
 | `exr` | 1.74.0 | BSD-3-Clause | Copyright (c) Contributors to the OpenEXR Project. All rights reserved. |
 | `fax` | 0.2.7 | MIT | Copyright © 2021 The pdf-rs contributers. |
 | `fdeflate` | 0.3.7 | MIT | (no notice in crate; authors: The image-rs Developers) |
