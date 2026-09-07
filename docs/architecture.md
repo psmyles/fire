@@ -231,7 +231,18 @@ called from the forward path. macOS needs no equivalent - Launch Services activa
   stores authored levels, filtered and gamma-corrected by whatever tool built the texture, and a
   box filter does not reproduce them - so `mips::complete` adopts what the file supplied and
   computes only the tail it stopped short of (`DecodedImage::source_mips`, dropped by
-  `transform_buffers` the moment any pass rewrites the canvas). After the upload, pan / zoom / exposure / channel /
+  `transform_buffers` the moment any pass rewrites the canvas).
+- **Looking at one mip level is a texture view, not a re-upload.** `<` / `>` (and the toolbar's
+  mip pair) rebuild the sampling view over the *same* `sg::Image` with `mip_levels.base = N` and
+  `count = 0`, so that level becomes the view's level 0 while minification still walks the levels
+  beneath it. sokol honours the range on both backends fire ships - D3D11 maps it to the SRV's
+  `MostDetailedMip`, Metal to `newTextureViewWithPixelFormat:…levels:` - so this needs no shader
+  change, no uniform, and no second upload; the 128-byte `Params` block is untouched. `image_dims`
+  then reports the *level's* size, which is the single chokepoint every geometry path already ran
+  through, so fit, zoom, 1:1, the pan clamp and the flipbook sheet all re-base together and a 1:1
+  view of level 3 is one of its texels per physical pixel. The level resets to 0 on open and is
+  clamped on every adopt, so a hot reload that comes back with a shorter chain lands somewhere
+  real. After the upload, pan / zoom / exposure / channel /
   tonemap (and the flipbook cell offsets + blend) are just values in a **128-byte uniform block**;
   the source texture never changes until a new image is opened (flipbook playback only moves the
   cell offsets - never re-uploads).
@@ -481,14 +492,17 @@ immediate-mode code with no window system and no GPU API in it; it reads a `View
 returns a `ui::Frame` of what the user asked for, which the viewer applies.
 
 - **Toolbar:** channel isolation (R/G/B/A/RGB), fit/1:1, zoom, flipbook, HDR tonemap + exposure
-  (float sources only), and a right-docked group (outline, octagon, backdrop, full-screen, menu).
+  (float sources only), the mip-level pair (only when the texture has a chain to walk - today a
+  DDS that brought its own), and a right-docked group (outline, octagon, backdrop, full-screen,
+  menu).
   Buttons dispatch the same `Action`s the keybinds drive - one state path. When the window is too
   narrow the left group sheds its lowest-priority slots into a "»" popup. There is **no gear**:
   Settings is the last entry of the menu button's popup, which is the same menu the viewport's
   right-click opens - one place to look, not two. That menu therefore stays enabled with no image
   loaded (its file entries hide themselves), or Settings would be unreachable from an empty window.
 - **Status bar:** file name, format, W×H, bit depth / channel layout, ICC presence, and on the right
-  the folder position and zoom % (plus `EV ±` for HDR).
+  the folder position and zoom % (plus `EV ±` for HDR, and `mip n/N` with the level's own
+  dimensions when a chain is being walked).
 - **Empty window:** a centred card with the logo, the product identity (long name + version, from
   `product.json` via `build.rs`) and the drop/open hint. It degrades gracefully - the logo and then
   the identity block drop out - when there is not enough room.

@@ -172,6 +172,8 @@ const ICON_STEMS: &[&str] = &[
     "icon_play",
     "icon_pause",
     "icon_more",
+    "icon_mip_down",
+    "icon_mip_up",
     "icon_octagon",
 ];
 

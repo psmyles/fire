@@ -50,6 +50,11 @@ pub enum KeyAction {
     ExposureUp,
     ExposureDown,
     ExposureReset,
+    // Mip levels
+    /// Step toward level 0 (the full-size image).
+    MipFiner,
+    /// Step toward the small end of the chain.
+    MipCoarser,
     // Appearance
     ToggleOutline,
     /// Walk the four backdrops (black → white → grey → checker → black).
@@ -86,6 +91,8 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ExposureUp,
     KeyAction::ExposureDown,
     KeyAction::ExposureReset,
+    KeyAction::MipFiner,
+    KeyAction::MipCoarser,
     KeyAction::ToggleOutline,
     KeyAction::CycleBackdrop,
     KeyAction::PrevImage,
@@ -118,6 +125,8 @@ impl KeyAction {
             KeyAction::ExposureUp => "exposure-up",
             KeyAction::ExposureDown => "exposure-down",
             KeyAction::ExposureReset => "exposure-reset",
+            KeyAction::MipFiner => "mip-finer",
+            KeyAction::MipCoarser => "mip-coarser",
             KeyAction::ToggleOutline => "toggle-outline",
             KeyAction::CycleBackdrop => "cycle-backdrop",
             KeyAction::PrevImage => "previous-image",
@@ -149,6 +158,8 @@ impl KeyAction {
             KeyAction::ExposureUp => "Increase exposure",
             KeyAction::ExposureDown => "Decrease exposure",
             KeyAction::ExposureReset => "Reset exposure",
+            KeyAction::MipFiner => "Finer mip level",
+            KeyAction::MipCoarser => "Coarser mip level",
             KeyAction::ToggleOutline => "Image boundary outline",
             KeyAction::CycleBackdrop => "Next backdrop",
             KeyAction::PrevImage => "Previous image",
@@ -178,6 +189,7 @@ impl KeyAction {
             | KeyAction::ExposureUp
             | KeyAction::ExposureDown
             | KeyAction::ExposureReset => "HDR",
+            KeyAction::MipFiner | KeyAction::MipCoarser => "Mip levels",
             KeyAction::ToggleOutline | KeyAction::CycleBackdrop => "Appearance",
             KeyAction::PrevImage | KeyAction::NextImage => "Navigation",
             KeyAction::ToggleFullscreen | KeyAction::CloseOrExitFullscreen => "Window",
@@ -567,6 +579,10 @@ impl Keybinds {
                 bind(KeyAction::ExposureUp, &["]"]),
                 bind(KeyAction::ExposureDown, &["["]),
                 bind(KeyAction::ExposureReset, &[]),
+                // `<` and `>`. `[`/`]` are exposure and bare `,`/`.` step flipbook frames, and
+                // conflict detection is one flat namespace, so the shifted pair is what is free.
+                bind(KeyAction::MipFiner, &["Shift+,"]),
+                bind(KeyAction::MipCoarser, &["Shift+."]),
                 bind(KeyAction::ToggleOutline, &[]),
                 bind(KeyAction::CycleBackdrop, &["Z"]),
                 bind(KeyAction::PrevImage, &["Left"]),
@@ -874,6 +890,21 @@ mod tests {
         ] {
             assert_eq!(kb.lookup(KeyChord::plain(key), true), Some(action));
             assert_eq!(kb.lookup(KeyChord::plain(key), false), None);
+        }
+        // The mip steps are `<` and `>`: the *shifted* comma and period, which is what leaves the
+        // bare pair free to step flipbook frames. They work in either mode.
+        let shifted = |key| KeyChord {
+            key,
+            primary: false,
+            alt: false,
+            shift: true,
+        };
+        for (key, action) in [
+            (KeyCode::Comma, KeyAction::MipFiner),
+            (KeyCode::Period, KeyAction::MipCoarser),
+        ] {
+            assert_eq!(kb.lookup(shifted(key), false), Some(action), "{key:?}");
+            assert_eq!(kb.lookup(shifted(key), true), Some(action), "{key:?}");
         }
         // Z cycles the backdrop, in either mode.
         assert_eq!(

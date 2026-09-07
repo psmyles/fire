@@ -1035,6 +1035,8 @@ impl Viewer {
             Action::Channel(Channel::Rgb | Channel::Rgba) => self.surface.toggle_composite(),
             Action::Channel(c) => self.surface.toggle_channel(c),
             Action::ToggleTonemap => self.surface.toggle_tonemap(),
+            Action::MipDown => self.surface.step_mip(-1),
+            Action::MipUp => self.surface.step_mip(1),
             Action::ExpUp => self.surface.adjust_exposure(self.cfg.exposure_step),
             Action::ExpReset => self.surface.reset_exposure(),
             Action::ExpDown => self.surface.adjust_exposure(-self.cfg.exposure_step),
@@ -1142,6 +1144,8 @@ impl Viewer {
             KeyAction::ChannelB => self.surface.toggle_channel(Channel::B),
             KeyAction::ChannelA => self.surface.toggle_channel(Channel::A),
             KeyAction::ToggleTonemap => self.surface.toggle_tonemap(),
+            KeyAction::MipFiner => self.surface.step_mip(-1),
+            KeyAction::MipCoarser => self.surface.step_mip(1),
             KeyAction::ExposureUp => self.surface.adjust_exposure(self.cfg.exposure_step),
             KeyAction::ExposureDown => self.surface.adjust_exposure(-self.cfg.exposure_step),
             KeyAction::ExposureReset => self.surface.reset_exposure(),
@@ -1918,6 +1922,22 @@ impl Viewer {
         if let Some(f) = &self.folder {
             let _ = write!(status_right, "{} / {}", f.position(), f.len());
         }
+        // Which mip level is showing, and how big it is. Only when there is a chain to walk.
+        // The dimensions are the level's own, because fit, zoom and 1:1 now describe the level
+        // rather than the file's level 0.
+        if has_image && s.mip_count() > 1 {
+            if !status_right.is_empty() {
+                status_right.push_str("    ");
+            }
+            let (fw, fh) = s.current_image().map_or((1, 1), |i| (i.width, i.height));
+            let (lw, lh) = crate::render::mips::level_dims(fw, fh, s.mip_level());
+            let _ = write!(
+                status_right,
+                "mip {}/{}  {lw}×{lh}",
+                s.mip_level(),
+                s.mip_count() - 1
+            );
+        }
         if has_image {
             if !status_right.is_empty() {
                 status_right.push_str("    ");
@@ -1958,6 +1978,8 @@ impl Viewer {
             fullscreen: self.fullscreen(),
             flipbook: self.flipbook_state().is_some(),
             has_animation: self.surface.frame_delay_ms().is_some(),
+            mip_level: s.mip_level(),
+            mip_count: s.mip_count(),
             shortcuts: Arc::clone(&self.shortcut_labels),
             status_left,
             status_right,

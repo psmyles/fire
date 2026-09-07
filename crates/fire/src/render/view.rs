@@ -120,6 +120,10 @@ pub struct DisplayState {
     /// Exposure in stops; multiplies linear color by `2^exposure` (HDR sources only).
     pub exposure: f32,
     pub tonemap: Tonemap,
+    /// Which mip level of the uploaded texture is being looked at, 0 being the full-size image.
+    /// A texture view narrows the sampler to this level, so the whole pipeline below — fit, zoom,
+    /// 1:1, the flipbook sheet — sees the level as if it were the image.
+    pub mip_level: u32,
 }
 
 impl Default for DisplayState {
@@ -130,6 +134,7 @@ impl Default for DisplayState {
             channel: Channel::Rgb,
             exposure: 0.0,
             tonemap: Tonemap::Reinhard,
+            mip_level: 0,
         }
     }
 }

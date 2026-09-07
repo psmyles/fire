@@ -38,6 +38,10 @@ pub enum Action {
     ExpUp,
     ExpReset,
     ExpDown,
+    /// Step to a finer (`MipDown`, toward level 0) or coarser (`MipUp`) mip level. Only offered
+    /// when the image has a chain worth stepping through — today, a DDS that brought one.
+    MipDown,
+    MipUp,
     /// Toggle the 1px image-boundary outline (right-side group).
     ToggleOutline,
     /// Toggle the octagon overlay — Unity VFX Graph's octagon particle shape drawn over the image
@@ -89,6 +93,11 @@ pub struct ViewSnapshot {
     pub flipbook: bool,
     /// The current image is an animated source (GIF) — flipbook mode is disabled for it.
     pub has_animation: bool,
+    /// Which mip level is being viewed, and how many the texture has. The mip buttons are laid
+    /// out only when there is more than one level, and each end of the chain disables its own
+    /// button — so a single-level image never sees the control at all.
+    pub mip_level: u32,
+    pub mip_count: u32,
     /// The live keyboard shortcuts, so a button's tooltip shows the key that *currently* drives it
     /// rather than a literal baked into the string (the settings dialog can rebind any of them).
     /// Behind an `Arc`: the snapshot is rebuilt every drawn frame (every mouse move), and the
@@ -119,6 +128,9 @@ impl ViewSnapshot {
             Action::ToggleTonemap | Action::ExpUp | Action::ExpReset | Action::ExpDown => {
                 self.is_hdr
             }
+            // Each end of the chain is a dead end, and says so rather than silently doing nothing.
+            Action::MipDown => self.mip_level > 0,
+            Action::MipUp => self.mip_level + 1 < self.mip_count,
             // The menu's *file* entries need an image, but it always carries Settings — and since the
             // toolbar no longer has a gear of its own, this button is the only way to reach it. It
             // must never be dead. (The menu itself hides the entries that need a file.)
@@ -191,6 +203,18 @@ impl ViewSnapshot {
             Action::ExpUp => format!("Increase exposure{}", k(KeyAction::ExposureUp)),
             Action::ExpReset => format!("Reset exposure{}", k(KeyAction::ExposureReset)),
             Action::ExpDown => format!("Decrease exposure{}", k(KeyAction::ExposureDown)),
+            Action::MipDown => format!(
+                "Finer mip level ({} of {}){}",
+                self.mip_level,
+                self.mip_count.saturating_sub(1),
+                k(KeyAction::MipFiner)
+            ),
+            Action::MipUp => format!(
+                "Coarser mip level ({} of {}){}",
+                self.mip_level,
+                self.mip_count.saturating_sub(1),
+                k(KeyAction::MipCoarser)
+            ),
             Action::ToggleOutline => {
                 format!("Image boundary outline{}", k(KeyAction::ToggleOutline))
             }
@@ -244,6 +268,8 @@ impl ViewSnapshot {
             Action::ExpUp => Icon::EvUp,
             Action::ExpReset => Icon::EvReset,
             Action::ExpDown => Icon::EvDown,
+            Action::MipDown => Icon::MipDown,
+            Action::MipUp => Icon::MipUp,
             Action::ToggleOutline => Icon::Outline,
             Action::ToggleOctagon => Icon::Octagon,
             // Drawn from the same SVGs as the blue/green channel buttons, but their own icons, so
@@ -257,5 +283,59 @@ impl ViewSnapshot {
             Action::ToggleFlipbook => Icon::Flipbook,
             Action::Overflow => Icon::More,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot with nothing displayed, for tests that only care about one field.
+    fn empty() -> ViewSnapshot {
+        ViewSnapshot {
+            channel: Channel::Rgb,
+            fit: true,
+            tonemap: Tonemap::Reinhard,
+            is_hdr: false,
+            has_image: true,
+            loading: false,
+            has_alpha: false,
+            background: Background::Black,
+            outline: false,
+            octagon: None,
+            can_navigate: false,
+            fullscreen: false,
+            flipbook: false,
+            has_animation: false,
+            mip_level: 0,
+            mip_count: 1,
+            shortcuts: std::sync::Arc::new(ShortcutLabels::default()),
+            status_left: String::new(),
+            status_right: String::new(),
+        }
+    }
+
+    /// Each end of the mip chain disables its own button, so neither is ever a click that does
+    /// nothing. A single-level image is not laid out at all (the toolbar gates the whole group),
+    /// but both ends still read as dead here.
+    #[test]
+    fn the_mip_buttons_stop_at_both_ends_of_the_chain() {
+        let at = |level, count| ViewSnapshot {
+            mip_level: level,
+            mip_count: count,
+            ..empty()
+        };
+        // Top of a 4-level chain: finer is a dead end, coarser is live.
+        assert!(!at(0, 4).enabled(Action::MipDown));
+        assert!(at(0, 4).enabled(Action::MipUp));
+        // The middle goes both ways.
+        assert!(at(2, 4).enabled(Action::MipDown));
+        assert!(at(2, 4).enabled(Action::MipUp));
+        // The smallest level is the other dead end.
+        assert!(at(3, 4).enabled(Action::MipDown));
+        assert!(!at(3, 4).enabled(Action::MipUp));
+        // One level: neither direction goes anywhere.
+        assert!(!at(0, 1).enabled(Action::MipDown));
+        assert!(!at(0, 1).enabled(Action::MipUp));
     }
 }
