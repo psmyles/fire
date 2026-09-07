@@ -89,6 +89,21 @@ impl FlipbookState {
         s
     }
 
+    /// A fresh state for a sheet the *file* laid out — a DDS cubemap, texture array or volume.
+    ///
+    /// Two things differ from [`Self::new`]. The frame count is what the file holds rather than
+    /// the whole grid, so the empty trailing cells of a five-layer array tiled 3x2 are not
+    /// steppable; and it starts paused whatever `autoplay` says, because a cubemap is six views
+    /// of one thing rather than an animation — the transport is there to step faces, not to run
+    /// them.
+    pub fn for_layout(layout: fire_decode::SheetLayout, cfg: &crate::config::FlipbookCfg) -> Self {
+        let mut s = Self::new(Grid::new(layout.cols, layout.rows), cfg);
+        s.frame_count = layout.frames.max(1);
+        s.playing = false;
+        s.clamp();
+        s
+    }
+
     /// Re-establish every invariant after an edit: grid axes in range, `frame_count` in
     /// `1..=cells`, `fps` in range, `frame_pos` wrapped into `[0, frame_count)`.
     pub fn clamp(&mut self) {
@@ -529,6 +544,11 @@ fn analysis_thumbnail(image: &DecodedImage, signal: Signal) -> Option<(Vec<f32>,
     let bpp = image.format.bytes_per_pixel();
     let stride = w as usize * bpp;
     let px = &image.pixels;
+    // The dimensions and the buffer come from different producers, and the sampling loop below
+    // indexes from the dimensions. A short buffer declines to guess rather than reading past it.
+    if px.len() < stride * h as usize {
+        return None;
+    }
     // Step within each bin so at most `THUMB_SAMPLES_PER_AXIS` samples are read per axis (bounding
     // total reads to ≈ `tw·th·N²`); `1` for a small bin means "read every pixel" (no sub-sampling).
     let step = (b / THUMB_SAMPLES_PER_AXIS).max(1);
@@ -749,6 +769,55 @@ mod tests {
         assert_eq!(s.frame_count, 8);
     }
 
+    /// A layout the file stated is adopted whole: the grid it names, and the surfaces it actually
+    /// holds rather than every cell of the grid — so the empty sixth cell of a five-layer array
+    /// tiled 3x2 is not steppable.
+    #[test]
+    fn a_file_stated_layout_keeps_its_real_frame_count() {
+        let cfg = crate::config::FlipbookCfg {
+            fps: 24.0,
+            blend: false,
+            // Autoplay is deliberately on, to prove a stated layout overrides it.
+            autoplay: true,
+            auto_detect: true,
+        };
+        let s = FlipbookState::for_layout(
+            fire_decode::SheetLayout {
+                cols: 3,
+                rows: 2,
+                frames: 5,
+                kind: fire_decode::SheetKind::ArrayLayers,
+            },
+            &cfg,
+        );
+        assert_eq!(s.grid, Grid::new(3, 2));
+        assert_eq!(s.frame_count, 5, "the sixth cell is empty, not a frame");
+        // A cubemap or an array is several views of one thing, not an animation: the transport is
+        // there to step surfaces, so it parks rather than running them.
+        assert!(!s.playing);
+    }
+
+    /// A cubemap fills its grid exactly, and every face is a frame.
+    #[test]
+    fn a_cubemap_layout_uses_the_whole_grid() {
+        let s = FlipbookState::for_layout(
+            fire_decode::SheetLayout {
+                cols: 3,
+                rows: 2,
+                frames: 6,
+                kind: fire_decode::SheetKind::CubeFaces,
+            },
+            &crate::config::FlipbookCfg {
+                fps: 24.0,
+                blend: false,
+                autoplay: false,
+                auto_detect: true,
+            },
+        );
+        assert_eq!(s.frame_count, 6);
+        assert_eq!(s.frame_pos, 0.0);
+    }
+
     // ---- detection: synthetic sheets -------------------------------------------------------
 
     /// Build an Rgba8 `DecodedImage` from a luma closure `f(x, y) -> 0..=255` (gray, opaque).
@@ -772,6 +841,7 @@ mod tests {
             source_format: "TEST",
             downscaled_from: None,
             source_mips: None,
+            layout: None,
             animation: None,
         }
     }
@@ -994,6 +1064,7 @@ mod tests {
             source_format: "TEST",
             downscaled_from: None,
             source_mips: None,
+            layout: None,
             animation: None,
         };
         assert_eq!(

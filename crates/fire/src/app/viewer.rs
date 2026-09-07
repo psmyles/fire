@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fire_decode::{DecodeOptions, DecodedImage};
+use fire_decode::{DecodeOptions, DecodedImage, SheetLayout};
 use fire_ipc::OpenRequest;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -619,6 +619,8 @@ impl Viewer {
         match outcome.result {
             Ok(img) => {
                 let (w, h, fmt) = (img.width, img.height, img.source_format);
+                // Read before the image moves into the surface below.
+                let layout = img.layout;
                 self.file_label.clone_from(&name);
                 let file_size = std::fs::metadata(&outcome.path).map(|m| m.len()).ok();
                 self.meta = format_meta(&img, file_size);
@@ -654,6 +656,12 @@ impl Viewer {
                 self.redraw();
                 // Start playback if this is an animated GIF; stop any prior animation otherwise.
                 self.sync_animation();
+                // A cubemap, array or volume arrives as one sheet with the grid that reads it
+                // back. That is authored structure, so it turns the flipbook on rather than
+                // offering a chip the way a *detected* sprite-sheet grid does.
+                if let Some(l) = layout {
+                    self.seed_layout_flipbook(&outcome.path, l);
+                }
                 // Re-apply any per-path flipbook state for the adopted image (restores it on
                 // navigate-back). The auto-detection hint for a fresh open arrives *later*, via
                 // `FlipbookGuess` (kept off the time-to-first-pixel path), and re-applies then — so
@@ -666,6 +674,27 @@ impl Viewer {
                 self.fail_load(&name, format!("failed: {e}"));
             }
         }
+    }
+
+    /// Turn the flipbook on for a source whose surfaces the *file* laid out — a DDS cubemap,
+    /// texture array or volume, composited into one sheet by the decoder.
+    ///
+    /// Unlike `flipbook::detect`'s guess this is not a suggestion, so it enters the mode instead
+    /// of popping the hint chip. Any state the user already established for this path wins: a
+    /// grid they edited, or a mode they deliberately turned off, survives navigating away and
+    /// coming back, and survives a hot reload.
+    fn seed_layout_flipbook(&mut self, path: &Path, layout: SheetLayout) {
+        let defaults = self.cfg.flipbook;
+        let grid = Grid::new(layout.cols, layout.rows);
+        let entry = self.flipbook.entry(path.to_path_buf()).or_default();
+        if entry.state.is_some() {
+            return;
+        }
+        entry.state = Some(FlipbookState::for_layout(layout, &defaults));
+        entry.enabled = true;
+        entry.hint = Some(grid);
+        // There is nothing to suggest: the mode is already on.
+        entry.hint_dismissed = true;
     }
 
     /// Apply a flipbook auto-detection result that arrived after its image. Stale-dropped by
@@ -2189,9 +2218,22 @@ fn format_meta(img: &DecodedImage, file_size: Option<u64>) -> String {
         4 => "RGBA",
         _ => "·",
     };
+    // A cubemap, array or volume reports the surfaces it holds and how big each one is. Its
+    // `width`/`height` are the tiled sheet's, which is an implementation detail of how the
+    // faces are shown rather than anything the file says about itself.
+    let size = match img.layout {
+        Some(l) => format!(
+            "{} {} × {}×{}",
+            l.kind.label(),
+            l.frames,
+            img.width / l.cols.max(1),
+            img.height / l.rows.max(1)
+        ),
+        None => format!("{}×{}", img.width, img.height),
+    };
     let mut s = format!(
-        "{}   {}×{}   {}-bit {}",
-        img.source_format, img.width, img.height, img.bit_depth, ch
+        "{}   {size}   {}-bit {}",
+        img.source_format, img.bit_depth, ch
     );
     use std::fmt::Write as _;
     if let Some(bytes) = file_size {

@@ -33,12 +33,16 @@
 //! back the raw -127..127 range reinterpreted as bytes, which would show a normal map as noise,
 //! so [`snorm_to_unorm`] maps it to 0..255 the way a sampler would.
 //!
-//! The file's own mip chain comes along in [`DecodedImage::source_mips`]; its cubemap faces,
-//! array layers and volume slices are located by [`Surfaces`] but only the first is decoded.
+//! The file's own mip chain comes along in [`DecodedImage::source_mips`], and a file holding more
+//! than one surface — a cubemap's six faces, a texture array's layers, a volume's depth slices —
+//! is composited into a near-square sheet and described by a [`SheetLayout`], which is what lets
+//! the viewer's flipbook step through them with the transport it already has.
 
 use ddsfile::{Dds, DxgiFormat, FourCC, PixelFormatFlags};
 
-use crate::{check_dims, level_dims, DecodeError, DecodedImage, PixelFormat};
+use crate::{
+    check_dims, level_dims, DecodeError, DecodedImage, PixelFormat, SheetKind, SheetLayout,
+};
 
 /// Half-precision 1.0, the alpha filled in for the alpha-less HDR formats.
 const HALF_ONE: u16 = 0x3c00;
@@ -478,7 +482,11 @@ impl Surfaces {
 
 // --- decoding ------------------------------------------------------------------------------
 
-/// Decode a DDS from memory: mip 0 of the first array layer, normalized to RGBA.
+/// Decode a DDS from memory, normalized to RGBA.
+///
+/// A single-surface file decodes to its one surface. A cubemap, texture array or volume is
+/// composited into one sheet and described by a [`SheetLayout`], so the viewer's flipbook can step
+/// through the faces or slices with the transport it already has.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     let dds = Dds::read(bytes).map_err(|e| DecodeError::Malformed(format!("DDS: {e}")))?;
     let fmt = identify(&dds).ok_or_else(|| {
@@ -491,7 +499,11 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
             "DDS declares a {width}x{height} surface"
         )));
     }
-    // Before anything is allocated from the header's numbers.
+
+    // The guard runs on the header's bare claim *first*, before the surface walk below reads
+    // anything else from it. Order matters beyond tidiness: a decode bomb has to come back as
+    // `TooLarge` — "we refused this" — and not as the `Malformed` that a walk over its absurd
+    // (and therefore truncated) surface data would produce first.
     check_dims(
         width as usize,
         height as usize,
@@ -499,31 +511,66 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         "DDS",
     )?;
 
-    let surfaces = Surfaces::new(&dds, &fmt, dds.data.len())?;
-    let range = surfaces
-        .range(0, 0)
-        .ok_or_else(|| DecodeError::Malformed("DDS has no surfaces".into()))?;
-    let src = dds
-        .data
-        .get(range)
-        .ok_or_else(|| DecodeError::Malformed("DDS surface data is truncated".into()))?;
+    // A cubemap's sheet is six times the surface its header describes, so the product is guarded
+    // too — from the grid the *header* asks for, before the payload is consulted at all. A guard
+    // that only fired once the data was known to be present would be no guard: the interesting
+    // case is a header claiming far more than the file could ever hold.
+    let declared = layout_for(&dds, dds.get_num_array_layers().max(1));
+    if let Some(l) = declared {
+        check_dims(
+            width.checked_mul(l.cols).ok_or_else(too_large)? as usize,
+            height.checked_mul(l.rows).ok_or_else(too_large)? as usize,
+            fmt.out.bytes_per_pixel(),
+            "DDS sheet",
+        )?;
+    }
 
-    let mut pixels = decode_surface(&fmt, src, width, height);
+    let surfaces = Surfaces::new(&dds, &fmt, dds.data.len())?;
+    // The layout the data actually backs, which is what gets tiled. `Surfaces` has already
+    // clamped the layer count to the bytes present, so a header claiming a hundred layers over a
+    // six-layer file lays out six.
+    let layout = layout_for(&dds, surfaces.layers);
+    let (cols, rows) = layout.map_or((1, 1), |l| (l.cols, l.rows));
+    let (out_w, out_h) = (
+        width.checked_mul(cols).ok_or_else(too_large)?,
+        height.checked_mul(rows).ok_or_else(too_large)?,
+    );
+
+    let mut pixels = match layout {
+        // The common case: one surface, decoded straight into the canvas with no tiling copy.
+        None => {
+            let range = surfaces
+                .range(0, 0)
+                .ok_or_else(|| DecodeError::Malformed("DDS has no surfaces".into()))?;
+            let src = dds
+                .data
+                .get(range)
+                .ok_or_else(|| DecodeError::Malformed("DDS surface data is truncated".into()))?;
+            decode_surface(&fmt, src, width, height)
+        }
+        Some(l) => composite_level(&fmt, &dds, &surfaces, 0, l)
+            .ok_or_else(|| DecodeError::Malformed("DDS surface data is truncated".into()))?,
+    };
 
     // The file's own chain, levels 1.. — authored, often with a better filter than a box, and
     // the whole reason to look at a `.dds` mip rather than a computed one. A level whose bytes
-    // are missing ends the chain rather than failing the decode: half an authored chain is still
-    // better than none, and the worker pads whatever is short.
+    // are missing — or, for a sheet, whose surfaces no longer tile it exactly — ends the chain
+    // rather than failing the decode: half an authored chain is still better than none, and the
+    // worker pads whatever is short.
     let mut source_mips = Vec::new();
     for level in 1..surfaces.levels {
-        let (lw, lh) = level_dims(width, height, level);
-        let Some(range) = surfaces.range(0, level) else {
-            break;
+        let next = match layout {
+            None => {
+                let (lw, lh) = level_dims(width, height, level);
+                surfaces
+                    .range(0, level)
+                    .and_then(|r| dds.data.get(r))
+                    .map(|src| decode_surface(&fmt, src, lw, lh))
+            }
+            Some(l) => composite_level(&fmt, &dds, &surfaces, level, l),
         };
-        let Some(src) = dds.data.get(range) else {
-            break;
-        };
-        source_mips.push(decode_surface(&fmt, src, lw, lh));
+        let Some(next) = next else { break };
+        source_mips.push(next);
     }
 
     // `DXT2`/`DXT4`, and any DX10 header that says so, store colour already multiplied by alpha.
@@ -537,18 +584,154 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 
     Ok(DecodedImage {
         pixels,
-        width,
-        height,
         format: fmt.out,
         bit_depth: fmt.bit_depth,
         channels: fmt.channels,
         icc: None,
         source_format: fmt.label,
         alpha_opaque: false, // set by `decode` after the final buffer is built
+        width: out_w,
+        height: out_h,
         downscaled_from: None,
         source_mips: (!source_mips.is_empty()).then_some(source_mips),
+        layout,
         animation: None,
     })
+}
+
+/// The `TooLarge` a header's own arithmetic overflowing earns.
+fn too_large() -> DecodeError {
+    DecodeError::TooLarge("DDS sheet dimensions overflow".into())
+}
+
+/// The widest grid axis a sheet is tiled into. Matches the viewer's own flipbook grid limit — a
+/// sheet wider than that could not be read back by the transport that displays it.
+const MAX_GRID_AXIS: u32 = 64;
+
+/// How a file's `layers` array layers are laid out, or `None` for the ordinary single-surface
+/// case. Depth is read first: a volume is one array layer holding many slices, where a cubemap or
+/// an array is many layers holding one surface each.
+///
+/// `layers` is a parameter rather than read from `dds` because it is asked twice with different
+/// answers: the header's *declared* count for the size guard, then the count the data actually
+/// backs for the tiling.
+fn layout_for(dds: &Dds, layers: u32) -> Option<SheetLayout> {
+    let depth = dds.get_depth().max(1);
+    let (frames, kind) = if depth > 1 {
+        (depth, SheetKind::VolumeSlices)
+    } else if layers > 1 {
+        let cube = dds.header10.as_ref().map_or_else(
+            || dds.header.caps2.contains(ddsfile::Caps2::CUBEMAP),
+            |h| h.misc_flag.contains(ddsfile::MiscFlag::TEXTURECUBE),
+        );
+        let kind = if cube {
+            SheetKind::CubeFaces
+        } else {
+            SheetKind::ArrayLayers
+        };
+        (layers, kind)
+    } else {
+        return None;
+    };
+    let (cols, rows) = layout_grid(frames)?;
+    Some(SheetLayout {
+        cols,
+        rows,
+        frames: frames.min(cols * rows),
+        kind,
+    })
+}
+
+/// The grid `frames` surfaces tile into: as near square as it gets, filled row-major.
+///
+/// A single strip would be simpler and much worse — six 4096 faces side by side is a 24576-wide
+/// canvas, most of the way to a decode-guard rejection for a texture that tiles comfortably as
+/// 3x2. Square-ish is also how a cubemap is conventionally drawn.
+fn layout_grid(frames: u32) -> Option<(u32, u32)> {
+    if frames == 0 || frames > MAX_GRID_AXIS * MAX_GRID_AXIS {
+        return None;
+    }
+    let cols = (f64::from(frames).sqrt().ceil() as u32).clamp(1, MAX_GRID_AXIS);
+    let rows = frames.div_ceil(cols).min(MAX_GRID_AXIS);
+    Some((cols, rows))
+}
+
+/// Decode every surface of mip `level` and tile them into one sheet, row-major.
+///
+/// `None` when a surface's bytes are missing, or — for a mip level — when the surfaces no longer
+/// tile the sheet exactly. That second case is the honest one: past the point where
+/// `cols * (w >> n)` stops equalling `(cols * w) >> n`, a tiled level is not a level *of* the
+/// sheet it claims to belong to, and the chain would sample the wrong texels. For a
+/// power-of-two face — which is nearly every real cubemap — it holds all the way down.
+fn composite_level(
+    fmt: &Format,
+    dds: &Dds,
+    surfaces: &Surfaces,
+    level: u32,
+    layout: SheetLayout,
+) -> Option<Vec<u8>> {
+    let (w, h) = (dds.header.width, dds.header.height);
+    let (fw, fh) = level_dims(w, h, level);
+    let (sheet_w, sheet_h) = level_dims(
+        w.checked_mul(layout.cols)?,
+        h.checked_mul(layout.rows)?,
+        level,
+    );
+    if fw.checked_mul(layout.cols)? != sheet_w || fh.checked_mul(layout.rows)? != sheet_h {
+        return None;
+    }
+
+    let bpp = fmt.out.bytes_per_pixel();
+    let sheet_row = (sheet_w as usize).checked_mul(bpp)?;
+    let cell_row = (fw as usize).checked_mul(bpp)?;
+    // Trailing cells of a partly filled grid stay transparent black.
+    let mut out = vec![0u8; sheet_row.checked_mul(sheet_h as usize)?];
+
+    for frame in 0..layout.frames {
+        let src = surface_bytes(dds, surfaces, level, frame, layout, fmt, fw, fh)?;
+        let cell = decode_surface(fmt, src, fw, fh);
+        let x0 = (frame % layout.cols) as usize * cell_row;
+        let y0 = (frame / layout.cols) as usize * fh as usize;
+        for y in 0..fh as usize {
+            let dst = (y0 + y) * sheet_row + x0;
+            out[dst..dst + cell_row].copy_from_slice(&cell[y * cell_row..y * cell_row + cell_row]);
+        }
+    }
+    Some(out)
+}
+
+/// The bytes of one surface: an array layer of its own for a cubemap or an array, or one depth
+/// slice carved out of the single layer's level for a volume.
+#[allow(clippy::too_many_arguments)]
+fn surface_bytes<'a>(
+    dds: &'a Dds,
+    surfaces: &Surfaces,
+    level: u32,
+    frame: u32,
+    layout: SheetLayout,
+    fmt: &Format,
+    fw: u32,
+    fh: u32,
+) -> Option<&'a [u8]> {
+    match layout.kind {
+        SheetKind::VolumeSlices => {
+            // A volume's level holds every slice back to back, so one slice is that level's range
+            // divided by the slice count.
+            let range = surfaces.range(0, level)?;
+            let slice = fmt.level_bytes(fw, fh, 1)?;
+            let start = range
+                .start
+                .checked_add((frame as usize).checked_mul(slice)?)?;
+            let end = start.checked_add(slice)?;
+            if end > range.end {
+                return None;
+            }
+            dds.data.get(start..end)
+        }
+        SheetKind::CubeFaces | SheetKind::ArrayLayers => {
+            dds.data.get(surfaces.range(frame, level)?)
+        }
+    }
 }
 
 /// Whether the file says its colour channels are already multiplied by alpha.

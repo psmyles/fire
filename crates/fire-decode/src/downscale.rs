@@ -80,6 +80,7 @@ mod tests {
             alpha_opaque: false,
             downscaled_from: None,
             source_mips: None,
+            layout: None,
             animation: None,
         }
     }

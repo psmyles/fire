@@ -10,7 +10,7 @@
 use ddsfile::{
     AlphaMode, D3D10ResourceDimension, D3DFormat, Dds, DxgiFormat, NewD3dParams, NewDxgiParams,
 };
-use fire_decode::{decode, DecodeError, DecodeOptions, DecodedImage, PixelFormat};
+use fire_decode::{decode, DecodeError, DecodeOptions, DecodedImage, PixelFormat, SheetKind};
 
 // --- fixture helpers -------------------------------------------------------------------------
 
@@ -399,6 +399,146 @@ fn a_downscale_drops_the_file_chain() {
     );
 }
 
+// --- cubemaps, arrays and volumes ---------------------------------------------------------------
+
+/// A multi-surface DX10 file: `layers` array layers (times six if `cube`) and `depth` slices.
+fn multi(
+    format: DxgiFormat,
+    width: u32,
+    height: u32,
+    layers: u32,
+    cube: bool,
+    depth: Option<u32>,
+    levels: Option<u32>,
+) -> Dds {
+    Dds::new_dxgi(NewDxgiParams {
+        height,
+        width,
+        depth,
+        format,
+        mipmap_levels: levels,
+        array_layers: Some(layers),
+        is_cubemap: cube,
+        resource_dimension: if depth.is_some() {
+            D3D10ResourceDimension::Texture3D
+        } else {
+            D3D10ResourceDimension::Texture2D
+        },
+        alpha_mode: AlphaMode::Straight,
+        caps2: Default::default(),
+    })
+    .expect("multi-surface header")
+}
+
+/// Fill `dds.data` with one solid BC1 block per 8 bytes, cycling through `colours`.
+fn fill_blocks(dds: &mut Dds, colours: &[u16]) {
+    for (i, chunk) in dds.data.chunks_mut(8).enumerate() {
+        chunk.copy_from_slice(&bc1_solid(colours[i % colours.len()]));
+    }
+}
+
+/// A cubemap's six faces are tiled into one near-square sheet, in the DDS face order, and the
+/// layout says how to read them back. A single 24576-wide strip would be the obvious alternative
+/// and nearly a decode-guard rejection at 4096 per face.
+#[test]
+fn a_cubemap_tiles_its_six_faces_into_a_sheet() {
+    let mut dds = multi(DxgiFormat::BC1_UNorm, 4, 4, 6, true, None, None);
+    // One distinct colour per face, so a mis-ordered or mis-placed face is visible.
+    let colours = [0xf800u16, 0x07e0, 0x001f, 0xffe0, 0xf81f, 0x07ff];
+    fill_blocks(&mut dds, &colours);
+    let img = decode(&bytes(&dds), Some("dds"), &opts()).expect("cubemap decodes");
+
+    let l = img.layout.expect("a cubemap is a sheet");
+    assert_eq!((l.cols, l.rows, l.frames), (3, 2, 6));
+    assert_eq!(l.kind, SheetKind::CubeFaces);
+    assert_eq!((img.width, img.height), (12, 8), "3x2 grid of 4x4 faces");
+
+    // Face k sits at cell k, row-major. Check each one's top-left texel.
+    let expected = [
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+        [255, 255, 0, 255],
+        [255, 0, 255, 255],
+        [0, 255, 255, 255],
+    ];
+    for (face, want) in expected.iter().enumerate() {
+        let (cx, cy) = (face as u32 % 3, face as u32 / 3);
+        let i = (cy * 4 * 12 + cx * 4) as usize;
+        assert_eq!(&rgba8(&img, i), want, "face {face}");
+    }
+}
+
+/// A texture array is the same mechanism with a different name, and a count that need not fill
+/// the grid: five layers tile 3x2 with one cell left over, and `frames` says so, so the viewer's
+/// transport does not step onto the empty one.
+#[test]
+fn an_array_reports_its_real_layer_count_not_the_grid_size() {
+    let mut dds = multi(DxgiFormat::BC1_UNorm, 4, 4, 5, false, None, None);
+    fill_blocks(&mut dds, &[0xf800]);
+    let img = decode(&bytes(&dds), Some("dds"), &opts()).expect("array decodes");
+
+    let l = img.layout.expect("an array is a sheet");
+    assert_eq!((l.cols, l.rows, l.frames), (3, 2, 5));
+    assert_eq!(l.kind, SheetKind::ArrayLayers);
+    assert_eq!((img.width, img.height), (12, 8));
+    // The sixth cell was never written, so it is transparent black rather than a stale layer.
+    let (cx, cy, cell, sheet_w) = (2usize, 1usize, 4usize, 12usize);
+    assert_eq!(rgba8(&img, cy * cell * sheet_w + cx * cell), [0, 0, 0, 0]);
+}
+
+/// A volume's slices live inside one array layer rather than in layers of their own, so they are
+/// carved out of the level instead of indexed by layer.
+#[test]
+fn a_volume_tiles_its_depth_slices() {
+    let mut dds = multi(DxgiFormat::BC1_UNorm, 4, 4, 1, false, Some(4), None);
+    fill_blocks(&mut dds, &[0xf800, 0x07e0, 0x001f, 0xffe0]);
+    let img = decode(&bytes(&dds), Some("dds"), &opts()).expect("volume decodes");
+
+    let l = img.layout.expect("a volume is a sheet");
+    assert_eq!((l.cols, l.rows, l.frames), (2, 2, 4));
+    assert_eq!(l.kind, SheetKind::VolumeSlices);
+    assert_eq!((img.width, img.height), (8, 8));
+    assert_eq!(rgba8(&img, 0), [255, 0, 0, 255], "slice 0");
+    assert_eq!(rgba8(&img, 4), [0, 255, 0, 255], "slice 1");
+}
+
+/// A volume's depth halves with each mip, so level 1 holds half as many slices and cannot tile
+/// the same grid. Rather than show a level that is not a level of this sheet, the chain is
+/// dropped and the viewer builds one from the composited level 0.
+#[test]
+fn a_volumes_chain_is_not_adopted() {
+    let mut dds = multi(DxgiFormat::BC1_UNorm, 8, 8, 1, false, Some(4), Some(2));
+    fill_blocks(&mut dds, &[0xf800]);
+    let img = decode(&bytes(&dds), Some("dds"), &opts()).expect("mipped volume decodes");
+    assert!(img.layout.is_some());
+    assert!(img.source_mips.is_none());
+}
+
+/// A cubemap's own chain *is* adopted, because a power-of-two face tiles every level exactly:
+/// `cols * (w >> n)` and `(cols * w) >> n` agree all the way down.
+#[test]
+fn a_cubemaps_chain_is_adopted_when_the_faces_tile_exactly() {
+    let mut dds = multi(DxgiFormat::BC1_UNorm, 8, 8, 6, true, None, Some(4));
+    fill_blocks(&mut dds, &[0xf800]);
+    let img = decode(&bytes(&dds), Some("dds"), &opts()).expect("mipped cubemap decodes");
+
+    assert_eq!((img.width, img.height), (24, 16));
+    let mips = img.source_mips.expect("the faces tile every level");
+    // The 24x16 sheet has five levels; level 1 is a 3x2 tiling of 4x4 faces.
+    assert_eq!(mips[0].len(), 12 * 8 * 4);
+    assert_eq!(mips[1].len(), 6 * 4 * 4);
+}
+
+/// An ordinary single-surface file is not a sheet, and must not pay the tiling copy or grow a
+/// transport band it has no use for.
+#[test]
+fn a_single_surface_file_has_no_layout() {
+    let file = dxgi(DxgiFormat::BC1_UNorm, 4, 4, &bc1_solid(0xf800));
+    let img = decode(&file, Some("dds"), &opts()).expect("BC1 decodes");
+    assert!(img.layout.is_none());
+}
+
 // --- alpha -----------------------------------------------------------------------------------
 
 /// `DXT2` is `DXT3` with the colour channels already multiplied by alpha. Displaying that as-is
@@ -478,6 +618,24 @@ fn a_decode_bomb_header_is_refused_before_allocating() {
     let file = raw_header(100_000, 100_000, None);
     match decode(&file, Some("dds"), &opts()) {
         Err(DecodeError::TooLarge(m)) => assert!(m.contains("DDS"), "{m}"),
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+}
+
+/// A sheet multiplies the header's dimensions, so the guard runs again on the product.
+///
+/// A 16384² surface is a legal 1 GiB image on its own and passes the first check; six of them
+/// tiled 3x2 is 49152x32768, still inside the per-axis limit but 6.4 GB of pixels — exactly the
+/// multiplication a per-surface check alone would wave through.
+#[test]
+fn a_sheet_that_only_overflows_once_tiled_is_refused() {
+    let mut file = raw_header(16_384, 16_384, None);
+    // caps2 sits at byte 112: CUBEMAP plus all six face flags, which is how a legacy cubemap
+    // announces itself. Built by hand because the `ddsfile` writer would try to allocate it.
+    file[112..116].copy_from_slice(&(0x200u32 | 0xfc00).to_le_bytes());
+
+    match decode(&file, Some("dds"), &opts()) {
+        Err(DecodeError::TooLarge(m)) => assert!(m.contains("sheet"), "{m}"),
         other => panic!("expected TooLarge, got {other:?}"),
     }
 }

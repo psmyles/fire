@@ -178,6 +178,46 @@ impl PixelFormat {
     }
 }
 
+/// What a multi-surface source's surfaces *are*, for the status bar and for the wording of the
+/// viewer's transport controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SheetKind {
+    /// The six faces of a cubemap, in the DDS order `+X -X +Y -Y +Z -Z`.
+    CubeFaces,
+    /// The layers of a texture array.
+    ArrayLayers,
+    /// The depth slices of a volume texture.
+    VolumeSlices,
+}
+
+impl SheetKind {
+    /// The word for these surfaces, singular, for the status bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            SheetKind::CubeFaces => "cubemap",
+            SheetKind::ArrayLayers => "array",
+            SheetKind::VolumeSlices => "volume",
+        }
+    }
+}
+
+/// A source whose one canvas is really several surfaces tiled into a grid.
+///
+/// A cubemap, a texture array and a volume are all "N images of the same size" — exactly what the
+/// viewer's flipbook already displays, so they are composited into one sheet here and handed over
+/// with the grid that reads it back. This is *authored* structure, not the guess
+/// `flipbook::detect` makes from pixel content, which is why it travels with the image instead of
+/// being re-derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SheetLayout {
+    pub cols: u32,
+    pub rows: u32,
+    /// Surfaces actually present, `1..=cols*rows`. The trailing cells of a partly filled grid are
+    /// transparent black and are not meant to be stepped onto.
+    pub frames: u32,
+    pub kind: SheetKind,
+}
+
 /// The dimensions of mip `level` of a `w`x`h` image: each axis halves, flooring but never
 /// dropping below 1.
 ///
@@ -231,6 +271,13 @@ pub struct DecodedImage {
     /// moment anything rewrites `pixels` — see [`transform_buffers`](Self::transform_buffers) —
     /// because a chain that no longer describes the canvas is worse than no chain at all.
     pub source_mips: Option<Vec<Vec<u8>>>,
+    /// When the canvas is several surfaces tiled into a grid — a cubemap's faces, an array's
+    /// layers, a volume's slices — how to read it back. Only DDS sets it. `None` for the ordinary
+    /// single-surface case, which is every other format.
+    ///
+    /// Unlike a detected sprite-sheet grid this is *authored*: the file says how many surfaces it
+    /// holds and how big each one is, so the viewer adopts it rather than offering it as a guess.
+    pub layout: Option<SheetLayout>,
     /// Playback timing/pixels for an animated source (animated GIF). `None` for a still image —
     /// the common case, so the still path is untouched. When `Some`, `pixels` above is frame 0
     /// (shown immediately) and [`Animation::frames`] holds the full sequence for the viewer to
@@ -611,6 +658,7 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
         source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -693,6 +741,7 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
         source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -729,6 +778,7 @@ fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, Decode
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
         source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -805,6 +855,7 @@ fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
         source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -871,6 +922,7 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
         source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -999,6 +1051,7 @@ fn decode_zune(
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
         source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -1098,6 +1151,7 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
         source_mips: None,
+        layout: None,
         animation,
     })
 }
@@ -1184,6 +1238,7 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
         source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -1316,6 +1371,7 @@ mod icc {
                 alpha_opaque: false,
                 downscaled_from: None,
                 source_mips: None,
+                layout: None,
                 animation: None,
             }
         }

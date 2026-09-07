@@ -444,12 +444,24 @@ Notes:
   scanning work unchanged. Per-frame delays below 20 ms (including the common 0 = "as fast as
   possible") are clamped to 100 ms, matching browsers. The viewer plays it back on a loop timer
   (§10). Animated WebP is *not* animated (WebP stays on the still zune hot path).
-- **DDS = the first surface only, for now.** A DDS is a container: it can hold a mip chain, six
-  cubemap faces, an array of layers, or a volume's depth slices, and `dds.rs` locates all of them
-  (`Surfaces`) but currently decodes mip 0 of layer 0. Signed block formats are re-centred for
-  display (`bcdec` returns the raw -127..127 range as bytes, which would show a signed normal map
-  as noise), and `DXT2`/`DXT4` - and any DX10 header that says so - have their premultiplied alpha
-  straightened, the same fixup the TIFF path applies.
+- **DDS is a container, so a `.dds` can be several images.** A cubemap's six faces, a texture
+  array's layers and a volume's depth slices are all "N images of the same size" - which is
+  exactly what the flipbook already displays - so `dds.rs` composites them into one near-square
+  sheet (six faces tile 3x2; a 64-slice volume 8x8) and hands over a `SheetLayout` saying how to
+  read it back. A single strip would be simpler and nearly a decode-guard rejection: six 4096
+  faces side by side is 24576 px wide. Because the grid is *authored* rather than guessed, the
+  viewer skips `flipbook::detect` for these files entirely and turns the mode on instead of
+  offering a hint chip, with playback parked - the transport is there to step faces, not run
+  them. `frames` is what the file holds rather than the whole grid, so the empty sixth cell of a
+  five-layer array is not steppable. A cubemap's own mip chain is adopted too, since a
+  power-of-two face tiles every level exactly; a volume's is not, because its depth halves with
+  each level and half as many slices cannot tile the same grid.
+- **DDS fixups.** Signed block formats are re-centred for display (`bcdec` returns the raw
+  -127..127 range as bytes, which would show a signed normal map as noise), and `DXT2`/`DXT4` -
+  and any DX10 header that says so - have their premultiplied alpha straightened, the same fixup
+  the TIFF path applies. The decode-bomb guard runs **twice**: once on the header's bare surface,
+  then on the tiled sheet, both before the payload is consulted - a 16384² surface is a legal
+  1 GiB image, and six of them tiled is 6.4 GB.
 - **Oversized images:** `DecodeOptions::max_dim` is a **CPU/RAM guard**, not a GPU texture
   limit (an RGBA8 bitmap at 16384² is ~1 GiB; float HDR is 4×). It defaults to 16384, is
   configurable, and anything past it is CPU-downscaled to fit, recording the original size
@@ -500,9 +512,10 @@ returns a `ui::Frame` of what the user asked for, which the viewer applies.
   Settings is the last entry of the menu button's popup, which is the same menu the viewport's
   right-click opens - one place to look, not two. That menu therefore stays enabled with no image
   loaded (its file entries hide themselves), or Settings would be unreachable from an empty window.
-- **Status bar:** file name, format, W×H, bit depth / channel layout, ICC presence, and on the right
-  the folder position and zoom % (plus `EV ±` for HDR, and `mip n/N` with the level's own
-  dimensions when a chain is being walked).
+- **Status bar:** file name, format, W×H - or `cubemap 6 × 512×512` for a multi-surface source,
+  since the sheet's own size is an artefact of how the faces are shown - bit depth / channel
+  layout, ICC presence, and on the right the folder position and zoom % (plus `EV ±` for HDR, and
+  `mip n/N` with the level's own dimensions when a chain is being walked).
 - **Empty window:** a centred card with the logo, the product identity (long name + version, from
   `product.json` via `build.rs`) and the drop/open hint. It degrades gracefully - the logo and then
   the identity block drop out - when there is not enough room.
@@ -941,7 +954,9 @@ accelerator leaves AppKit to pick. The red button still closes the window.
 path (§4.1)**; GPU render through sokol_gfx with channel/alpha/gamma/exposure/tonemap; async worker
 decode; zune + image + tiff + exr + psd_sdk + libheif decoders; camera-raw embedded-preview decode;
 animated GIF playback; ICC honoring via lcms2; tonemap-to-SDR HDR with exposure; downscale-to-fit
-RAM guard; content-detected **flipbook (sprite-sheet) playback** with a transport band; the
+RAM guard; content-detected **flipbook (sprite-sheet) playback** with a transport band, which
+also carries a DDS cubemap's faces / an array's layers / a volume's slices; a **mip-level
+viewer** for textures that ship a chain; the
 **octagon overlay**; folder ←/→ navigation; hot-reload of the displayed image; **DPI-aware,
 dark-mode-aware ImGui toolbar + status bar + settings window**; portable physical-key keybinds;
 open-in-editor and the clipboard actions; file association on both OSes; an unsigned Windows
