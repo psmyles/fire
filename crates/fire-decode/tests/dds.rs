@@ -307,6 +307,98 @@ fn single_channel_float_replicates_to_grey() {
     assert_eq!(px[..4], [0.25, 0.25, 0.25, 1.0]);
 }
 
+// --- the file's own mip chain ------------------------------------------------------------------
+
+/// A DDS with mips hands its own levels over rather than letting the viewer compute them. The
+/// levels in a `.dds` are authored — often with a filter and a gamma a box filter will not
+/// reproduce — and an artist opening one wants to see what shipped.
+#[test]
+fn an_authored_mip_chain_is_carried_through() {
+    // 8x8 BC1 with all four levels: 4, 1, 1, 1 blocks. Each level a different colour, so a
+    // recomputed chain (which would blend towards level 0's red) is distinguishable.
+    let mut dds = Dds::new_dxgi(NewDxgiParams {
+        height: 8,
+        width: 8,
+        depth: None,
+        format: DxgiFormat::BC1_UNorm,
+        mipmap_levels: Some(4),
+        array_layers: None,
+        is_cubemap: false,
+        resource_dimension: D3D10ResourceDimension::Texture2D,
+        alpha_mode: AlphaMode::Straight,
+        caps2: Default::default(),
+    })
+    .expect("mipped header");
+    let colours = [0xf800u16, 0x07e0, 0x001f, 0xf800];
+    let mut at = 0;
+    for (level, colour) in colours.iter().enumerate() {
+        let blocks = if level == 0 { 4 } else { 1 };
+        for _ in 0..blocks {
+            dds.data[at..at + 8].copy_from_slice(&bc1_solid(*colour));
+            at += 8;
+        }
+    }
+    let img = decode(&bytes(&dds), Some("dds"), &opts()).expect("mipped BC1 decodes");
+
+    let mips = img.source_mips.expect("the file's chain came along");
+    assert_eq!(mips.len(), 3, "levels 1..3 of an 8x8 chain");
+    // Level 1 is 4x4 green, level 2 is 2x2 blue, level 3 is 1x1 red — exactly as authored.
+    assert_eq!(mips[0].len(), 4 * 4 * 4);
+    assert_eq!(mips[0][..4], [0, 255, 0, 255]);
+    assert_eq!(mips[1].len(), 2 * 2 * 4);
+    assert_eq!(mips[1][..4], [0, 0, 255, 255]);
+    assert_eq!(mips[2].len(), 4);
+    assert_eq!(mips[2][..4], [255, 0, 0, 255]);
+}
+
+/// A DDS without mips reports none, and the viewer builds the chain as it always has.
+#[test]
+fn a_single_level_file_supplies_no_chain() {
+    let file = dxgi(DxgiFormat::BC1_UNorm, 4, 4, &bc1_solid(0xf800));
+    let img = decode(&file, Some("dds"), &opts()).expect("BC1 decodes");
+    assert!(img.source_mips.is_none());
+}
+
+/// Anything that rewrites the canvas invalidates the chain, because those levels are levels *of*
+/// the canvas that was replaced. Downscaling is the reachable case: a nearest-neighbour resample
+/// is not what produced the file's level 1, so keeping it would show the wrong pixels when
+/// zoomed out.
+#[test]
+fn a_downscale_drops_the_file_chain() {
+    let mut dds = Dds::new_dxgi(NewDxgiParams {
+        height: 8,
+        width: 8,
+        depth: None,
+        format: DxgiFormat::BC1_UNorm,
+        mipmap_levels: Some(4),
+        array_layers: None,
+        is_cubemap: false,
+        resource_dimension: D3D10ResourceDimension::Texture2D,
+        alpha_mode: AlphaMode::Straight,
+        caps2: Default::default(),
+    })
+    .expect("mipped header");
+    for chunk in dds.data.chunks_mut(8) {
+        chunk.copy_from_slice(&bc1_solid(0xf800));
+    }
+    let file = bytes(&dds);
+
+    let big = decode(&file, Some("dds"), &opts()).expect("decodes");
+    assert!(big.source_mips.is_some(), "kept at full size");
+
+    let shrunk = DecodeOptions {
+        max_dim: 4,
+        ..DecodeOptions::default()
+    };
+    let small = decode(&file, Some("dds"), &shrunk).expect("decodes");
+    assert_eq!((small.width, small.height), (4, 4));
+    assert_eq!(small.downscaled_from, Some((8, 8)));
+    assert!(
+        small.source_mips.is_none(),
+        "a rewritten canvas invalidates the file's levels"
+    );
+}
+
 // --- alpha -----------------------------------------------------------------------------------
 
 /// `DXT2` is `DXT3` with the colour channels already multiplied by alpha. Displaying that as-is

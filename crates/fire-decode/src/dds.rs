@@ -33,12 +33,12 @@
 //! back the raw -127..127 range reinterpreted as bytes, which would show a normal map as noise,
 //! so [`snorm_to_unorm`] maps it to 0..255 the way a sampler would.
 //!
-//! Only mip 0 of the first array layer is read. The file's own mip chain and its cubemap /
-//! array / volume slices are located by [`Surfaces`] but not yet surfaced to the viewer.
+//! The file's own mip chain comes along in [`DecodedImage::source_mips`]; its cubemap faces,
+//! array layers and volume slices are located by [`Surfaces`] but only the first is decoded.
 
 use ddsfile::{Dds, DxgiFormat, FourCC, PixelFormatFlags};
 
-use crate::{check_dims, DecodeError, DecodedImage, PixelFormat};
+use crate::{check_dims, level_dims, DecodeError, DecodedImage, PixelFormat};
 
 /// Half-precision 1.0, the alpha filled in for the alpha-less HDR formats.
 const HALF_ONE: u16 = 0x3c00;
@@ -510,10 +510,29 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 
     let mut pixels = decode_surface(&fmt, src, width, height);
 
+    // The file's own chain, levels 1.. — authored, often with a better filter than a box, and
+    // the whole reason to look at a `.dds` mip rather than a computed one. A level whose bytes
+    // are missing ends the chain rather than failing the decode: half an authored chain is still
+    // better than none, and the worker pads whatever is short.
+    let mut source_mips = Vec::new();
+    for level in 1..surfaces.levels {
+        let (lw, lh) = level_dims(width, height, level);
+        let Some(range) = surfaces.range(0, level) else {
+            break;
+        };
+        let Some(src) = dds.data.get(range) else {
+            break;
+        };
+        source_mips.push(decode_surface(&fmt, src, lw, lh));
+    }
+
     // `DXT2`/`DXT4`, and any DX10 header that says so, store colour already multiplied by alpha.
     // Displaying that directly renders every semi-transparent area about twice too dark.
     if premultiplied(&dds) {
         straighten(&mut pixels, fmt.out);
+        for level in &mut source_mips {
+            straighten(level, fmt.out);
+        }
     }
 
     Ok(DecodedImage {
@@ -527,6 +546,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: fmt.label,
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: (!source_mips.is_empty()).then_some(source_mips),
         animation: None,
     })
 }

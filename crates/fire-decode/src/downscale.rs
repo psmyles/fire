@@ -79,6 +79,7 @@ mod tests {
             source_format: "test",
             alpha_opaque: false,
             downscaled_from: None,
+            source_mips: None,
             animation: None,
         }
     }

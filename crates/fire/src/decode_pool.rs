@@ -119,19 +119,40 @@ impl DecodePool {
                         if job.generation < latest.load(Ordering::Relaxed) {
                             continue;
                         }
-                        let result = decode(&job).map(Arc::new);
-                        // The mip chain, built here so the UI thread's adopt is one upload.
+                        let mut result = decode(&job);
+                        // Take the file's own chain out of the image before it is shared: only
+                        // the uploader wants it, and leaving it in would keep a second copy of
+                        // roughly a third of level 0 alive behind every `Arc` for the life of
+                        // the window.
+                        let source_mips =
+                            result.as_mut().ok().and_then(|img| img.source_mips.take());
+                        let result = result.map(Arc::new);
+                        // The mip chain, completed here so the UI thread's adopt is one upload.
                         let mips = match &result {
                             Ok(img) => {
                                 let t = Instant::now();
-                                let chain = crate::render::mips::build(
-                                    &img.pixels,
-                                    img.width,
-                                    img.height,
-                                    img.format,
-                                );
+                                let authored = source_mips.as_ref().map_or(0, Vec::len);
+                                let chain = match source_mips {
+                                    // A DDS brings its own, and those levels were authored — with
+                                    // a filter and a gamma a box filter does not reproduce. Keep
+                                    // what the file supplied and compute only the tail it stopped
+                                    // short of.
+                                    Some(src) => crate::render::mips::complete(
+                                        src,
+                                        &img.pixels,
+                                        img.width,
+                                        img.height,
+                                        img.format,
+                                    ),
+                                    None => crate::render::mips::build(
+                                        &img.pixels,
+                                        img.width,
+                                        img.height,
+                                        img.format,
+                                    ),
+                                };
                                 crate::render::gpu::report_timing(&format!(
-                                    "mips — {:.2} ms ({} levels, {}×{})",
+                                    "mips — {:.2} ms ({} levels, {authored} from the file, {}×{})",
                                     t.elapsed().as_secs_f64() * 1e3,
                                     chain.len() + 1,
                                     img.width,

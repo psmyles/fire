@@ -227,7 +227,11 @@ called from the forward path. macOS needs no equivalent - Launch Services activa
   built on the CPU on the decode worker (`render/mips.rs`, D21) - ~5 ms on an 8.9 MB image, off the
   UI thread. Each level is a 2×2 box filter of the level above, with 8-bit sRGB sources averaged in
   *linear* light through two lookup tables (what hardware does for an `*_SRGB` format); rows are
-  split across threads for the big levels. After the upload, pan / zoom / exposure / channel /
+  split across threads for the big levels. **A decoder that brings its own chain keeps it**: a DDS
+  stores authored levels, filtered and gamma-corrected by whatever tool built the texture, and a
+  box filter does not reproduce them - so `mips::complete` adopts what the file supplied and
+  computes only the tail it stopped short of (`DecodedImage::source_mips`, dropped by
+  `transform_buffers` the moment any pass rewrites the canvas). After the upload, pan / zoom / exposure / channel /
   tonemap (and the flipbook cell offsets + blend) are just values in a **128-byte uniform block**;
   the source texture never changes until a new image is opened (flipbook playback only moves the
   cell offsets - never re-uploads).
@@ -407,8 +411,9 @@ Notes:
   and runs on a decode worker, so a malformed file cannot take down the viewer process.
   (This is also why `panic = "abort"` is *not* set in the release profile - `catch_unwind` only
   works with unwinding panics.)
-- **The mip chain is built here too** (§5): on the decode worker, right after the decode and
-  before the image is posted, so the UI thread never pays for it.
+- **The mip chain is built or completed here too** (§5): on the decode worker, right after the
+  decode and before the image is posted, so the UI thread never pays for it. A DDS supplies its
+  own authored levels, which are adopted rather than recomputed.
 - **Camera raw = embedded preview, not develop.** A raw file is a per-vendor container
   around the sensor mosaic plus a full-size, camera-rendered **JPEG preview**. Developing
   the mosaic (demosaic + white balance + color matrices) is slow and at odds with the

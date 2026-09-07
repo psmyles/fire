@@ -771,6 +771,7 @@ mod tests {
             icc: None,
             source_format: "TEST",
             downscaled_from: None,
+            source_mips: None,
             animation: None,
         }
     }
@@ -992,6 +993,7 @@ mod tests {
             icc: None,
             source_format: "TEST",
             downscaled_from: None,
+            source_mips: None,
             animation: None,
         };
         assert_eq!(

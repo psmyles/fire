@@ -178,6 +178,18 @@ impl PixelFormat {
     }
 }
 
+/// The dimensions of mip `level` of a `w`x`h` image: each axis halves, flooring but never
+/// dropping below 1.
+///
+/// The one halving rule the whole pipeline agrees on — what the renderer's mip builder steps
+/// through, and what a DDS stores its own levels by. It lives here, next to
+/// [`DecodedImage::source_mips`], because that field's contract is stated in terms of it and a
+/// second copy in the viewer crate would be a rule in two places.
+pub fn level_dims(w: u32, h: u32, level: u32) -> (u32, u32) {
+    let shift = level.min(31);
+    ((w >> shift).max(1), (h >> shift).max(1))
+}
+
 /// A successfully decoded image, normalized to RGBA in `format`'s layout.
 #[derive(Debug, Clone)]
 pub struct DecodedImage {
@@ -206,6 +218,19 @@ pub struct DecodedImage {
     /// If the image was downscaled to fit `DecodeOptions::max_dim`, the original
     /// (width, height) before downscaling; the pixel inspector notes this (§6).
     pub downscaled_from: Option<(u32, u32)>,
+    /// The file's own mip chain, levels `1..`, when it brought one. Each buffer is one level in
+    /// `format`'s layout at `((width >> i).max(1), (height >> i).max(1))`, smallest last — the
+    /// same shape and the same halving rule the viewer's own mip builder uses, so a chain that
+    /// survives to the worker can be adopted verbatim instead of rebuilt.
+    ///
+    /// Only DDS supplies one today, and it is the format where it matters: the levels in a `.dds`
+    /// are *authored*, often with a filter and a gamma the box filter does not reproduce, and an
+    /// artist opening one wants to see what shipped rather than what we would have computed.
+    ///
+    /// May be **partial** (a file is free to stop its chain at 4x4) or absent. It is dropped the
+    /// moment anything rewrites `pixels` — see [`transform_buffers`](Self::transform_buffers) —
+    /// because a chain that no longer describes the canvas is worse than no chain at all.
+    pub source_mips: Option<Vec<Vec<u8>>>,
     /// Playback timing/pixels for an animated source (animated GIF). `None` for a still image —
     /// the common case, so the still path is untouched. When `Some`, `pixels` above is frame 0
     /// (shown immediately) and [`Animation::frames`] holds the full sequence for the viewer to
@@ -245,6 +270,14 @@ impl DecodedImage {
     /// assumes) are dropped rather than indexed past, and an animation left with no frames is
     /// removed entirely.
     pub(crate) fn transform_buffers(&mut self, needed: usize, mut f: impl FnMut(&mut Vec<u8>)) {
+        // Every pass that rewrites the canvas comes through here, which makes this the one place
+        // that has to invalidate a file-supplied mip chain: a rotated, colour-transformed or
+        // resampled level 0 is no longer what those levels are levels *of*. Transforming them
+        // alongside would be wrong as often as right — a nearest-neighbour downscale in
+        // particular does not produce the file's level 1 — so the chain is dropped and the worker
+        // rebuilds one. Orientation 1, no ICC profile and an in-budget image never reach here,
+        // which is every ordinary DDS.
+        self.source_mips = None;
         f(&mut self.pixels);
         if let Some(anim) = self.animation.as_mut() {
             anim.frames.retain(|frame| frame.pixels.len() >= needed);
@@ -577,6 +610,7 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "PSD",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
         animation: None,
     })
 }
@@ -658,6 +692,7 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "OpenEXR",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
         animation: None,
     })
 }
@@ -693,6 +728,7 @@ fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, Decode
         source_format: label,
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
         animation: None,
     })
 }
@@ -768,6 +804,7 @@ fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "Radiance HDR",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
         animation: None,
     })
 }
@@ -833,6 +870,7 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "PNG",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
         animation: None,
     })
 }
@@ -960,6 +998,7 @@ fn decode_zune(
         source_format: zune_format_name(fmt),
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
         animation: None,
     })
 }
@@ -1058,6 +1097,7 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "GIF",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
         animation,
     })
 }
@@ -1143,6 +1183,7 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         source_format: format.map_or("image", format_name),
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
         animation: None,
     })
 }
@@ -1274,6 +1315,7 @@ mod icc {
                 source_format: "test",
                 alpha_opaque: false,
                 downscaled_from: None,
+                source_mips: None,
                 animation: None,
             }
         }
