@@ -278,15 +278,17 @@ impl Viewer {
         proxy: EventLoopProxy<AppEvent>,
     ) -> Result<Self, String> {
         let t_window = Instant::now();
-        // Restore the remembered size now, so the surface starts at the right size. The
-        // launcher's Run setting (a Windows shortcut's Normal/Minimized/Maximized) wins for the
-        // show state; otherwise the remembered maximized state is restored.
+        // Restore the remembered size now, so the surface starts at the right size. A launcher
+        // that explicitly asked to be maximized wins over the remembered state; anything else
+        // (the shell's default show state included — see `platform::launcher_show`) leaves
+        // `window.toml` in charge.
         let saved = WindowState::load();
         let launcher = platform::launcher_show();
         let maximized = match launcher {
             Some(LaunchShow::Maximized) => true,
-            Some(LaunchShow::Minimized) | Some(LaunchShow::Normal) => false,
-            None => saved.is_some_and(|s| s.maximized),
+            // `Minimized` says how to *show* the window, not what it should be once it comes
+            // back: restoring from the taskbar has to give back the remembered placement.
+            Some(LaunchShow::Minimized) | None => saved.is_some_and(|s| s.maximized),
         };
         let mut attrs = Window::default_attributes()
             .with_title(crate::product::NAME)

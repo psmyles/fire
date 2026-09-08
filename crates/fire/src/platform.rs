@@ -4,7 +4,7 @@
 //! one small function behind a `cfg`, with a no-op or portable fallback for the other OS, so the
 //! shell above reads as one program:
 //!
-//! * the launcher's Run = Normal/Minimized/Maximized (a Windows `STARTUPINFO` field);
+//! * the launcher's Run = Minimized/Maximized (a Windows `STARTUPINFO` field);
 //! * the one-shot foreground grant on the forward path (`AllowSetForegroundWindow`);
 //! * the clipboard, for the actions menu's Copy File / Copy Path / Copy File Name;
 //! * "Show in Explorer" / "Reveal in Finder";
@@ -12,24 +12,32 @@
 
 use std::path::Path;
 
-/// How the launcher asked the window to be shown.
+/// How the launcher asked the window to be shown — only the two states that are a genuine
+/// *request*. There is deliberately no `Normal`: see [`launcher_show`].
 ///
-/// Every variant is matched by the viewer on both OSes, but only [`launcher_show`]'s Windows arm
+/// Both variants are matched by the viewer on both OSes, but only [`launcher_show`]'s Windows arm
 /// ever *constructs* one — off Windows it always answers `None`, which is what the dead-code
 /// allowance is for. The alternative, `cfg`-ing the variants themselves, would make the viewer's
 /// match arms platform-specific too, which is the opposite of what this module is for.
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchShow {
-    Normal,
     Maximized,
     Minimized,
 }
 
-/// The show state the launcher requested — a Windows shortcut's "Run" field (Normal / Minimized /
-/// Maximized), or what `CreateProcess` passed as `nCmdShow`. `None` if the launcher didn't
-/// specify one (then the remembered state is used). Always `None` off Windows: Finder has no
-/// such setting.
+/// The show state the launcher requested — a Windows shortcut's "Run = Minimized / Maximized", or
+/// what `CreateProcess` passed as `nCmdShow`. `None` when the launcher expressed no preference,
+/// and then the remembered state (`window.toml`) is what stands. Always `None` off Windows:
+/// Finder has no such setting.
+///
+/// **A "normal" show is not a preference.** Every shell launch — double-clicking an image in
+/// Explorer, "Open with", a jump-list entry — goes through `ShellExecuteEx`, which sets
+/// `STARTF_USESHOWWINDOW` with `SW_SHOWNORMAL` on *every* process it starts. That is the shell's
+/// default, not the user's wish, and it is byte-identical to a shortcut whose Run field says
+/// "Normal window", so the two cannot be told apart. Reading it as a request meant a
+/// double-click un-maximized a window the user had left maximized. So only the two states that
+/// can *only* come from someone asking for them are reported; everything else is `None`.
 pub fn launcher_show() -> Option<LaunchShow> {
     #[cfg(windows)]
     {
@@ -56,7 +64,9 @@ pub fn launcher_show() -> Option<LaunchShow> {
         {
             Some(LaunchShow::Minimized)
         } else {
-            Some(LaunchShow::Normal)
+            // `SW_SHOWNORMAL`, `SW_SHOWDEFAULT`, `SW_SHOW`, … — the defaults every launcher
+            // passes when it has nothing to say. No preference; the remembered state wins.
+            None
         }
     }
     #[cfg(not(windows))]

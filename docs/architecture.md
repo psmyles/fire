@@ -615,10 +615,12 @@ returns a `ui::Frame` of what the user asked for, which the viewer applies.
 - **Window placement:** each window opens at the size/position it had when the last one closed -
   the restored (non-maximized) rect plus a maximized flag, captured on close and persisted to
   `window.toml` in the config directory (`window_state.rs`), then re-applied next launch. The
-  window is **never** resized to the image - every open lands in fit-to-window mode. On Windows the
-  launcher's "Run" setting (the shortcut's Normal/Minimized/Maximized, read from
-  `STARTUPINFO.wShowWindow`) overrides the show state; off Windows that leaf answers `None` and the
-  remembered state stands.
+  window is **never** resized to the image - every open lands in fit-to-window mode. On Windows a
+  launcher that explicitly asks to be **maximized** or **minimized** (a shortcut's "Run" setting,
+  read from `STARTUPINFO.wShowWindow`) overrides the show state. A *normal* show is deliberately
+  not treated as a request: `ShellExecuteEx` stamps `STARTF_USESHOWWINDOW` + `SW_SHOWNORMAL` on
+  every shell launch, so honouring it made a double-click in Explorer un-maximize a window the
+  user had left maximized. Off Windows that leaf answers `None` and the remembered state stands.
 - **Settings:** stored as **TOML** in the per-user config directory - `%APPDATA%\fire` on Windows,
   `~/Library/Application Support/fire` on macOS, `$XDG_CONFIG_HOME/fire` elsewhere (one definition,
   `util::fire_dir`, so the files cannot drift apart). Fire writes a fully commented
