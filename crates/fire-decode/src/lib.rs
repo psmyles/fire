@@ -423,6 +423,10 @@ enum Backend {
     /// directory fields reused for the hotspot. The `image` crate's ICO decoder reads one
     /// unchanged but does not recognize the magic, so it is named for it here.
     Cur,
+    /// An uncompressed true-colour TGA, recognized from its header rather than from magic it
+    /// does not have — see [`is_uncompressed_tga`], which also keeps it out of [`Backend::Cur`],
+    /// whose magic it shares. Decoded by the `image` crate like any other TGA.
+    Tga,
     /// PNG; decoded by the `image` crate, *not* zune — see [`decode_png`] for why
     /// zune-png is avoided.
     Png,
@@ -446,6 +450,42 @@ fn heif_label(bytes: &[u8]) -> Option<&'static str> {
         b"mif1" | b"msf1" | b"mif2" => Some("HEIF"),
         _ => None,
     }
+}
+
+/// Whether `bytes` is an uncompressed true-colour TGA — the variant that wears the Windows
+/// cursor's magic.
+///
+/// `00 00 02 00` is the `.cur` magic (two reserved bytes, then the type word `2`) and it is also,
+/// byte for byte, the start of the most ordinary TGA there is: id length 0, no colour map, image
+/// type 2 (uncompressed true-colour), then the low byte of the colour-map origin. That is what
+/// every art tool writes, so those four bytes cannot decide `Backend::Cur` on their own — they
+/// used to, which sent such files to the ICO decoder to be refused ("ICO directory contains no
+/// image"). They did not open at all, extension hint or not.
+///
+/// TGA has no magic to test for (only an *optional* end-of-file `TRUEVISION-XFILE.` footer), so
+/// test the header for self-consistency instead: a file with no colour map says so in all three
+/// colour-map fields, an uncompressed true-colour depth is one of four values, and the pixel data
+/// the dimensions promise has to fit in the file. A cursor cannot satisfy all of that at once —
+/// its image count and its first directory entry's width and height land in the very fields this
+/// requires to be zero, so passing would mean a cursor holding no images whose first image is
+/// 0x0, which has nothing to decode either way.
+fn is_uncompressed_tga(bytes: &[u8]) -> bool {
+    const HEADER: usize = 18;
+    let Some(h) = bytes.get(..HEADER) else {
+        return false;
+    };
+    // Image type 2, and no colour map: type 0 with a zero origin, length and entry size.
+    if h[2] != 2 || h[1] != 0 || h[3..8] != [0; 5] {
+        return false;
+    }
+    let width = u16::from_le_bytes([h[12], h[13]]) as usize;
+    let height = u16::from_le_bytes([h[14], h[15]]) as usize;
+    let depth = h[16];
+    if width == 0 || height == 0 || !matches!(depth, 15 | 16 | 24 | 32) {
+        return false;
+    }
+    // Header, then the optional image-id field, then one uncompressed pixel per texel.
+    HEADER + h[0] as usize + width * height * (depth as usize).div_ceil(8) <= bytes.len()
 }
 
 fn sniff(bytes: &[u8], ext: Option<&str>) -> Backend {
@@ -478,9 +518,15 @@ fn sniff(bytes: &[u8], ext: Option<&str>) -> Backend {
         // DXT-only decoder), so it is sniffed here and handled by our own backend.
         Backend::Dds
     } else if bytes.starts_with(&[0x00, 0x00, 0x02, 0x00]) {
-        // A Windows cursor: byte 2 is the ICO/CUR type word, 1 for an icon and 2 for a cursor.
-        // Nothing else claims this magic, and the ICO decoder reads the payload unchanged.
-        Backend::Cur
+        // Byte 2 is the ICO/CUR type word, 1 for an icon and 2 for a cursor — but a cursor is
+        // not the only thing that claims this magic. An uncompressed true-colour TGA opens with
+        // the same four bytes, so the header has to break the tie; see `is_uncompressed_tga`.
+        if is_uncompressed_tga(bytes) {
+            Backend::Tga
+        } else {
+            // A cursor. The ICO decoder reads the payload unchanged.
+            Backend::Cur
+        }
     } else if bytes.starts_with(b"GIF8") {
         // GIF (b"GIF87a"/b"GIF89a"): route to the dedicated multi-frame decoder so an animated
         // GIF plays. zune has no GIF decoder anyway, so this only pre-empts the `image` fallback.
@@ -532,6 +578,8 @@ pub fn decode(
         Backend::Hdr => decode_hdr(bytes)?,
         Backend::Dds => dds::decode(bytes)?,
         Backend::Cur => decode_cur(bytes)?,
+        // Sniffed from its header, so it needs no extension hint to name itself.
+        Backend::Tga => decode_image(bytes, Some("tga"))?,
         Backend::Png => decode_png(bytes)?,
         // zune is the hot path, not the only path. It has gaps the `image` crate does not —
         // zune-bmp cannot read a 24-bit BMP narrower than 3 pixels, so a 1x1 colour swatch
@@ -1681,6 +1729,10 @@ mod tests {
     /// A Windows cursor is an ICO whose type word is 2 instead of 1, with two directory fields
     /// reused for the hotspot. The `image` crate reads the payload unchanged but will not sniff
     /// the magic, so `sniff` names the format for it — and the status bar says CUR, not ICO.
+    ///
+    /// The `sniff` assertion is also what keeps the TGA disambiguation honest: an uncompressed
+    /// true-colour TGA shares this magic (see `uncompressed_truecolor_tga_is_not_a_cursor`) and
+    /// telling the two apart must not cost us the cursor.
     #[test]
     fn cur_decodes_through_the_ico_decoder_and_is_labelled_cur() {
         let mut src = image::RgbaImage::new(4, 4);
@@ -1974,6 +2026,61 @@ mod tests {
             out.channels, 4,
             "32-bit RGBA TGA must report an alpha channel"
         );
+    }
+
+    /// Build an uncompressed true-colour TGA (image type 2) by hand — the variant every art
+    /// tool writes, and the one no encoder in our test deps produces (`image` writes RLE).
+    fn raw_tga(width: u16, height: u16, bpp: u8, pixels: &[u8]) -> Vec<u8> {
+        let mut v = vec![
+            0, // id length
+            0, // colour-map type: none
+            2, // image type: uncompressed true-colour
+            0, 0, // colour-map origin
+            0, 0, // colour-map length
+            0, // colour-map entry size
+            0, 0, // x origin
+            0, 0, // y origin
+        ];
+        v.extend_from_slice(&width.to_le_bytes());
+        v.extend_from_slice(&height.to_le_bytes());
+        v.push(bpp);
+        v.push(0x20); // descriptor: top-left origin, no attribute bits
+        v.extend_from_slice(pixels);
+        v.extend_from_slice(b"\0\0\0\0\0\0\0\0TRUEVISION-XFILE.\0");
+        v
+    }
+
+    /// An uncompressed true-colour TGA opens as a TGA and not as a cursor.
+    ///
+    /// Its first four bytes are `00 00 02 00` — id length 0, no colour map, image type 2, and the
+    /// low byte of the colour-map origin — which is byte-for-byte the Windows `.cur` magic (`00 00`
+    /// reserved, type word `2`). `sniff` claimed that magic for CUR before anything could consider
+    /// TGA, so the most ordinary TGA there is (what Photoshop, Substance and every game-texture
+    /// pipeline writes) went to the ICO decoder and failed to open at all, extension hint or not.
+    #[test]
+    fn uncompressed_truecolor_tga_is_not_a_cursor() {
+        // BGR, top-left origin.
+        let bytes = raw_tga(2, 1, 24, &[40, 30, 200, 60, 220, 10]);
+        assert_eq!(
+            &bytes[..4],
+            &[0x00, 0x00, 0x02, 0x00],
+            "this fixture only tests the collision if it actually collides"
+        );
+
+        for ext in [Some("tga"), Some("TGA"), None] {
+            let out = decode(&bytes, ext, &DecodeOptions::default())
+                .unwrap_or_else(|e| panic!("ext {ext:?}: {e:?}"));
+            assert_eq!(out.source_format, "TGA");
+            assert_eq!((out.width, out.height), (2, 1));
+            assert_eq!(out.channels, 3);
+            assert_eq!(&out.pixels[0..4], &[200, 30, 40, 255]);
+        }
+
+        // 32-bit, the other common uncompressed variant, collides identically.
+        let bytes = raw_tga(1, 1, 32, &[3, 2, 1, 128]);
+        let out = decode(&bytes, Some("tga"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.source_format, "TGA");
+        assert_eq!(&out.pixels[0..4], &[1, 2, 3, 128]);
     }
 
     /// Encode a GIF from a list of `(solid RGBA color, delay ms)` frames (test fixture). One frame
