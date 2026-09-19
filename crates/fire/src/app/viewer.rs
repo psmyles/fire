@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fire_decode::{DecodeOptions, DecodedImage};
+use fire_decode::{DecodeOptions, DecodedImage, SheetLayout};
 use fire_ipc::OpenRequest;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -278,15 +278,17 @@ impl Viewer {
         proxy: EventLoopProxy<AppEvent>,
     ) -> Result<Self, String> {
         let t_window = Instant::now();
-        // Restore the remembered size now, so the surface starts at the right size. The
-        // launcher's Run setting (a Windows shortcut's Normal/Minimized/Maximized) wins for the
-        // show state; otherwise the remembered maximized state is restored.
+        // Restore the remembered size now, so the surface starts at the right size. A launcher
+        // that explicitly asked to be maximized wins over the remembered state; anything else
+        // (the shell's default show state included — see `platform::launcher_show`) leaves
+        // `window.toml` in charge.
         let saved = WindowState::load();
         let launcher = platform::launcher_show();
         let maximized = match launcher {
             Some(LaunchShow::Maximized) => true,
-            Some(LaunchShow::Minimized) | Some(LaunchShow::Normal) => false,
-            None => saved.is_some_and(|s| s.maximized),
+            // `Minimized` says how to *show* the window, not what it should be once it comes
+            // back: restoring from the taskbar has to give back the remembered placement.
+            Some(LaunchShow::Minimized) | None => saved.is_some_and(|s| s.maximized),
         };
         let mut attrs = Window::default_attributes()
             .with_title(crate::product::NAME)
@@ -619,6 +621,8 @@ impl Viewer {
         match outcome.result {
             Ok(img) => {
                 let (w, h, fmt) = (img.width, img.height, img.source_format);
+                // Read before the image moves into the surface below.
+                let layout = img.layout;
                 self.file_label.clone_from(&name);
                 let file_size = std::fs::metadata(&outcome.path).map(|m| m.len()).ok();
                 self.meta = format_meta(&img, file_size);
@@ -654,6 +658,12 @@ impl Viewer {
                 self.redraw();
                 // Start playback if this is an animated GIF; stop any prior animation otherwise.
                 self.sync_animation();
+                // A cubemap, array or volume arrives as one sheet with the grid that reads it
+                // back. That is authored structure, so it turns the flipbook on rather than
+                // offering a chip the way a *detected* sprite-sheet grid does.
+                if let Some(l) = layout {
+                    self.seed_layout_flipbook(&outcome.path, l);
+                }
                 // Re-apply any per-path flipbook state for the adopted image (restores it on
                 // navigate-back). The auto-detection hint for a fresh open arrives *later*, via
                 // `FlipbookGuess` (kept off the time-to-first-pixel path), and re-applies then — so
@@ -666,6 +676,27 @@ impl Viewer {
                 self.fail_load(&name, format!("failed: {e}"));
             }
         }
+    }
+
+    /// Turn the flipbook on for a source whose surfaces the *file* laid out — a DDS cubemap,
+    /// texture array or volume, composited into one sheet by the decoder.
+    ///
+    /// Unlike `flipbook::detect`'s guess this is not a suggestion, so it enters the mode instead
+    /// of popping the hint chip. Any state the user already established for this path wins: a
+    /// grid they edited, or a mode they deliberately turned off, survives navigating away and
+    /// coming back, and survives a hot reload.
+    fn seed_layout_flipbook(&mut self, path: &Path, layout: SheetLayout) {
+        let defaults = self.cfg.flipbook;
+        let grid = Grid::new(layout.cols, layout.rows);
+        let entry = self.flipbook.entry(path.to_path_buf()).or_default();
+        if entry.state.is_some() {
+            return;
+        }
+        entry.state = Some(FlipbookState::for_layout(layout, &defaults));
+        entry.enabled = true;
+        entry.hint = Some(grid);
+        // There is nothing to suggest: the mode is already on.
+        entry.hint_dismissed = true;
     }
 
     /// Apply a flipbook auto-detection result that arrived after its image. Stale-dropped by
@@ -1035,6 +1066,8 @@ impl Viewer {
             Action::Channel(Channel::Rgb | Channel::Rgba) => self.surface.toggle_composite(),
             Action::Channel(c) => self.surface.toggle_channel(c),
             Action::ToggleTonemap => self.surface.toggle_tonemap(),
+            Action::MipDown => self.surface.step_mip(-1),
+            Action::MipUp => self.surface.step_mip(1),
             Action::ExpUp => self.surface.adjust_exposure(self.cfg.exposure_step),
             Action::ExpReset => self.surface.reset_exposure(),
             Action::ExpDown => self.surface.adjust_exposure(-self.cfg.exposure_step),
@@ -1142,6 +1175,8 @@ impl Viewer {
             KeyAction::ChannelB => self.surface.toggle_channel(Channel::B),
             KeyAction::ChannelA => self.surface.toggle_channel(Channel::A),
             KeyAction::ToggleTonemap => self.surface.toggle_tonemap(),
+            KeyAction::MipFiner => self.surface.step_mip(-1),
+            KeyAction::MipCoarser => self.surface.step_mip(1),
             KeyAction::ExposureUp => self.surface.adjust_exposure(self.cfg.exposure_step),
             KeyAction::ExposureDown => self.surface.adjust_exposure(-self.cfg.exposure_step),
             KeyAction::ExposureReset => self.surface.reset_exposure(),
@@ -1918,6 +1953,22 @@ impl Viewer {
         if let Some(f) = &self.folder {
             let _ = write!(status_right, "{} / {}", f.position(), f.len());
         }
+        // Which mip level is showing, and how big it is. Only when there is a chain to walk.
+        // The dimensions are the level's own, because fit, zoom and 1:1 now describe the level
+        // rather than the file's level 0.
+        if has_image && s.mip_count() > 1 {
+            if !status_right.is_empty() {
+                status_right.push_str("    ");
+            }
+            let (fw, fh) = s.current_image().map_or((1, 1), |i| (i.width, i.height));
+            let (lw, lh) = crate::render::mips::level_dims(fw, fh, s.mip_level());
+            let _ = write!(
+                status_right,
+                "mip {}/{}  {lw}×{lh}",
+                s.mip_level(),
+                s.mip_count() - 1
+            );
+        }
         if has_image {
             if !status_right.is_empty() {
                 status_right.push_str("    ");
@@ -1958,6 +2009,8 @@ impl Viewer {
             fullscreen: self.fullscreen(),
             flipbook: self.flipbook_state().is_some(),
             has_animation: self.surface.frame_delay_ms().is_some(),
+            mip_level: s.mip_level(),
+            mip_count: s.mip_count(),
             shortcuts: Arc::clone(&self.shortcut_labels),
             status_left,
             status_right,
@@ -2167,9 +2220,22 @@ fn format_meta(img: &DecodedImage, file_size: Option<u64>) -> String {
         4 => "RGBA",
         _ => "·",
     };
+    // A cubemap, array or volume reports the surfaces it holds and how big each one is. Its
+    // `width`/`height` are the tiled sheet's, which is an implementation detail of how the
+    // faces are shown rather than anything the file says about itself.
+    let size = match img.layout {
+        Some(l) => format!(
+            "{} {} × {}×{}",
+            l.kind.label(),
+            l.frames,
+            img.width / l.cols.max(1),
+            img.height / l.rows.max(1)
+        ),
+        None => format!("{}×{}", img.width, img.height),
+    };
     let mut s = format!(
-        "{}   {}×{}   {}-bit {}",
-        img.source_format, img.width, img.height, img.bit_depth, ch
+        "{}   {size}   {}-bit {}",
+        img.source_format, img.bit_depth, ch
     );
     use std::fmt::Write as _;
     if let Some(bytes) = file_size {

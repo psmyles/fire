@@ -27,6 +27,12 @@ question of how fast someone else's decoder runs.
 * **[exr](https://github.com/johannesvollmer/exrs)** - Johannes Vollmer and contributors. OpenEXR,
   in pure Rust, with **[lebe](https://github.com/johannesvollmer/lebe)**.
 * **[jxl-oxide](https://github.com/tirr-c/jxl-oxide)** - Wonwoo Choi. JPEG XL.
+* **[ddsfile](https://github.com/cwfitzgerald/ddsfile)** - Michael Dilger and Connor Fitzgerald.
+  The DDS container: the legacy D3D9 header, the DX10 extension, and the cubemap/array/volume
+  layout rules.
+* **[bcdec_rs](https://github.com/ScanMountGoat/bcdec_rs)** - ScanMountGoat, from
+  **[bcdec](https://github.com/iOrange/bcdec)** by Sergii "iOrange" Kudlai. The BC1-BC7 block
+  decoders behind Fire's DDS support, BC6H's HDR blocks included - a safe, dependency-free port.
 * **[libheif](https://github.com/strukturag/libheif)** and
   **[libde265](https://github.com/strukturag/libde265)** - Dirk Farin and struktur AG. HEIF/HEIC.
 * **[dav1d](https://code.videolan.org/videolan/dav1d)** - VideoLAN and the dav1d authors. The AV1

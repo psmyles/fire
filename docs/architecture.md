@@ -227,7 +227,22 @@ called from the forward path. macOS needs no equivalent - Launch Services activa
   built on the CPU on the decode worker (`render/mips.rs`, D21) - ~5 ms on an 8.9 MB image, off the
   UI thread. Each level is a 2×2 box filter of the level above, with 8-bit sRGB sources averaged in
   *linear* light through two lookup tables (what hardware does for an `*_SRGB` format); rows are
-  split across threads for the big levels. After the upload, pan / zoom / exposure / channel /
+  split across threads for the big levels. **A decoder that brings its own chain keeps it**: a DDS
+  stores authored levels, filtered and gamma-corrected by whatever tool built the texture, and a
+  box filter does not reproduce them - so `mips::complete` adopts what the file supplied and
+  computes only the tail it stopped short of (`DecodedImage::source_mips`, dropped by
+  `transform_buffers` the moment any pass rewrites the canvas).
+- **Looking at one mip level is a texture view, not a re-upload.** `<` / `>` (and the toolbar's
+  mip pair) rebuild the sampling view over the *same* `sg::Image` with `mip_levels.base = N` and
+  `count = 0`, so that level becomes the view's level 0 while minification still walks the levels
+  beneath it. sokol honours the range on both backends fire ships - D3D11 maps it to the SRV's
+  `MostDetailedMip`, Metal to `newTextureViewWithPixelFormat:…levels:` - so this needs no shader
+  change, no uniform, and no second upload; the 128-byte `Params` block is untouched. `image_dims`
+  then reports the *level's* size, which is the single chokepoint every geometry path already ran
+  through, so fit, zoom, 1:1, the pan clamp and the flipbook sheet all re-base together and a 1:1
+  view of level 3 is one of its texels per physical pixel. The level resets to 0 on open and is
+  clamped on every adopt, so a hot reload that comes back with a shorter chain lands somewhere
+  real. After the upload, pan / zoom / exposure / channel /
   tonemap (and the flipbook cell offsets + blend) are just values in a **128-byte uniform block**;
   the source texture never changes until a new image is opened (flipbook playback only moves the
   cell offsets - never re-uploads).
@@ -383,14 +398,15 @@ also detected by magic so a no-extension open still routes correctly.
 | PNG | `image` crate → RGBA8/RGBA16 (+ICC). Deliberately **not** zune: the `png`+`fdeflate` stack measured ~1.8× faster than zune-png on large textures (the gap is in the core decode) |
 | Radiance HDR (`.hdr`/`.pic`) | `image` crate → 32-bit float RGBA. Deliberately **not** zune: zune-hdr ≤ 0.5.2 wraps RGBE exponents ≥ 32 stops from unity (dark pixels decode 2³² too bright), and the `image` decoder is ~2× faster besides |
 | TIFF | **`tiff` crate directly** → RGBA at the source depth (8/16/32f, +ICC). Going through `image` lost samples: it can only represent what `tiff`'s conservative `colortype()` names, so an unlabelled 4th sample (Photoshop's `ExtraSamples = 0`) was dropped, grey+alpha was refused outright, and 16-bit was narrowed to 8. Associated (premultiplied) alpha is straightened here. Palette/CMYK/YCbCr/Lab still fall back to `image` |
-| TGA, ICO | `image` crate (formats zune doesn't decode) |
+| TGA, ICO, CUR | `image` crate (formats zune doesn't decode). A `.cur` is an ICO with `2` in its type word and two directory fields reused for the hotspot, neither of which the ICO decoder reads - so it decodes unchanged, and is only sniffed and labelled separately |
+| DDS | **`ddsfile`** (header, incl. the DX10 extension) + **`bcdec_rs`** (blocks), both pure Rust → BC1-BC7 to RGBA8, **BC6H to RGBA16F** (the HDR path), and every uncompressed layout via the header's channel bit masks. Decompressed on the CPU rather than uploaded as blocks: `DecodedImage` is an uncompressed canvas by contract, and the mip builder, downscale guard, alpha scan and flipbook detector all read it as one |
 | AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
 | EXR | `exr` crate (pure Rust) → 32-bit float RGBA |
 | PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite, at the document's own depth (8/16/32f). `wrapper.cpp` owns the colour-mode conversion: RGB/Grey/Duotone direct, Indexed through the palette, CMYK composited **through K** (PSD stores CMYK inverted), Lab via D50 XYZ. 16-bit samples are Photoshop's 15-bit+1 range (**0…32768**, not 0…65535); 1-bit Bitmap mode is refused, since psd_sdk sizes its planes `bits/8` = 0 |
 | Camera raw (CR2/CR3, NEF, ARW, RAF, ORF, RW2, DNG, …) | **`raw`** (pure Rust) → extract the embedded JPEG **preview**, decode via zune |
 | ICC transforms | **Little CMS** (`lcms2`) over FFI |
 
-`SUPPORTED_EXTENSIONS` in `fire-decode` is *the* table of what Fire opens - 54 extensions. The
+`SUPPORTED_EXTENSIONS` in `fire-decode` is *the* table of what Fire opens - 61 extensions. The
 Windows installer keeps a second copy because an Inno Setup script can import nothing, and a test
 (`installer_associations_match_the_extension_table`) polices the two against each other; the macOS `Info.plist`
 needs no such test because `scripts/build-mac.sh` parses the const itself.
@@ -406,8 +422,9 @@ Notes:
   and runs on a decode worker, so a malformed file cannot take down the viewer process.
   (This is also why `panic = "abort"` is *not* set in the release profile - `catch_unwind` only
   works with unwinding panics.)
-- **The mip chain is built here too** (§5): on the decode worker, right after the decode and
-  before the image is posted, so the UI thread never pays for it.
+- **The mip chain is built or completed here too** (§5): on the decode worker, right after the
+  decode and before the image is posted, so the UI thread never pays for it. A DDS supplies its
+  own authored levels, which are adopted rather than recomputed.
 - **Camera raw = embedded preview, not develop.** A raw file is a per-vendor container
   around the sensor mosaic plus a full-size, camera-rendered **JPEG preview**. Developing
   the mosaic (demosaic + white balance + color matrices) is slow and at odds with the
@@ -427,6 +444,24 @@ Notes:
   scanning work unchanged. Per-frame delays below 20 ms (including the common 0 = "as fast as
   possible") are clamped to 100 ms, matching browsers. The viewer plays it back on a loop timer
   (§10). Animated WebP is *not* animated (WebP stays on the still zune hot path).
+- **DDS is a container, so a `.dds` can be several images.** A cubemap's six faces, a texture
+  array's layers and a volume's depth slices are all "N images of the same size" - which is
+  exactly what the flipbook already displays - so `dds.rs` composites them into one near-square
+  sheet (six faces tile 3x2; a 64-slice volume 8x8) and hands over a `SheetLayout` saying how to
+  read it back. A single strip would be simpler and nearly a decode-guard rejection: six 4096
+  faces side by side is 24576 px wide. Because the grid is *authored* rather than guessed, the
+  viewer skips `flipbook::detect` for these files entirely and turns the mode on instead of
+  offering a hint chip, with playback parked - the transport is there to step faces, not run
+  them. `frames` is what the file holds rather than the whole grid, so the empty sixth cell of a
+  five-layer array is not steppable. A cubemap's own mip chain is adopted too, since a
+  power-of-two face tiles every level exactly; a volume's is not, because its depth halves with
+  each level and half as many slices cannot tile the same grid.
+- **DDS fixups.** Signed block formats are re-centred for display (`bcdec` returns the raw
+  -127..127 range as bytes, which would show a signed normal map as noise), and `DXT2`/`DXT4` -
+  and any DX10 header that says so - have their premultiplied alpha straightened, the same fixup
+  the TIFF path applies. The decode-bomb guard runs **twice**: once on the header's bare surface,
+  then on the tiled sheet, both before the payload is consulted - a 16384² surface is a legal
+  1 GiB image, and six of them tiled is 6.4 GB.
 - **Oversized images:** `DecodeOptions::max_dim` is a **CPU/RAM guard**, not a GPU texture
   limit (an RGBA8 bitmap at 16384² is ~1 GiB; float HDR is 4×). It defaults to 16384, is
   configurable, and anything past it is CPU-downscaled to fit, recording the original size
@@ -469,14 +504,18 @@ immediate-mode code with no window system and no GPU API in it; it reads a `View
 returns a `ui::Frame` of what the user asked for, which the viewer applies.
 
 - **Toolbar:** channel isolation (R/G/B/A/RGB), fit/1:1, zoom, flipbook, HDR tonemap + exposure
-  (float sources only), and a right-docked group (outline, octagon, backdrop, full-screen, menu).
+  (float sources only), the mip-level pair (only when the texture has a chain to walk - today a
+  DDS that brought its own), and a right-docked group (outline, octagon, backdrop, full-screen,
+  menu).
   Buttons dispatch the same `Action`s the keybinds drive - one state path. When the window is too
   narrow the left group sheds its lowest-priority slots into a "»" popup. There is **no gear**:
   Settings is the last entry of the menu button's popup, which is the same menu the viewport's
   right-click opens - one place to look, not two. That menu therefore stays enabled with no image
   loaded (its file entries hide themselves), or Settings would be unreachable from an empty window.
-- **Status bar:** file name, format, W×H, bit depth / channel layout, ICC presence, and on the right
-  the folder position and zoom % (plus `EV ±` for HDR).
+- **Status bar:** file name, format, W×H - or `cubemap 6 × 512×512` for a multi-surface source,
+  since the sheet's own size is an artefact of how the faces are shown - bit depth / channel
+  layout, ICC presence, and on the right the folder position and zoom % (plus `EV ±` for HDR, and
+  `mip n/N` with the level's own dimensions when a chain is being walked).
 - **Empty window:** a centred card with the logo, the product identity (long name + version, from
   `product.json` via `build.rs`) and the drop/open hint. It degrades gracefully - the logo and then
   the identity block drop out - when there is not enough room.
@@ -576,10 +615,12 @@ returns a `ui::Frame` of what the user asked for, which the viewer applies.
 - **Window placement:** each window opens at the size/position it had when the last one closed -
   the restored (non-maximized) rect plus a maximized flag, captured on close and persisted to
   `window.toml` in the config directory (`window_state.rs`), then re-applied next launch. The
-  window is **never** resized to the image - every open lands in fit-to-window mode. On Windows the
-  launcher's "Run" setting (the shortcut's Normal/Minimized/Maximized, read from
-  `STARTUPINFO.wShowWindow`) overrides the show state; off Windows that leaf answers `None` and the
-  remembered state stands.
+  window is **never** resized to the image - every open lands in fit-to-window mode. On Windows a
+  launcher that explicitly asks to be **maximized** or **minimized** (a shortcut's "Run" setting,
+  read from `STARTUPINFO.wShowWindow`) overrides the show state. A *normal* show is deliberately
+  not treated as a request: `ShellExecuteEx` stamps `STARTF_USESHOWWINDOW` + `SW_SHOWNORMAL` on
+  every shell launch, so honouring it made a double-click in Explorer un-maximize a window the
+  user had left maximized. Off Windows that leaf answers `None` and the remembered state stands.
 - **Settings:** stored as **TOML** in the per-user config directory - `%APPDATA%\fire` on Windows,
   `~/Library/Application Support/fire` on macOS, `$XDG_CONFIG_HOME/fire` elsewhere (one definition,
   `util::fire_dir`, so the files cannot drift apart). Fire writes a fully commented
@@ -768,7 +809,7 @@ shows up in "Open With" and can be made the default, without taking `.png` away 
 install. One entry rather than one per format, because with `Alternate` we do not own the UTI and
 the per-type name never surfaces. The extension list is **parsed out of `fire-decode`'s
 `SUPPORTED_EXTENSIONS`** by `scripts/build-mac.sh`, so unlike the installer's copy it cannot drift;
-54 extensions in, and LaunchServices resolves them to 48 claimed UTIs (the real ones -
+61 extensions in, and LaunchServices resolves them to 48 claimed UTIs (the real ones -
 `public.png`, `com.ilm.openexr-image`, `com.adobe.photoshop-image`, every camera-raw UTI - plus
 dynamic ones for formats macOS has no UTI for, like `.qoi`, `.ff`, `.x3f`). `NSSupportsSuddenTermination`
 is pointedly *not* declared: it would let the OS skip the `atexit` that removes the instance socket
@@ -915,7 +956,9 @@ accelerator leaves AppKit to pick. The red button still closes the window.
 path (§4.1)**; GPU render through sokol_gfx with channel/alpha/gamma/exposure/tonemap; async worker
 decode; zune + image + tiff + exr + psd_sdk + libheif decoders; camera-raw embedded-preview decode;
 animated GIF playback; ICC honoring via lcms2; tonemap-to-SDR HDR with exposure; downscale-to-fit
-RAM guard; content-detected **flipbook (sprite-sheet) playback** with a transport band; the
+RAM guard; content-detected **flipbook (sprite-sheet) playback** with a transport band, which
+also carries a DDS cubemap's faces / an array's layers / a volume's slices; a **mip-level
+viewer** for textures that ship a chain; the
 **octagon overlay**; folder ←/→ navigation; hot-reload of the displayed image; **DPI-aware,
 dark-mode-aware ImGui toolbar + status bar + settings window**; portable physical-key keybinds;
 open-in-editor and the clipboard actions; file association on both OSes; an unsigned Windows

@@ -102,6 +102,9 @@ flipbook       = 0.9
 # The transport band's play/pause button (sized off the text line, not `icon_size`).
 play           = 1.0
 pause          = 1.0
+# Step to a finer / coarser mip level (only shown when the image has a chain).
+mip_down       = 0.85
+mip_up         = 0.85
 # The » overflow button, and the octagon crop.
 more           = 1.0
 octagon        = 0.8

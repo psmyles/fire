@@ -64,6 +64,8 @@ pub enum Icon {
     Play,
     Pause,
     More,
+    MipDown,
+    MipUp,
     Octagon,
 }
 
@@ -111,6 +113,8 @@ icon_masters![
     "icon_play",
     "icon_pause",
     "icon_more",
+    "icon_mip_down",
+    "icon_mip_up",
     "icon_octagon",
 ];
 
@@ -165,6 +169,8 @@ impl Icon {
             Icon::Play => "play",
             Icon::Pause => "pause",
             Icon::More => "more",
+            Icon::MipDown => "mip_down",
+            Icon::MipUp => "mip_up",
             Icon::Octagon => "octagon",
         }
     }
@@ -202,6 +208,8 @@ impl Icon {
             Icon::Play => "icon_play",
             Icon::Pause => "icon_pause",
             Icon::More => "icon_more",
+            Icon::MipDown => "icon_mip_down",
+            Icon::MipUp => "icon_mip_up",
             Icon::Octagon => "icon_octagon",
         }
     }
@@ -237,6 +245,8 @@ pub const ALL: [Icon; COUNT] = [
     Icon::Play,
     Icon::Pause,
     Icon::More,
+    Icon::MipDown,
+    Icon::MipUp,
     Icon::Octagon,
 ];
 

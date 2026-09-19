@@ -166,6 +166,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> 
         source_format: "TIFF",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
+        layout: None,
         animation: None,
     }))
 }

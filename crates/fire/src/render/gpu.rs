@@ -431,6 +431,10 @@ struct ImageContent {
     /// 1 if the texture samples already-linear (8-bit sRGB / float), 0 if the shader must
     /// sRGB-decode (16-bit unorm).
     linear_sample: i32,
+    /// Mip levels the uploaded texture carries. 0 with no image. The mip-level control is offered
+    /// only when this is above 1, and [`DisplayState::mip_level`] is clamped to it on every adopt
+    /// (a hot reload can come back with a shorter chain).
+    mip_count: u32,
     /// The displayed image — retained for the pixel inspector (#16) and for re-fit on resize.
     /// For an animated source this holds frame 0 (dimensions/format/metadata are frame-invariant);
     /// the frames themselves live in [`AnimState`]. Held behind an `Arc` because the decode worker
@@ -827,8 +831,16 @@ impl GpuSurface {
         Some((x, y, w, h))
     }
 
+    /// Dimensions of what is on screen: the *viewed mip level*, not the file's level 0. Every
+    /// geometry path runs through here, so choosing a level re-bases fit, zoom, 1:1, the pan
+    /// clamp and the flipbook sheet together.
     fn image_dims(&self) -> Option<(u32, u32)> {
-        self.tex.current.as_ref().map(|i| (i.width, i.height))
+        let img = self.tex.current.as_ref()?;
+        Some(mips::level_dims(
+            img.width,
+            img.height,
+            self.display.mip_level,
+        ))
     }
 
     /// Dimensions the pan/zoom/fit math operates on: the frame rect in flipbook mode, else the
@@ -872,6 +884,8 @@ impl GpuSurface {
     /// frames so the viewer's next `frame_delay_ms()` returns `None` and the playback timer stops.
     pub fn clear_image(&mut self) {
         self.tex.current = None;
+        self.tex.mip_count = 0;
+        self.display.mip_level = 0;
         self.tex.release();
         self.bindings = make_bindings(&self.gpu, self.gpu.placeholder_view);
         self.anim.clear();
@@ -886,8 +900,9 @@ impl GpuSurface {
     pub fn set_image(&mut self, img: Arc<DecodedImage>, mips: &[Vec<u8>]) -> Result<(), String> {
         let (w, h) = (img.width, img.height);
         // Upload first: if the GPU rejects the texture we bail here, before mutating any state,
-        // so a failed adopt can't leave the surface half-updated.
-        self.upload_texture(&img, mips)?;
+        // so a failed adopt can't leave the surface half-updated. Level 0: a new file always
+        // opens at full size, whatever mip the last one was left on.
+        self.upload_texture(&img, mips, 0)?;
         // Adopt any animation frames for playback and start from frame 0 (already uploaded above).
         // The viewer arms the timer from `frame_delay_ms()` after this.
         self.anim.adopt(&img);
@@ -933,7 +948,9 @@ impl GpuSurface {
         img: Arc<DecodedImage>,
         mips: &[Vec<u8>],
     ) -> Result<(), String> {
-        self.upload_texture(&img, mips)?;
+        // The viewed mip level is part of the view being kept; `adopt_texture` clamps it in case
+        // the re-exported file came back with a shorter chain.
+        self.upload_texture(&img, mips, self.display.mip_level)?;
         // Refresh the animation frames from the re-decoded file and restart from frame 0 (the view
         // is preserved, but the animation plays from the top). The viewer re-arms the timer.
         self.anim.adopt(&img);
@@ -971,8 +988,10 @@ impl GpuSurface {
         if n <= 1 {
             return None;
         }
-        let (w, h) = self.image_dims()?;
-        let format = self.tex.current.as_ref()?.format;
+        // The frame's own full-size dimensions, deliberately not `image_dims` — that reports the
+        // mip level being viewed, and a frame is uploaded whole.
+        let img = self.tex.current.as_ref()?;
+        let (w, h, format) = (img.width, img.height, img.format);
         let next = (self.anim.index + 1) % n;
         match create_image_texture(
             &self.gpu,
@@ -982,9 +1001,12 @@ impl GpuSurface {
             format,
             None,
         ) {
-            Ok((image, view, linear)) => {
-                self.adopt_texture(image, view, linear);
-                self.anim.index = next;
+            // `adopt_texture` re-applies the viewed mip level to the new texture, clamped.
+            Ok((image, levels, linear)) => {
+                match self.adopt_texture(image, levels, linear, self.display.mip_level) {
+                    Ok(()) => self.anim.index = next,
+                    Err(e) => eprintln!("fire: animation frame upload failed: {e}"),
+                }
             }
             Err(e) => eprintln!("fire: animation frame upload failed: {e}"),
         }
@@ -993,8 +1015,13 @@ impl GpuSurface {
 
     /// Upload `img`'s (frame-0) pixels as a texture with its full mip chain. Returns the GPU
     /// error rather than panicking if creation fails — this runs synchronously on the UI thread.
-    fn upload_texture(&mut self, img: &DecodedImage, mips: &[Vec<u8>]) -> Result<(), String> {
-        let (image, view, linear_sample) = create_image_texture(
+    fn upload_texture(
+        &mut self,
+        img: &DecodedImage,
+        mips: &[Vec<u8>],
+        level: u32,
+    ) -> Result<(), String> {
+        let (image, levels, linear_sample) = create_image_texture(
             &self.gpu,
             &img.pixels,
             img.width,
@@ -1002,17 +1029,88 @@ impl GpuSurface {
             img.format,
             Some(mips),
         )?;
-        self.adopt_texture(image, view, linear_sample);
-        Ok(())
+        self.adopt_texture(image, levels, linear_sample, level)
     }
 
     /// Install a freshly created texture and rebuild the bindings around it.
-    fn adopt_texture(&mut self, image: sg::Image, view: sg::View, linear_sample: i32) {
+    ///
+    /// The view is made here rather than by the uploader because it depends on display state:
+    /// the mip level being looked at. Clamping first is what keeps a hot reload safe — a
+    /// re-exported file can come back with a shorter chain than the level the user was on.
+    fn adopt_texture(
+        &mut self,
+        image: sg::Image,
+        levels: u32,
+        linear_sample: i32,
+        level: u32,
+    ) -> Result<(), String> {
+        let level = level.min(levels.saturating_sub(1));
+        let view = match make_level_view(image, level) {
+            Ok(v) => v,
+            Err(e) => {
+                // Nothing has been swapped in yet, so releasing the new image leaves the
+                // previously displayed one intact.
+                sg::destroy_image(image);
+                return Err(e);
+            }
+        };
         self.tex.release();
         self.bindings = make_bindings(&self.gpu, view);
         self.tex.image = Some(image);
         self.tex.view = Some(view);
         self.tex.linear_sample = linear_sample;
+        self.tex.mip_count = levels;
+        self.display.mip_level = level;
+        Ok(())
+    }
+
+    /// Which mip level is being viewed, and how many the texture has (0 with no image). The
+    /// toolbar shows its mip group only when there is more than one.
+    pub fn mip_level(&self) -> u32 {
+        self.display.mip_level
+    }
+
+    pub fn mip_count(&self) -> u32 {
+        self.tex.mip_count
+    }
+
+    /// Look at mip `level`, rebuilding the texture view over the same image — no re-upload.
+    ///
+    /// In fit mode the view re-fits, because the point of stepping down the chain is to see a
+    /// 512² level the way you saw the 4096² one; at a manual zoom the zoom is kept and the pan
+    /// re-clamped, so 1:1 stays one texel per physical pixel at every level.
+    pub fn set_mip_level(&mut self, level: u32) {
+        let level = level.min(self.tex.mip_count.saturating_sub(1));
+        if level == self.display.mip_level {
+            return;
+        }
+        let Some(image) = self.tex.image else { return };
+        let view = match make_level_view(image, level) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("fire: {e}");
+                return;
+            }
+        };
+        if let Some(old) = self.tex.view.replace(view) {
+            sg::destroy_view(old);
+        }
+        self.bindings = make_bindings(&self.gpu, view);
+        self.display.mip_level = level;
+        if let Some(dims) = self.view_dims() {
+            if self.view.fit {
+                self.view.fit_to_window(dims, &self.viewport, false);
+            } else {
+                self.view.clamp_pan(dims, &self.viewport);
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Step `delta` levels along the chain, saturating at both ends.
+    pub fn step_mip(&mut self, delta: i32) {
+        let next = self.display.mip_level as i64 + delta as i64;
+        self.set_mip_level(next.clamp(0, u32::MAX as i64) as u32);
     }
 
     /// The client changed size (physical px): resize the swapchain to match. The image's sub-rect
@@ -1155,12 +1253,13 @@ impl GpuSurface {
     /// (fractional) cell size and the fb_* fields pick which cell(s) of the sheet to sample. Off
     /// (still image / whole sheet), the fb fields are identity so the shader path is untouched.
     fn resolve_source_rect(&self) -> (f32, f32, i32, FlipbookCells) {
-        let (img_w, img_h, has_image, fbf) = match self.tex.current.as_ref().zip(self.flipbook) {
-            Some((img, fbp)) => {
-                let sheet = (img.width, img.height);
+        // Sizes come from `image_dims`, i.e. the viewed mip level: the sheet, the cell offsets
+        // and the LOD clamp all have to be in the same texels the sampler will see.
+        let (img_w, img_h, has_image, fbf) = match self.image_dims().zip(self.flipbook) {
+            Some((sheet, fbp)) => {
                 let (fw, fh) = (
-                    img.width as f32 / fbp.grid.cols.max(1) as f32,
-                    img.height as f32 / fbp.grid.rows.max(1) as f32,
+                    sheet.0 as f32 / fbp.grid.cols.max(1) as f32,
+                    sheet.1 as f32 / fbp.grid.rows.max(1) as f32,
                 );
                 let (a, b, blend) =
                     crate::flipbook::resolve_frames(fbp.frame_pos, fbp.frame_count, fbp.blend);
@@ -1169,8 +1268,8 @@ impl GpuSurface {
                 let lod = crate::flipbook::max_lod(fbp.grid, sheet);
                 (fw, fh, 1, Some((sheet, (ax, ay), (bx, by), blend, lod)))
             }
-            None => match &self.tex.current {
-                Some(img) => (img.width as f32, img.height as f32, 1, None),
+            None => match self.image_dims() {
+                Some((w, h)) => (w as f32, h as f32, 1, None),
                 None => (1.0, 1.0, 0, None),
             },
         };
@@ -1490,7 +1589,7 @@ fn create_image_texture(
     height: u32,
     format: PixelFormat,
     mips: Option<&[Vec<u8>]>,
-) -> Result<(sg::Image, sg::View, i32), String> {
+) -> Result<(sg::Image, u32, i32), String> {
     // The dimensions and the buffer arrive from different producers (decode headers vs the
     // pixel Vec — part of it native FFI); a short buffer is refused here rather than read past.
     let src_bpp = mips::bytes_per_texel(format);
@@ -1564,14 +1663,29 @@ fn create_image_texture(
             "the GPU refused a {width}×{height} {tex_format:?} texture with {levels} mip levels"
         ));
     }
+    Ok((image, levels as u32, linear_sample))
+}
+
+/// A sampling view onto one mip level of `image`, with `level` as the view's level 0.
+///
+/// This is the whole mechanism behind the mip-level control. `mip_levels.base` re-bases the view
+/// so normalized UV spans that level's extent and `textureGrad`'s LOD 0 *is* that level — exact
+/// texels, no re-upload, and no shader change. A `count` of 0 means "to the end of the chain",
+/// so minification below the chosen level still walks the levels beneath it rather than
+/// aliasing. Honored on both backends fire ships: D3D11 maps it to the SRV's `MostDetailedMip`,
+/// Metal to `newTextureViewWithPixelFormat:…levels:`.
+fn make_level_view(image: sg::Image, level: u32) -> Result<sg::View, String> {
     let mut vd = sg::ViewDesc::new();
     vd.texture.image = image;
+    vd.texture.mip_levels = sg::TextureViewRange {
+        base: level as i32,
+        count: 0,
+    };
     vd.label = c"fire image".as_ptr();
     let view = sg::make_view(&vd);
     if sg::query_view_state(view) != sg::ResourceState::Valid {
         sg::destroy_view(view);
-        sg::destroy_image(image);
-        return Err("the image's texture view could not be created".into());
+        return Err(format!("mip level {level} could not be viewed"));
     }
-    Ok((image, view, linear_sample))
+    Ok(view)
 }

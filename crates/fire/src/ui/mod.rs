@@ -140,6 +140,8 @@ const LEFT: &[(Action, u8, u8)] = &[
     (Action::ExpUp, 3, 20),
     (Action::ExpReset, 3, 15),
     (Action::ExpDown, 3, 20),
+    (Action::MipDown, 5, 25),
+    (Action::MipUp, 5, 25),
 ];
 
 /// Right-docked slots, in visual left→right order. Never overflow (anchored to the far edge).
@@ -161,6 +163,11 @@ use crate::render::view::{Background as Bg, Channel as Ch};
 
 /// The HDR group: laid out only for float sources.
 const HDR_GROUP: u8 = 3;
+
+/// The mip group: laid out only for an image whose texture has a chain to walk — today, a DDS
+/// that brought its own levels. Everything else has exactly one level worth looking at, and a
+/// permanently dead pair of buttons is worse than no buttons.
+const MIP_GROUP: u8 = 5;
 
 /// Everything one UI frame reads. Bundled because it is a dozen values and a positional argument
 /// list that long is a bug waiting to happen (two `f32` pairs and three `bool`s, all interchangeable
@@ -704,7 +711,7 @@ fn toolbar(
         .copied()
         .filter(|(a, g, _)| match a {
             Action::Channel(Ch::A) => snap.has_alpha,
-            _ => *g != HDR_GROUP || snap.is_hdr,
+            _ => (*g != HDR_GROUP || snap.is_hdr) && (*g != MIP_GROUP || snap.mip_count > 1),
         })
         .collect();
 
@@ -1211,6 +1218,8 @@ fn action_id(a: Action) -> u32 {
         Action::ExpUp => 21,
         Action::ExpReset => 22,
         Action::ExpDown => 23,
+        Action::MipDown => 24,
+        Action::MipUp => 25,
         Action::ToggleOutline => 30,
         Action::ToggleOctagon => 31,
         Action::Background(Bg::Black) => 40,

@@ -14,11 +14,55 @@
 
 use std::sync::OnceLock;
 
+// The halving rule lives with the decode contract that states it (`DecodedImage::source_mips`).
+pub use fire_decode::level_dims;
 use fire_decode::PixelFormat;
 
 /// The number of mip levels in a full chain for a `w`×`h` texture.
 pub fn level_count(w: u32, h: u32) -> u32 {
     32 - w.max(h).max(1).leading_zeros()
+}
+
+/// Turn a file's own mip chain into the full one the uploader requires.
+///
+/// A decoder may hand over a chain that is short (a `.dds` is free to stop at 4x4), longer than
+/// the dimensions allow, or simply wrong. Each supplied level is kept only while its length
+/// matches what its dimensions demand; the first that does not ends the adopted run, because
+/// past that point the file's own offsets are no longer trustworthy. The tail is then box-filtered
+/// down from the last level kept — not from level 0 — so the authored levels stay upstream of
+/// everything computed.
+///
+/// The alternative, throwing the whole chain away and rebuilding, would be simpler and worse:
+/// authored mips are the reason to look at a texture's mips at all.
+pub fn complete(
+    supplied: Vec<Vec<u8>>,
+    level0: &[u8],
+    w: u32,
+    h: u32,
+    format: PixelFormat,
+) -> Vec<Vec<u8>> {
+    let bpp = bytes_per_texel(format);
+    let levels = level_count(w, h) as usize;
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(levels.saturating_sub(1));
+    for level in supplied.into_iter().take(levels.saturating_sub(1)) {
+        let (lw, lh) = level_dims(w, h, out.len() as u32 + 1);
+        if level.len() != lw as usize * lh as usize * bpp {
+            break;
+        }
+        out.push(level);
+    }
+    // Whatever the file did not carry, and the whole chain when it carried nothing usable.
+    while out.len() + 1 < levels {
+        let n = out.len() as u32;
+        let (sw, sh) = level_dims(w, h, n);
+        let (dw, dh) = level_dims(w, h, n + 1);
+        let src: &[u8] = out.last().map_or(level0, |v| v.as_slice());
+        if src.len() < sw as usize * sh as usize * bpp {
+            return Vec::new();
+        }
+        out.push(downsample_level(src, sw, sh, dw, dh, format));
+    }
+    out
 }
 
 /// Bytes per texel of `format` as the decoder hands it over.
@@ -48,26 +92,30 @@ pub fn build(pixels: &[u8], w: u32, h: u32, format: PixelFormat) -> Vec<Vec<u8>>
         let (dw, dh) = ((sw / 2).max(1), (sh / 2).max(1));
         let next = {
             let src: &[u8] = out.last().map_or(pixels, |v| v.as_slice());
-            match format {
-                PixelFormat::Rgba8Unorm => {
-                    downsample::<4>(src, sw, sh, dw, dh, load_srgb8, store_srgb8)
-                }
-                PixelFormat::Rgba16Unorm => {
-                    downsample::<8>(src, sw, sh, dw, dh, load_u16, store_u16)
-                }
-                PixelFormat::Rgba16Float => {
-                    downsample::<8>(src, sw, sh, dw, dh, load_f16, store_f16)
-                }
-                PixelFormat::Rgba32Float => {
-                    downsample::<16>(src, sw, sh, dw, dh, load_f32, store_f32)
-                }
-            }
+            downsample_level(src, sw, sh, dw, dh, format)
         };
         out.push(next);
         sw = dw;
         sh = dh;
     }
     out
+}
+
+/// One level's reduction, dispatched on the pixel format. Shared by [`build`] and [`complete`].
+fn downsample_level(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    dw: u32,
+    dh: u32,
+    format: PixelFormat,
+) -> Vec<u8> {
+    match format {
+        PixelFormat::Rgba8Unorm => downsample::<4>(src, sw, sh, dw, dh, load_srgb8, store_srgb8),
+        PixelFormat::Rgba16Unorm => downsample::<8>(src, sw, sh, dw, dh, load_u16, store_u16),
+        PixelFormat::Rgba16Float => downsample::<8>(src, sw, sh, dw, dh, load_f16, store_f16),
+        PixelFormat::Rgba32Float => downsample::<16>(src, sw, sh, dw, dh, load_f32, store_f32),
+    }
 }
 
 /// Levels with at least this many texels are reduced on several threads.
@@ -379,5 +427,107 @@ mod tests {
         }
         let chain = build(&px, 2, 2, PixelFormat::Rgba32Float);
         assert_eq!(load_f32(&chain[0][..16]), [4.0; 4]);
+    }
+
+    /// Levels floor-halve and stop at 1, on each axis independently — the rule a DDS stores its
+    /// own chain by, which is what lets one be adopted without rescaling.
+    #[test]
+    fn level_dims_floor_halve_and_never_reach_zero() {
+        assert_eq!(level_dims(8, 4, 0), (8, 4));
+        assert_eq!(level_dims(8, 4, 2), (2, 1));
+        assert_eq!(level_dims(8, 4, 3), (1, 1));
+        // Past the end of the chain, and past a shift that would be undefined.
+        assert_eq!(level_dims(8, 4, 99), (1, 1));
+        // Non-power-of-two floors rather than rounds.
+        assert_eq!(level_dims(5, 3, 1), (2, 1));
+    }
+
+    /// A solid buffer of `v` at `w`x`h`, RGBA8.
+    fn solid(w: u32, h: u32, v: u8) -> Vec<u8> {
+        vec![v; w as usize * h as usize * 4]
+    }
+
+    /// A full chain from the file is taken exactly as given: the point of an authored chain is
+    /// that its levels are *not* what a box filter would have produced.
+    #[test]
+    fn complete_adopts_a_full_chain_untouched() {
+        let level0 = solid(4, 4, 10);
+        let supplied = vec![solid(2, 2, 200), solid(1, 1, 250)];
+        let chain = complete(supplied.clone(), &level0, 4, 4, PixelFormat::Rgba8Unorm);
+        assert_eq!(chain, supplied, "no level was recomputed");
+    }
+
+    /// A file may stop its chain early. What it supplied is kept, and only the tail is computed —
+    /// from the last authored level, not from level 0, so the authored data stays upstream.
+    #[test]
+    fn complete_pads_a_partial_chain_from_the_last_authored_level() {
+        // Level 0 is black, but the file's level 1 is white. A correctly padded level 2 must come
+        // from the white level 1, not from the black level 0.
+        let level0 = solid(4, 4, 0);
+        let chain = complete(
+            vec![solid(2, 2, 255)],
+            &level0,
+            4,
+            4,
+            PixelFormat::Rgba8Unorm,
+        );
+        assert_eq!(chain.len(), 2, "4x4 has three levels in all");
+        assert_eq!(chain[0], solid(2, 2, 255));
+        assert_eq!(
+            chain[1],
+            solid(1, 1, 255),
+            "padded from level 1, not level 0"
+        );
+    }
+
+    /// A level whose length does not match its dimensions ends the adopted run: past a bad
+    /// offset the file's own layout is no longer trustworthy, so the rest is recomputed.
+    #[test]
+    fn complete_stops_adopting_at_a_wrong_sized_level() {
+        let level0 = solid(4, 4, 0);
+        let chain = complete(
+            vec![solid(2, 2, 255), vec![1u8; 3]],
+            &level0,
+            4,
+            4,
+            PixelFormat::Rgba8Unorm,
+        );
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0], solid(2, 2, 255));
+        assert_eq!(chain[1], solid(1, 1, 255), "the short level was recomputed");
+    }
+
+    /// A header can claim more levels than the dimensions allow. The extras are dropped rather
+    /// than uploaded — sokol takes at most 16, and a chain longer than `level_count` would index
+    /// past its mip-level array.
+    #[test]
+    fn complete_drops_levels_past_the_end_of_the_chain() {
+        let level0 = solid(2, 2, 0);
+        let chain = complete(
+            vec![solid(1, 1, 9), solid(1, 1, 9), solid(1, 1, 9)],
+            &level0,
+            2,
+            2,
+            PixelFormat::Rgba8Unorm,
+        );
+        assert_eq!(chain.len(), level_count(2, 2) as usize - 1);
+    }
+
+    /// No usable chain at all falls back to building the whole thing, which is the pre-existing
+    /// behaviour for every format but DDS.
+    #[test]
+    fn complete_with_nothing_supplied_matches_build() {
+        let level0 = solid(4, 4, 40);
+        assert_eq!(
+            complete(Vec::new(), &level0, 4, 4, PixelFormat::Rgba8Unorm),
+            build(&level0, 4, 4, PixelFormat::Rgba8Unorm)
+        );
+    }
+
+    /// A level 0 shorter than its dimensions declare yields no chain rather than a read past the
+    /// end — the same refusal `build` makes.
+    #[test]
+    fn complete_refuses_a_short_level_zero() {
+        assert!(complete(Vec::new(), &[0u8; 3], 4, 4, PixelFormat::Rgba8Unorm).is_empty());
     }
 }

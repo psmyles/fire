@@ -20,6 +20,8 @@ zune-core.workspace = true
 image.workspace = true
 tiff.workspace = true
 exr.workspace = true
+ddsfile.workspace = true
+bcdec_rs.workspace = true
 lcms2.workspace = true
 psd-sdk-sys = { workspace = true, optional = true }
 heif-sys = { workspace = true, optional = true }

@@ -5,6 +5,7 @@
 //! extension, since the many TIFF-structured raws can't be told from plain TIFF by header):
 //!   - PSD            -> psd_sdk (C++ FFI) : merged composite, 8-bit RGBA (+ICC)
 //!   - EXR            -> `exr` crate       : 32-bit float RGBA (linear/HDR)
+//!   - DDS            -> `ddsfile` + `bcdec_rs`: BC1-BC7 and the uncompressed layouts
 //!   - HEIC/HEIF/AVIF -> libheif (C FFI)   : 8-bit RGBA, or 16-bit RGBA for HDR (+ICC)
 //!   - camera raw     -> [`raw`] preview   : extract the embedded JPEG, decode via zune
 //!   - GIF            -> `image` crate     : every frame (animated GIF plays; see [`Animation`])
@@ -39,6 +40,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
+mod dds;
 mod downscale;
 mod exif;
 mod raw;
@@ -129,9 +131,9 @@ pub(crate) fn to_ne_bytes<T: bytemuck::Pod>(v: &[T]) -> Vec<u8> {
 /// bytes and will happily open a supported image with the wrong extension (or none).
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     // Still formats, in the order the module doc lists the backends.
-    "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "tif", "tiff", "webp", "ico", "tga",
-    "qoi", "ppm", "pgm", "pbm", "pnm", "ff", "jxl", "hdr", "exr", "psd", "psb", "heic", "heif",
-    "avif", //
+    "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "tif", "tiff", "tx", "webp", "ico",
+    "cur", "tga", "qoi", "ppm", "pgm", "pbm", "pnm", "pam", "ff", "jxl", "hdr", "pic", "rgbe",
+    "xyze", "exr", "dds", "psd", "psb", "heic", "heif", "avif", //
     // Camera raw (embedded-preview decode). Mirrors `raw::EXT_LABELS`, which is what actually
     // routes them — `raw_extensions_are_all_listed` keeps the two honest.
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "srw",
@@ -176,6 +178,58 @@ impl PixelFormat {
     }
 }
 
+/// What a multi-surface source's surfaces *are*, for the status bar and for the wording of the
+/// viewer's transport controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SheetKind {
+    /// The six faces of a cubemap, in the DDS order `+X -X +Y -Y +Z -Z`.
+    CubeFaces,
+    /// The layers of a texture array.
+    ArrayLayers,
+    /// The depth slices of a volume texture.
+    VolumeSlices,
+}
+
+impl SheetKind {
+    /// The word for these surfaces, singular, for the status bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            SheetKind::CubeFaces => "cubemap",
+            SheetKind::ArrayLayers => "array",
+            SheetKind::VolumeSlices => "volume",
+        }
+    }
+}
+
+/// A source whose one canvas is really several surfaces tiled into a grid.
+///
+/// A cubemap, a texture array and a volume are all "N images of the same size" — exactly what the
+/// viewer's flipbook already displays, so they are composited into one sheet here and handed over
+/// with the grid that reads it back. This is *authored* structure, not the guess
+/// `flipbook::detect` makes from pixel content, which is why it travels with the image instead of
+/// being re-derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SheetLayout {
+    pub cols: u32,
+    pub rows: u32,
+    /// Surfaces actually present, `1..=cols*rows`. The trailing cells of a partly filled grid are
+    /// transparent black and are not meant to be stepped onto.
+    pub frames: u32,
+    pub kind: SheetKind,
+}
+
+/// The dimensions of mip `level` of a `w`x`h` image: each axis halves, flooring but never
+/// dropping below 1.
+///
+/// The one halving rule the whole pipeline agrees on — what the renderer's mip builder steps
+/// through, and what a DDS stores its own levels by. It lives here, next to
+/// [`DecodedImage::source_mips`], because that field's contract is stated in terms of it and a
+/// second copy in the viewer crate would be a rule in two places.
+pub fn level_dims(w: u32, h: u32, level: u32) -> (u32, u32) {
+    let shift = level.min(31);
+    ((w >> shift).max(1), (h >> shift).max(1))
+}
+
 /// A successfully decoded image, normalized to RGBA in `format`'s layout.
 #[derive(Debug, Clone)]
 pub struct DecodedImage {
@@ -204,6 +258,26 @@ pub struct DecodedImage {
     /// If the image was downscaled to fit `DecodeOptions::max_dim`, the original
     /// (width, height) before downscaling; the pixel inspector notes this (§6).
     pub downscaled_from: Option<(u32, u32)>,
+    /// The file's own mip chain, levels `1..`, when it brought one. Each buffer is one level in
+    /// `format`'s layout at `((width >> i).max(1), (height >> i).max(1))`, smallest last — the
+    /// same shape and the same halving rule the viewer's own mip builder uses, so a chain that
+    /// survives to the worker can be adopted verbatim instead of rebuilt.
+    ///
+    /// Only DDS supplies one today, and it is the format where it matters: the levels in a `.dds`
+    /// are *authored*, often with a filter and a gamma the box filter does not reproduce, and an
+    /// artist opening one wants to see what shipped rather than what we would have computed.
+    ///
+    /// May be **partial** (a file is free to stop its chain at 4x4) or absent. It is dropped the
+    /// moment anything rewrites `pixels` — see [`transform_buffers`](Self::transform_buffers) —
+    /// because a chain that no longer describes the canvas is worse than no chain at all.
+    pub source_mips: Option<Vec<Vec<u8>>>,
+    /// When the canvas is several surfaces tiled into a grid — a cubemap's faces, an array's
+    /// layers, a volume's slices — how to read it back. Only DDS sets it. `None` for the ordinary
+    /// single-surface case, which is every other format.
+    ///
+    /// Unlike a detected sprite-sheet grid this is *authored*: the file says how many surfaces it
+    /// holds and how big each one is, so the viewer adopts it rather than offering it as a guess.
+    pub layout: Option<SheetLayout>,
     /// Playback timing/pixels for an animated source (animated GIF). `None` for a still image —
     /// the common case, so the still path is untouched. When `Some`, `pixels` above is frame 0
     /// (shown immediately) and [`Animation::frames`] holds the full sequence for the viewer to
@@ -243,6 +317,14 @@ impl DecodedImage {
     /// assumes) are dropped rather than indexed past, and an animation left with no frames is
     /// removed entirely.
     pub(crate) fn transform_buffers(&mut self, needed: usize, mut f: impl FnMut(&mut Vec<u8>)) {
+        // Every pass that rewrites the canvas comes through here, which makes this the one place
+        // that has to invalidate a file-supplied mip chain: a rotated, colour-transformed or
+        // resampled level 0 is no longer what those levels are levels *of*. Transforming them
+        // alongside would be wrong as often as right — a nearest-neighbour downscale in
+        // particular does not produce the file's level 1 — so the chain is dropped and the worker
+        // rebuilds one. Orientation 1, no ICC profile and an in-budget image never reach here,
+        // which is every ordinary DDS.
+        self.source_mips = None;
         f(&mut self.pixels);
         if let Some(anim) = self.animation.as_mut() {
             anim.frames.retain(|frame| frame.pixels.len() >= needed);
@@ -334,6 +416,17 @@ enum Backend {
     /// Radiance HDR (`.hdr`/`.pic`); decoded by the `image` crate, *not* zune — see
     /// [`decode_hdr`] for why zune-hdr is avoided.
     Hdr,
+    /// DDS (DirectDraw Surface); the game-development texture container, decompressed on the
+    /// CPU by [`crate::dds`].
+    Dds,
+    /// A Windows cursor (`.cur`): an ICO container with a different type word, and two of its
+    /// directory fields reused for the hotspot. The `image` crate's ICO decoder reads one
+    /// unchanged but does not recognize the magic, so it is named for it here.
+    Cur,
+    /// An uncompressed true-colour TGA, recognized from its header rather than from magic it
+    /// does not have — see [`is_uncompressed_tga`], which also keeps it out of [`Backend::Cur`],
+    /// whose magic it shares. Decoded by the `image` crate like any other TGA.
+    Tga,
     /// PNG; decoded by the `image` crate, *not* zune — see [`decode_png`] for why
     /// zune-png is avoided.
     Png,
@@ -357,6 +450,42 @@ fn heif_label(bytes: &[u8]) -> Option<&'static str> {
         b"mif1" | b"msf1" | b"mif2" => Some("HEIF"),
         _ => None,
     }
+}
+
+/// Whether `bytes` is an uncompressed true-colour TGA — the variant that wears the Windows
+/// cursor's magic.
+///
+/// `00 00 02 00` is the `.cur` magic (two reserved bytes, then the type word `2`) and it is also,
+/// byte for byte, the start of the most ordinary TGA there is: id length 0, no colour map, image
+/// type 2 (uncompressed true-colour), then the low byte of the colour-map origin. That is what
+/// every art tool writes, so those four bytes cannot decide `Backend::Cur` on their own — they
+/// used to, which sent such files to the ICO decoder to be refused ("ICO directory contains no
+/// image"). They did not open at all, extension hint or not.
+///
+/// TGA has no magic to test for (only an *optional* end-of-file `TRUEVISION-XFILE.` footer), so
+/// test the header for self-consistency instead: a file with no colour map says so in all three
+/// colour-map fields, an uncompressed true-colour depth is one of four values, and the pixel data
+/// the dimensions promise has to fit in the file. A cursor cannot satisfy all of that at once —
+/// its image count and its first directory entry's width and height land in the very fields this
+/// requires to be zero, so passing would mean a cursor holding no images whose first image is
+/// 0x0, which has nothing to decode either way.
+fn is_uncompressed_tga(bytes: &[u8]) -> bool {
+    const HEADER: usize = 18;
+    let Some(h) = bytes.get(..HEADER) else {
+        return false;
+    };
+    // Image type 2, and no colour map: type 0 with a zero origin, length and entry size.
+    if h[2] != 2 || h[1] != 0 || h[3..8] != [0; 5] {
+        return false;
+    }
+    let width = u16::from_le_bytes([h[12], h[13]]) as usize;
+    let height = u16::from_le_bytes([h[14], h[15]]) as usize;
+    let depth = h[16];
+    if width == 0 || height == 0 || !matches!(depth, 15 | 16 | 24 | 32) {
+        return false;
+    }
+    // Header, then the optional image-id field, then one uncompressed pixel per texel.
+    HEADER + h[0] as usize + width * height * (depth as usize).div_ceil(8) <= bytes.len()
 }
 
 fn sniff(bytes: &[u8], ext: Option<&str>) -> Backend {
@@ -383,6 +512,21 @@ fn sniff(bytes: &[u8], ext: Option<&str>) -> Backend {
         // TIFF-structured camera raws, which share this magic, still route to the preview
         // extractor — and it falls back to `image` for the colour types it does not own.
         Backend::Tiff
+    } else if bytes.starts_with(b"DDS ") {
+        // DDS: a unique four-byte magic, and a container neither zune nor the `image` crate
+        // reads the modern formats of (BC4-BC7 and the DX10 header are all past `image`'s
+        // DXT-only decoder), so it is sniffed here and handled by our own backend.
+        Backend::Dds
+    } else if bytes.starts_with(&[0x00, 0x00, 0x02, 0x00]) {
+        // Byte 2 is the ICO/CUR type word, 1 for an icon and 2 for a cursor — but a cursor is
+        // not the only thing that claims this magic. An uncompressed true-colour TGA opens with
+        // the same four bytes, so the header has to break the tie; see `is_uncompressed_tga`.
+        if is_uncompressed_tga(bytes) {
+            Backend::Tga
+        } else {
+            // A cursor. The ICO decoder reads the payload unchanged.
+            Backend::Cur
+        }
     } else if bytes.starts_with(b"GIF8") {
         // GIF (b"GIF87a"/b"GIF89a"): route to the dedicated multi-frame decoder so an animated
         // GIF plays. zune has no GIF decoder anyway, so this only pre-empts the `image` fallback.
@@ -432,6 +576,10 @@ pub fn decode(
             }
         }
         Backend::Hdr => decode_hdr(bytes)?,
+        Backend::Dds => dds::decode(bytes)?,
+        Backend::Cur => decode_cur(bytes)?,
+        // Sniffed from its header, so it needs no extension hint to name itself.
+        Backend::Tga => decode_image(bytes, Some("tga"))?,
         Backend::Png => decode_png(bytes)?,
         // zune is the hot path, not the only path. It has gaps the `image` crate does not —
         // zune-bmp cannot read a 24-bit BMP narrower than 3 pixels, so a 1x1 colour swatch
@@ -557,6 +705,8 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "PSD",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -638,6 +788,8 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "OpenEXR",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -673,6 +825,8 @@ fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, Decode
         source_format: label,
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -748,6 +902,8 @@ fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "Radiance HDR",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -813,6 +969,8 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "PNG",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -940,6 +1098,8 @@ fn decode_zune(
         source_format: zune_format_name(fmt),
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -1038,6 +1198,8 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         source_format: "GIF",
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
+        layout: None,
         animation,
     })
 }
@@ -1050,6 +1212,16 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 /// TGA carries no start-of-file magic (only an optional end-of-file `TRUEVISION-XFILE.`
 /// footer), so `with_guessed_format` can't detect it from content. Fall back to the file
 /// extension for any format content-sniffing misses.
+/// A Windows cursor. The container is an ICO with `2` in the type word, and with the directory's
+/// "colour planes" and "bits per pixel" fields reused for the hotspot coordinates — neither of
+/// which the `image` crate's ICO decoder needs, so the payload reads unchanged. All this does is
+/// name the format for the decoder that will not sniff it, and label it honestly afterwards.
+fn decode_cur(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    let mut img = decode_image(bytes, Some("ico"))?;
+    img.source_format = "CUR";
+    Ok(img)
+}
+
 fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, DecodeError> {
     use image::DynamicImage;
 
@@ -1113,6 +1285,8 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         source_format: format.map_or("image", format_name),
         alpha_opaque: false, // set by `decode` after the final buffer is built
         downscaled_from: None,
+        source_mips: None,
+        layout: None,
         animation: None,
     })
 }
@@ -1244,6 +1418,8 @@ mod icc {
                 source_format: "test",
                 alpha_opaque: false,
                 downscaled_from: None,
+                source_mips: None,
+                layout: None,
                 animation: None,
             }
         }
@@ -1550,6 +1726,75 @@ mod tests {
         );
     }
 
+    /// A Windows cursor is an ICO whose type word is 2 instead of 1, with two directory fields
+    /// reused for the hotspot. The `image` crate reads the payload unchanged but will not sniff
+    /// the magic, so `sniff` names the format for it — and the status bar says CUR, not ICO.
+    ///
+    /// The `sniff` assertion is also what keeps the TGA disambiguation honest: an uncompressed
+    /// true-colour TGA shares this magic (see `uncompressed_truecolor_tga_is_not_a_cursor`) and
+    /// telling the two apart must not cost us the cursor.
+    #[test]
+    fn cur_decodes_through_the_ico_decoder_and_is_labelled_cur() {
+        let mut src = image::RgbaImage::new(4, 4);
+        src.put_pixel(0, 0, image::Rgba([200, 30, 40, 255]));
+        let mut bytes = encode(
+            &image::DynamicImage::ImageRgba8(src),
+            image::ImageFormat::Ico,
+        );
+        // Bytes 2..4 are the ICONDIR type: 1 = icon, 2 = cursor. Everything else is identical.
+        bytes[2] = 2;
+        bytes[3] = 0;
+
+        assert!(matches!(sniff(&bytes, None), Backend::Cur));
+        let out = decode(&bytes, Some("cur"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.width, out.height), (4, 4));
+        assert_eq!(out.source_format, "CUR");
+        assert_eq!(
+            [out.pixels[0], out.pixels[1], out.pixels[2], out.pixels[3]],
+            [200, 30, 40, 255]
+        );
+    }
+
+    /// Netpbm's `P7` (Portable Arbitrary Map) is the one member of the family the extension
+    /// table did not list, though the decoders have always read it.
+    #[test]
+    fn pam_decodes() {
+        let mut bytes =
+            b"P7\nWIDTH 2\nHEIGHT 1\nDEPTH 3\nMAXVAL 255\nTUPLTYPE RGB\nENDHDR\n".to_vec();
+        bytes.extend_from_slice(&[200, 30, 40, 10, 20, 30]);
+
+        let out = decode(&bytes, Some("pam"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.width, out.height), (2, 1));
+        assert_eq!(out.format, PixelFormat::Rgba8Unorm);
+        assert_eq!(out.channels, 3);
+        assert_eq!(out.pixels[..8], [200, 30, 40, 255, 10, 20, 30, 255]);
+    }
+
+    /// The Radiance aliases carry the same magic as `.hdr`, so listing them is purely about the
+    /// extension table — nothing about the routing changes.
+    #[test]
+    fn radiance_aliases_are_listed_and_route_to_the_hdr_backend() {
+        for ext in ["hdr", "pic", "rgbe", "xyze"] {
+            assert!(is_supported_extension(ext), ".{ext} is listed");
+        }
+        let bytes = b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 1\n\x80\x80\x80\x81".to_vec();
+        assert!(matches!(sniff(&bytes, Some("pic")), Backend::Hdr));
+    }
+
+    /// DDS is sniffed by its own magic ahead of every fallback, and `.tx` (an OpenImageIO tiled
+    /// TIFF) still reaches the TIFF backend by TIFF's magic.
+    #[test]
+    fn dds_and_tx_route_to_the_right_backends() {
+        assert!(matches!(sniff(b"DDS \x7c\x00\x00\x00", None), Backend::Dds));
+        assert!(matches!(
+            sniff(b"II\x2a\x00rest", Some("tx")),
+            Backend::Tiff
+        ));
+        for ext in ["dds", "cur", "pam", "tx"] {
+            assert!(is_supported_extension(ext), ".{ext} is listed");
+        }
+    }
+
     /// A camera-raw file routes to the preview extractor: a synthetic little-endian TIFF
     /// whose IFD points at an embedded full-size JPEG (with Orientation 8 / rotate-90°-CCW)
     /// decodes to the preview's pixels, re-labeled as the raw family, oriented upright. This
@@ -1781,6 +2026,61 @@ mod tests {
             out.channels, 4,
             "32-bit RGBA TGA must report an alpha channel"
         );
+    }
+
+    /// Build an uncompressed true-colour TGA (image type 2) by hand — the variant every art
+    /// tool writes, and the one no encoder in our test deps produces (`image` writes RLE).
+    fn raw_tga(width: u16, height: u16, bpp: u8, pixels: &[u8]) -> Vec<u8> {
+        let mut v = vec![
+            0, // id length
+            0, // colour-map type: none
+            2, // image type: uncompressed true-colour
+            0, 0, // colour-map origin
+            0, 0, // colour-map length
+            0, // colour-map entry size
+            0, 0, // x origin
+            0, 0, // y origin
+        ];
+        v.extend_from_slice(&width.to_le_bytes());
+        v.extend_from_slice(&height.to_le_bytes());
+        v.push(bpp);
+        v.push(0x20); // descriptor: top-left origin, no attribute bits
+        v.extend_from_slice(pixels);
+        v.extend_from_slice(b"\0\0\0\0\0\0\0\0TRUEVISION-XFILE.\0");
+        v
+    }
+
+    /// An uncompressed true-colour TGA opens as a TGA and not as a cursor.
+    ///
+    /// Its first four bytes are `00 00 02 00` — id length 0, no colour map, image type 2, and the
+    /// low byte of the colour-map origin — which is byte-for-byte the Windows `.cur` magic (`00 00`
+    /// reserved, type word `2`). `sniff` claimed that magic for CUR before anything could consider
+    /// TGA, so the most ordinary TGA there is (what Photoshop, Substance and every game-texture
+    /// pipeline writes) went to the ICO decoder and failed to open at all, extension hint or not.
+    #[test]
+    fn uncompressed_truecolor_tga_is_not_a_cursor() {
+        // BGR, top-left origin.
+        let bytes = raw_tga(2, 1, 24, &[40, 30, 200, 60, 220, 10]);
+        assert_eq!(
+            &bytes[..4],
+            &[0x00, 0x00, 0x02, 0x00],
+            "this fixture only tests the collision if it actually collides"
+        );
+
+        for ext in [Some("tga"), Some("TGA"), None] {
+            let out = decode(&bytes, ext, &DecodeOptions::default())
+                .unwrap_or_else(|e| panic!("ext {ext:?}: {e:?}"));
+            assert_eq!(out.source_format, "TGA");
+            assert_eq!((out.width, out.height), (2, 1));
+            assert_eq!(out.channels, 3);
+            assert_eq!(&out.pixels[0..4], &[200, 30, 40, 255]);
+        }
+
+        // 32-bit, the other common uncompressed variant, collides identically.
+        let bytes = raw_tga(1, 1, 32, &[3, 2, 1, 128]);
+        let out = decode(&bytes, Some("tga"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.source_format, "TGA");
+        assert_eq!(&out.pixels[0..4], &[1, 2, 3, 128]);
     }
 
     /// Encode a GIF from a list of `(solid RGBA color, delay ms)` frames (test fixture). One frame
