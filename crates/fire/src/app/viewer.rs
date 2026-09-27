@@ -635,9 +635,11 @@ impl Viewer {
                 let same_dims =
                     self.surface.current_image().map(|i| (i.width, i.height)) == Some((w, h));
                 let upload = if outcome.reload && same_dims {
-                    self.surface.replace_image_keep_view(img, &outcome.mips)
+                    self.surface
+                        .replace_image_keep_view(img, &outcome.mips, outcome.authored_mips)
                 } else {
-                    self.surface.set_image(img, &outcome.mips)
+                    self.surface
+                        .set_image(img, &outcome.mips, outcome.authored_mips)
                 };
                 // The image decoded fine but the GPU may still reject the upload (e.g. out of
                 // memory on a very large texture). Treat that like a decode failure rather than
@@ -1640,7 +1642,9 @@ impl Viewer {
 
     /// Whether the current placement is a *normal* one worth remembering.
     fn placement_is_normal(&self) -> bool {
-        !self.fullscreen() && !self.window.is_maximized() && self.window.is_minimized() != Some(true)
+        !self.fullscreen()
+            && !self.window.is_maximized()
+            && self.window.is_minimized() != Some(true)
     }
 
     // --- events ---------------------------------------------------------------------------------

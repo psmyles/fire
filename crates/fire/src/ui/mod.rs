@@ -164,8 +164,9 @@ use crate::render::view::{Background as Bg, Channel as Ch};
 /// The HDR group: laid out only for float sources.
 const HDR_GROUP: u8 = 3;
 
-/// The mip group: laid out only for an image whose texture has a chain to walk — today, a DDS
-/// that brought its own levels. Everything else has exactly one level worth looking at, and a
+/// The mip group: laid out only for an image whose *file* supplied a chain to walk — today, a DDS
+/// that brought its own levels. The chain the viewer builds for every other image is for display
+/// only and does not count. Everything else has exactly one level worth looking at, and a
 /// permanently dead pair of buttons is worse than no buttons.
 const MIP_GROUP: u8 = 5;
 

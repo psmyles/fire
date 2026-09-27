@@ -72,6 +72,10 @@ pub struct DecodeOutcome {
     /// Levels `1..` of the image's mip chain (see [`crate::render::mips`]), built here on the
     /// worker so the UI thread's adopt is one upload; empty on failure.
     pub mips: Vec<Vec<u8>>,
+    /// How many of `mips` (from level 1) came from the file itself rather than being computed
+    /// here. Only a DDS carries its own chain, so this is 0 for every other format — and the
+    /// mip-level control is offered only when it is above 0.
+    pub authored_mips: u32,
     /// Echoed from the job; see [`DecodeJob::reload`].
     pub reload: bool,
 }
@@ -128,10 +132,16 @@ impl DecodePool {
                             result.as_mut().ok().and_then(|img| img.source_mips.take());
                         let result = result.map(Arc::new);
                         // The mip chain, completed here so the UI thread's adopt is one upload.
-                        let mips = match &result {
+                        let (mips, authored_mips) = match &result {
                             Ok(img) => {
                                 let t = Instant::now();
-                                let authored = source_mips.as_ref().map_or(0, Vec::len);
+                                // Counted before `complete` consumes the levels: only the run it
+                                // adopts is the file's, everything past it is computed.
+                                let authored = source_mips.as_deref().map_or(0, |src| {
+                                    crate::render::mips::authored_levels(
+                                        src, img.width, img.height, img.format,
+                                    )
+                                });
                                 let chain = match source_mips {
                                     // A DDS brings its own, and those levels were authored — with
                                     // a filter and a gamma a box filter does not reproduce. Keep
@@ -158,9 +168,12 @@ impl DecodePool {
                                     img.width,
                                     img.height
                                 ));
-                                chain
+                                // `complete` hands back nothing for a short level 0, and then
+                                // none of the file's levels reach the texture either.
+                                let authored = if chain.is_empty() { 0 } else { authored };
+                                (chain, authored as u32)
                             }
-                            Err(_) => Vec::new(),
+                            Err(_) => (Vec::new(), 0),
                         };
                         // Keep a clone to run flipbook detection *after* the image is posted, so a
                         // large sheet reaches the screen without waiting on the per-pixel scan.
@@ -187,6 +200,7 @@ impl DecodePool {
                             path: job.path,
                             result,
                             mips,
+                            authored_mips,
                             reload: job.reload,
                         });
                         // The only way a send fails is a closed event loop: the app is exiting.

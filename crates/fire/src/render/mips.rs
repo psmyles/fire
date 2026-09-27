@@ -43,14 +43,9 @@ pub fn complete(
 ) -> Vec<Vec<u8>> {
     let bpp = bytes_per_texel(format);
     let levels = level_count(w, h) as usize;
+    let adopted = authored_levels(&supplied, w, h, format);
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(levels.saturating_sub(1));
-    for level in supplied.into_iter().take(levels.saturating_sub(1)) {
-        let (lw, lh) = level_dims(w, h, out.len() as u32 + 1);
-        if level.len() != lw as usize * lh as usize * bpp {
-            break;
-        }
-        out.push(level);
-    }
+    out.extend(supplied.into_iter().take(adopted));
     // Whatever the file did not carry, and the whole chain when it carried nothing usable.
     while out.len() + 1 < levels {
         let n = out.len() as u32;
@@ -63,6 +58,23 @@ pub fn complete(
         out.push(downsample_level(src, sw, sh, dw, dh, format));
     }
     out
+}
+
+/// How many of a file's `supplied` levels (`1..`) [`complete`] keeps: the leading run whose
+/// lengths match their dimensions, capped at the chain a `w`×`h` texture can have. These are the
+/// levels the file really authored, as opposed to the tail `complete` computes.
+pub fn authored_levels(supplied: &[Vec<u8>], w: u32, h: u32, format: PixelFormat) -> usize {
+    let bpp = bytes_per_texel(format);
+    let max = (level_count(w, h) as usize).saturating_sub(1);
+    supplied
+        .iter()
+        .take(max)
+        .enumerate()
+        .take_while(|(i, level)| {
+            let (lw, lh) = level_dims(w, h, *i as u32 + 1);
+            level.len() == lw as usize * lh as usize * bpp
+        })
+        .count()
 }
 
 /// Bytes per texel of `format` as the decoder hands it over.
@@ -529,5 +541,24 @@ mod tests {
     #[test]
     fn complete_refuses_a_short_level_zero() {
         assert!(complete(Vec::new(), &[0u8; 3], 4, 4, PixelFormat::Rgba8Unorm).is_empty());
+    }
+
+    /// The authored count is exactly the run `complete` adopts: a full chain, a partial one, one
+    /// cut short by a bad level, and one that overshoots the dimensions.
+    #[test]
+    fn authored_levels_counts_only_what_complete_adopts() {
+        let f = PixelFormat::Rgba8Unorm;
+        assert_eq!(authored_levels(&[], 4, 4, f), 0);
+        assert_eq!(
+            authored_levels(&[solid(2, 2, 0), solid(1, 1, 0)], 4, 4, f),
+            2
+        );
+        assert_eq!(authored_levels(&[solid(2, 2, 0)], 4, 4, f), 1);
+        assert_eq!(authored_levels(&[solid(2, 2, 0), vec![1u8; 3]], 4, 4, f), 1);
+        assert_eq!(authored_levels(&[vec![1u8; 3], solid(1, 1, 0)], 4, 4, f), 0);
+        assert_eq!(
+            authored_levels(&[solid(1, 1, 0), solid(1, 1, 0), solid(1, 1, 0)], 2, 2, f),
+            1
+        );
     }
 }

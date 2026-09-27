@@ -431,10 +431,14 @@ struct ImageContent {
     /// 1 if the texture samples already-linear (8-bit sRGB / float), 0 if the shader must
     /// sRGB-decode (16-bit unorm).
     linear_sample: i32,
-    /// Mip levels the uploaded texture carries. 0 with no image. The mip-level control is offered
-    /// only when this is above 1, and [`DisplayState::mip_level`] is clamped to it on every adopt
-    /// (a hot reload can come back with a shorter chain).
+    /// Mip levels the uploaded texture carries. 0 with no image. Always a full chain, because
+    /// minified display samples it — but most of it is usually computed here, not read from the
+    /// file; see `authored_mips`.
     mip_count: u32,
+    /// How many of the texture's levels past 0 the *file* supplied (a DDS's own chain). 0 for
+    /// every format that carries none. Only these levels are offered for viewing: stepping into
+    /// a box-filtered level the viewer made up would say nothing about the file.
+    authored_mips: u32,
     /// The displayed image — retained for the pixel inspector (#16) and for re-fit on resize.
     /// For an animated source this holds frame 0 (dimensions/format/metadata are frame-invariant);
     /// the frames themselves live in [`AnimState`]. Held behind an `Arc` because the decode worker
@@ -885,6 +889,7 @@ impl GpuSurface {
     pub fn clear_image(&mut self) {
         self.tex.current = None;
         self.tex.mip_count = 0;
+        self.tex.authored_mips = 0;
         self.display.mip_level = 0;
         self.tex.release();
         self.bindings = make_bindings(&self.gpu, self.gpu.placeholder_view);
@@ -892,17 +897,24 @@ impl GpuSurface {
         self.flipbook = None;
     }
 
-    /// Adopt a decoded image: upload it (level 0 plus `mips`, the chain the decode worker built)
-    /// as a GPU texture and reset to fit + neutral display state for the new file (#17). Returns
+    /// Adopt a decoded image: upload it (level 0 plus `mips`, the chain the decode worker built,
+    /// whose first `authored_mips` levels came from the file) as a GPU texture and reset to fit +
+    /// neutral display state for the new file (#17). Returns
     /// the GPU error if the upload fails (e.g. out of memory on a very large image) so the caller
     /// can report it instead of the process aborting; on failure the prior display state is left
     /// untouched.
-    pub fn set_image(&mut self, img: Arc<DecodedImage>, mips: &[Vec<u8>]) -> Result<(), String> {
+    pub fn set_image(
+        &mut self,
+        img: Arc<DecodedImage>,
+        mips: &[Vec<u8>],
+        authored_mips: u32,
+    ) -> Result<(), String> {
         let (w, h) = (img.width, img.height);
         // Upload first: if the GPU rejects the texture we bail here, before mutating any state,
         // so a failed adopt can't leave the surface half-updated. Level 0: a new file always
         // opens at full size, whatever mip the last one was left on.
         self.upload_texture(&img, mips, 0)?;
+        self.tex.authored_mips = authored_mips;
         // Adopt any animation frames for playback and start from frame 0 (already uploaded above).
         // The viewer arms the timer from `frame_delay_ms()` after this.
         self.anim.adopt(&img);
@@ -947,10 +959,12 @@ impl GpuSurface {
         &mut self,
         img: Arc<DecodedImage>,
         mips: &[Vec<u8>],
+        authored_mips: u32,
     ) -> Result<(), String> {
-        // The viewed mip level is part of the view being kept; `adopt_texture` clamps it in case
-        // the re-exported file came back with a shorter chain.
-        self.upload_texture(&img, mips, self.display.mip_level)?;
+        // The viewed mip level is part of the view being kept, clamped in case the re-exported
+        // file came back with a shorter chain — or with none of its own at all.
+        self.upload_texture(&img, mips, self.display.mip_level.min(authored_mips))?;
+        self.tex.authored_mips = authored_mips;
         // Refresh the animation frames from the re-decoded file and restart from frame 0 (the view
         // is preserved, but the animation plays from the top). The viewer re-arms the timer.
         self.anim.adopt(&img);
@@ -1064,14 +1078,15 @@ impl GpuSurface {
         Ok(())
     }
 
-    /// Which mip level is being viewed, and how many the texture has (0 with no image). The
-    /// toolbar shows its mip group only when there is more than one.
+    /// Which mip level is being viewed, and how many can be (0 with no image). Only levels the
+    /// file supplied count, level 0 included, so a PNG is 1 however long the chain the viewer
+    /// built for it. The toolbar shows its mip group only when there is more than one.
     pub fn mip_level(&self) -> u32 {
         self.display.mip_level
     }
 
     pub fn mip_count(&self) -> u32 {
-        self.tex.mip_count
+        self.tex.mip_count.min(self.tex.authored_mips + 1)
     }
 
     /// Look at mip `level`, rebuilding the texture view over the same image — no re-upload.
@@ -1080,7 +1095,7 @@ impl GpuSurface {
     /// 512² level the way you saw the 4096² one; at a manual zoom the zoom is kept and the pan
     /// re-clamped, so 1:1 stays one texel per physical pixel at every level.
     pub fn set_mip_level(&mut self, level: u32) {
-        let level = level.min(self.tex.mip_count.saturating_sub(1));
+        let level = level.min(self.mip_count().saturating_sub(1));
         if level == self.display.mip_level {
             return;
         }

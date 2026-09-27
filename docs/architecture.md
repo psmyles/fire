@@ -504,8 +504,8 @@ immediate-mode code with no window system and no GPU API in it; it reads a `View
 returns a `ui::Frame` of what the user asked for, which the viewer applies.
 
 - **Toolbar:** channel isolation (R/G/B/A/RGB), fit/1:1, zoom, flipbook, HDR tonemap + exposure
-  (float sources only), the mip-level pair (only when the texture has a chain to walk - today a
-  DDS that brought its own), and a right-docked group (outline, octagon, backdrop, full-screen,
+  (float sources only), the mip-level pair (only when the file itself supplied a chain to walk -
+  today a DDS that brought its own; the chain Fire builds for display does not count), and a right-docked group (outline, octagon, backdrop, full-screen,
   menu).
   Buttons dispatch the same `Action`s the keybinds drive - one state path. When the window is too
   narrow the left group sheds its lowest-priority slots into a "»" popup. There is **no gear**:
