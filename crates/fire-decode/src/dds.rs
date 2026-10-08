@@ -884,8 +884,65 @@ fn snorm_to_unorm(v: u8, signed: bool) -> u8 {
     ((x * 255 + 127) / 254) as u8
 }
 
-/// Expand an uncompressed surface into `out`.
+/// Expand an uncompressed surface into `out`, split across threads like the block codecs.
 fn decode_plain(p: Plain, src: &[u8], out_format: PixelFormat, out: &mut [u8]) {
+    let bpp = out_format.bytes_per_pixel();
+    let stride = p.texel_bytes();
+    crate::par_chunks_mut(out, bpp, |offset, part| {
+        let src = src.get(offset / bpp * stride..).unwrap_or_default();
+        match byte_lanes(p, out_format) {
+            Some(lanes) => copy_byte_lanes(lanes, src, part),
+            None => decode_plain_texels(p, src, out_format, part),
+        }
+    });
+}
+
+/// Where R, G, B and A sit in a 4-byte texel whose masks are each one whole byte (alpha may be
+/// absent: `None`), for an 8-bit output — RGBA8, BGRA8 and their X variants, which is nearly every
+/// uncompressed DDS. For those the general mask arithmetic reduces exactly to picking bytes.
+fn byte_lanes(p: Plain, out_format: PixelFormat) -> Option<([usize; 3], Option<usize>)> {
+    let Plain::Masked {
+        bytes: 4,
+        masks,
+        luminance: false,
+    } = p
+    else {
+        return None;
+    };
+    if out_format != PixelFormat::Rgba8Unorm {
+        return None;
+    }
+    let lane = |m: u32| {
+        let at = m.trailing_zeros();
+        (at.is_multiple_of(8) && m >> at == 0xff).then_some(at as usize / 8)
+    };
+    let rgb = [lane(masks[0])?, lane(masks[1])?, lane(masks[2])?];
+    let alpha = match masks[3] {
+        0 => None,
+        m => Some(lane(m)?),
+    };
+    Some((rgb, alpha))
+}
+
+fn copy_byte_lanes(([r, g, b], alpha): ([usize; 3], Option<usize>), src: &[u8], out: &mut [u8]) {
+    let texels = src.as_chunks::<4>().0;
+    let out = out.as_chunks_mut::<4>().0;
+    match alpha {
+        Some(a) => {
+            for (d, s) in out.iter_mut().zip(texels) {
+                *d = [s[r], s[g], s[b], s[a]];
+            }
+        }
+        None => {
+            for (d, s) in out.iter_mut().zip(texels) {
+                *d = [s[r], s[g], s[b], 255];
+            }
+        }
+    }
+}
+
+/// [`decode_plain`]'s general case: one texel at a time, any layout.
+fn decode_plain_texels(p: Plain, src: &[u8], out_format: PixelFormat, out: &mut [u8]) {
     let bpp = out_format.bytes_per_pixel();
     let texels = out.len() / bpp;
     let stride = p.texel_bytes();
@@ -1086,5 +1143,49 @@ fn straighten(pixels: &mut [u8], format: PixelFormat) {
         }
         // The only half-float source is BC6H, which has no alpha channel to have multiplied by.
         PixelFormat::Rgba16Float => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `decode_plain` — threaded, with the byte-lane shortcut for whole-byte masks — against the
+    /// per-texel decoder it replaced, over the layouts that take the shortcut and ones that must
+    /// not. The surface is large enough to be split across threads, and the last case's source
+    /// stops short, which has to leave the same zeroed tail either way.
+    #[test]
+    fn plain_surfaces_match_the_per_texel_decoder() {
+        let texels = 600 * 700usize;
+        let src: Vec<u8> = (0..texels * 4)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 9) as u8)
+            .collect();
+        let masked = |bytes, masks| Plain::Masked {
+            bytes,
+            masks,
+            luminance: false,
+        };
+        let cases = [
+            masked(4, [0xff_0000, 0xff00, 0xff, 0xff00_0000]), // BGRA8
+            masked(4, [0xff, 0xff00, 0xff_0000, 0xff00_0000]), // RGBA8
+            masked(4, [0xff_0000, 0xff00, 0xff, 0]),           // BGRX8
+            masked(2, [0xf800, 0x07e0, 0x001f, 0]),            // B5G6R5: not whole bytes
+            masked(4, [0x3ff, 0xffc00, 0x3ff0_0000, 0]),       // 10-bit lanes
+        ];
+        for (i, p) in cases.into_iter().enumerate() {
+            let src = &src[..texels * p.texel_bytes()];
+            let mut expected = vec![0u8; texels * 4];
+            decode_plain_texels(p, src, PixelFormat::Rgba8Unorm, &mut expected);
+            let mut out = vec![0u8; texels * 4];
+            decode_plain(p, src, PixelFormat::Rgba8Unorm, &mut out);
+            assert!(out == expected, "case {i}");
+        }
+        let p = masked(4, [0xff_0000, 0xff00, 0xff, 0xff00_0000]);
+        let short = &src[..texels * 4 - 1000];
+        let mut expected = vec![0u8; texels * 4];
+        decode_plain_texels(p, short, PixelFormat::Rgba8Unorm, &mut expected);
+        let mut out = vec![0u8; texels * 4];
+        decode_plain(p, short, PixelFormat::Rgba8Unorm, &mut out);
+        assert!(out == expected, "short source");
     }
 }

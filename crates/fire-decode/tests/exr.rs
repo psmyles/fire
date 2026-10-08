@@ -160,3 +160,50 @@ fn exr_garbage_errors_cleanly() {
     let stub = [0x76, 0x2f, 0x31, 0x01, 0, 0, 0, 0];
     assert!(decode(&stub, Some("exr"), &DecodeOptions::default()).is_err());
 }
+
+/// A half-float EXR — the common kind; HDRIs and renders are written as half — stays half:
+/// `Rgba16Float`, carrying the file's exact bits, with an absent alpha filled with half 1.0. It is
+/// big enough to be interleaved on several threads, and odd-sized so no split lands on a row.
+#[test]
+fn half_float_exr_stays_half() {
+    let (w, h) = (613usize, 437usize);
+    let value = |i: usize, c: usize| f16::from_f32(((i * 4 + c) % 977) as f32 / 61.0 - 3.0);
+    for alpha in [true, false] {
+        let mut buf = Cursor::new(Vec::new());
+        if alpha {
+            let channels = SpecificChannels::rgba(|p: Vec2<usize>| {
+                let i = p.y() * w + p.x();
+                (value(i, 0), value(i, 1), value(i, 2), value(i, 3))
+            });
+            Image::from_channels((w, h), channels)
+                .write()
+                .to_buffered(&mut buf)
+        } else {
+            let channels = SpecificChannels::rgb(|p: Vec2<usize>| {
+                let i = p.y() * w + p.x();
+                (value(i, 0), value(i, 1), value(i, 2))
+            });
+            Image::from_channels((w, h), channels)
+                .write()
+                .to_buffered(&mut buf)
+        }
+        .expect("write exr fixture");
+
+        let out = decode(&buf.into_inner(), Some("exr"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.format, PixelFormat::Rgba16Float);
+        assert!(out.format.is_hdr());
+        assert_eq!(out.channels, if alpha { 4 } else { 3 });
+        let px: Vec<u16> = out
+            .pixels
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_ne_bytes(*b))
+            .collect();
+        for i in 0..w * h {
+            let a = if alpha { value(i, 3) } else { f16::ONE };
+            let expected = [value(i, 0), value(i, 1), value(i, 2), a].map(f16::to_bits);
+            assert_eq!(px[i * 4..i * 4 + 4], expected, "pixel {i}, alpha {alpha}");
+        }
+    }
+}

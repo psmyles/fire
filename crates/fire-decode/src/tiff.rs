@@ -114,7 +114,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> 
         .ok()
         .filter(|v| !v.is_empty());
 
-    let samples = match dec.read_image() {
+    let samples = match read_strips_parallel(bytes, &mut dec).unwrap_or_else(|| dec.read_image()) {
         Ok(s) => s,
         Err(e) => return Some(Err(DecodeError::Malformed(e.to_string()))),
     };
@@ -134,22 +134,29 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> 
             "TIFF sample data is shorter than its dimensions declare".into(),
         )));
     }
+    // The CPU shader reads Rgba16Unorm / Rgba32Float back as native-endian, matching the other
+    // backends.
     let (pixels, format, bit_depth) = match samples {
+        // Straight RGBA8 is already the output layout: hand the buffer over rather than copy it.
+        DecodingResult::U8(mut v) if src_channels == 4 && !premultiplied => {
+            v.truncate(want);
+            (v, PixelFormat::Rgba8Unorm, 8u8)
+        }
         DecodingResult::U8(v) => (
-            expand::<u8>(&v, n, src_channels, 255, premultiplied),
+            widen(&v, n, src_channels, 255, premultiplied),
             PixelFormat::Rgba8Unorm,
             8u8,
         ),
-        DecodingResult::U16(v) => {
-            let rgba = expand::<u16>(&v, n, src_channels, u16::MAX, premultiplied);
-            // The CPU shader reads Rgba16Unorm / Rgba32Float back as native-endian,
-            // matching the other backends.
-            (crate::to_ne_bytes(&rgba), PixelFormat::Rgba16Unorm, 16)
-        }
-        DecodingResult::F32(v) => {
-            let rgba = expand::<f32>(&v, n, src_channels, 1.0, premultiplied);
-            (crate::to_ne_bytes(&rgba), PixelFormat::Rgba32Float, 32)
-        }
+        DecodingResult::U16(v) => (
+            widen(&v, n, src_channels, u16::MAX, premultiplied),
+            PixelFormat::Rgba16Unorm,
+            16,
+        ),
+        DecodingResult::F32(v) => (
+            widen(&v, n, src_channels, 1.0, premultiplied),
+            PixelFormat::Rgba32Float,
+            32,
+        ),
         // 64-bit, signed, and half-float TIFFs are rare enough that the `image` crate's
         // conversions are a better answer than a hand-rolled one here.
         _ => return None,
@@ -170,6 +177,107 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> 
         layout: None,
         animation: None,
     }))
+}
+
+/// Read the image's samples one strip per task, across threads, into the same interleaved buffer
+/// `read_image` would return. `None` when the layout is not one this handles — tiles, planar
+/// configuration, a single strip, a sample type other than 8/16-bit unsigned or 32-bit float —
+/// and the caller reads the image the ordinary, sequential way.
+///
+/// Strips are independent by construction (each is compressed on its own, so a decoder can start
+/// at any of them), and a compressed TIFF is all strip decoding: an 8192² LZW or Deflate file took
+/// ~1.2 s / ~0.9 s on one thread against ~0.15 s uncompressed. Each thread opens its own decoder
+/// over the same bytes — re-reading the IFD costs microseconds — and decodes a contiguous run of
+/// strips straight into its own slice of the output, which is exactly the row range they cover.
+fn read_strips_parallel(
+    bytes: &[u8],
+    dec: &mut Decoder<Cursor<&[u8]>>,
+) -> Option<tiff::TiffResult<DecodingResult>> {
+    use tiff::decoder::{ChunkType, DecodingSampleType};
+
+    if dec.get_chunk_type() != ChunkType::Strip
+        || dec
+            .find_tag_unsigned::<u16>(Tag::PlanarConfiguration)
+            .ok()
+            .flatten()
+            .is_some_and(|p| p != 1)
+    {
+        return None;
+    }
+    let strips = dec.strip_count().ok()? as usize;
+    let layout = dec.image_buffer_layout().ok()?;
+    let rows_per_strip = dec.chunk_dimensions().1 as usize;
+    let row_stride = layout.row_stride?.get();
+    let strip_bytes = rows_per_strip.checked_mul(row_stride)?;
+    // Every strip but the last is exactly `strip_bytes`; the last is whatever is left. Anything
+    // else (a strip layout that does not tile the image the way the arithmetic says) is left to
+    // the crate.
+    let last = strips.checked_sub(1)?;
+    if strips < 2
+        || dec.image_chunk_buffer_layout(0).ok()?.len != strip_bytes
+        || last * strip_bytes + dec.image_chunk_buffer_layout(last as u32).ok()?.len != layout.len
+    {
+        return None;
+    }
+
+    fn read<T: bytemuck::Pod + Default + Send>(
+        bytes: &[u8],
+        total: usize,
+        strip_bytes: usize,
+    ) -> tiff::TiffResult<Vec<T>> {
+        let mut out = vec![T::default(); total / std::mem::size_of::<T>()];
+        let error = std::sync::Mutex::new(None);
+        crate::par_chunks_mut(
+            bytemuck::cast_slice_mut(&mut out),
+            strip_bytes,
+            |offset, part| {
+                let result = (|| {
+                    let mut dec =
+                        Decoder::new(Cursor::new(bytes))?.with_limits(Limits::unlimited());
+                    let first = offset / strip_bytes;
+                    for (i, strip) in part.chunks_mut(strip_bytes).enumerate() {
+                        dec.read_chunk_bytes((first + i) as u32, strip)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    *error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                }
+            },
+        );
+        match error.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
+    let total = layout.len;
+    Some(match layout.sample_type? {
+        DecodingSampleType::U8 => read::<u8>(bytes, total, strip_bytes).map(DecodingResult::U8),
+        DecodingSampleType::U16 => read::<u16>(bytes, total, strip_bytes).map(DecodingResult::U16),
+        DecodingSampleType::F32 => read::<f32>(bytes, total, strip_bytes).map(DecodingResult::F32),
+        _ => return None,
+    })
+}
+
+/// Widen `pixels` pixels of `src` to RGBA bytes: [`crate::rgba_bytes`]' parallel pass for straight
+/// alpha, the un-premultiplying [`expand`] for associated alpha.
+fn widen<T: Sample + bytemuck::Pod + Sync>(
+    src: &[T],
+    pixels: usize,
+    channels: u8,
+    opaque: T,
+    premultiplied: bool,
+) -> Vec<u8> {
+    if premultiplied {
+        crate::to_ne_bytes(&expand(src, pixels, channels, opaque, true))
+    } else {
+        crate::rgba_bytes(
+            &src[..pixels * channels as usize],
+            channels as usize,
+            opaque,
+        )
+    }
 }
 
 /// One sample type's worth of "widen to RGBA".
@@ -480,6 +588,51 @@ mod tests {
                 "grey replicates across RGB and the second sample is alpha"
             );
         }
+    }
+
+    /// A compressed, many-strip TIFF big enough to be decoded on several threads comes back
+    /// exactly as written — 8-bit RGB and 16-bit RGBA alike, so both the widening and the
+    /// pass-through land on the strip boundaries correctly. Odd dimensions and a strip height that
+    /// does not divide the image leave a short last strip, the case the layout check exists for.
+    #[test]
+    fn many_strip_compressed_tiff_reads_in_parallel() {
+        use tiff::encoder::{colortype, Compression, TiffEncoder};
+
+        let (w, h) = (701u32, 523u32);
+        let rgb: Vec<u8> = (0..w * h * 3)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        let rgba16: Vec<u16> = (0..w * h * 4)
+            .map(|i| i.wrapping_mul(2_654_435_761) as u16)
+            .collect();
+
+        let mut file = Cursor::new(Vec::new());
+        let mut enc = TiffEncoder::new(&mut file)
+            .unwrap()
+            .with_compression(Compression::Lzw);
+        let mut img = enc.new_image::<colortype::RGB8>(w, h).unwrap();
+        img.rows_per_strip(7).unwrap();
+        img.write_data(&rgb).unwrap();
+        let out = run(&file.into_inner());
+        assert_eq!((out.width, out.height, out.channels), (w, h, 3));
+        let expected: Vec<u8> = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect();
+        assert!(out.pixels == expected, "8-bit RGB");
+
+        let mut file = Cursor::new(Vec::new());
+        let mut enc = TiffEncoder::new(&mut file)
+            .unwrap()
+            .with_compression(Compression::Lzw);
+        let mut img = enc.new_image::<colortype::RGBA16>(w, h).unwrap();
+        img.rows_per_strip(5).unwrap();
+        img.write_data(&rgba16).unwrap();
+        let out = run(&file.into_inner());
+        assert_eq!(out.format, PixelFormat::Rgba16Unorm);
+        assert!(out.pixels == crate::to_ne_bytes(&rgba16), "16-bit RGBA");
     }
 
     /// 16-bit TIFFs keep 16 bits. The `image` adapter special-cased only float, so everything

@@ -4,7 +4,7 @@
 //! never see per-format detail. Routing is by magic bytes (and, for camera raw, the file
 //! extension, since the many TIFF-structured raws can't be told from plain TIFF by header):
 //!   - PSD            -> psd_sdk (C++ FFI) : merged composite, 8-bit RGBA (+ICC)
-//!   - EXR            -> `exr` crate       : 32-bit float RGBA (linear/HDR)
+//!   - EXR            -> `exr` crate       : half or 32-bit float RGBA, as stored (linear/HDR)
 //!   - DDS            -> `ddsfile` + `bcdec_rs`: BC1-BC7 and the uncompressed layouts
 //!   - HEIC/HEIF/AVIF -> libheif (C FFI)   : 8-bit RGBA, or 16-bit RGBA for HDR (+ICC)
 //!   - camera raw     -> [`raw`] preview   : extract the embedded JPEG, decode via zune
@@ -116,6 +116,50 @@ fn check_dims(
 /// that can be gigabytes — and there were seven of them.
 pub(crate) fn to_ne_bytes<T: bytemuck::Pod>(v: &[T]) -> Vec<u8> {
     bytemuck::cast_slice(v).to_vec()
+}
+
+/// Run `f` over `buf` split into contiguous parts, each a whole number of `unit`-byte items, on
+/// up to 8 scoped threads; `f` also gets the part's byte offset into `buf`. A buffer under 1 MiB
+/// runs on the calling thread: below that the hand-off costs more than the work.
+pub(crate) fn par_chunks_mut(buf: &mut [u8], unit: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
+    const PARALLEL_MIN_BYTES: usize = 1 << 20;
+    let threads = if buf.len() >= PARALLEL_MIN_BYTES {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+    } else {
+        1
+    };
+    if threads <= 1 {
+        f(0, buf);
+        return;
+    }
+    let per = buf.len().div_ceil(threads).div_ceil(unit) * unit;
+    std::thread::scope(|scope| {
+        for (i, part) in buf.chunks_mut(per).enumerate() {
+            let f = &f;
+            scope.spawn(move || f(i * per, part));
+        }
+    });
+}
+
+/// [`par_chunks_mut`] for a buffer that is only read.
+pub(crate) fn par_chunks(buf: &[u8], unit: usize, f: impl Fn(usize, &[u8]) + Sync) {
+    const PARALLEL_MIN_BYTES: usize = 1 << 20;
+    let threads = if buf.len() >= PARALLEL_MIN_BYTES {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+    } else {
+        1
+    };
+    if threads <= 1 {
+        f(0, buf);
+        return;
+    }
+    let per = buf.len().div_ceil(threads).div_ceil(unit) * unit;
+    std::thread::scope(|scope| {
+        for (i, part) in buf.chunks(per).enumerate() {
+            let f = &f;
+            scope.spawn(move || f(i * per, part));
+        }
+    });
 }
 
 /// Every file extension fire can open, lower-case.
@@ -632,35 +676,59 @@ pub fn decode(
     Ok(img)
 }
 
-/// Whether the normalized RGBA buffer is fully opaque (every alpha sample at its max). A cheap
-/// linear scan over just the alpha lane that short-circuits on the first transparent sample;
-/// run once per decode off the UI thread (see [`decode`]).
+/// Whether the normalized RGBA buffer is fully opaque (every alpha sample at its max). Run once
+/// per decode off the UI thread (see [`decode`]).
+///
+/// A scan over just the alpha lane, split across threads and taken a 64 KiB block at a time: each
+/// block is checked without an early exit, which is what lets it vectorize, and the scan stops
+/// between blocks as soon as any thread has found a transparent sample. On an opaque 8192² RGBA8
+/// image — the case that has to read everything — that is ~4 ms against ~25 ms for the
+/// sample-at-a-time loop it replaced.
 fn alpha_is_opaque(img: &DecodedImage) -> bool {
-    let px = &img.pixels;
-    match img.format {
-        // 8-bit: 4 bytes/px, alpha is byte 3; opaque == 0xff.
-        PixelFormat::Rgba8Unorm => px.as_chunks::<4>().0.iter().all(|p| p[3] == 0xff),
-        // 16-bit unorm (native-endian u16): 8 bytes/px, alpha is bytes 6..8; opaque == 0xffff.
-        PixelFormat::Rgba16Unorm => px
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .all(|p| p[6] == 0xff && p[7] == 0xff),
-        // 16-bit half-float: opaque == 1.0 == 0x3c00. No decode path emits this today, but keep
-        // the lane handling exhaustive over PixelFormat.
-        PixelFormat::Rgba16Float => px
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .all(|p| u16::from_ne_bytes([p[6], p[7]]) == 0x3c00),
-        // 32-bit float (linear/HDR): 16 bytes/px, alpha is the 4th f32. Opaque == 1.0; values
-        // above 1.0 count as opaque, NaN does not (keeping the alpha channel is the safe default).
-        PixelFormat::Rgba32Float => px
-            .as_chunks::<16>()
-            .0
-            .iter()
-            .all(|p| f32::from_ne_bytes([p[12], p[13], p[14], p[15]]) >= 1.0),
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn block_is_opaque(format: PixelFormat, block: &[u8]) -> bool {
+        match format {
+            // 8-bit: 4 bytes/px, alpha is byte 3; opaque == 0xff.
+            PixelFormat::Rgba8Unorm => {
+                block.as_chunks::<4>().0.iter().fold(0xff, |m, p| m & p[3]) == 0xff
+            }
+            // 16-bit unorm (native-endian u16): 8 bytes/px, alpha is bytes 6..8; opaque == 0xffff.
+            PixelFormat::Rgba16Unorm => {
+                block
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .fold(0xffff, |m, p| m & u16::from_ne_bytes([p[6], p[7]]))
+                    == 0xffff
+            }
+            // 16-bit half-float (half-float OpenEXR, RGBA16F/BC6H DDS): opaque == 1.0 == 0x3c00.
+            PixelFormat::Rgba16Float => block.as_chunks::<8>().0.iter().fold(true, |ok, p| {
+                ok & (u16::from_ne_bytes([p[6], p[7]]) == 0x3c00)
+            }),
+            // 32-bit float (linear/HDR): 16 bytes/px, alpha is the 4th f32. Opaque == 1.0; values
+            // above 1.0 count as opaque, NaN does not (keeping the alpha channel is the safe
+            // default).
+            PixelFormat::Rgba32Float => block.as_chunks::<16>().0.iter().fold(true, |ok, p| {
+                ok & (f32::from_ne_bytes([p[12], p[13], p[14], p[15]]) >= 1.0)
+            }),
+        }
     }
+
+    const BLOCK_BYTES: usize = 64 * 1024; // a whole number of pixels at every bytes-per-pixel
+    let transparent = AtomicBool::new(false);
+    par_chunks(&img.pixels, BLOCK_BYTES, |_, part| {
+        for block in part.chunks(BLOCK_BYTES) {
+            if transparent.load(Ordering::Relaxed) {
+                return;
+            }
+            if !block_is_opaque(img.format, block) {
+                transparent.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+    });
+    !transparent.into_inner()
 }
 
 /// Convenience wrapper: read a file and decode it (used by the decode worker).
@@ -722,7 +790,103 @@ fn decode_psd(_bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     ))
 }
 
-/// OpenEXR via the `exr` crate → 32-bit float RGBA (linear/HDR).
+/// The OpenEXR fast path: read the first layer's channels as the file stores them, then
+/// interleave R, G, B and (if present) A on several threads.
+///
+/// A file whose four channels are all half-float stays half: `Rgba16Float`, which every consumer
+/// of a decoded image already handles (BC6H and RGBA16F DDS arrive that way). That is lossless,
+/// and it halves everything downstream of the decode — the buffer, the mip chain and the upload
+/// (1 GiB instead of 2 for a 16384×8192 HDRI). Any float or uint channel widens the lot to
+/// `Rgba32Float`, converted exactly as the general reader converts.
+///
+/// The general reader ([`decode_exr`]'s `rgba_channels` path) hands over one pixel at a time to a
+/// closure on a single thread and builds an `f32` buffer that then had to be copied out as bytes;
+/// on that 16K HDRI that was ~1.2 s of a ~1.5 s open. `None` sends the file there anyway: a first
+/// layer without plain `R`, `G`, `B` channels (the names it requires), a subsampled channel, or
+/// anything this reader fails on.
+fn decode_exr_planes(bytes: &[u8]) -> Option<DecodedImage> {
+    use exr::prelude::*;
+
+    let image = read()
+        .no_deep_data()
+        .largest_resolution_level()
+        .all_channels()
+        .first_valid_layer()
+        .all_attributes()
+        .from_buffered(Cursor::new(bytes))
+        .ok()?;
+    let layer = &image.layer_data;
+    let list = &layer.channel_data.list;
+    let find = |name: &str| list.iter().find(|c| c.name == *name);
+    let mut channels = vec![find("R")?, find("G")?, find("B")?];
+    channels.extend(find("A"));
+    if channels.iter().any(|c| c.sampling != Vec2(1, 1)) {
+        return None;
+    }
+    let n = layer.size.width() * layer.size.height();
+    let has_alpha = channels.len() == 4;
+    let halves: Option<Vec<&[f16]>> = channels
+        .iter()
+        .map(|c| match &c.sample_data {
+            FlatSamples::F16(v) => Some(v.as_slice()),
+            _ => None,
+        })
+        .collect();
+
+    let (pixels, format) = if let Some(planes) = halves {
+        if planes.iter().any(|p| p.len() < n) {
+            return None;
+        }
+        const HALF_ONE: u16 = 0x3c00;
+        let mut out = vec![0u8; n * 8];
+        par_chunks_mut(&mut out, 8, |offset, part| {
+            let first = offset / 8;
+            for (i, px) in part.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                let at = first + i;
+                let a = planes.get(3).map_or(HALF_ONE, |p| p[at].to_bits());
+                let rgba = [
+                    planes[0][at].to_bits(),
+                    planes[1][at].to_bits(),
+                    planes[2][at].to_bits(),
+                    a,
+                ];
+                for (c, v) in rgba.into_iter().enumerate() {
+                    px[c * 2..c * 2 + 2].copy_from_slice(&v.to_ne_bytes());
+                }
+            }
+        });
+        (out, PixelFormat::Rgba16Float)
+    } else {
+        // The general reader's conversions: `f16::to_f32`, and a uint sample as its value.
+        let sample = |s: &FlatSamples, at: usize| match s {
+            FlatSamples::F16(v) => v[at].to_f32(),
+            FlatSamples::F32(v) => v[at],
+            FlatSamples::U32(v) => v[at] as f32,
+        };
+        if channels.iter().any(|c| c.sample_data.len() < n) {
+            return None;
+        }
+        let mut out = vec![0u8; n * 16];
+        par_chunks_mut(&mut out, 16, |offset, part| {
+            let first = offset / 16;
+            for (i, px) in part.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+                let at = first + i;
+                let s = |c: usize| sample(&channels[c].sample_data, at);
+                let a = if has_alpha { s(3) } else { 1.0 };
+                for (c, v) in [s(0), s(1), s(2), a].into_iter().enumerate() {
+                    px[c * 4..c * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+                }
+            }
+        });
+        (out, PixelFormat::Rgba32Float)
+    };
+    let dims = (layer.size.width(), layer.size.height());
+    let channels = if has_alpha { 4 } else { 3 };
+    Some(still(pixels, dims, format, channels, None, "OpenEXR"))
+}
+
+/// OpenEXR via the `exr` crate → 32-bit float RGBA (linear/HDR), for what
+/// [`decode_exr_planes`] declines.
 ///
 /// The headers are parsed on their own first, because the `rgba_channels` size closure below
 /// cannot fail: it allocates 16 bytes per declared pixel and hands the buffer back by value, so a
@@ -745,6 +909,10 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         let size = header.layer_size;
         // 16 bytes/px: the closure's `[f32; 4]` buffer, and again for the `Vec<u8>` built from it.
         check_dims(size.width(), size.height(), 16, "OpenEXR")?;
+    }
+
+    if let Some(img) = decode_exr_planes(bytes) {
+        return Ok(img);
     }
 
     let image = read()
@@ -879,7 +1047,7 @@ fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     let decoder = image::codecs::hdr::HdrDecoder::with_strictness(Cursor::new(bytes), false)
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
     // Constructed directly (not via `ImageReader`), so the reader's default memory limits don't
-    // apply — the header guard is ours to make, exactly as in `decode_png`. `into_rgba32f` below
+    // apply — the header guard is ours to make, exactly as in `decode_png`. `into_rgba32f_bytes` below
     // allocates 16 bytes per declared pixel.
     let (w, h) = decoder.dimensions();
     check_dims(w as usize, h as usize, 16, "Radiance HDR")?;
@@ -888,8 +1056,7 @@ fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
     let (width, height) = (dynimg.width(), dynimg.height());
 
-    let rgba = dynimg.into_rgba32f();
-    let pixels = to_ne_bytes(rgba.as_raw());
+    let pixels = into_rgba32f_bytes(dynimg);
 
     Ok(DecodedImage {
         pixels,
@@ -908,50 +1075,106 @@ fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     })
 }
 
-/// `DynamicImage::into_rgba8`, as a raw buffer — minus the `image` crate's slow path for grey
-/// sources.
+/// `DynamicImage::into_rgba8`, as a raw buffer — minus the `image` crate's slow paths.
 ///
 /// Since 0.25 the crate's RGBA conversions go through a colour-space-aware cast that has direct
 /// paths only for same-layout and RGB → RGBA. Grey and grey+alpha fall back to expanding every
 /// pixel through `f32` and back, which made an 8192² greyscale TGA spend ~420 ms converting —
-/// nearly 10× what the three-times-larger RGB file took. The expansion it computes is exactly the
-/// grey sample copied to R, G and B, so do that here and leave every other layout to the crate.
+/// nearly 10× what the three-times-larger RGB file took — and even the direct RGB path runs on one
+/// thread. Every layout here is a plain widening (the sample copied to R, G and B, opaque alpha),
+/// so [`rgba_bytes`] does it; an RGBA source is handed over as is, and anything else is left to
+/// the crate.
 fn into_rgba8(img: image::DynamicImage) -> Vec<u8> {
     use image::DynamicImage;
     match img {
-        DynamicImage::ImageLuma8(b) => expand_luma(b.as_raw(), 1, u8::MAX),
-        DynamicImage::ImageLumaA8(b) => expand_luma(b.as_raw(), 2, u8::MAX),
+        DynamicImage::ImageLuma8(b) => rgba_bytes(b.as_raw(), 1, u8::MAX),
+        DynamicImage::ImageLumaA8(b) => rgba_bytes(b.as_raw(), 2, u8::MAX),
+        DynamicImage::ImageRgb8(b) => rgba_bytes(b.as_raw(), 3, u8::MAX),
+        DynamicImage::ImageRgba8(b) => b.into_raw(),
         other => other.into_rgba8().into_raw(),
     }
 }
 
-/// [`into_rgba8`] for 16-bit sources, with the same fix.
-fn into_rgba16(img: image::DynamicImage) -> Vec<u16> {
+/// [`into_rgba8`] for 16-bit sources, straight to the native-endian bytes `Rgba16Unorm` carries
+/// (no intermediate `Vec<u16>` to copy out of).
+fn into_rgba16_bytes(img: image::DynamicImage) -> Vec<u8> {
     use image::DynamicImage;
     match img {
-        DynamicImage::ImageLuma16(b) => expand_luma(b.as_raw(), 1, u16::MAX),
-        DynamicImage::ImageLumaA16(b) => expand_luma(b.as_raw(), 2, u16::MAX),
-        other => other.into_rgba16().into_raw(),
+        DynamicImage::ImageLuma16(b) => rgba_bytes(b.as_raw(), 1, u16::MAX),
+        DynamicImage::ImageLumaA16(b) => rgba_bytes(b.as_raw(), 2, u16::MAX),
+        DynamicImage::ImageRgb16(b) => rgba_bytes(b.as_raw(), 3, u16::MAX),
+        DynamicImage::ImageRgba16(b) => rgba_bytes(b.as_raw(), 4, u16::MAX),
+        other => to_ne_bytes(other.into_rgba16().as_raw()),
     }
 }
 
-/// Expand interleaved grey (`channels == 1`) or grey+alpha (`channels == 2`) samples to RGBA,
-/// with `opaque` as the alpha of a source that has none. The output is allocated up front and
-/// filled as fixed-size pixel arrays, which is the shape LLVM vectorizes.
-fn expand_luma<T: Copy>(src: &[T], channels: usize, opaque: T) -> Vec<T> {
-    debug_assert!(matches!(channels, 1 | 2));
-    let mut out = vec![opaque; src.len() / channels * 4];
-    let px = out.as_chunks_mut::<4>().0;
-    if channels == 1 {
-        for (o, &g) in px.iter_mut().zip(src) {
-            *o = [g, g, g, opaque];
-        }
-    } else {
-        for (o, &[g, a]) in px.iter_mut().zip(src.as_chunks::<2>().0) {
-            *o = [g, g, g, a];
-        }
+/// [`into_rgba8`] for float sources, straight to the native-endian bytes `Rgba32Float` carries.
+fn into_rgba32f_bytes(img: image::DynamicImage) -> Vec<u8> {
+    use image::DynamicImage;
+    match img {
+        DynamicImage::ImageRgb32F(b) => rgba_bytes(b.as_raw(), 3, 1.0f32),
+        DynamicImage::ImageRgba32F(b) => rgba_bytes(b.as_raw(), 4, 1.0f32),
+        other => to_ne_bytes(other.into_rgba32f().as_raw()),
     }
+}
+
+/// Widen interleaved samples — grey (`channels == 1`), grey+alpha (2), RGB (3) or RGBA (4) — to
+/// RGBA, as the native-endian bytes every [`PixelFormat`] is carried in. Grey is copied to R, G
+/// and B; a source without alpha gets `opaque`.
+///
+/// This is every backend's last pass over the pixels, so it is written to cost one read and one
+/// write of the buffer: split across threads ([`par_chunks_mut`]), each part filled as fixed-size
+/// pixel arrays (the shape LLVM vectorizes), and written straight into the byte buffer that is
+/// returned rather than into a typed one that would then be copied out.
+pub(crate) fn rgba_bytes<T: bytemuck::Pod + Sync>(
+    src: &[T],
+    channels: usize,
+    opaque: T,
+) -> Vec<u8> {
+    debug_assert!(matches!(channels, 1..=4));
+    let size = std::mem::size_of::<T>();
+    let pixels = src.len() / channels;
+    let mut out = vec![0u8; pixels * 4 * size];
+    par_chunks_mut(&mut out, 4 * size, |offset, part| {
+        let first = offset / (4 * size);
+        let n = part.len() / (4 * size);
+        let src = &src[first * channels..(first + n) * channels];
+        match bytemuck::try_cast_slice_mut::<u8, T>(part) {
+            Ok(typed) => widen_to_rgba(src, channels, opaque, typed),
+            // A byte buffer is only guaranteed byte alignment. Every allocator fire runs on
+            // hands back more for a buffer this size, so this is the path never taken — but
+            // it must still be correct: widen into an aligned scratch and copy its bytes.
+            Err(_) => {
+                let mut scratch = vec![opaque; n * 4];
+                widen_to_rgba(src, channels, opaque, &mut scratch);
+                part.copy_from_slice(bytemuck::cast_slice(&scratch));
+            }
+        }
+    });
     out
+}
+
+/// The per-part body of [`rgba_bytes`]: `src` holds exactly the pixels `out` (RGBA) has room for.
+fn widen_to_rgba<T: Copy>(src: &[T], channels: usize, opaque: T, out: &mut [T]) {
+    let px = out.as_chunks_mut::<4>().0;
+    match channels {
+        1 => {
+            for (o, &g) in px.iter_mut().zip(src) {
+                *o = [g, g, g, opaque];
+            }
+        }
+        2 => {
+            for (o, &[g, a]) in px.iter_mut().zip(src.as_chunks::<2>().0) {
+                *o = [g, g, g, a];
+            }
+        }
+        3 => {
+            for (o, &[r, g, b]) in px.iter_mut().zip(src.as_chunks::<3>().0) {
+                *o = [r, g, b, opaque];
+            }
+        }
+        _ => out.copy_from_slice(src),
+    }
 }
 
 /// PNG via the `image` crate → RGBA8, or RGBA16 for 16-bit sources (precision preserved
@@ -998,8 +1221,7 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     );
     let (pixels, format, bit_depth) = if is_16bit {
         // The CPU shader reads Rgba16Unorm back as native-endian u16.
-        let rgba = into_rgba16(dynimg);
-        (to_ne_bytes(&rgba), PixelFormat::Rgba16Unorm, 16u8)
+        (into_rgba16_bytes(dynimg), PixelFormat::Rgba16Unorm, 16u8)
     } else {
         (into_rgba8(dynimg), PixelFormat::Rgba8Unorm, 8)
     };
@@ -1066,27 +1288,410 @@ fn check_zune_dims(
     check_dims(width, height, bpp, zune_format_name(fmt))
 }
 
-/// The hot path: zune for JPEG/BMP/QOI/PPM/WebP/farbfeld/JPEG-XL. Decoded with
-/// the speed-first options, normalized to interleaved RGBA in the source bit depth, and
-/// carrying the embedded ICC profile where the format exposes one.
+/// The speed-first options every zune decoder runs with: platform intrinsics and unsafe fast
+/// paths on, and the dimension guard raised well past zune's 16384 default so large sources
+/// decode (the downscale pass shrinks anything beyond the caller's `max_dim` afterwards).
+fn zune_options() -> zune_core::options::DecoderOptions {
+    zune_core::options::DecoderOptions::new_fast()
+        .set_max_width(MAX_DECODE_DIM)
+        .set_max_height(MAX_DECODE_DIM)
+}
+
+/// The hot path: zune for JPEG/BMP/QOI/PPM/WebP/farbfeld/JPEG-XL.
+///
+/// Each format's own decoder is called directly and its interleaved output widened to RGBA in one
+/// pass ([`rgba_bytes`]). `zune_image::Image::read`, which this used to go through for all of them,
+/// splits the decoded pixels into one plane per channel, allocates and fills an alpha plane, and
+/// interleaves the lot back together: three extra passes over the image, ~70 ms of an 8192²
+/// JPEG's ~400. It remains the fallback for what the direct paths decline ([`decode_zune_image`]).
+fn decode_zune(
+    bytes: &[u8],
+    fmt: zune_image::codecs::ImageFormat,
+) -> Result<DecodedImage, DecodeError> {
+    use zune_image::codecs::ImageFormat as Z;
+    let direct = match fmt {
+        Z::JPEG => Some(decode_jpeg(bytes)?),
+        Z::BMP => decode_bmp(bytes)?,
+        Z::QOI => decode_qoi(bytes)?,
+        Z::PPM => decode_ppm(bytes)?,
+        Z::Farbfeld => Some(decode_farbfeld(bytes)?),
+        Z::WEBP => decode_webp(bytes)?,
+        Z::JPEG_XL => decode_jxl(bytes)?,
+        _ => None,
+    };
+    match direct {
+        Some(img) => Ok(img),
+        None => decode_zune_image(bytes, fmt),
+    }
+}
+
+fn malformed(e: impl std::fmt::Debug) -> DecodeError {
+    DecodeError::Malformed(format!("{e:?}"))
+}
+
+/// The fields every still, single-level image fills the same way.
+fn still(
+    pixels: Vec<u8>,
+    (width, height): (usize, usize),
+    format: PixelFormat,
+    channels: u8,
+    icc: Option<Vec<u8>>,
+    source_format: &'static str,
+) -> DecodedImage {
+    let bit_depth = match format {
+        PixelFormat::Rgba8Unorm => 8,
+        PixelFormat::Rgba16Unorm | PixelFormat::Rgba16Float => 16,
+        PixelFormat::Rgba32Float => 32,
+    };
+    DecodedImage {
+        pixels,
+        width: width as u32,
+        height: height as u32,
+        format,
+        bit_depth,
+        channels,
+        icc,
+        source_format,
+        alpha_opaque: false, // set by `decode` after the final buffer is built
+        downscaled_from: None,
+        source_mips: None,
+        layout: None,
+        animation: None,
+    }
+}
+
+/// An 8-bit interleaved zune buffer in `cs`, widened to RGBA, with the source's channel count.
+/// `None` for a layout this does not widen (CMYK, BGR, …), which sends the file to
+/// [`decode_zune_image`].
+fn zune_rgba8(cs: zune_core::colorspace::ColorSpace, px: Vec<u8>) -> Option<(Vec<u8>, u8)> {
+    use zune_core::colorspace::ColorSpace;
+    let channels = match cs {
+        ColorSpace::Luma => 1,
+        ColorSpace::LumaA => 2,
+        ColorSpace::RGB => 3,
+        ColorSpace::RGBA => return Some((px, 4)),
+        _ => return None,
+    };
+    Some((rgba_bytes(&px, channels, u8::MAX), channels as u8))
+}
+
+/// JPEG through zune-jpeg, decoded straight into RGBA. The header is read once, here, and the
+/// [`check_dims`] guard applied to it before anything is allocated.
+///
+/// CMYK/YCCK are decoded to RGB and widened rather than asked for as RGBA: zune-jpeg's RGBA output
+/// converts ink through a different path than its RGB one, and the RGB one is what fire has
+/// always shown.
+fn decode_jpeg(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    use zune_core::bytestream::ZCursor;
+    use zune_core::colorspace::ColorSpace;
+
+    // The output colorspace has to be chosen before the header is read — zune-jpeg sets up its
+    // per-component output state from it there — so CMYK, which only the header reveals, costs a
+    // second (microseconds-long) header parse.
+    let open = |out: ColorSpace| -> Result<_, DecodeError> {
+        let opts = zune_options().jpeg_set_out_colorspace(out);
+        let mut d = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), opts);
+        d.decode_headers().map_err(malformed)?;
+        Ok(d)
+    };
+    let mut d = open(ColorSpace::RGBA)?;
+    let info = d
+        .info()
+        .ok_or_else(|| malformed("JPEG has no frame header"))?;
+    let dims = (info.width as usize, info.height as usize);
+    check_dims(dims.0, dims.1, 4, "JPEG")?;
+    let input = d.input_colorspace().unwrap_or(ColorSpace::RGB);
+    let ink = matches!(input, ColorSpace::CMYK | ColorSpace::YCCK);
+    if ink {
+        d = open(ColorSpace::RGB)?;
+    }
+    let px = d.decode().map_err(malformed)?;
+    let pixels = if ink { rgba_bytes(&px, 3, u8::MAX) } else { px };
+    // The channels the *file* carries, for the status bar: a JPEG has no alpha, and its grey
+    // variant is one channel even though it is shown as RGBA.
+    let channels = if input.num_components() == 1 { 1 } else { 3 };
+    let icc = d.icc_profile();
+    Ok(still(
+        pixels,
+        dims,
+        PixelFormat::Rgba8Unorm,
+        channels,
+        icc,
+        "JPEG",
+    ))
+}
+
+/// BMP. 24-bit goes through zune-bmp (the faster of the two decoders for it); every other depth
+/// through the `image` crate, whose 32-bit and palette paths measured 3× and 1.8× faster than
+/// zune-bmp's on an 8192² file (156 vs 502 ms, 264 vs 476 ms) for identical pixels. `None`
+/// (→ the generic zune path) only for a 24-bit layout zune hands back as something unexpected.
+fn decode_bmp(bytes: &[u8]) -> Result<Option<DecodedImage>, DecodeError> {
+    use zune_core::bytestream::ZCursor;
+
+    // BITMAPINFOHEADER and every later version: header size at 14, bits per pixel at 28. The
+    // 12-byte OS/2 header keeps its depth elsewhere, and goes to the `image` crate, which reads it.
+    let le16 = |at: usize| {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    let le32 = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if !(le32(14).is_some_and(|h| h >= 40) && le16(28) == Some(24)) {
+        return decode_image(bytes, Some("bmp")).map(Some);
+    }
+    let mut d = zune_bmp::BmpDecoder::new_with_options(ZCursor::new(bytes), zune_options());
+    d.decode_headers().map_err(malformed)?;
+    let dims = d
+        .dimensions()
+        .ok_or_else(|| malformed("BMP has no dimensions"))?;
+    check_dims(dims.0, dims.1, 4, "BMP")?;
+    let cs = d
+        .colorspace()
+        .ok_or_else(|| malformed("BMP has no colorspace"))?;
+    let px = d.decode().map_err(malformed)?;
+    Ok(zune_rgba8(cs, px)
+        .map(|(pixels, ch)| still(pixels, dims, PixelFormat::Rgba8Unorm, ch, None, "BMP")))
+}
+
+fn decode_qoi(bytes: &[u8]) -> Result<Option<DecodedImage>, DecodeError> {
+    use zune_core::bytestream::ZCursor;
+
+    let mut d = zune_qoi::QoiDecoder::new_with_options(ZCursor::new(bytes), zune_options());
+    d.decode_headers().map_err(malformed)?;
+    let dims = d
+        .dimensions()
+        .ok_or_else(|| malformed("QOI has no dimensions"))?;
+    check_dims(dims.0, dims.1, 4, "QOI")?;
+    let cs = d
+        .colorspace()
+        .ok_or_else(|| malformed("QOI has no colorspace"))?;
+    let px = d.decode().map_err(malformed)?;
+    Ok(zune_rgba8(cs, px)
+        .map(|(pixels, ch)| still(pixels, dims, PixelFormat::Rgba8Unorm, ch, None, "QOI")))
+}
+
+/// PPM/PGM/PBM/PAM, and the float PFM, at the file's own depth.
+fn decode_ppm(bytes: &[u8]) -> Result<Option<DecodedImage>, DecodeError> {
+    use zune_core::bit_depth::BitDepth;
+    use zune_core::bytestream::ZCursor;
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::result::DecodingResult;
+
+    let mut d = zune_ppm::PPMDecoder::new_with_options(ZCursor::new(bytes), zune_options());
+    d.decode_headers().map_err(malformed)?;
+    let dims = d
+        .dimensions()
+        .ok_or_else(|| malformed("PPM has no dimensions"))?;
+    let cs = d
+        .colorspace()
+        .ok_or_else(|| malformed("PPM has no colorspace"))?;
+    let channels = match cs {
+        ColorSpace::Luma => 1,
+        ColorSpace::LumaA => 2,
+        ColorSpace::RGB => 3,
+        ColorSpace::RGBA => 4,
+        _ => return Ok(None),
+    };
+    let sample = match d.bit_depth() {
+        Some(BitDepth::Sixteen) => 2,
+        Some(BitDepth::Float32) => 4,
+        _ => 1,
+    };
+    check_dims(dims.0, dims.1, 4 * sample, "PPM")?;
+    let (pixels, format) = match d.decode().map_err(malformed)? {
+        DecodingResult::U8(v) => (rgba_bytes(&v, channels, u8::MAX), PixelFormat::Rgba8Unorm),
+        DecodingResult::U16(v) => (rgba_bytes(&v, channels, u16::MAX), PixelFormat::Rgba16Unorm),
+        DecodingResult::F32(v) => (rgba_bytes(&v, channels, 1.0f32), PixelFormat::Rgba32Float),
+        _ => return Ok(None),
+    };
+    Ok(Some(still(
+        pixels,
+        dims,
+        format,
+        channels as u8,
+        None,
+        "PPM",
+    )))
+}
+
+/// farbfeld, read here rather than by zune-farbfeld, which (0.5.2) refuses every file: its
+/// `decode` sizes the output in bytes and then checks it as a count of `u16`s ("Too small output
+/// buffer size"). The format is a 16-byte header — `farbfeld`, then width and height as big-endian
+/// `u32` — and big-endian 16-bit RGBA, so all there is to do is swap each sample to native order.
+fn decode_farbfeld(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    let header = bytes
+        .get(..16)
+        .filter(|h| h.starts_with(b"farbfeld"))
+        .ok_or_else(|| malformed("not a farbfeld header"))?;
+    let be32 = |at: usize| {
+        u32::from_be_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
+    };
+    let dims = (be32(8) as usize, be32(12) as usize);
+    check_dims(dims.0, dims.1, 8, "Farbfeld")?;
+    let len = dims.0 * dims.1 * 8;
+    let data = bytes
+        .get(16..16 + len)
+        .ok_or_else(|| malformed("farbfeld pixel data is shorter than its dimensions declare"))?;
+    let mut pixels = vec![0u8; len];
+    par_chunks_mut(&mut pixels, 8, |offset, part| {
+        let src = data[offset..offset + part.len()].as_chunks::<2>().0;
+        for (d, s) in part.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+            *d = u16::from_be_bytes(*s).to_ne_bytes();
+        }
+    });
+    Ok(still(
+        pixels,
+        dims,
+        PixelFormat::Rgba16Unorm,
+        4,
+        None,
+        "Farbfeld",
+    ))
+}
+
+/// A still WebP through image-webp (the decoder zune wraps), read straight into an RGB(A)
+/// buffer. Animated files go to [`decode_zune_image`], which knows how to pick their first frame.
+fn decode_webp(bytes: &[u8]) -> Result<Option<DecodedImage>, DecodeError> {
+    let mut d = image_webp::WebPDecoder::new(Cursor::new(bytes)).map_err(malformed)?;
+    if d.is_animated() {
+        return Ok(None);
+    }
+    let (w, h) = d.dimensions();
+    let dims = (w as usize, h as usize);
+    check_dims(dims.0, dims.1, 4, "WebP")?;
+    let channels = if d.has_alpha() { 4 } else { 3 };
+    let len = d
+        .output_buffer_size()
+        .ok_or_else(|| malformed("WebP is too large"))?;
+    let mut px = vec![0u8; len];
+    d.read_image(&mut px).map_err(malformed)?;
+    let pixels = if channels == 4 {
+        px
+    } else {
+        rgba_bytes(&px, 3, u8::MAX)
+    };
+    let icc = d.icc_profile().ok().flatten();
+    Ok(Some(still(
+        pixels,
+        dims,
+        PixelFormat::Rgba8Unorm,
+        channels,
+        icc,
+        "WebP",
+    )))
+}
+
+/// JPEG XL through jxl-oxide, at the depth the file was authored in.
+///
+/// jxl-oxide renders to `f32` in the image's own colour encoding — for an ordinary sRGB file,
+/// sRGB-*encoded* values in 0..1, not linear light. The zune wrapper handed those floats over as
+/// `Rgba32Float`, which the viewer takes to mean linear/HDR: an 8-bit JPEG XL was shown through
+/// the exposure/tonemap path, wrongly, at 16 bytes a pixel. An integer-sample file of up to 8 bits
+/// is quantized back to `Rgba8Unorm` (exactly, for a lossless one) and up to 16 bits to
+/// `Rgba16Unorm`, both of which the viewer treats as the display-encoded values they are.
+///
+/// Float-sample and HDR (PQ/HLG) files keep the old `f32` path, as does anything with channels
+/// beyond colour and alpha (CMYK's black, spot colours), by returning `None`. Only keyframe 0 is
+/// rendered; the zune wrapper rendered every frame of an animation to keep the first.
+fn decode_jxl(bytes: &[u8]) -> Result<Option<DecodedImage>, DecodeError> {
+    let img = jxl_oxide::JxlImage::builder()
+        .read(Cursor::new(bytes))
+        .map_err(malformed)?;
+    let dims = (img.width() as usize, img.height() as usize);
+    let bits = match img.image_header().metadata.bit_depth {
+        jxl_oxide::image::BitDepth::IntegerSample { bits_per_sample } if bits_per_sample <= 16 => {
+            bits_per_sample
+        }
+        _ => return Ok(None),
+    };
+    let fmt = img.pixel_format();
+    if img.hdr_type().is_some() || fmt.has_black() {
+        return Ok(None);
+    }
+    let color = if fmt.is_grayscale() { 1 } else { 3 };
+    let channels = color + usize::from(fmt.has_alpha());
+    let format = if bits <= 8 {
+        PixelFormat::Rgba8Unorm
+    } else {
+        PixelFormat::Rgba16Unorm
+    };
+    check_dims(dims.0, dims.1, format.bytes_per_pixel(), "JPEG XL")?;
+
+    let render = img.render_frame(0).map_err(malformed)?;
+    // One buffer per channel, orientation applied; alpha follows the colour channels.
+    let planes = render.image_planar();
+    if planes.len() != channels {
+        return Ok(None);
+    }
+    let planes: Vec<&[f32]> = planes.iter().map(|fb| fb.buf()).collect();
+    let n = dims.0 * dims.1;
+    if planes.iter().any(|p| p.len() < n) {
+        return Err(malformed("JPEG XL render is smaller than the image"));
+    }
+    let pixels = if bits <= 8 {
+        quantize_planes::<4>(&planes, n, 255.0)
+    } else {
+        quantize_planes::<8>(&planes, n, 65535.0)
+    };
+    let icc = Some(img.rendered_icc());
+    Ok(Some(still(
+        pixels,
+        dims,
+        format,
+        channels as u8,
+        icc,
+        "JPEG XL",
+    )))
+}
+
+/// Planar `f32` (0..1) to interleaved RGBA of `PX` bytes a pixel — 4 for 8-bit samples, 8 for
+/// native-endian 16-bit ones — scaled to `max` and rounded to nearest. One plane is grey, two grey+alpha, three RGB, four RGBA.
+fn quantize_planes<const PX: usize>(planes: &[&[f32]], n: usize, max: f32) -> Vec<u8> {
+    let mut out = vec![0u8; n * PX];
+    par_chunks_mut(&mut out, PX, |offset, part| {
+        let first = offset / PX;
+        for (i, px) in part.as_chunks_mut::<PX>().0.iter_mut().enumerate() {
+            let at = first + i;
+            let s = |c: usize| planes[c][at];
+            let rgba = match planes.len() {
+                1 => [s(0), s(0), s(0), 1.0],
+                2 => [s(0), s(0), s(0), s(1)],
+                3 => [s(0), s(1), s(2), 1.0],
+                _ => [s(0), s(1), s(2), s(3)],
+            };
+            for (c, v) in rgba.into_iter().enumerate() {
+                let q = (v.clamp(0.0, 1.0) * max + 0.5) as u16;
+                if PX == 4 {
+                    px[c] = q as u8;
+                } else {
+                    px[c * 2..c * 2 + 2].copy_from_slice(&q.to_ne_bytes());
+                }
+            }
+        }
+    });
+    out
+}
+
+/// The generic zune path: `zune_image::Image::read`, normalized to interleaved RGBA in the source
+/// bit depth, carrying the embedded ICC profile where the format exposes one. What remains here is
+/// what [`decode_zune`]'s direct paths decline — an animated WebP, a float or HDR JPEG XL, a
+/// colour layout the direct readers do not widen.
 ///
 /// v1 takes the first frame only (#18: animated GIF → frame 0).
-fn decode_zune(
+fn decode_zune_image(
     bytes: &[u8],
     fmt: zune_image::codecs::ImageFormat,
 ) -> Result<DecodedImage, DecodeError> {
     use zune_core::bit_depth::BitDepth;
     use zune_core::bytestream::ZCursor;
     use zune_core::colorspace::ColorSpace;
-    use zune_core::options::DecoderOptions;
     use zune_image::image::Image;
 
-    // Speed is the project's top metric: enable platform intrinsics + unsafe fast paths.
-    // Raise the dimension guard well past zune's 16384 default so large sources decode
-    // (the downscale pass shrinks anything beyond the caller's max_dim afterwards).
-    let opts = DecoderOptions::new_fast()
-        .set_max_width(MAX_DECODE_DIM)
-        .set_max_height(MAX_DECODE_DIM);
+    let opts = zune_options();
 
     // zune's options cap each *axis* but nothing caps the product, which is what actually gets
     // allocated — so this is the guard that matters, and it has to happen before `Image::read`.
@@ -1314,8 +1919,7 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
     let (pixels, fmt, bit_depth) = match dynimg {
         // Float sources (Radiance HDR, float TIFF) stay 32-bit float / linear (HDR).
         DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_) => {
-            let rgba = dynimg.into_rgba32f();
-            (to_ne_bytes(rgba.as_raw()), PixelFormat::Rgba32Float, 32)
+            (into_rgba32f_bytes(dynimg), PixelFormat::Rgba32Float, 32)
         }
         _ => (into_rgba8(dynimg), PixelFormat::Rgba8Unorm, 8),
     };
@@ -1383,19 +1987,31 @@ mod icc {
     }
 
     fn transform_to_srgb(img: &mut DecodedImage, icc: &[u8]) {
-        use lcms2::{ColorSpaceSignature, Flags, Intent, PixelFormat as Fmt, Profile, Transform};
+        use lcms2::{
+            ColorSpaceSignature, DisallowCache, Flags, Intent, PixelFormat as Fmt, Profile,
+            ThreadContext, Transform,
+        };
 
-        let Ok(src) = Profile::new_icc(icc) else {
+        // The transform is shared by the threads `par_chunks_mut` runs it on, which lcms2 allows
+        // only for a transform made in a `ThreadContext` with NO_CACHE (its `Sync` bound). The
+        // one-pixel cache given up is worthless on photographic data anyway.
+        let ctx = ThreadContext::new();
+        let Ok(src) = Profile::new_icc_context(&ctx, icc) else {
             return;
         };
         // Only RGB(A) source profiles map cleanly onto our RGBA pixels.
         if src.color_space() != ColorSpaceSignature::RgbData {
             return;
         }
-        let dst = Profile::new_srgb();
+        let dst = Profile::new_srgb_context(&ctx);
         // Perceptual: the usual choice for displaying photographic images. COPY_ALPHA so
         // the alpha channel passes through untouched (lcms only transforms color).
         let intent = Intent::Perceptual;
+        let flags = Flags::COPY_ALPHA | Flags::NO_CACHE;
+
+        if is_srgb_equivalent(&ctx, &src, &dst, intent) {
+            return;
+        }
 
         // The same conversion runs over the canvas and every animation frame
         // (`transform_buffers`): a converted canvas over unconverted frames would visibly
@@ -1405,46 +2021,102 @@ mod icc {
             .saturating_mul(img.format.bytes_per_pixel());
         match img.format {
             PixelFormat::Rgba8Unorm => {
-                let t: Transform<[u8; 4], [u8; 4]> = match Transform::new_flags(
-                    &src,
-                    Fmt::RGBA_8,
-                    &dst,
-                    Fmt::RGBA_8,
-                    intent,
-                    Flags::COPY_ALPHA,
-                ) {
-                    Ok(t) => t,
-                    Err(_) => return,
-                };
+                let t: Transform<[u8; 4], [u8; 4], ThreadContext, DisallowCache> =
+                    match Transform::new_flags_context(
+                        &ctx,
+                        &src,
+                        Fmt::RGBA_8,
+                        &dst,
+                        Fmt::RGBA_8,
+                        intent,
+                        flags,
+                    ) {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
                 img.transform_buffers(needed, |pixels| {
-                    if let Ok(px) = bytemuck::try_cast_slice_mut::<u8, [u8; 4]>(pixels) {
-                        t.transform_in_place(px);
-                    }
+                    crate::par_chunks_mut(pixels, 4, |_, part| {
+                        if let Ok(px) = bytemuck::try_cast_slice_mut::<u8, [u8; 4]>(part) {
+                            t.transform_in_place(px);
+                        }
+                    });
                 });
             }
             PixelFormat::Rgba16Unorm => {
-                let t: Transform<[u16; 4], [u16; 4]> = match Transform::new_flags(
-                    &src,
-                    Fmt::RGBA_16,
-                    &dst,
-                    Fmt::RGBA_16,
-                    intent,
-                    Flags::COPY_ALPHA,
-                ) {
-                    Ok(t) => t,
-                    Err(_) => return,
-                };
+                let t: Transform<[u16; 4], [u16; 4], ThreadContext, DisallowCache> =
+                    match Transform::new_flags_context(
+                        &ctx,
+                        &src,
+                        Fmt::RGBA_16,
+                        &dst,
+                        Fmt::RGBA_16,
+                        intent,
+                        flags,
+                    ) {
+                        Ok(t) => t,
+                        Err(_) => return,
+                    };
                 // 16-bit pixels are native-endian u16 bytes; cast may fail on alignment,
                 // in which case we skip (sRGB assumption) rather than panic.
                 img.transform_buffers(needed, |pixels| {
-                    if let Ok(px) = bytemuck::try_cast_slice_mut::<u8, [u16; 4]>(pixels) {
-                        t.transform_in_place(px);
-                    }
+                    crate::par_chunks_mut(pixels, 8, |_, part| {
+                        if let Ok(px) = bytemuck::try_cast_slice_mut::<u8, [u16; 4]>(part) {
+                            t.transform_in_place(px);
+                        }
+                    });
                 });
             }
             // Float is handled by the is_hdr() early-out in apply().
             _ => {}
         }
+    }
+
+    /// Whether converting from `src` to sRGB would leave every colour within one 8-bit code of
+    /// where it started — i.e. the embedded profile *is* sRGB, as it is in every Photoshop export
+    /// and most camera JPEGs. Running lcms over such an image costs ~9 ns a pixel (over half a
+    /// second at 8192²) to move a fraction of a percent of colours by a single code: that is the
+    /// quantization of the profile's sampled tone curve against lcms's parametric one, not a
+    /// colour change, so the transform is skipped.
+    ///
+    /// Probed rather than recognized by name or hash, because sRGB ships under dozens of
+    /// descriptions and byte layouts. The probe is a 17³ lattice (every 16th code, plus 255) for
+    /// the matrix and full 256-step ramps — grey and each primary alone — for the tone curves,
+    /// ~6k colours for ~0.1 ms. A matrix-shaper profile that differs from sRGB by more than one
+    /// code anywhere differs on that probe, because both of its parts are smooth.
+    fn is_srgb_equivalent(
+        ctx: &lcms2::ThreadContext,
+        src: &lcms2::Profile<lcms2::ThreadContext>,
+        dst: &lcms2::Profile<lcms2::ThreadContext>,
+        intent: lcms2::Intent,
+    ) -> bool {
+        use lcms2::{PixelFormat as Fmt, Transform};
+
+        let Ok(t) = Transform::<[u8; 3], [u8; 3], _>::new_context(
+            ctx,
+            src,
+            Fmt::RGB_8,
+            dst,
+            Fmt::RGB_8,
+            intent,
+        ) else {
+            return false;
+        };
+        let lattice = (0..=16u32).map(|i| (i * 16).min(255) as u8);
+        let mut probe: Vec<[u8; 3]> = Vec::with_capacity(17 * 17 * 17 + 4 * 256);
+        for r in lattice.clone() {
+            for g in lattice.clone() {
+                probe.extend(lattice.clone().map(|b| [r, g, b]));
+            }
+        }
+        for v in 0..=255u8 {
+            probe.extend([[v, v, v], [v, 0, 0], [0, v, 0], [0, 0, v]]);
+        }
+        let mut out = probe.clone();
+        t.transform_in_place(&mut out);
+        probe
+            .iter()
+            .zip(&out)
+            .all(|(a, b)| (0..3).all(|c| a[c].abs_diff(b[c]) <= 1))
     }
 
     #[cfg(test)]
@@ -1506,6 +2178,85 @@ mod icc {
             let before = img.pixels.clone();
             apply(&mut img); // must not panic
             assert_eq!(img.pixels, before);
+        }
+
+        /// sRGB primaries with `trc` on all three channels — the shape of every matrix-shaper
+        /// profile these tests need.
+        fn srgb_primaries_with(trc: &lcms2::ToneCurve) -> Vec<u8> {
+            use lcms2::{CIExyY, CIExyYTRIPLE, Profile};
+            let xy = |x, y| CIExyY { x, y, Y: 1.0 };
+            let primaries = CIExyYTRIPLE {
+                Red: xy(0.640, 0.330),
+                Green: xy(0.300, 0.600),
+                Blue: xy(0.150, 0.060),
+            };
+            Profile::new_rgb(&xy(0.3127, 0.3290), &primaries, &[trc, trc, trc])
+                .unwrap()
+                .icc()
+                .unwrap()
+        }
+
+        /// A profile that *is* sRGB but samples its tone curve into a table (as the sRGB profile
+        /// Windows ships does) lands within one code of identity, so it is not run at all: the
+        /// pixels come back exactly as decoded.
+        #[test]
+        fn tabulated_srgb_profile_is_skipped() {
+            let srgb = |c: f32| {
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let table: Vec<u16> = (0..1024)
+                .map(|i| (srgb(i as f32 / 1023.0) * 65535.0).round() as u16)
+                .collect();
+            let icc = srgb_primaries_with(&lcms2::ToneCurve::new_tabulated(&table));
+            let pixels: Vec<u8> = (0..=255u8).flat_map(|v| [v, 255 - v, v / 2, 200]).collect();
+            let mut img = img8(pixels.clone());
+            img.icc = Some(icc);
+            apply(&mut img);
+            assert_eq!(img.pixels, pixels);
+        }
+
+        /// The transform runs on several threads for a large image; the result must be exactly
+        /// what one lcms call over the whole buffer produces.
+        #[test]
+        fn threaded_transform_matches_a_single_pass() {
+            use lcms2::{Flags, Intent, PixelFormat as Fmt, Profile, Transform};
+
+            let icc = srgb_primaries_with(&lcms2::ToneCurve::new(1.0)); // linear: far from sRGB
+                                                                        // 2 MiB: comfortably past the threshold where the work is split.
+            let pixels: Vec<u8> = (0..512 * 1024u32)
+                .flat_map(|i| {
+                    [
+                        i as u8,
+                        (i >> 8) as u8,
+                        (i >> 16) as u8 ^ 0x5a,
+                        (i >> 3) as u8,
+                    ]
+                })
+                .collect();
+            let mut expected: Vec<[u8; 4]> = bytemuck::cast_slice(&pixels).to_vec();
+            let t: Transform<[u8; 4], [u8; 4]> = Transform::new_flags(
+                &Profile::new_icc(&icc).unwrap(),
+                Fmt::RGBA_8,
+                &Profile::new_srgb(),
+                Fmt::RGBA_8,
+                Intent::Perceptual,
+                Flags::COPY_ALPHA,
+            )
+            .unwrap();
+            t.transform_in_place(&mut expected);
+
+            let mut img = img8(pixels.clone());
+            img.icc = Some(icc);
+            apply(&mut img);
+            assert_ne!(
+                img.pixels, pixels,
+                "a linear profile must actually be applied"
+            );
+            assert_eq!(img.pixels, bytemuck::cast_slice::<[u8; 4], u8>(&expected));
         }
 
         /// Proves the embedded transfer curve is actually applied (not just channel
@@ -2015,6 +2766,148 @@ mod tests {
         );
     }
 
+    /// The threaded, block-wise opacity scan finds a lone transparent pixel wherever it is — first,
+    /// last, either side of a block boundary, at the start of the last thread's part — in every
+    /// format, and calls an all-opaque buffer opaque.
+    #[test]
+    fn alpha_scan_finds_one_transparent_pixel_anywhere() {
+        let n = 1_000_003usize; // ~4–16 MB: several threads, a ragged last block
+        for (format, opaque, clear) in [
+            (
+                PixelFormat::Rgba8Unorm,
+                vec![9, 9, 9, 0xff],
+                vec![9, 9, 9, 0xfe],
+            ),
+            (
+                PixelFormat::Rgba16Unorm,
+                to_ne_bytes(&[1u16, 2, 3, 0xffff]),
+                to_ne_bytes(&[1u16, 2, 3, 0xff00]),
+            ),
+            (
+                PixelFormat::Rgba16Float,
+                to_ne_bytes(&[1u16, 2, 3, 0x3c00]),
+                to_ne_bytes(&[1u16, 2, 3, 0x3bff]),
+            ),
+            (
+                PixelFormat::Rgba32Float,
+                to_ne_bytes(&[0.5f32, 2.0, 3.0, 1.5]),
+                to_ne_bytes(&[0.5f32, 2.0, 3.0, f32::NAN]),
+            ),
+        ] {
+            let bpp = opaque.len();
+            let mut img = still(opaque.repeat(n), (n, 1), format, 4, None, "test");
+            assert!(alpha_is_opaque(&img), "{format:?} all opaque");
+            let block = 64 * 1024 / bpp;
+            let part = (n * bpp).div_ceil(8).div_ceil(64 * 1024) * block;
+            for at in [0, block - 1, block, n / 2, part * 7, n - 1] {
+                img.pixels[at * bpp..(at + 1) * bpp].copy_from_slice(&clear);
+                assert!(!alpha_is_opaque(&img), "{format:?} transparent at {at}");
+                img.pixels[at * bpp..(at + 1) * bpp].copy_from_slice(&opaque);
+            }
+        }
+    }
+
+    /// A minimal uncompressed PSD: header, three empty sections, then the merged image as raw
+    /// big-endian planes (`samples` holds plane 0, then plane 1, …).
+    #[cfg(feature = "psd")]
+    fn raw_psd(w: u32, h: u32, channels: u16, depth: u16, mode: u16, samples: &[u16]) -> Vec<u8> {
+        let mut v = b"8BPS".to_vec();
+        v.extend_from_slice(&1u16.to_be_bytes());
+        v.extend_from_slice(&[0; 6]);
+        v.extend_from_slice(&channels.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&depth.to_be_bytes());
+        v.extend_from_slice(&mode.to_be_bytes());
+        v.extend_from_slice(&[0; 12]); // colour mode data, image resources, layers: all empty
+        v.extend_from_slice(&0u16.to_be_bytes()); // raw, uncompressed
+        for &s in samples {
+            if depth == 8 {
+                v.push(s as u8);
+            } else {
+                v.extend_from_slice(&s.to_be_bytes());
+            }
+        }
+        v
+    }
+
+    /// The PSD wrapper's integer fast path (8/16-bit RGB and greyscale) against the mapping its
+    /// generic float path defines: 8-bit samples unchanged, Photoshop's 16-bit 0..32768 scaled
+    /// to 0..65535 by `round(v / 32768 * 65535)` in `f32`, 32768 and above white, and a missing
+    /// alpha opaque. Large enough to be split across threads, with every 16-bit value covered.
+    #[cfg(feature = "psd")]
+    #[test]
+    fn psd_integer_fast_path_matches_the_float_mapping() {
+        let (w, h) = (1031u32, 523u32);
+        let n = (w * h) as usize;
+        let to16 = |v: u16| -> u16 {
+            let c = if v >= 32768 {
+                1.0f32
+            } else {
+                v as f32 * (1.0 / 32768.0)
+            };
+            (c * 65535.0 + 0.5) as u16
+        };
+        let plane = |seed: usize| -> Vec<u16> {
+            (0..n)
+                .map(|i| ((i * 7 + seed * 13_331) % 65536) as u16)
+                .collect()
+        };
+
+        // 8-bit RGBA.
+        let planes: Vec<Vec<u16>> = (0..4)
+            .map(|c| plane(c).iter().map(|v| v & 0xff).collect())
+            .collect();
+        let out = decode(
+            &raw_psd(w, h, 4, 8, 3, &planes.concat()),
+            Some("psd"),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!((out.format, out.channels), (PixelFormat::Rgba8Unorm, 4));
+        let expected: Vec<u8> = (0..n)
+            .flat_map(|i| planes.iter().map(move |p| p[i] as u8))
+            .collect();
+        assert!(out.pixels == expected, "8-bit RGBA");
+
+        // 16-bit RGB: no alpha plane, so alpha is opaque.
+        let planes: Vec<Vec<u16>> = (0..3).map(plane).collect();
+        let out = decode(
+            &raw_psd(w, h, 3, 16, 3, &planes.concat()),
+            Some("psd"),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!((out.format, out.channels), (PixelFormat::Rgba16Unorm, 3));
+        let expected: Vec<u16> = (0..n)
+            .flat_map(|i| {
+                [
+                    to16(planes[0][i]),
+                    to16(planes[1][i]),
+                    to16(planes[2][i]),
+                    65535,
+                ]
+            })
+            .collect();
+        assert!(out.pixels == to_ne_bytes(&expected), "16-bit RGB");
+
+        // 16-bit greyscale + alpha: grey to all three, the second plane as alpha.
+        let planes: Vec<Vec<u16>> = (0..2).map(plane).collect();
+        let out = decode(
+            &raw_psd(w, h, 2, 16, 1, &planes.concat()),
+            Some("psd"),
+            &DecodeOptions::default(),
+        )
+        .unwrap();
+        let expected: Vec<u16> = (0..n)
+            .flat_map(|i| {
+                let g = to16(planes[0][i]);
+                [g, g, g, to16(planes[1][i])]
+            })
+            .collect();
+        assert!(out.pixels == to_ne_bytes(&expected), "16-bit grey + alpha");
+    }
+
     /// TGA has no start-of-file magic, so content sniffing can't identify it — the decoder
     /// must lean on the file extension. Regression for TGA files failing to open at all.
     #[test]
@@ -2074,37 +2967,70 @@ mod tests {
         );
     }
 
-    /// `into_rgba8` / `into_rgba16` bypass the `image` crate's conversion for grey sources (whose
-    /// float round trip made an 8192² greyscale TGA decode ~4× slower than the RGB one). The
-    /// bypass must produce exactly what the crate would have, at both depths and with and without
-    /// alpha — including the extremes, where a float round trip would be the first to drift.
+    /// `into_rgba8` / `into_rgba16_bytes` / `into_rgba32f_bytes` widen with `rgba_bytes` instead
+    /// of the `image` crate's conversions (whose float round trip made an 8192² greyscale TGA
+    /// decode ~4× slower than the RGB one). They must produce exactly what the crate would have,
+    /// for every layout they take over, at every depth — including the extremes, where a float
+    /// round trip would be the first to drift. The image is big enough to be split across threads
+    /// and sized so that no part boundary falls on a whole row.
     #[test]
-    fn grey_expansion_matches_the_image_crate() {
-        use image::{DynamicImage, ImageBuffer, Luma, LumaA};
+    fn rgba_widening_matches_the_image_crate() {
+        use image::{DynamicImage, ImageBuffer, Luma, LumaA, Rgb, Rgba};
 
-        let (w, h) = (257u32, 3u32); // odd, and past one 256-pixel fallback chunk
+        let (w, h) = (1031u32, 263u32);
         let v8 = |i: u32| (i.wrapping_mul(97) % 256) as u8;
         let v16 = |i: u32| i.wrapping_mul(40_503) as u16;
-        let l8 = ImageBuffer::from_fn(w, h, |x, y| Luma([v8(y * w + x)]));
-        let la8 = ImageBuffer::from_fn(w, h, |x, y| LumaA([v8(y * w + x), v8(x * 7 + y)]));
-        let l16 = ImageBuffer::from_fn(w, h, |x, y| Luma([v16(y * w + x)]));
-        let la16 = ImageBuffer::from_fn(w, h, |x, y| LumaA([v16(y * w + x), v16(x * 7 + y)]));
+        let vf = |i: u32| (i % 1000) as f32 / 300.0 - 0.5;
+        let at = |x: u32, y: u32| y * w + x;
 
-        for img in [DynamicImage::ImageLuma8(l8), DynamicImage::ImageLumaA8(la8)] {
-            assert_eq!(
-                into_rgba8(img.clone()),
-                img.to_rgba8().into_raw(),
+        let eight = [
+            DynamicImage::ImageLuma8(ImageBuffer::from_fn(w, h, |x, y| Luma([v8(at(x, y))]))),
+            DynamicImage::ImageLumaA8(ImageBuffer::from_fn(w, h, |x, y| {
+                LumaA([v8(at(x, y)), v8(x * 7 + y)])
+            })),
+            DynamicImage::ImageRgb8(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgb([v8(at(x, y)), v8(x + 3), v8(y * 5)])
+            })),
+            DynamicImage::ImageRgba8(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgba([v8(at(x, y)), v8(x + 3), v8(y * 5), v8(x ^ y)])
+            })),
+        ];
+        for img in eight {
+            let expected = img.to_rgba8().into_raw();
+            assert!(into_rgba8(img.clone()) == expected, "{:?}", img.color());
+        }
+        let sixteen = [
+            DynamicImage::ImageLuma16(ImageBuffer::from_fn(w, h, |x, y| Luma([v16(at(x, y))]))),
+            DynamicImage::ImageLumaA16(ImageBuffer::from_fn(w, h, |x, y| {
+                LumaA([v16(at(x, y)), v16(x * 7 + y)])
+            })),
+            DynamicImage::ImageRgb16(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgb([v16(at(x, y)), v16(x + 3), v16(y * 5)])
+            })),
+            DynamicImage::ImageRgba16(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgba([v16(at(x, y)), v16(x + 3), v16(y * 5), v16(x ^ y)])
+            })),
+        ];
+        for img in sixteen {
+            let expected = to_ne_bytes(img.to_rgba16().as_raw());
+            assert!(
+                into_rgba16_bytes(img.clone()) == expected,
                 "{:?}",
                 img.color()
             );
         }
-        for img in [
-            DynamicImage::ImageLuma16(l16),
-            DynamicImage::ImageLumaA16(la16),
-        ] {
-            assert_eq!(
-                into_rgba16(img.clone()),
-                img.to_rgba16().into_raw(),
+        let float = [
+            DynamicImage::ImageRgb32F(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgb([vf(at(x, y)), vf(x + 3), vf(y * 5)])
+            })),
+            DynamicImage::ImageRgba32F(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgba([vf(at(x, y)), vf(x + 3), vf(y * 5), vf(x ^ y)])
+            })),
+        ];
+        for img in float {
+            let expected = to_ne_bytes(img.to_rgba32f().as_raw());
+            assert!(
+                into_rgba32f_bytes(img.clone()) == expected,
                 "{:?}",
                 img.color()
             );

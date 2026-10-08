@@ -68,28 +68,75 @@ pub fn apply(img: &mut DecodedImage, orientation: u16) {
     // Every buffer — the canvas and each animation frame — gets the same rotation; the
     // dimension swap happens once, afterwards.
     img.transform_buffers(needed, |pixels| {
-        let mut out = vec![0u8; ow * oh * bpp];
-        for sy in 0..h {
-            for sx in 0..w {
-                let (dx, dy) = match orientation {
-                    2 => (w - 1 - sx, sy),         // mirror horizontal
-                    3 => (w - 1 - sx, h - 1 - sy), // rotate 180
-                    4 => (sx, h - 1 - sy),         // mirror vertical
-                    5 => (sy, sx),                 // transpose (mirror along main diagonal)
-                    6 => (h - 1 - sy, sx),         // rotate 90° CW
-                    7 => (h - 1 - sy, w - 1 - sx), // transverse (mirror along anti-diagonal)
-                    8 => (sy, w - 1 - sx),         // rotate 90° CCW
-                    _ => (sx, sy),
-                };
-                let si = (sy * w + sx) * bpp;
-                let di = (dy * ow + dx) * bpp;
-                out[di..di + bpp].copy_from_slice(&pixels[si..si + bpp]);
-            }
-        }
-        *pixels = out;
+        *pixels = match bpp {
+            4 => reorient::<4>(&pixels[..needed], w, h, orientation),
+            8 => reorient::<8>(&pixels[..needed], w, h, orientation),
+            _ => reorient::<16>(&pixels[..needed], w, h, orientation),
+        };
     });
     img.width = ow as u32;
     img.height = oh as u32;
+}
+
+/// One buffer's worth of [`apply`]: `src` is `w`×`h` pixels of `N` bytes, and the result is the
+/// reoriented copy (`h`×`w` for the axis-swapping orientations 5..=8).
+///
+/// Written as a gather over output rows, so the output can be split into row bands across
+/// threads. The flips and the 180° turn read whole source rows; the transposing orientations read
+/// a source *column* per output row, so they walk a band of output rows together — one source
+/// row's run of adjacent pixels feeds one pixel of each — and every cache line read is used in
+/// full. The per-pixel scatter this replaced spent ~400 ms on an 8192² portrait photo.
+fn reorient<const N: usize>(src: &[u8], w: usize, h: usize, orientation: u16) -> Vec<u8> {
+    let src = src.as_chunks::<N>().0;
+    let transpose = orientation >= 5;
+    let ow = if transpose { h } else { w };
+    // Which source axes run backwards, in terms of the output (see the table in `apply`'s
+    // tests): for 2..=4 `flip_x`/`flip_y` mirror the row and pick the row; for 5..=8 they pick
+    // the source column from the output row and the source row from the output column.
+    let (flip_x, flip_y) = match orientation {
+        2 => (true, false),
+        3 => (true, true),
+        4 => (false, true),
+        5 => (false, false),
+        6 => (false, true),
+        7 => (true, true),
+        _ => (true, false), // 8
+    };
+    let mut out = vec![0u8; w * h * N];
+    crate::par_chunks_mut(&mut out, ow * N, |offset, part| {
+        let first = offset / (ow * N);
+        let rows = part.as_chunks_mut::<N>().0;
+        if !transpose {
+            for (r, drow) in rows.chunks_exact_mut(ow).enumerate() {
+                let dy = first + r;
+                let sy = if flip_y { h - 1 - dy } else { dy };
+                let srow = &src[sy * w..sy * w + w];
+                if flip_x {
+                    for (d, s) in drow.iter_mut().zip(srow.iter().rev()) {
+                        *d = *s;
+                    }
+                } else {
+                    drow.copy_from_slice(srow);
+                }
+            }
+            return;
+        }
+        const BAND: usize = 32;
+        let nrows = rows.len() / ow;
+        for r0 in (0..nrows).step_by(BAND) {
+            let r1 = (r0 + BAND).min(nrows);
+            for dx in 0..ow {
+                let sy = if flip_y { h - 1 - dx } else { dx };
+                let srow = &src[sy * w..sy * w + w];
+                for r in r0..r1 {
+                    let dy = first + r;
+                    let sx = if flip_x { w - 1 - dy } else { dy };
+                    rows[r * ow + dx] = srow[sx];
+                }
+            }
+        }
+    });
+    out
 }
 
 // --- container unwrapping -----------------------------------------------------
@@ -493,5 +540,52 @@ mod tests {
         assert_eq!((im.width, im.height), (2, 1));
         assert_eq!(&im.pixels[..16], &px[16..]);
         assert_eq!(&im.pixels[16..], &px[..16]);
+    }
+
+    /// Every orientation at every pixel size against the EXIF definition, written as the plain
+    /// per-pixel scatter from source to destination. The image is odd-sized on both axes (no
+    /// band or tile divides it) and large enough that `reorient` splits it across threads.
+    #[test]
+    fn every_orientation_matches_the_definition() {
+        let (w, h) = (601usize, 437usize);
+        for (format, bpp) in [
+            (PixelFormat::Rgba8Unorm, 4),
+            (PixelFormat::Rgba16Unorm, 8),
+            (PixelFormat::Rgba32Float, 16),
+        ] {
+            let px: Vec<u8> = (0..w * h * bpp)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect();
+            for o in 2..=8u16 {
+                let (ow, oh) = if o >= 5 { (h, w) } else { (w, h) };
+                let mut expected = vec![0u8; px.len()];
+                for sy in 0..h {
+                    for sx in 0..w {
+                        let (dx, dy) = match o {
+                            2 => (w - 1 - sx, sy),
+                            3 => (w - 1 - sx, h - 1 - sy),
+                            4 => (sx, h - 1 - sy),
+                            5 => (sy, sx),
+                            6 => (h - 1 - sy, sx),
+                            7 => (h - 1 - sy, w - 1 - sx),
+                            _ => (sy, w - 1 - sx),
+                        };
+                        let (si, di) = ((sy * w + sx) * bpp, (dy * ow + dx) * bpp);
+                        expected[di..di + bpp].copy_from_slice(&px[si..si + bpp]);
+                    }
+                }
+                let mut im = DecodedImage {
+                    format,
+                    ..img(w as u32, h as u32, px.clone())
+                };
+                apply(&mut im, o);
+                assert_eq!(
+                    (im.width, im.height),
+                    (ow as u32, oh as u32),
+                    "orientation {o}"
+                );
+                assert!(im.pixels == expected, "orientation {o}, {bpp} bytes/px");
+            }
+        }
     }
 }

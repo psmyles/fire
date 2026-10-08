@@ -44,7 +44,8 @@ typedef struct fire_psd_info {
     uint16_t reserved;
 } fire_psd_info;
 
-/* Open a PSD from an in-memory buffer. Returns NULL on failure. */
+/* Open a PSD from an in-memory buffer. Returns NULL on failure. The buffer is read in place
+ * and only during this call: it may be freed once fire_psd_open returns. */
 fire_psd* fire_psd_open(const uint8_t* bytes, size_t len);
 
 /* Populate *out_info. Returns 0 on success, non-zero on error. */

@@ -17,6 +17,13 @@ heif = ["dep:heif-sys"]
 [dependencies]
 zune-image.workspace = true
 zune-core.workspace = true
+zune-jpeg.workspace = true
+zune-bmp.workspace = true
+zune-qoi.workspace = true
+zune-ppm.workspace = true
+zune-farbfeld.workspace = true
+image-webp.workspace = true
+jxl-oxide.workspace = true
 image.workspace = true
 tiff.workspace = true
 exr.workspace = true

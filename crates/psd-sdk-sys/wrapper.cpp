@@ -23,10 +23,12 @@
 #include "PsdColorModeDataSection.h"
 #include "PsdParseColorModeDataSection.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <vector>
 #include <new>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -114,7 +116,9 @@ bool psd_size_is_sane(const psd::Document* document) {
 // Everything parsed for one document, owned behind a single opaque handle.
 struct Doc {
     psd::MallocAllocator allocator;
-    std::vector<uint8_t> bytes;      // owned copy; MemoryFile points into this
+    // Reads the caller's buffer in place. Every section is parsed inside fire_psd_open, so the
+    // file is never read after it returns and the buffer only has to outlive that call — which
+    // spares a copy of the whole document (hundreds of MB for a large one) on every open.
     MemoryFile* file = nullptr;
     psd::Document* document = nullptr;
     psd::ImageDataSection* imageData = nullptr;
@@ -219,6 +223,39 @@ inline void store_sample(void* out, unsigned int bits, size_t idx, float v) {
     }
 }
 
+// Run f(begin, end) over [0, n) split across up to 8 threads, the calling thread taking the
+// first part. Small jobs stay on the calling thread. A thread that cannot be started is not an
+// error: the calling thread takes over the rest of the range, and every thread that did start is
+// joined before returning (a joinable std::thread destroyed unjoined would terminate the process).
+template <typename F>
+void run_parallel(size_t n, F f) {
+    const size_t kMinPerThread = size_t(1) << 18;
+    unsigned int threads = std::thread::hardware_concurrency();
+    threads = std::min(threads == 0 ? 1u : threads, 8u);
+    if (threads <= 1 || n < 2 * kMinPerThread) {
+        f(size_t(0), n);
+        return;
+    }
+    const size_t per = (n + threads - 1) / threads;
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    size_t begin = per;
+    for (; begin < n; begin += per) {
+        try {
+            pool.emplace_back(f, begin, std::min(n, begin + per));
+        } catch (...) {
+            break;
+        }
+    }
+    f(size_t(0), std::min(n, per));
+    if (begin < n) {
+        f(begin, n);
+    }
+    for (std::thread& t : pool) {
+        t.join();
+    }
+}
+
 } // namespace
 
 struct fire_psd {
@@ -239,8 +276,7 @@ fire_psd* fire_psd_open(const uint8_t* bytes, size_t len) {
     // Rust (that is UB). Catch everything and surface it as a null handle.
     try {
         Doc& d = handle->d;
-        d.bytes.assign(bytes, bytes + len);
-        d.file = new (std::nothrow) MemoryFile(&d.allocator, d.bytes.data(), d.bytes.size());
+        d.file = new (std::nothrow) MemoryFile(&d.allocator, bytes, len);
         if (!d.file) {
             fire_psd_free(handle);
             return nullptr;
@@ -377,6 +413,68 @@ int fire_psd_read_merged(const fire_psd* doc, void* out_pixels, size_t out_len) 
             return 7; // indexed document with no usable palette
         }
         palette = d.colorModeData->colorData;
+    }
+
+    // The common documents — 8/16-bit RGB and greyscale — take an integer path. The generic loop
+    // below dispatches on the mode and depth for every sample and round-trips each one through
+    // float; for these modes that is an exact identity at 8 bits (v/255*255 lands back on v) and a
+    // fixed mapping at 16, so they are interleaved directly, the 16-bit mapping read from a table
+    // built by the very expressions the generic path uses. Same bytes, a fraction of the time.
+    if ((mode == psd::colorMode::RGB || mode == psd::colorMode::GRAYSCALE
+         || mode == psd::colorMode::DUOTONE)
+        && (bits == 8 || bits == 16)) {
+        // Which plane feeds each output channel: the generic path's RGB/MULTICHANNEL default
+        // falls back to plane 0 for a channel the document does not have, and greyscale is
+        // plane 0 throughout.
+        const void* src[4];
+        for (unsigned int c = 0; c < 3; ++c) {
+            src[c] = (colorChannels > c && imageCount > c) ? images[c].data : images[0].data;
+        }
+        src[3] = hasAlpha ? images[colorChannels].data : nullptr;
+        try {
+            if (bits == 8) {
+                const uint8_t* r = static_cast<const uint8_t*>(src[0]);
+                const uint8_t* g = static_cast<const uint8_t*>(src[1]);
+                const uint8_t* b = static_cast<const uint8_t*>(src[2]);
+                const uint8_t* a = static_cast<const uint8_t*>(src[3]);
+                uint8_t* out = static_cast<uint8_t*>(out_pixels);
+                run_parallel(pixels, [=](size_t begin, size_t end) {
+                    uint8_t* o = out + begin * 4;
+                    for (size_t i = begin; i < end; ++i, o += 4) {
+                        o[0] = r[i];
+                        o[1] = g[i];
+                        o[2] = b[i];
+                        o[3] = a ? a[i] : 255;
+                    }
+                });
+            } else {
+                // Photoshop's 0..32768 to the full 0..65535, through the generic path's own
+                // sample_norm/store_sample so the two can never disagree.
+                std::vector<uint16_t> to16(65536);
+                for (uint32_t v = 0; v < 65536; ++v) {
+                    const uint16_t sample = static_cast<uint16_t>(v);
+                    store_sample(&to16[v], 16, 0, sample_norm(&sample, 16, 0));
+                }
+                const uint16_t* table = to16.data();
+                const uint16_t* r = static_cast<const uint16_t*>(src[0]);
+                const uint16_t* g = static_cast<const uint16_t*>(src[1]);
+                const uint16_t* b = static_cast<const uint16_t*>(src[2]);
+                const uint16_t* a = static_cast<const uint16_t*>(src[3]);
+                uint16_t* out = static_cast<uint16_t*>(out_pixels);
+                run_parallel(pixels, [=](size_t begin, size_t end) {
+                    uint16_t* o = out + begin * 4;
+                    for (size_t i = begin; i < end; ++i, o += 4) {
+                        o[0] = table[r[i]];
+                        o[1] = table[g[i]];
+                        o[2] = table[b[i]];
+                        o[3] = a ? table[a[i]] : 65535;
+                    }
+                });
+            }
+        } catch (...) {
+            return 5;
+        }
+        return 0;
     }
 
     try {

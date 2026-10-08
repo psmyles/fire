@@ -134,14 +134,18 @@ fn downsample_level(
 const PARALLEL_MIN_TEXELS: usize = 256 * 256;
 
 /// One 2×2 box-filter reduction of a `sw`×`sh` level (`E` bytes per texel) into `dw`×`dh`.
+///
+/// `load` and `store` are taken as generic function items rather than `fn` pointers so that each
+/// format gets its own copy of the loop with its codec inlined: through a pointer every texel paid
+/// five indirect calls, which was most of the cost.
 fn downsample<const E: usize>(
     src: &[u8],
     sw: u32,
     sh: u32,
     dw: u32,
     dh: u32,
-    load: fn(&[u8]) -> [f32; 4],
-    store: fn([f32; 4], &mut [u8]),
+    load: impl Fn(&[u8]) -> [f32; 4] + Sync,
+    store: impl Fn([f32; 4], &mut [u8]) + Sync,
 ) -> Vec<u8> {
     let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
     let src_row = sw * E;
@@ -258,7 +262,22 @@ fn store_u16(v: [f32; 4], out: &mut [u8]) {
 }
 
 fn load_f16(b: &[u8]) -> [f32; 4] {
-    std::array::from_fn(|i| f16_bits_to_f32(u16::from_le_bytes([b[2 * i], b[2 * i + 1]])))
+    let t = f16_to_f32_table();
+    std::array::from_fn(|i| t[u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as usize])
+}
+
+/// Every half float, widened: [`f16_bits_to_f32`] for all 65536 bit patterns. The mip builder
+/// reads four half texels per output texel, and a table lookup is several times cheaper than
+/// the bit-by-bit conversion (whose subnormal case even loops).
+fn f16_to_f32_table() -> &'static [f32; 65536] {
+    static TABLE: OnceLock<Box<[f32; 65536]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = Box::new([0f32; 65536]);
+        for (h, v) in t.iter_mut().enumerate() {
+            *v = f16_bits_to_f32(h as u16);
+        }
+        t
+    })
 }
 
 fn store_f16(v: [f32; 4], out: &mut [u8]) {
