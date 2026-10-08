@@ -908,6 +908,52 @@ fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     })
 }
 
+/// `DynamicImage::into_rgba8`, as a raw buffer — minus the `image` crate's slow path for grey
+/// sources.
+///
+/// Since 0.25 the crate's RGBA conversions go through a colour-space-aware cast that has direct
+/// paths only for same-layout and RGB → RGBA. Grey and grey+alpha fall back to expanding every
+/// pixel through `f32` and back, which made an 8192² greyscale TGA spend ~420 ms converting —
+/// nearly 10× what the three-times-larger RGB file took. The expansion it computes is exactly the
+/// grey sample copied to R, G and B, so do that here and leave every other layout to the crate.
+fn into_rgba8(img: image::DynamicImage) -> Vec<u8> {
+    use image::DynamicImage;
+    match img {
+        DynamicImage::ImageLuma8(b) => expand_luma(b.as_raw(), 1, u8::MAX),
+        DynamicImage::ImageLumaA8(b) => expand_luma(b.as_raw(), 2, u8::MAX),
+        other => other.into_rgba8().into_raw(),
+    }
+}
+
+/// [`into_rgba8`] for 16-bit sources, with the same fix.
+fn into_rgba16(img: image::DynamicImage) -> Vec<u16> {
+    use image::DynamicImage;
+    match img {
+        DynamicImage::ImageLuma16(b) => expand_luma(b.as_raw(), 1, u16::MAX),
+        DynamicImage::ImageLumaA16(b) => expand_luma(b.as_raw(), 2, u16::MAX),
+        other => other.into_rgba16().into_raw(),
+    }
+}
+
+/// Expand interleaved grey (`channels == 1`) or grey+alpha (`channels == 2`) samples to RGBA,
+/// with `opaque` as the alpha of a source that has none. The output is allocated up front and
+/// filled as fixed-size pixel arrays, which is the shape LLVM vectorizes.
+fn expand_luma<T: Copy>(src: &[T], channels: usize, opaque: T) -> Vec<T> {
+    debug_assert!(matches!(channels, 1 | 2));
+    let mut out = vec![opaque; src.len() / channels * 4];
+    let px = out.as_chunks_mut::<4>().0;
+    if channels == 1 {
+        for (o, &g) in px.iter_mut().zip(src) {
+            *o = [g, g, g, opaque];
+        }
+    } else {
+        for (o, &[g, a]) in px.iter_mut().zip(src.as_chunks::<2>().0) {
+            *o = [g, g, g, a];
+        }
+    }
+    out
+}
+
 /// PNG via the `image` crate → RGBA8, or RGBA16 for 16-bit sources (precision preserved
 /// for the inspector / HDR pipeline). Extracts the embedded ICC profile.
 ///
@@ -952,10 +998,10 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     );
     let (pixels, format, bit_depth) = if is_16bit {
         // The CPU shader reads Rgba16Unorm back as native-endian u16.
-        let rgba = dynimg.into_rgba16();
-        (to_ne_bytes(rgba.as_raw()), PixelFormat::Rgba16Unorm, 16u8)
+        let rgba = into_rgba16(dynimg);
+        (to_ne_bytes(&rgba), PixelFormat::Rgba16Unorm, 16u8)
     } else {
-        (dynimg.into_rgba8().into_raw(), PixelFormat::Rgba8Unorm, 8)
+        (into_rgba8(dynimg), PixelFormat::Rgba8Unorm, 8)
     };
 
     Ok(DecodedImage {
@@ -1265,13 +1311,13 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
     // must not be presented as if it did.
     let src_channels = dynimg.color().channel_count();
 
-    let (pixels, fmt, bit_depth) = match &dynimg {
+    let (pixels, fmt, bit_depth) = match dynimg {
         // Float sources (Radiance HDR, float TIFF) stay 32-bit float / linear (HDR).
         DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_) => {
-            let rgba = dynimg.to_rgba32f();
+            let rgba = dynimg.into_rgba32f();
             (to_ne_bytes(rgba.as_raw()), PixelFormat::Rgba32Float, 32)
         }
-        _ => (dynimg.to_rgba8().into_raw(), PixelFormat::Rgba8Unorm, 8),
+        _ => (into_rgba8(dynimg), PixelFormat::Rgba8Unorm, 8),
     };
 
     Ok(DecodedImage {
@@ -2026,6 +2072,55 @@ mod tests {
             out.channels, 4,
             "32-bit RGBA TGA must report an alpha channel"
         );
+    }
+
+    /// `into_rgba8` / `into_rgba16` bypass the `image` crate's conversion for grey sources (whose
+    /// float round trip made an 8192² greyscale TGA decode ~4× slower than the RGB one). The
+    /// bypass must produce exactly what the crate would have, at both depths and with and without
+    /// alpha — including the extremes, where a float round trip would be the first to drift.
+    #[test]
+    fn grey_expansion_matches_the_image_crate() {
+        use image::{DynamicImage, ImageBuffer, Luma, LumaA};
+
+        let (w, h) = (257u32, 3u32); // odd, and past one 256-pixel fallback chunk
+        let v8 = |i: u32| (i.wrapping_mul(97) % 256) as u8;
+        let v16 = |i: u32| i.wrapping_mul(40_503) as u16;
+        let l8 = ImageBuffer::from_fn(w, h, |x, y| Luma([v8(y * w + x)]));
+        let la8 = ImageBuffer::from_fn(w, h, |x, y| LumaA([v8(y * w + x), v8(x * 7 + y)]));
+        let l16 = ImageBuffer::from_fn(w, h, |x, y| Luma([v16(y * w + x)]));
+        let la16 = ImageBuffer::from_fn(w, h, |x, y| LumaA([v16(y * w + x), v16(x * 7 + y)]));
+
+        for img in [DynamicImage::ImageLuma8(l8), DynamicImage::ImageLumaA8(la8)] {
+            assert_eq!(
+                into_rgba8(img.clone()),
+                img.to_rgba8().into_raw(),
+                "{:?}",
+                img.color()
+            );
+        }
+        for img in [
+            DynamicImage::ImageLuma16(l16),
+            DynamicImage::ImageLumaA16(la16),
+        ] {
+            assert_eq!(
+                into_rgba16(img.clone()),
+                img.to_rgba16().into_raw(),
+                "{:?}",
+                img.color()
+            );
+        }
+    }
+
+    /// A greyscale TGA (image type 3) decodes through the fast grey expansion end to end: one
+    /// source channel, the grey sample replicated across RGB, opaque alpha.
+    #[test]
+    fn grey_tga_expands_to_opaque_rgba() {
+        let mut bytes = vec![0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0, 8, 0x20];
+        bytes.extend_from_slice(&[17, 230]);
+        let out = decode(&bytes, Some("tga"), &DecodeOptions::default()).unwrap();
+        assert_eq!(out.source_format, "TGA");
+        assert_eq!(out.channels, 1);
+        assert_eq!(out.pixels, [17, 17, 17, 255, 230, 230, 230, 255]);
     }
 
     /// Build an uncompressed true-colour TGA (image type 2) by hand — the variant every art
