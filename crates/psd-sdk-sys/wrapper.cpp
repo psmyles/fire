@@ -144,12 +144,12 @@ inline float sample_norm(const void* data, unsigned int bits, size_t i) {
         return static_cast<const uint8_t*>(data)[i] * (1.0f / 255.0f);
     }
     if (bits == 16) {
-        // Photoshop stores 16-bit samples as 15-bit+1 integers in the range 0...32768 —
-        // see the comment in vendor/Psd/PsdParseImageDataSection.cpp. Treating them as
-        // full-range 0..65535 (an `x >> 8` narrowing does exactly that) renders every
-        // 16-bit document at HALF BRIGHTNESS: white, 32768, comes out 128.
-        const uint16_t v = static_cast<const uint16_t*>(data)[i];
-        return (v >= 32768u) ? 1.0f : v * (1.0f / 32768.0f);
+        // Full range, 0..65535. Photoshop *works* in 15-bit+1 (0..32768) internally, but it
+        // scales to the full 16-bit range on save — which is what the comment in
+        // vendor/Psd/PsdParseImageDataSection.cpp says ("16-bit values are stored directly").
+        // Reading it as 0..32768 instead clipped every sample above mid-scale to white: a 16-bit
+        // document saved by Photoshop 27 has ~40% of its samples there, white stored as 65535.
+        return static_cast<const uint16_t*>(data)[i] * (1.0f / 65535.0f);
     }
     return static_cast<const float*>(data)[i];
 }
@@ -254,6 +254,25 @@ void run_parallel(size_t n, F f) {
     for (std::thread& t : pool) {
         t.join();
     }
+}
+
+// Interleave up to four planes of `T` samples into RGBA; a null alpha plane is `opaque`.
+template <typename T>
+void interleave_planes(const void* const src[4], void* out_pixels, size_t pixels, T opaque) {
+    const T* r = static_cast<const T*>(src[0]);
+    const T* g = static_cast<const T*>(src[1]);
+    const T* b = static_cast<const T*>(src[2]);
+    const T* a = static_cast<const T*>(src[3]);
+    T* out = static_cast<T*>(out_pixels);
+    run_parallel(pixels, [=](size_t begin, size_t end) {
+        T* o = out + begin * 4;
+        for (size_t i = begin; i < end; ++i, o += 4) {
+            o[0] = r[i];
+            o[1] = g[i];
+            o[2] = b[i];
+            o[3] = a ? a[i] : opaque;
+        }
+    });
 }
 
 } // namespace
@@ -417,9 +436,8 @@ int fire_psd_read_merged(const fire_psd* doc, void* out_pixels, size_t out_len) 
 
     // The common documents — 8/16-bit RGB and greyscale — take an integer path. The generic loop
     // below dispatches on the mode and depth for every sample and round-trips each one through
-    // float; for these modes that is an exact identity at 8 bits (v/255*255 lands back on v) and a
-    // fixed mapping at 16, so they are interleaved directly, the 16-bit mapping read from a table
-    // built by the very expressions the generic path uses. Same bytes, a fraction of the time.
+    // float, which for these modes is an exact identity (v/max*max lands back on v), so their
+    // planes are interleaved directly. Same bytes, a fraction of the time.
     if ((mode == psd::colorMode::RGB || mode == psd::colorMode::GRAYSCALE
          || mode == psd::colorMode::DUOTONE)
         && (bits == 8 || bits == 16)) {
@@ -433,43 +451,9 @@ int fire_psd_read_merged(const fire_psd* doc, void* out_pixels, size_t out_len) 
         src[3] = hasAlpha ? images[colorChannels].data : nullptr;
         try {
             if (bits == 8) {
-                const uint8_t* r = static_cast<const uint8_t*>(src[0]);
-                const uint8_t* g = static_cast<const uint8_t*>(src[1]);
-                const uint8_t* b = static_cast<const uint8_t*>(src[2]);
-                const uint8_t* a = static_cast<const uint8_t*>(src[3]);
-                uint8_t* out = static_cast<uint8_t*>(out_pixels);
-                run_parallel(pixels, [=](size_t begin, size_t end) {
-                    uint8_t* o = out + begin * 4;
-                    for (size_t i = begin; i < end; ++i, o += 4) {
-                        o[0] = r[i];
-                        o[1] = g[i];
-                        o[2] = b[i];
-                        o[3] = a ? a[i] : 255;
-                    }
-                });
+                interleave_planes<uint8_t>(src, out_pixels, pixels, 255);
             } else {
-                // Photoshop's 0..32768 to the full 0..65535, through the generic path's own
-                // sample_norm/store_sample so the two can never disagree.
-                std::vector<uint16_t> to16(65536);
-                for (uint32_t v = 0; v < 65536; ++v) {
-                    const uint16_t sample = static_cast<uint16_t>(v);
-                    store_sample(&to16[v], 16, 0, sample_norm(&sample, 16, 0));
-                }
-                const uint16_t* table = to16.data();
-                const uint16_t* r = static_cast<const uint16_t*>(src[0]);
-                const uint16_t* g = static_cast<const uint16_t*>(src[1]);
-                const uint16_t* b = static_cast<const uint16_t*>(src[2]);
-                const uint16_t* a = static_cast<const uint16_t*>(src[3]);
-                uint16_t* out = static_cast<uint16_t*>(out_pixels);
-                run_parallel(pixels, [=](size_t begin, size_t end) {
-                    uint16_t* o = out + begin * 4;
-                    for (size_t i = begin; i < end; ++i, o += 4) {
-                        o[0] = table[r[i]];
-                        o[1] = table[g[i]];
-                        o[2] = table[b[i]];
-                        o[3] = a ? table[a[i]] : 65535;
-                    }
-                });
+                interleave_planes<uint16_t>(src, out_pixels, pixels, 65535);
             }
         } catch (...) {
             return 5;

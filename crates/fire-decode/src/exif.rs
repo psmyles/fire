@@ -225,15 +225,21 @@ fn png_exif(b: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// The TIFF stream in a WebP's RIFF `EXIF` chunk (extended WebP only — a simple lossy/lossless
-/// file has no chunk list past `VP8 `/`VP8L`, and the walk simply runs off the end).
+/// The TIFF stream in a WebP's RIFF `EXIF` chunk.
 fn webp_exif(b: &[u8]) -> Option<&[u8]> {
+    webp_chunk(b, b"EXIF").map(strip_exif_header)
+}
+
+/// The payload of a WebP's first RIFF chunk named `fourcc` (extended WebP only — a simple
+/// lossy/lossless file has no chunk list past `VP8 `/`VP8L`, and the walk simply runs off the
+/// end). Shared with the WebP decoder, which reads its `ICCP` chunk here.
+pub(crate) fn webp_chunk<'a>(b: &'a [u8], fourcc: &[u8; 4]) -> Option<&'a [u8]> {
     let mut i = 12usize; // past "RIFF" + size + "WEBP"
     loop {
         let kind = b.get(i..i.checked_add(4)?)?;
         let len = u32::from_le_bytes(b.get(i + 4..i + 8)?.try_into().ok()?) as usize;
-        if kind == b"EXIF" {
-            return Some(strip_exif_header(b.get(i + 8..i + 8 + len)?));
+        if kind == fourcc {
+            return b.get(i + 8..i.checked_add(8)?.checked_add(len)?);
         }
         // RIFF pads every chunk to an even size, and the pad byte is not counted in `len`.
         i = i.checked_add(8)?.checked_add(len)?.checked_add(len & 1)?;

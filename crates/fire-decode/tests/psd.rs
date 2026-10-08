@@ -100,15 +100,16 @@ fn psd_rgb8_without_alpha_synthesizes_opaque_lane() {
     );
 }
 
-/// 16-bit PSDs keep 16 bits, and are scaled from Photoshop's range rather than Photoshop's
-/// *nominal* one.
+/// 16-bit PSDs keep 16 bits, and their samples are full-range 0…65535, passed through as stored.
 ///
-/// Photoshop stores 16-bit samples as 15-bit+1 integers in the range **0…32768**, not 0…65535 —
-/// the vendored SDK says so itself in `PsdParseImageDataSection.cpp`. The wrapper used to narrow
-/// with `x >> 8`, which treats 32768 (white) as 128, i.e. rendered every 16-bit document at half
-/// brightness. It also flattened the buffer to 8 bits while `bit_depth` went on claiming 16.
+/// Photoshop *works* in 15-bit+1 (0…32768) internally, but scales to the full 16-bit range when it
+/// saves — the vendored SDK's `PsdParseImageDataSection.cpp` says the values "are stored directly".
+/// A 16-bit document saved by Photoshop 27 bears that out: white is 65535, and ~40% of its samples
+/// lie above 32768. Reading the samples as 0…32768 instead clipped every one of those to white.
+/// (Before that, the wrapper narrowed with `x >> 8` and flattened the buffer to 8 bits while
+/// `bit_depth` went on claiming 16.)
 #[test]
-fn psd_rgb16_scales_from_photoshops_32768_range() {
+fn psd_rgb16_keeps_full_range_samples() {
     let plane16 =
         |vals: [u16; 2]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_be_bytes()).collect() };
     let bytes = psd(
@@ -117,9 +118,9 @@ fn psd_rgb16_scales_from_photoshops_32768_range() {
         COLOR_MODE_RGB,
         16,
         &[
-            plane16([32768, 0]),     // R: white, then black
-            plane16([16384, 32768]), // G: half, then white
-            plane16([0, 16384]),     // B: black, then half
+            plane16([65535, 0]),     // R: white, then black
+            plane16([32768, 65535]), // G: mid-scale (not white), then white
+            plane16([0, 40000]),     // B: black, then above mid-scale (not clipped)
         ],
     );
 
@@ -138,8 +139,7 @@ fn psd_rgb16_scales_from_photoshops_32768_range() {
         .iter()
         .map(|c| u16::from_ne_bytes(*c))
         .collect();
-    // 32768 is full white, not half. 16384 is the midpoint.
-    assert_eq!(s, vec![65535, 32768, 0, 65535, 0, 65535, 32768, 65535]);
+    assert_eq!(s, vec![65535, 32768, 0, 65535, 0, 65535, 40000, 65535]);
 }
 
 /// 32-bit PSDs are linear/HDR and stay that way: values above 1.0 survive instead of being

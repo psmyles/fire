@@ -11,7 +11,7 @@ Fire's own code is MIT licensed; see [`../LICENSE`](../LICENSE).
 * **Section 1** covers the native C/C++ libraries. Read this one — it is short, and it contains
   the only obligation in the whole distribution that goes beyond attribution (the LGPL relink
   right, below).
-* **Section 2** covers the Rust crates (161 of them). One of them, `option-ext`, is MPL-2.0; the
+* **Section 2** covers the Rust crates (163 of them). One of them, `option-ext`, is MPL-2.0; the
   note under the table says what that does and does not require.
 * **Section 3** notes what is *not* here, and why.
 
@@ -25,7 +25,8 @@ metal` — is excluded: it produces the binary but no part of it is linked into 
 
 ## 1. Native libraries
 
-These are C/C++ libraries, vendored under `crates/*/vendor/` and statically linked.
+These are C/C++ libraries, statically linked: vendored under `crates/*/vendor/`, or inside the
+`-sys` crate that compiles them.
 
 ### libheif — LGPL-3.0-only
 
@@ -70,6 +71,15 @@ Copyright © 2018-2024 VideoLAN and dav1d authors. All rights reserved.
 <https://code.videolan.org/videolan/dav1d>
 License text: [`licenses/BSD-2-Clause.txt`](../licenses/BSD-2-Clause.txt)
 
+### libwebp — BSD-3-Clause
+
+*WebP decoder, used for lossy `.webp`. Version 1.6.0, compiled from source by the `libwebp-sys`
+crate, which vendors it.*
+Copyright © 2010, Google Inc. All rights reserved. — <https://chromium.googlesource.com/webm/libwebp>
+License text: [`licenses/BSD-3-Clause.txt`](../licenses/BSD-3-Clause.txt). Google additionally
+grants a patent license for WebP; its terms are in the `PATENTS` file of the libwebp source
+(included in the `libwebp-sys` crate).
+
 ### psd_sdk — BSD-2-Clause
 
 *Photoshop `.psd` / `.psb` reader. Linked via `crates/psd-sdk-sys`; vendored at commit
@@ -110,14 +120,14 @@ License text: [`licenses/Zlib.txt`](../licenses/Zlib.txt)
 
 ## 2. Rust crates
 
-161 crates are linked into the Fire binary (the union of both shipped targets). Where a crate
+163 crates are linked into the Fire binary (the union of both shipped targets). Where a crate
 offers a choice of licenses, the column below records **the license Fire elects**, not the full
 SPDX expression — Fire elects MIT wherever MIT is offered, then the most permissive of what is
 left. Full texts:
 
 | License | Text |
 |---|---|
-| MIT (150 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
+| MIT (152 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
 | BSD-3-Clause (6) | [`licenses/BSD-3-Clause.txt`](../licenses/BSD-3-Clause.txt) |
 | 0BSD (3) | [`licenses/0BSD.txt`](../licenses/0BSD.txt) |
 | Apache-2.0 (1, plus 1 in addition to MIT) | [`licenses/Apache-2.0.txt`](../licenses/Apache-2.0.txt) |
@@ -204,6 +214,7 @@ rows name the authors the crate itself declares.
 | `lcms2-sys` | 4.0.6 | MIT | (no notice in crate; authors: Kornel Lesiński <kornel@geekhood.net>) |
 | `lebe` | 0.5.3 | BSD-3-Clause | Copyright (c) 2022 Contributors to the lebe Project. All rights reserved. |
 | `libc` | 0.2.186 | MIT | Copyright (c) The Rust Project Developers |
+| `libwebp-sys` | 0.14.4 | MIT | (no notice in crate; authors: XianYou <xianyou.cyq@alibaba-inc.com>, Kornel Lesiński <kornel@geekhood.net>) |
 | `lock_api` | 0.4.14 | MIT | Copyright (c) 2016 The Rust Project Developers |
 | `log` | 0.4.33 | MIT | Copyright (c) 2014 The Rust Project Developers |
 | `miniz_oxide` | 0.8.9 | MIT | Copyright 2013-2014 RAD Game Tools and Valve Software; Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC; Copyright 2016 Martin Molzer |
@@ -232,6 +243,7 @@ rows name the authors the crate itself declares.
 | `png` | 0.18.1 | MIT | Copyright (c) 2015 nwin |
 | `proc-macro2` | 1.0.106 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>, Alex Crichton <alex@alexcrichton.com>) |
 | `pxfm` | 0.1.29 | BSD-3-Clause | Copyright (c) Radzivon Bartoshyk. All rights reserved. |
+| `qoi` | 0.4.1 | MIT | Copyright (c) 2022 Ivan Smirnov |
 | `quick-error` | 2.0.1 | MIT | Copyright (c) 2015 The quick-error Developers |
 | `quote` | 1.0.46 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>) |
 | `raw-window-handle` | 0.6.2 | MIT | Copyright (c) 2019 Osspial |
@@ -361,4 +373,5 @@ Take the **union** of the two — both targets ship — and cross-reference
 line out of each package's own `LICENSE*` file in the local cargo registry. The workspace's own
 crates (`fire`, `fire-decode`, `fire-ipc`, `psd-sdk-sys`, `heif-sys`) and the vendored `sokol`
 path dependency are excluded from the table: the first five are Fire, and sokol is section 1. The
-native libraries in section 1 change only when `crates/*/vendor/` or `vendor/sokol-rust` changes.
+native libraries in section 1 change only when `crates/*/vendor/`, `vendor/sokol-rust`, or a `-sys`
+crate that vendors one (`lcms2-sys`, `libwebp-sys`, `dear-imgui-sys`) changes.

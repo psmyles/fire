@@ -15,8 +15,9 @@
 //!
 //! What this module owns is only the *interpretation* of the samples. Every hard part —
 //! LZW/Deflate/PackBits, strips vs. tiles, predictors, planar configuration, endianness — stays
-//! inside the `tiff` crate, which is the same code `image` was driving. Colour types we have
-//! nothing better to say about (palette, CMYK, YCbCr, Lab) fall back to the `image` path, which
+//! inside the `tiff` crate, which is the same code `image` was driving. Palette images, which
+//! neither crate will read, are relabelled and mapped here ([`decode_palette`]). Colour types we
+//! have nothing better to say about (CMYK, YCbCr, Lab) fall back to the `image` path, which
 //! already converts them correctly; [`decode`] returns `None` to ask for that.
 
 use std::borrow::Cow;
@@ -36,6 +37,9 @@ const EXTRA_ASSOCIATED_ALPHA: u16 = 1;
 /// Decode a TIFF, or return `None` if its colour type is one the caller should hand to the
 /// `image` crate instead.
 pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> {
+    if let Some(palette) = decode_palette(bytes) {
+        return Some(palette);
+    }
     // Limits::unlimited defers the size question to our own guard below, which is expressed in
     // the same byte budget every other backend uses rather than this crate's private defaults.
     let mut dec = Decoder::new(Cursor::new(bytes))
@@ -60,8 +64,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> 
             bit_depth,
             num_samples: 2,
         } => (2, bit_depth),
-        // Palette / CMYK / CMYKA / YCbCr / Lab, and multiband images with more bands than we
-        // can assign meaning to: let the `image` crate's conversions handle them.
+        // CMYK / CMYKA / YCbCr / Lab, and multiband images with more bands than we can assign
+        // meaning to: let the `image` crate's conversions handle them.
         _ => return None,
     };
     // Four output lanes at the source's own sample width. Sub-byte depths (1/2/4-bit bilevel
@@ -386,6 +390,16 @@ pub(crate) fn extra_sample_as_alpha(bytes: &[u8]) -> Cow<'_, [u8]> {
 /// header — or a BigTIFF — yields `None` rather than reaching for a byte that isn't there.
 fn unspecified_extra_sample(bytes: &[u8]) -> Option<usize> {
     const EXTRA_SAMPLES: u16 = 338;
+    // More than one extra channel is beyond what this fixup claims to understand, and
+    // `ifd0_short` only answers for a lone SHORT.
+    ifd0_short(bytes, EXTRA_SAMPLES).and_then(|(at, value)| (value == 0).then_some(at))
+}
+
+/// IFD0's entry for `tag`, when it holds a single SHORT: the byte offset of that value (stored
+/// inline, left-justified in the entry's 4-byte value field, in both byte orders) and the value.
+/// `None` for a classic TIFF without the entry, an entry of any other type or count, a BigTIFF,
+/// or a header too short or malformed to walk — every read is bounds-checked.
+fn ifd0_short(bytes: &[u8], tag: u16) -> Option<(usize, u16)> {
     const SHORT: u16 = 3;
 
     let little_endian = match bytes.get(..4)? {
@@ -401,18 +415,163 @@ fn unspecified_extra_sample(bytes: &[u8]) -> Option<usize> {
     let ifd = u32at(4)? as usize;
     for i in 0..u16at(ifd)? as usize {
         let entry = ifd.checked_add(2)?.checked_add(i.checked_mul(12)?)?;
-        if u16at(entry)? != EXTRA_SAMPLES {
+        if u16at(entry)? != tag {
             continue;
         }
-        // One SHORT fits the entry's 4-byte value field, so it is stored inline and
-        // left-justified there (in both byte orders). More than one extra channel, or any
-        // other type, is beyond what this fixup claims to understand.
         if u16at(entry + 2)? != SHORT || u32at(entry + 4)? != 1 {
             return None;
         }
-        return (u16at(entry + 8)? == 0).then_some(entry + 8);
+        return Some((entry + 8, u16at(entry + 8)?));
     }
     None
+}
+
+/// A palette TIFF (`PhotometricInterpretation` 3, "RGBPalette"): one index per pixel, looked up
+/// in the `ColorMap` tag. `None` if the file is not one.
+///
+/// The `tiff` crate (0.11) refuses palette images outright — `colortype()` errors, and every
+/// readout goes through it — and the `image` crate, which drives the same crate, refuses them
+/// too, so a palette TIFF did not open at all. The indices themselves are ordinary 1/2/4/8/16-bit
+/// greyscale samples, though, so the file is relabelled greyscale (`BlackIsZero`) in a copy of
+/// its bytes — the same kind of one-field patch [`extra_sample_as_alpha`] makes — and read by the
+/// crate as such, with all of its decompression, predictor and strip/tile handling intact. The
+/// `ColorMap` tag is untouched by the relabelling and maps the indices to colour here.
+pub(crate) fn decode_palette(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> {
+    const PHOTOMETRIC_INTERPRETATION: u16 = 262;
+    const RGB_PALETTE: u16 = 3;
+    const BLACK_IS_ZERO: u16 = 1;
+
+    let (at, value) = ifd0_short(bytes, PHOTOMETRIC_INTERPRETATION)?;
+    if value != RGB_PALETTE {
+        return None;
+    }
+    let mut patched = bytes.to_vec();
+    let relabel = if bytes[0] == b'M' {
+        BLACK_IS_ZERO.to_be_bytes()
+    } else {
+        BLACK_IS_ZERO.to_le_bytes()
+    };
+    patched[at..at + 2].copy_from_slice(&relabel);
+    Some(read_palette(&patched))
+}
+
+fn read_palette(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    let malformed = |what: &str| DecodeError::Malformed(format!("palette TIFF: {what}"));
+    let err = |e: tiff::TiffError| DecodeError::Malformed(e.to_string());
+
+    let mut dec = Decoder::new(Cursor::new(bytes))
+        .map_err(err)?
+        .with_limits(Limits::unlimited());
+    let (width, height) = dec.dimensions().map_err(err)?;
+    let bits = match dec.colortype().map_err(err)? {
+        ColorType::Gray(b @ (1 | 2 | 4 | 8 | 16)) => b,
+        _ => {
+            return Err(malformed(
+                "indices must be one 1/2/4/8/16-bit sample a pixel",
+            ))
+        }
+    };
+    check_dims(width as usize, height as usize, 4, "TIFF")?;
+    // The file-side buffers are laid out from SamplesPerPixel (see `decode`); a palette image
+    // has one, and one is all the guard above accounts for.
+    if dec
+        .find_tag_unsigned::<u16>(Tag::SamplesPerPixel)
+        .ok()
+        .flatten()
+        .is_some_and(|spp| spp != 1)
+    {
+        return Err(malformed("more than one sample per pixel"));
+    }
+
+    // The map is all reds, then all greens, then all blues, 2^bits each, 16 bits a value. Very
+    // old writers stored 8-bit values; like libtiff, read a map with nothing above 255 as that.
+    let map = dec.get_tag_u16_vec(Tag::ColorMap).map_err(err)?;
+    let entries = 1usize << bits;
+    if map.len() < 3 * entries {
+        return Err(malformed("ColorMap is shorter than the bit depth requires"));
+    }
+    let eight_bit_map = map.iter().all(|&v| v <= 255);
+    let to8 = |v: u16| {
+        if eight_bit_map {
+            v as u8
+        } else {
+            ((u32::from(v) * 255 + 32767) / 65535) as u8
+        }
+    };
+    let colors: Vec<[u8; 4]> = (0..entries)
+        .map(|i| {
+            [
+                to8(map[i]),
+                to8(map[entries + i]),
+                to8(map[2 * entries + i]),
+                255,
+            ]
+        })
+        .collect();
+    let icc = dec
+        .get_tag_u8_vec(Tag::IccProfile)
+        .ok()
+        .filter(|v| !v.is_empty());
+
+    let samples = read_strips_parallel(bytes, &mut dec)
+        .unwrap_or_else(|| dec.read_image())
+        .map_err(err)?;
+    let (w, h) = (width as usize, height as usize);
+    let mut pixels = vec![0u8; w * h * 4];
+    match samples {
+        // Sub-byte indices are packed most-significant first, each row starting on a byte.
+        DecodingResult::U8(packed) => {
+            let bits = bits as usize;
+            let row_bytes = (w * bits).div_ceil(8);
+            if packed.len() < row_bytes * h {
+                return Err(malformed(
+                    "index data is shorter than its dimensions declare",
+                ));
+            }
+            let mask = (1u16 << bits) - 1;
+            crate::par_chunks_mut(&mut pixels, w * 4, |offset, part| {
+                let first = offset / (w * 4);
+                for (y, row) in part.chunks_exact_mut(w * 4).enumerate() {
+                    let src = &packed[(first + y) * row_bytes..][..row_bytes];
+                    for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                        let bit = x * bits;
+                        let index = (u16::from(src[bit / 8]) >> (8 - bits - bit % 8)) & mask;
+                        *px = colors[index as usize];
+                    }
+                }
+            });
+        }
+        DecodingResult::U16(indices) => {
+            if indices.len() < w * h {
+                return Err(malformed(
+                    "index data is shorter than its dimensions declare",
+                ));
+            }
+            crate::par_chunks_mut(&mut pixels, 4, |offset, part| {
+                let src = &indices[offset / 4..];
+                for (px, &i) in part.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                    *px = colors[i as usize];
+                }
+            });
+        }
+        _ => return Err(malformed("unexpected index sample type")),
+    }
+
+    Ok(DecodedImage {
+        pixels,
+        width,
+        height,
+        format: PixelFormat::Rgba8Unorm,
+        bit_depth: 8,
+        channels: 3,
+        icc,
+        source_format: "TIFF",
+        alpha_opaque: false, // set by `decode` after the final buffer is built
+        downscaled_from: None,
+        source_mips: None,
+        layout: None,
+        animation: None,
+    })
 }
 
 #[cfg(test)]
@@ -496,6 +655,130 @@ mod tests {
         assert_eq!(b.len(), data_off);
         b.extend_from_slice(data);
         b
+    }
+
+    /// An uncompressed single-strip palette TIFF (photometric 3) with `map` as its `ColorMap`,
+    /// in either byte order — `build` cannot place a tag that large, so this lays out its own.
+    fn palette(w: u32, h: u32, bits: u16, map: &[u16], data: &[u8], big_endian: bool) -> Vec<u8> {
+        let u16b = |v: u16| {
+            if big_endian {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let u32b = |v: u32| {
+            if big_endian {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        // A SHORT value sits left-justified in the entry's 4-byte field.
+        let short = |v: u16| -> u32 { u32::from_ne_bytes([u16b(v)[0], u16b(v)[1], 0, 0]) };
+        let n = 10usize;
+        let after_ifd = 8 + 2 + n * 12 + 4;
+        let data_off = after_ifd + map.len() * 2;
+        let entries: [(u16, u16, u32, u32); 10] = [
+            (256, 3, 1, short(w as u16)),
+            (257, 3, 1, short(h as u16)),
+            (258, 3, 1, short(bits)),
+            (259, 3, 1, short(1)),
+            (262, 3, 1, short(3)), // RGBPalette
+            (273, 4, 1, u32::from_ne_bytes(u32b(data_off as u32))),
+            (277, 3, 1, short(1)),
+            (278, 3, 1, short(h as u16)),
+            (279, 4, 1, u32::from_ne_bytes(u32b(data.len() as u32))),
+            (
+                320,
+                3,
+                map.len() as u32,
+                u32::from_ne_bytes(u32b(after_ifd as u32)),
+            ),
+        ];
+        let mut b = if big_endian {
+            b"MM\0\x2a".to_vec()
+        } else {
+            b"II\x2a\0".to_vec()
+        };
+        b.extend_from_slice(&u32b(8));
+        b.extend_from_slice(&u16b(n as u16));
+        for (tag, typ, cnt, val) in entries {
+            b.extend_from_slice(&u16b(tag));
+            b.extend_from_slice(&u16b(typ));
+            b.extend_from_slice(&u32b(cnt));
+            b.extend_from_slice(&val.to_ne_bytes());
+        }
+        b.extend_from_slice(&u32b(0));
+        for &v in map {
+            b.extend_from_slice(&u16b(v));
+        }
+        assert_eq!(b.len(), data_off);
+        b.extend_from_slice(data);
+        b
+    }
+
+    /// Palette TIFFs open — they used to fail in both the `tiff` crate and the `image` fallback —
+    /// with each pixel the colour its index names, at every index width: 8-bit, packed 4- and
+    /// 1-bit (on an odd width, so rows end mid-byte and are padded), 16-bit, in both byte orders.
+    /// The 16-bit map scales to 8 bits with rounding, and a map with nothing above 255 is read as
+    /// the 8-bit map very old writers stored.
+    #[test]
+    fn palette_tiffs_map_indices_to_colours() {
+        // Entry i: red i*257, green (255-i)*257, blue a fixed 0x1234 (→ 18 at 8 bits).
+        let map16 = |entries: usize| -> Vec<u16> {
+            let channel = |f: &dyn Fn(usize) -> u16| (0..entries).map(f).collect::<Vec<_>>();
+            [
+                channel(&|i| (i % 256) as u16 * 257),
+                channel(&|i| (255 - i % 256) as u16 * 257),
+                channel(&|_| 0x1234),
+            ]
+            .concat()
+        };
+        let colour = |i: usize| [(i % 256) as u8, (255 - i % 256) as u8, 18, 255];
+
+        for big_endian in [false, true] {
+            // 8-bit, 3x2.
+            let idx = [0u8, 1, 255, 128, 7, 200];
+            let out = run(&palette(3, 2, 8, &map16(256), &idx, big_endian));
+            assert_eq!((out.channels, out.format), (3, PixelFormat::Rgba8Unorm));
+            let expected: Vec<u8> = idx.iter().flat_map(|&i| colour(i as usize)).collect();
+            assert_eq!(out.pixels, expected, "8-bit, big-endian {big_endian}");
+
+            // 4-bit, 3x2: two indices a byte, high nibble first; each row padded to a byte.
+            let idx = [[1usize, 15, 7], [0, 9, 2]];
+            let data = [0x1f, 0x70, 0x09, 0x20];
+            let out = run(&palette(3, 2, 4, &map16(16), &data, big_endian));
+            let expected: Vec<u8> = idx.iter().flatten().flat_map(|&i| colour(i)).collect();
+            assert_eq!(out.pixels, expected, "4-bit, big-endian {big_endian}");
+
+            // 1-bit, 9x1: eight indices in the first byte, the ninth in the next one's top bit.
+            let data = [0b1010_0110, 0b1000_0000];
+            let out = run(&palette(9, 1, 1, &map16(2), &data, big_endian));
+            let bits = [1usize, 0, 1, 0, 0, 1, 1, 0, 1];
+            let expected: Vec<u8> = bits.iter().flat_map(|&i| colour(i)).collect();
+            assert_eq!(out.pixels, expected, "1-bit, big-endian {big_endian}");
+
+            // 16-bit indices, 2x1.
+            let data: Vec<u8> = [300u16, 65535]
+                .iter()
+                .flat_map(|&i| {
+                    if big_endian {
+                        i.to_be_bytes()
+                    } else {
+                        i.to_le_bytes()
+                    }
+                })
+                .collect();
+            let out = run(&palette(2, 1, 16, &map16(65536), &data, big_endian));
+            let expected: Vec<u8> = [300usize, 65535].iter().flat_map(|&i| colour(i)).collect();
+            assert_eq!(out.pixels, expected, "16-bit, big-endian {big_endian}");
+        }
+
+        // A legacy 8-bit map: every value at most 255, read as is rather than scaled down to ~0.
+        let legacy: Vec<u16> = [vec![200u16, 10], vec![100, 20], vec![50, 30]].concat();
+        let out = run(&palette(2, 1, 1, &legacy, &[0b0100_0000], false));
+        assert_eq!(out.pixels, vec![200, 100, 50, 255, 10, 20, 30, 255]);
     }
 
     const RGB: u32 = 2;

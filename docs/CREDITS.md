@@ -13,8 +13,13 @@ Fire's whole reason to exist is getting a pixel on screen quickly, and that is a
 question of how fast someone else's decoder runs.
 
 * **[zune-image](https://github.com/etemesi254/zune-image)** - Caleb Etemesi and the zune-image
-  developers. The hot path. JPEG, PNG, BMP, PPM, QOI, PSD, farbfeld, HDR, JPEG XL - Fire's
-  time-to-first-pixel is largely zune's decode speed.
+  developers. The hot path: the JPEG, BMP and PPM decoders, the format sniffing that routes every
+  file, and the first frame of an animated WebP. JPEG is the format people open most, so Fire's
+  time-to-first-pixel is largely zune-jpeg's decode speed.
+* **[libwebp](https://chromium.googlesource.com/webm/libwebp)** - Google. Lossy WebP, decoded
+  SIMD-dispatched and multithreaded, through the
+  **[libwebp-sys](https://github.com/NoXF/libwebp-sys)** bindings.
+* **[qoi](https://github.com/aldanor/qoi-rust)** - Ivan Smirnov. QOI.
 * **[image](https://github.com/image-rs/image)** - the image-rs developers. The fallback decoder,
   the animated GIF path, and - measured, not assumed - the faster PNG and Radiance HDR decoders.
   With it come **[png](https://github.com/image-rs/image-png)**,

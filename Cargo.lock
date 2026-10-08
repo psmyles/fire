@@ -657,7 +657,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fire"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "cc",
  "crossbeam-channel",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "fire-decode"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "bcdec_rs",
  "bytemuck",
@@ -700,7 +700,9 @@ dependencies = [
  "image-webp",
  "jxl-oxide",
  "lcms2",
+ "libwebp-sys",
  "psd-sdk-sys",
+ "qoi",
  "tiff",
  "zune-bmp",
  "zune-core 0.5.1",
@@ -708,12 +710,11 @@ dependencies = [
  "zune-image",
  "zune-jpeg 0.5.15",
  "zune-ppm",
- "zune-qoi",
 ]
 
 [[package]]
 name = "fire-ipc"
-version = "0.4.3"
+version = "0.4.4"
 
 [[package]]
 name = "flate2"
@@ -892,7 +893,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "heif-sys"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "bindgen",
  "cc",
@@ -1362,6 +1363,17 @@ dependencies = [
  "libc",
  "plain",
  "redox_syscall 0.9.3",
+]
+
+[[package]]
+name = "libwebp-sys"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b3a87b44e34d17161e4f17d92a463d596cb13825dcd1758ed18fd3a721e189c"
+dependencies = [
+ "cc",
+ "glob",
+ "pkg-config",
 ]
 
 [[package]]
@@ -1988,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "psd-sdk-sys"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "bindgen",
  "cc",
@@ -1999,6 +2011,15 @@ name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
+
+[[package]]
+name = "qoi"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "quick-error"

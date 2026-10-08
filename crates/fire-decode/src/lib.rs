@@ -1312,7 +1312,7 @@ fn decode_zune(
     let direct = match fmt {
         Z::JPEG => Some(decode_jpeg(bytes)?),
         Z::BMP => decode_bmp(bytes)?,
-        Z::QOI => decode_qoi(bytes)?,
+        Z::QOI => Some(decode_qoi(bytes)?),
         Z::PPM => decode_ppm(bytes)?,
         Z::Farbfeld => Some(decode_farbfeld(bytes)?),
         Z::WEBP => decode_webp(bytes)?,
@@ -1457,21 +1457,27 @@ fn decode_bmp(bytes: &[u8]) -> Result<Option<DecodedImage>, DecodeError> {
         .map(|(pixels, ch)| still(pixels, dims, PixelFormat::Rgba8Unorm, ch, None, "BMP")))
 }
 
-fn decode_qoi(bytes: &[u8]) -> Result<Option<DecodedImage>, DecodeError> {
-    use zune_core::bytestream::ZCursor;
-
-    let mut d = zune_qoi::QoiDecoder::new_with_options(ZCursor::new(bytes), zune_options());
-    d.decode_headers().map_err(malformed)?;
-    let dims = d
-        .dimensions()
-        .ok_or_else(|| malformed("QOI has no dimensions"))?;
+/// QOI through the `qoi` crate, decoded straight to RGBA — an RGB file gets its opaque alpha in
+/// the same pass. QOI is a strictly sequential format, so the decoder's inner loop is the whole
+/// cost: zune-qoi spent ~530 ms on an 8192² RGBA file that this does in a fraction of that.
+fn decode_qoi(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    let d = qoi::Decoder::new(bytes).map_err(malformed)?;
+    let header = *d.header();
+    let dims = (header.width as usize, header.height as usize);
     check_dims(dims.0, dims.1, 4, "QOI")?;
-    let cs = d
-        .colorspace()
-        .ok_or_else(|| malformed("QOI has no colorspace"))?;
-    let px = d.decode().map_err(malformed)?;
-    Ok(zune_rgba8(cs, px)
-        .map(|(pixels, ch)| still(pixels, dims, PixelFormat::Rgba8Unorm, ch, None, "QOI")))
+    let pixels = d
+        .with_channels(qoi::Channels::Rgba)
+        .decode_to_vec()
+        .map_err(malformed)?;
+    let channels = header.channels.as_u8();
+    Ok(still(
+        pixels,
+        dims,
+        PixelFormat::Rgba8Unorm,
+        channels,
+        None,
+        "QOI",
+    ))
 }
 
 /// PPM/PGM/PBM/PAM, and the float PFM, at the file's own depth.
@@ -1553,28 +1559,77 @@ fn decode_farbfeld(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
     ))
 }
 
-/// A still WebP through image-webp (the decoder zune wraps), read straight into an RGB(A)
-/// buffer. Animated files go to [`decode_zune_image`], which knows how to pick their first frame.
+/// A still WebP, by whichever decoder is faster for its kind of bitstream; both produce the same
+/// pixels. Animated files go to [`decode_zune_image`], which knows how to pick their first frame.
+///
+/// - **Lossy (VP8)** through libwebp, decoded straight into an RGBA buffer fire owns — a file
+///   without alpha gets its opaque lane in the same pass — with libwebp's threaded decoding on:
+///   ~0.76 s on an 8192² file where image-webp, the pure-Rust decoder zune wraps, took ~1.6 s.
+/// - **Lossless (VP8L)** through image-webp. Lossless decoding is sequential entropy decoding
+///   that threads cannot help, and there image-webp measured slightly ahead (~1.01 s vs ~1.10 s).
+///
+/// Neither decoder's still-image path reads the `ICCP` chunk, so it is read here.
 fn decode_webp(bytes: &[u8]) -> Result<Option<DecodedImage>, DecodeError> {
-    let mut d = image_webp::WebPDecoder::new(Cursor::new(bytes)).map_err(malformed)?;
-    if d.is_animated() {
+    use libwebp_sys as webp;
+
+    let status = |s: webp::VP8StatusCode| match s {
+        webp::VP8StatusCode::VP8_STATUS_OK => Ok(()),
+        e => Err(malformed(format!("WebP: {e:?}"))),
+    };
+    let mut config =
+        webp::WebPDecoderConfig::new().map_err(|_| malformed("libwebp ABI mismatch"))?;
+    // SAFETY: `bytes` is a live slice for the call, and `config.input` a valid, initialized
+    // struct for libwebp to fill.
+    status(unsafe { webp::WebPGetFeatures(bytes.as_ptr(), bytes.len(), &mut config.input) })?;
+    if config.input.has_animation != 0 {
         return Ok(None);
     }
-    let (w, h) = d.dimensions();
-    let dims = (w as usize, h as usize);
+    let dims = (config.input.width as usize, config.input.height as usize);
     check_dims(dims.0, dims.1, 4, "WebP")?;
-    let channels = if d.has_alpha() { 4 } else { 3 };
-    let len = d
-        .output_buffer_size()
-        .ok_or_else(|| malformed("WebP is too large"))?;
-    let mut px = vec![0u8; len];
-    d.read_image(&mut px).map_err(malformed)?;
-    let pixels = if channels == 4 {
-        px
-    } else {
-        rgba_bytes(&px, 3, u8::MAX)
+    let channels = if config.input.has_alpha != 0 { 4 } else { 3 };
+    let icc = exif::webp_chunk(bytes, b"ICCP").map(<[u8]>::to_vec);
+    const LOSSLESS: std::ffi::c_int = 2; // `WebPBitstreamFeatures::format`: 1 lossy, 2 lossless
+    if config.input.format == LOSSLESS {
+        let mut d = image_webp::WebPDecoder::new(Cursor::new(bytes)).map_err(malformed)?;
+        let len = d
+            .output_buffer_size()
+            .ok_or_else(|| malformed("WebP is too large"))?;
+        let mut px = vec![0u8; len];
+        d.read_image(&mut px).map_err(malformed)?;
+        let pixels = if d.has_alpha() {
+            px
+        } else {
+            rgba_bytes(&px, 3, u8::MAX)
+        };
+        return Ok(Some(still(
+            pixels,
+            dims,
+            PixelFormat::Rgba8Unorm,
+            channels,
+            icc,
+            "WebP",
+        )));
+    }
+
+    let mut pixels = vec![0u8; dims.0 * dims.1 * 4];
+    config.options.use_threads = 1;
+    config.output.colorspace = webp::WEBP_CSP_MODE::MODE_RGBA; // straight, not premultiplied
+    config.output.is_external_memory = 1;
+    config.output.u.RGBA = webp::WebPRGBABuffer {
+        rgba: pixels.as_mut_ptr(),
+        stride: (dims.0 * 4) as std::ffi::c_int,
+        size: pixels.len(),
     };
-    let icc = d.icc_profile().ok().flatten();
+    // SAFETY: the output buffer is `pixels`, sized and strided for exactly the dimensions the
+    // header reported (libwebp re-checks it against the bitstream and refuses a mismatch), and it
+    // outlives the call. With external memory libwebp allocates no output of its own, but
+    // `WebPFreeDecBuffer` is its documented release either way.
+    let decoded = unsafe {
+        let s = webp::WebPDecode(bytes.as_ptr(), bytes.len(), &mut config);
+        webp::WebPFreeDecBuffer(&mut config.output);
+        s
+    };
+    status(decoded)?;
     Ok(Some(still(
         pixels,
         dims,
@@ -2807,6 +2862,122 @@ mod tests {
         }
     }
 
+    /// WebP routes each still by bitstream kind — lossy to libwebp, lossless to image-webp — and
+    /// both must give exactly what image-webp, as an independent reference, decodes: straight
+    /// (not premultiplied) alpha, an opaque lane added where the file has none, and the file's
+    /// own channel count. The alpha ramps across each row so premultiplying would show; 7×5, so
+    /// no row is a multiple of any SIMD width. (ImageMagick-encoded, from a crop of a test image.)
+    #[test]
+    fn webp_stills_match_the_reference_decoder() {
+        const LOSSY: &[u8] = &[
+            0x52, 0x49, 0x46, 0x46, 0x42, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50,
+            0x38, 0x20, 0x36, 0x00, 0x00, 0x00, 0xd0, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x07, 0x00,
+            0x05, 0x00, 0x01, 0x00, 0x1c, 0x25, 0x98, 0x02, 0x74, 0x00, 0xf9, 0x8a, 0xc8, 0x85,
+            0x60, 0x00, 0xfe, 0xf3, 0x40, 0xaf, 0x65, 0xff, 0x45, 0xb0, 0x66, 0x48, 0x79, 0x42,
+            0xac, 0xd7, 0xfe, 0x55, 0x47, 0x97, 0xfd, 0x82, 0xff, 0xa9, 0x99, 0x07, 0x1f, 0x04,
+            0xdd, 0x38, 0x00, 0x00,
+        ];
+        const LOSSY_ALPHA: &[u8] = &[
+            0x52, 0x49, 0x46, 0x46, 0x78, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50,
+            0x38, 0x58, 0x0a, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x41, 0x4c, 0x50, 0x48, 0x1c, 0x00, 0x00, 0x00, 0x01, 0x37, 0x20, 0x10,
+            0x48, 0xe1, 0x30, 0x1d, 0x11, 0x91, 0x6d, 0x90, 0x65, 0x23, 0x6d, 0x37, 0x1f, 0xcb,
+            0xb1, 0xbc, 0xbf, 0xce, 0x2b, 0x44, 0xf4, 0x3f, 0x6c, 0x7c, 0x56, 0x50, 0x38, 0x20,
+            0x36, 0x00, 0x00, 0x00, 0xd0, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x07, 0x00, 0x05, 0x00,
+            0x01, 0x00, 0x1c, 0x25, 0x98, 0x02, 0x74, 0x00, 0xf9, 0x8a, 0x67, 0xb5, 0x00, 0x00,
+            0xfe, 0xf5, 0xb9, 0x9a, 0xf5, 0xc9, 0xd0, 0xe9, 0xc0, 0x1b, 0x3d, 0x85, 0xa4, 0x99,
+            0xbf, 0xf9, 0x4b, 0x23, 0x9f, 0xe9, 0x27, 0xfb, 0x1b, 0xd4, 0xe0, 0x00, 0x9b, 0xb0,
+            0x30, 0x00,
+        ];
+        const LOSSLESS: &[u8] = &[
+            0x52, 0x49, 0x46, 0x46, 0x74, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50,
+            0x38, 0x4c, 0x68, 0x00, 0x00, 0x00, 0x2f, 0x06, 0x00, 0x01, 0x10, 0xb5, 0x30, 0x68,
+            0x24, 0x49, 0x91, 0xc1, 0x63, 0xe6, 0xbb, 0x67, 0x7e, 0xff, 0x52, 0x46, 0x8a, 0x80,
+            0xa0, 0x44, 0xc2, 0x20, 0x00, 0xc0, 0x32, 0xfd, 0xeb, 0xcc, 0xb6, 0x79, 0x14, 0x22,
+            0x08, 0x20, 0x91, 0x49, 0x26, 0x98, 0x65, 0x86, 0x59, 0x66, 0x99, 0xc0, 0x0b, 0x71,
+            0x2e, 0x1d, 0x5a, 0x9c, 0xaf, 0x51, 0xdf, 0x96, 0x3f, 0xfe, 0x00, 0x07, 0x6d, 0x78,
+            0xc7, 0xba, 0x9d, 0xaa, 0x9b, 0xc5, 0xe3, 0x42, 0x58, 0x39, 0xa5, 0x2f, 0xca, 0xe9,
+            0x24, 0x6e, 0x52, 0x8e, 0x9d, 0xa2, 0x48, 0x32, 0x5f, 0x94, 0xd3, 0x49, 0x58, 0x54,
+            0x8e, 0xf5, 0x80, 0x6b, 0x49, 0xfa, 0xa3, 0x7a, 0x5b, 0xb4, 0x39, 0xfd,
+        ];
+        for (name, bytes, channels) in [
+            ("lossy", LOSSY, 3),
+            ("lossy + alpha", LOSSY_ALPHA, 4),
+            ("lossless + alpha", LOSSLESS, 4),
+        ] {
+            let mut d = image_webp::WebPDecoder::new(Cursor::new(bytes)).unwrap();
+            let mut buf = vec![0; d.output_buffer_size().unwrap()];
+            d.read_image(&mut buf).unwrap();
+            let expected = if d.has_alpha() {
+                buf
+            } else {
+                rgba_bytes(&buf, 3, u8::MAX)
+            };
+            let out = decode(bytes, Some("webp"), &DecodeOptions::default()).unwrap();
+            assert_eq!(
+                (out.width, out.height, out.channels, out.source_format),
+                (7, 5, channels, "WebP"),
+                "{name}"
+            );
+            assert_eq!(out.pixels, expected, "{name}");
+            if channels == 4 {
+                assert!(out.pixels.as_chunks::<4>().0.iter().any(|p| p[3] < 255));
+            }
+        }
+    }
+
+    /// QOI round-trips through the `qoi` crate's decoder in both of its layouts: RGBA as stored,
+    /// RGB with an opaque alpha added, and the file's channel count reported either way.
+    #[test]
+    fn qoi_decodes_rgb_and_rgba() {
+        let (w, h) = (13u32, 7u32);
+        let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i * 37 % 251) as u8).collect();
+        let rgb: Vec<u8> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect();
+        for (src, channels) in [(&rgba, 4u8), (&rgb, 3)] {
+            let bytes = qoi::encode_to_vec(src, w, h).unwrap();
+            let out = decode(&bytes, Some("qoi"), &DecodeOptions::default()).unwrap();
+            assert_eq!((out.width, out.height, out.channels), (w, h, channels));
+            assert_eq!(out.source_format, "QOI");
+            let expected = if channels == 4 {
+                rgba.clone()
+            } else {
+                rgba_bytes(&rgb, 3, u8::MAX)
+            };
+            assert_eq!(out.pixels, expected, "{channels} channels");
+        }
+    }
+
+    /// farbfeld (which zune-farbfeld refuses outright) reads as big-endian 16-bit RGBA, and a file
+    /// cut short of its declared pixels is refused rather than read past.
+    #[test]
+    fn farbfeld_decodes_big_endian_rgba16() {
+        let samples: [u16; 8] = [0x0102, 0xfffe, 0, 65535, 300, 40_000, 1, 0x8000];
+        let mut bytes = b"farbfeld".to_vec();
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        for s in samples {
+            bytes.extend_from_slice(&s.to_be_bytes());
+        }
+        let out = decode(&bytes, Some("ff"), &DecodeOptions::default()).unwrap();
+        assert_eq!(
+            (out.width, out.height, out.format),
+            (2, 1, PixelFormat::Rgba16Unorm)
+        );
+        assert_eq!(out.source_format, "Farbfeld");
+        assert_eq!(out.pixels, to_ne_bytes(&samples));
+        assert!(decode(
+            &bytes[..bytes.len() - 1],
+            Some("ff"),
+            &DecodeOptions::default()
+        )
+        .is_err());
+    }
+
     /// A minimal uncompressed PSD: header, three empty sections, then the merged image as raw
     /// big-endian planes (`samples` holds plane 0, then plane 1, …).
     #[cfg(feature = "psd")]
@@ -2831,23 +3002,16 @@ mod tests {
         v
     }
 
-    /// The PSD wrapper's integer fast path (8/16-bit RGB and greyscale) against the mapping its
-    /// generic float path defines: 8-bit samples unchanged, Photoshop's 16-bit 0..32768 scaled
-    /// to 0..65535 by `round(v / 32768 * 65535)` in `f32`, 32768 and above white, and a missing
-    /// alpha opaque. Large enough to be split across threads, with every 16-bit value covered.
+    /// The PSD wrapper's integer fast path (8/16-bit RGB and greyscale): every sample comes out
+    /// exactly as stored, at 16 bits too — a PSD's 16-bit samples are full-range 0..65535
+    /// (Photoshop's 15-bit+1 is internal only; it scales on save), and reading them as 0..32768
+    /// clipped everything above mid-scale to white. A missing alpha is opaque. Large enough to be
+    /// split across threads, with every 16-bit value covered.
     #[cfg(feature = "psd")]
     #[test]
-    fn psd_integer_fast_path_matches_the_float_mapping() {
+    fn psd_integer_fast_path_keeps_samples_as_stored() {
         let (w, h) = (1031u32, 523u32);
         let n = (w * h) as usize;
-        let to16 = |v: u16| -> u16 {
-            let c = if v >= 32768 {
-                1.0f32
-            } else {
-                v as f32 * (1.0 / 32768.0)
-            };
-            (c * 65535.0 + 0.5) as u16
-        };
         let plane = |seed: usize| -> Vec<u16> {
             (0..n)
                 .map(|i| ((i * 7 + seed * 13_331) % 65536) as u16)
@@ -2880,14 +3044,7 @@ mod tests {
         .unwrap();
         assert_eq!((out.format, out.channels), (PixelFormat::Rgba16Unorm, 3));
         let expected: Vec<u16> = (0..n)
-            .flat_map(|i| {
-                [
-                    to16(planes[0][i]),
-                    to16(planes[1][i]),
-                    to16(planes[2][i]),
-                    65535,
-                ]
-            })
+            .flat_map(|i| [planes[0][i], planes[1][i], planes[2][i], 65535])
             .collect();
         assert!(out.pixels == to_ne_bytes(&expected), "16-bit RGB");
 
@@ -2901,8 +3058,8 @@ mod tests {
         .unwrap();
         let expected: Vec<u16> = (0..n)
             .flat_map(|i| {
-                let g = to16(planes[0][i]);
-                [g, g, g, to16(planes[1][i])]
+                let g = planes[0][i];
+                [g, g, g, planes[1][i]]
             })
             .collect();
         assert!(out.pixels == to_ne_bytes(&expected), "16-bit grey + alpha");

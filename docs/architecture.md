@@ -393,16 +393,21 @@ also detected by magic so a no-extension open still routes correctly.
 
 | Format(s) | Decoder |
 |---|---|
-| JPEG, BMP, QOI, PPM, WebP, farbfeld, JXL | **zune** - hot path |
+| JPEG, BMP (24-bit), PPM/PGM/PAM/PFM | **zune**'s decoders, called directly - hot path. JPEG decodes straight to RGBA (CMYK via RGB, which is how zune-jpeg converts ink); the others are widened to RGBA in one parallel pass. `zune_image::Image::read` is no longer in the way: it split every image into planes and re-interleaved it, three extra passes |
+| BMP (other depths) | `image` crate: its 32-bit and palette paths measured 3× and 1.8× faster than zune-bmp's for identical pixels |
+| WebP | Still **lossy** (VP8, with or without alpha) → **libwebp** (C, SIMD-dispatched, threaded; ~2× image-webp); still **lossless** (VP8L) → `image-webp`, which measured slightly ahead there; animated → zune (first frame). Both decoders produce identical pixels |
+| QOI | `qoi` crate, straight to RGBA (~3× zune-qoi) |
+| farbfeld | Read directly - a header and big-endian 16-bit RGBA. zune-farbfeld 0.5.2 refuses every file |
+| JPEG XL | `jxl-oxide` → RGBA8 / RGBA16 at the file's integer depth. Its renders are sRGB-*encoded* `f32`, so they are quantized back rather than handed over as linear float (which showed an 8-bit JXL through the HDR tonemap). Float-sample and PQ/HLG files keep the 32-bit float path |
 | GIF | `image` crate - **all frames** (animated GIF plays; still GIF is a single frame) |
 | PNG | `image` crate → RGBA8/RGBA16 (+ICC). Deliberately **not** zune: the `png`+`fdeflate` stack measured ~1.8× faster than zune-png on large textures (the gap is in the core decode) |
 | Radiance HDR (`.hdr`/`.pic`) | `image` crate → 32-bit float RGBA. Deliberately **not** zune: zune-hdr ≤ 0.5.2 wraps RGBE exponents ≥ 32 stops from unity (dark pixels decode 2³² too bright), and the `image` decoder is ~2× faster besides |
-| TIFF | **`tiff` crate directly** → RGBA at the source depth (8/16/32f, +ICC). Going through `image` lost samples: it can only represent what `tiff`'s conservative `colortype()` names, so an unlabelled 4th sample (Photoshop's `ExtraSamples = 0`) was dropped, grey+alpha was refused outright, and 16-bit was narrowed to 8. Associated (premultiplied) alpha is straightened here. Palette/CMYK/YCbCr/Lab still fall back to `image` |
+| TIFF | **`tiff` crate directly** → RGBA at the source depth (8/16/32f, +ICC). Going through `image` lost samples: it can only represent what `tiff`'s conservative `colortype()` names, so an unlabelled 4th sample (Photoshop's `ExtraSamples = 0`) was dropped, grey+alpha was refused outright, and 16-bit was narrowed to 8. Associated (premultiplied) alpha is straightened here. Strips decode in parallel, one decoder per thread (LZW/Deflate files ~5× faster). Palette images, which neither crate reads, are relabelled greyscale in a copy so `tiff` reads the indices, then mapped through `ColorMap` here. CMYK/YCbCr/Lab still fall back to `image` |
 | TGA, ICO, CUR | `image` crate (formats zune doesn't decode). A `.cur` is an ICO with `2` in its type word and two directory fields reused for the hotspot, neither of which the ICO decoder reads - so it decodes unchanged, and is only sniffed and labelled separately |
 | DDS | **`ddsfile`** (header, incl. the DX10 extension) + **`bcdec_rs`** (blocks), both pure Rust → BC1-BC7 to RGBA8, **BC6H to RGBA16F** (the HDR path), and every uncompressed layout via the header's channel bit masks. Decompressed on the CPU rather than uploaded as blocks: `DecodedImage` is an uncompressed canvas by contract, and the mip builder, downscale guard, alpha scan and flipbook detector all read it as one |
 | AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
-| EXR | `exr` crate (pure Rust) → 32-bit float RGBA |
-| PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite, at the document's own depth (8/16/32f). `wrapper.cpp` owns the colour-mode conversion: RGB/Grey/Duotone direct, Indexed through the palette, CMYK composited **through K** (PSD stores CMYK inverted), Lab via D50 XYZ. 16-bit samples are Photoshop's 15-bit+1 range (**0…32768**, not 0…65535); 1-bit Bitmap mode is refused, since psd_sdk sizes its planes `bits/8` = 0 |
+| EXR | `exr` crate (pure Rust), channels read as stored and interleaved in parallel → **half-float RGBA** when every channel is half (lossless, and half the memory, mips and upload of `f32`), 32-bit float RGBA otherwise |
+| PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite, at the document's own depth (8/16/32f). `wrapper.cpp` owns the colour-mode conversion: RGB/Grey/Duotone direct, Indexed through the palette, CMYK composited **through K** (PSD stores CMYK inverted), Lab via D50 XYZ; 8/16-bit RGB and greyscale are interleaved directly, in parallel. 16-bit samples are **full-range 0…65535** - Photoshop works in 15-bit+1 (0…32768) internally but scales on save, as a Photoshop 27 file confirms (white = 65535); 1-bit Bitmap mode is refused, since psd_sdk sizes its planes `bits/8` = 0 |
 | Camera raw (CR2/CR3, NEF, ARW, RAF, ORF, RW2, DNG, …) | **`raw`** (pure Rust) → extract the embedded JPEG **preview**, decode via zune |
 | ICC transforms | **Little CMS** (`lcms2`) over FFI |
 
@@ -443,7 +448,7 @@ Notes:
   untouched. Frame 0 is duplicated into `DecodedImage::pixels` so first-paint / downscale / alpha
   scanning work unchanged. Per-frame delays below 20 ms (including the common 0 = "as fast as
   possible") are clamped to 100 ms, matching browsers. The viewer plays it back on a loop timer
-  (§10). Animated WebP is *not* animated (WebP stays on the still zune hot path).
+  (§10). Animated WebP is *not* animated: it shows its first frame, decoded by zune.
 - **DDS is a container, so a `.dds` can be several images.** A cubemap's six faces, a texture
   array's layers and a volume's depth slices are all "N images of the same size" - which is
   exactly what the flipbook already displays - so `dds.rs` composites them into one near-square
@@ -482,9 +487,11 @@ and the instance-socket server thread follow.
 ## 7. Color management
 
 - **Working space:** sRGB for 8/16-bit LDR; linear for float/half HDR.
-- **ICC honored:** embedded profiles (PNG `iCCP`, JPEG APP2, TIFF tag, PSD resource) are
-  parsed and transformed into the working space via `lcms2`. Files without a profile fall
-  back to the sRGB assumption.
+- **ICC honored:** embedded profiles (PNG `iCCP`, JPEG APP2, TIFF tag, PSD resource, WebP
+  `ICCP`, JPEG XL) are parsed and transformed into the working space via `lcms2`, on all cores.
+  A profile that a probe finds within one 8-bit code of sRGB - most embedded profiles *are* sRGB -
+  is not run at all: the transform would cost ~0.6 s on an 8192² image to move nothing visible.
+  Files without a profile fall back to the sRGB assumption.
 - **HDR display:** tonemap to SDR in the shader with an exposure-stops control (works on any
   monitor). The float source is sampled and tonemapped live each frame, so exposure/operator
   changes are free. A true HDR (scRGB / 10-bit, or EDR on macOS) swapchain is *possible* on both

@@ -16,7 +16,7 @@ members = [
 exclude = ["vendor/sokol-rust"]
 
 [workspace.package]
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
@@ -92,11 +92,12 @@ zune-image = { version = "0.5", default-features = false, features = [
 zune-core = "0.5"
 zune-jpeg = "0.5"
 zune-bmp = "0.5"
-zune-qoi = "0.5"
 zune-ppm = "0.5"
 zune-farbfeld = "0.5"
-image-webp = "0.2"
 jxl-oxide = "0.12"
+qoi = "0.4"
+libwebp-sys = "0.14"
+image-webp = "0.2"
 # The `image` crate is the fallback decoder (TIFF/TGA/ICO), the multi-frame GIF path, and —
 # deliberately — the PNG and Radiance HDR paths, whose decoders measured faster than zune's; see
 # `decode_png` / `decode_hdr`. Only the formats we actually route to it are enabled: the default
