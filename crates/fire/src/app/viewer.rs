@@ -1070,9 +1070,7 @@ impl Viewer {
             Action::ToggleTonemap => self.surface.toggle_tonemap(),
             Action::MipDown => self.surface.step_mip(-1),
             Action::MipUp => self.surface.step_mip(1),
-            Action::ExpUp => self.surface.adjust_exposure(self.cfg.exposure_step),
             Action::ExpReset => self.surface.reset_exposure(),
-            Action::ExpDown => self.surface.adjust_exposure(-self.cfg.exposure_step),
             Action::ToggleOutline => self.surface.toggle_outline(),
             Action::ToggleOctagon => self.surface.toggle_octagon(),
             Action::Background(bg) => self.surface.set_background(bg),
@@ -2003,6 +2001,7 @@ impl Viewer {
             fit: s.is_fit(),
             tonemap: s.tonemap(),
             is_hdr,
+            exposure: s.exposure(),
             has_image,
             loading: self.loading,
             has_alpha: s.has_alpha(),
@@ -2137,6 +2136,12 @@ impl Viewer {
         }
         if let Some(anchor) = frame.menu {
             self.open_menu(anchor.kind, anchor.pos);
+        }
+
+        // The exposure slider moved.
+        if let Some(stops) = frame.exposure {
+            self.surface.set_exposure(stops);
+            self.redraw();
         }
 
         // The octagon overlay's options window edited something.

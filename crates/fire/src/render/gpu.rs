@@ -1510,7 +1510,12 @@ impl GpuSurface {
     }
 
     pub fn adjust_exposure(&mut self, delta: f32) {
-        self.display.exposure = (self.display.exposure + delta).clamp(-16.0, 16.0);
+        self.set_exposure(self.display.exposure + delta);
+    }
+
+    /// Set the exposure outright, in stops — the toolbar slider's path (the keys step it instead).
+    pub fn set_exposure(&mut self, stops: f32) {
+        self.display.exposure = stops.clamp(-16.0, 16.0);
         self.invalidate();
     }
 

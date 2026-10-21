@@ -50,9 +50,7 @@ pub enum Icon {
     B,
     A,
     Aces,
-    EvUp,
     EvReset,
-    EvDown,
     BackdropBlack,
     White,
     BackdropGrey,
@@ -99,9 +97,7 @@ icon_masters![
     "icon_B",
     "icon_A",
     "icon_aces",
-    "icon_ev+",
     "icon_ev0",
-    "icon_ev-",
     "icon_B",
     "icon_W",
     "icon_G",
@@ -137,7 +133,7 @@ impl Icon {
     }
 
     /// This icon's name in the stylesheet — the key `[icon_scale]` in `ui/theme.toml` addresses it
-    /// by. Deliberately *not* derived from [`Icon::stem`]: the file stems include `icon_ev+` and
+    /// by. Deliberately *not* derived from [`Icon::stem`]: the file stems include `icon_ev0` and
     /// `icon_RGB`, which make poor TOML keys, so these are the variant names in snake_case and every
     /// one of them is a bare key. Exhaustive, so a new variant must name itself before it compiles.
     pub fn name(self) -> &'static str {
@@ -155,9 +151,7 @@ impl Icon {
             Icon::B => "b",
             Icon::A => "a",
             Icon::Aces => "aces",
-            Icon::EvUp => "ev_up",
             Icon::EvReset => "ev_reset",
-            Icon::EvDown => "ev_down",
             Icon::BackdropBlack => "backdrop_black",
             Icon::White => "white",
             Icon::BackdropGrey => "backdrop_grey",
@@ -194,9 +188,7 @@ impl Icon {
             Icon::B => "icon_B",
             Icon::A => "icon_A",
             Icon::Aces => "icon_aces",
-            Icon::EvUp => "icon_ev+",
             Icon::EvReset => "icon_ev0",
-            Icon::EvDown => "icon_ev-",
             Icon::BackdropBlack => "icon_B",
             Icon::White => "icon_W",
             Icon::BackdropGrey => "icon_G",
@@ -231,9 +223,7 @@ pub const ALL: [Icon; COUNT] = [
     Icon::B,
     Icon::A,
     Icon::Aces,
-    Icon::EvUp,
     Icon::EvReset,
-    Icon::EvDown,
     Icon::BackdropBlack,
     Icon::White,
     Icon::BackdropGrey,

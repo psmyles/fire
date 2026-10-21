@@ -34,10 +34,9 @@ pub enum Action {
     Channel(Channel),
     /// Reinhard ↔ ACES (HDR only).
     ToggleTonemap,
-    /// Exposure +/- one step, or reset to 0 EV (HDR only).
-    ExpUp,
+    /// Reset exposure to 0 EV (HDR only). The exposure itself is a toolbar *slider*, which reports
+    /// a value rather than a command — see [`crate::ui::Frame::exposure`].
     ExpReset,
-    ExpDown,
     /// Step to a finer (`MipDown`, toward level 0) or coarser (`MipUp`) mip level. Only offered
     /// when the image has a chain worth stepping through — today, a DDS that brought one.
     MipDown,
@@ -71,6 +70,8 @@ pub struct ViewSnapshot {
     pub fit: bool,
     pub tonemap: Tonemap,
     pub is_hdr: bool,
+    /// Exposure in stops — the HDR exposure slider's value.
+    pub exposure: f32,
     pub has_image: bool,
     /// True between an open request and its decode landing. With `!has_image` it distinguishes
     /// "still loading" (show nothing) from "empty" (show the drop hint).
@@ -125,9 +126,7 @@ impl ViewSnapshot {
             Action::ZoomOut | Action::ZoomIn | Action::ZoomToggle => self.has_image,
             Action::Channel(_) | Action::Background(_) | Action::ToggleOutline => self.has_image,
             Action::ToggleOctagon => self.has_image,
-            Action::ToggleTonemap | Action::ExpUp | Action::ExpReset | Action::ExpDown => {
-                self.is_hdr
-            }
+            Action::ToggleTonemap | Action::ExpReset => self.is_hdr,
             // Each end of the chain is a dead end, and says so rather than silently doing nothing.
             Action::MipDown => self.mip_level > 0,
             Action::MipUp => self.mip_level + 1 < self.mip_count,
@@ -146,7 +145,7 @@ impl ViewSnapshot {
     }
 
     /// Whether a toggle button is in its "on" state (drawn filled with the accent). Momentary
-    /// buttons (navigation, zoom steps, the fit/1:1 toggle, exposure) never latch.
+    /// buttons (navigation, zoom steps, the fit/1:1 toggle, exposure reset) never latch.
     pub(crate) fn active(&self, a: Action) -> bool {
         match a {
             // The composite button latches in *either* composite mode — it marks "not soloing a
@@ -200,9 +199,7 @@ impl ViewSnapshot {
                 "Tone map: Reinhard \u{2194} ACES{}",
                 k(KeyAction::ToggleTonemap)
             ),
-            Action::ExpUp => format!("Increase exposure{}", k(KeyAction::ExposureUp)),
             Action::ExpReset => format!("Reset exposure{}", k(KeyAction::ExposureReset)),
-            Action::ExpDown => format!("Decrease exposure{}", k(KeyAction::ExposureDown)),
             Action::MipDown => format!(
                 "Finer mip level ({} of {}){}",
                 self.mip_level,
@@ -227,6 +224,20 @@ impl ViewSnapshot {
             Action::ToggleFullscreen => format!("Full screen{}", k(KeyAction::ToggleFullscreen)),
             Action::ToggleFlipbook => format!("Flipbook mode{}", k(KeyAction::ToggleFlipbook)),
             Action::Overflow => "More controls\u{2026}".into(),
+        }
+    }
+
+    /// Hover-tooltip text for the exposure slider. It is not an [`Action`], so it has no entry in
+    /// [`Self::tooltip`]; the parenthetical is the pair of keys that step it, as currently bound.
+    pub(crate) fn exposure_tooltip(&self) -> String {
+        let keys: Vec<&str> = [KeyAction::ExposureDown, KeyAction::ExposureUp]
+            .into_iter()
+            .filter_map(|ka| self.shortcuts.get(ka))
+            .collect();
+        if keys.is_empty() {
+            "Exposure".into()
+        } else {
+            format!("Exposure  ({})", keys.join(" / "))
         }
     }
 
@@ -265,9 +276,7 @@ impl ViewSnapshot {
             Action::Channel(Channel::B) => Icon::B,
             Action::Channel(Channel::A) => Icon::A,
             Action::ToggleTonemap => Icon::Aces,
-            Action::ExpUp => Icon::EvUp,
             Action::ExpReset => Icon::EvReset,
-            Action::ExpDown => Icon::EvDown,
             Action::MipDown => Icon::MipDown,
             Action::MipUp => Icon::MipUp,
             Action::ToggleOutline => Icon::Outline,
@@ -297,6 +306,7 @@ mod tests {
             fit: true,
             tonemap: Tonemap::Reinhard,
             is_hdr: false,
+            exposure: 0.0,
             has_image: true,
             loading: false,
             has_alpha: false,

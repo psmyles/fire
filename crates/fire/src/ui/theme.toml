@@ -84,11 +84,9 @@ r              = 0.8
 g              = 0.8
 b              = 0.8
 a              = 0.8
-# Tone map, and the exposure trio.
+# Tone map, and the exposure reset beside the exposure slider.
 aces           = 1.0
-ev_up          = 1.0
 ev_reset       = 1.0
-ev_down        = 1.0
 # Backdrop: black, white, grey, checkerboard — and the alpha outline.
 backdrop_black = 0.7
 white          = 0.7
@@ -163,6 +161,9 @@ chip_offset_y = 12.0
 # toolbar's height (0.0 = top edge, 1.0 = bottom). Full height would look like a table.
 divider_top    = 0.2
 divider_bottom = 0.8
+# Width of the HDR exposure slider on the toolbar (its height is a control's — see
+# [chrome.controls] input_height).
+exposure_slider_w = 120.0
 # Line spacing of the two-line "Drop an image here" hint, as a multiple of the line height.
 empty_hint_line_gap = 1.5
 # Logical edge of the logo on the empty-window card (drawn from an embedded 256 px raster,
@@ -199,11 +200,12 @@ popup_border  = 1.0
 image_border  = 0.0
 
 [chrome.controls]
-# See [form.controls] below for what these are and why they exist. The flipbook transport is the only
-# place in the chrome with real controls in it. These are *separate* from the form's: the two styles
-# are separate, so a checkbox is only the same size in both windows if you say so in both.
+# See [form.controls] below for what these are and why they exist. The flipbook transport and the
+# toolbar's exposure slider are the only real controls in the chrome. These are *separate* from the
+# form's: the two styles are separate, so a checkbox is only the same size in both windows if you say
+# so in both.
 checkbox_size = 16.0   # the "Blend" box — an exact square edge (unlike the rest, no font floor)
-input_height  = 0.0    # the cols/rows/count/fps fields, the scrub slider, the play button
+input_height  = 0.0    # the cols/rows/count/fps fields, the scrub and exposure sliders, the play button
 
 [chrome.colors]
 text          = "text"

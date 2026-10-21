@@ -145,6 +145,7 @@ pub struct Chrome {
     chip_offset_y: f32,
     divider_top: f32,
     divider_bottom: f32,
+    exposure_slider_w: f32,
     empty_hint_line_gap: f32,
     empty_logo_size: f32,
     geom: Geom,
@@ -444,6 +445,8 @@ pub struct Metrics {
     /// The group divider's extent, as a fraction of the toolbar's height.
     pub divider_top: f32,
     pub divider_bottom: f32,
+    /// Width of the HDR exposure slider on the toolbar.
+    pub exposure_slider_w: f32,
     /// Line spacing of the empty-state hint, as a multiple of the line height.
     pub empty_hint_line_gap: f32,
     /// Edge of the empty-window card's logo.
@@ -468,6 +471,7 @@ impl Metrics {
             item_spacing: s(c.geom.item_spacing[0]),
             divider_top: c.divider_top,
             divider_bottom: c.divider_bottom,
+            exposure_slider_w: s(c.exposure_slider_w),
             empty_hint_line_gap: c.empty_hint_line_gap,
             empty_logo: s(c.empty_logo_size),
         }

@@ -70,10 +70,18 @@ impl MenuState {
 pub enum MenuKind {
     /// The actions menu: right-click on the image, or the "Open in…" toolbar button.
     Actions,
-    /// The "»" overflow menu — the toolbar buttons that didn't fit the window width. They carry their
+    /// The "»" overflow menu — the toolbar slots that didn't fit the window width. They carry their
     /// own enabled/checked state, so a dropped button behaves in the menu exactly as it would on the
-    /// bar.
-    Overflow(Vec<Action>),
+    /// bar (and a dropped exposure slider is still a slider).
+    Overflow(Vec<Slot>),
+}
+
+/// One slot of the toolbar's left strip: an icon button, or the HDR exposure slider — which is wider
+/// than a button, and reports a value ([`Frame::exposure`]) rather than an [`Action`].
+#[derive(Clone, Copy, PartialEq)]
+pub enum Slot {
+    Button(Action),
+    Exposure,
 }
 
 /// Something chosen from the actions menu that isn't a view [`Action`].
@@ -99,6 +107,8 @@ pub struct MenuAnchor {
 pub struct Frame {
     pub actions: Vec<Action>,
     pub edits: Vec<TransportEdit>,
+    /// The exposure slider moved: the new exposure, in stops.
+    pub exposure: Option<f32>,
     /// A toolbar button wants a popup opened under it.
     pub menu: Option<MenuAnchor>,
     /// Something was chosen from the actions menu.
@@ -123,26 +133,31 @@ pub struct Frame {
 /// Left-docked slots, in order, each with the overflow priority the GDI chrome used: navigation is
 /// kept longest, then zoom, then flipbook, then the all-channels reset, the channel solos, and the
 /// HDR group is shed first. Higher = stays on the bar longer.
-const LEFT: &[(Action, u8, u8)] = &[
-    // (action, group, prio) — groups are separated by a divider.
-    (Action::Prev, 0, 90),
-    (Action::Next, 0, 90),
-    (Action::ZoomOut, 1, 70),
-    (Action::ZoomToggle, 1, 75),
-    (Action::ZoomIn, 1, 70),
-    (Action::Channel(Ch::Rgb), 2, 50),
-    (Action::Channel(Ch::R), 2, 40),
-    (Action::Channel(Ch::G), 2, 40),
-    (Action::Channel(Ch::B), 2, 40),
-    (Action::Channel(Ch::A), 2, 40),
-    (Action::ToggleFlipbook, 4, 55),
-    (Action::ToggleTonemap, 3, 20),
-    (Action::ExpUp, 3, 20),
-    (Action::ExpReset, 3, 15),
-    (Action::ExpDown, 3, 20),
-    (Action::MipDown, 5, 25),
-    (Action::MipUp, 5, 25),
+const LEFT: &[(Slot, u8, u8)] = &[
+    // (slot, group, prio) — groups are separated by a divider.
+    (Slot::Button(Action::Prev), 0, 90),
+    (Slot::Button(Action::Next), 0, 90),
+    (Slot::Button(Action::ZoomOut), 1, 70),
+    (Slot::Button(Action::ZoomToggle), 1, 75),
+    (Slot::Button(Action::ZoomIn), 1, 70),
+    (Slot::Button(Action::Channel(Ch::Rgb)), 2, 50),
+    (Slot::Button(Action::Channel(Ch::R)), 2, 40),
+    (Slot::Button(Action::Channel(Ch::G)), 2, 40),
+    (Slot::Button(Action::Channel(Ch::B)), 2, 40),
+    (Slot::Button(Action::Channel(Ch::A)), 2, 40),
+    (Slot::Button(Action::ToggleFlipbook), 4, 55),
+    (Slot::Button(Action::ToggleTonemap), 3, 20),
+    (Slot::Exposure, 3, 20),
+    (Slot::Button(Action::ExpReset), 3, 15),
+    (Slot::Button(Action::MipDown), 5, 25),
+    (Slot::Button(Action::MipUp), 5, 25),
 ];
+
+/// The exposure slider's travel, in stops either side of 0 EV. Narrower than the surface's own
+/// ±16 clamp on purpose: over the full range one pixel of a toolbar-sized track is a quarter stop.
+/// The keys (and a Ctrl+click typed value) still reach the rest; the grab then just rests at the end
+/// of the track while the label shows the real value.
+const EXPOSURE_RANGE: f32 = 8.0;
 
 /// Right-docked slots, in visual left→right order. Never overflow (anchored to the far edge).
 ///
@@ -248,7 +263,7 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
 
     // The popups last, and outside any window — which is where ImGui expects them to live.
     if let Some(st) = menu {
-        menus(ui, st, cfg, snap, &mut out);
+        menus(ui, st, cfg, snap, m, &mut out);
     }
     if let Some(st) = settings {
         settings::build(ui, st, form, dark, m.scale, client, &mut out);
@@ -264,7 +279,14 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
 /// The popup's ImGui id. There is only ever one up at a time, so one id serves both kinds.
 const MENU_ID: &str = "##menu";
 
-fn menus(ui: &Ui, st: &mut MenuState, cfg: &Config, snap: &ViewSnapshot, out: &mut Frame) {
+fn menus(
+    ui: &Ui,
+    st: &mut MenuState,
+    cfg: &Config,
+    snap: &ViewSnapshot,
+    m: &Metrics,
+    out: &mut Frame,
+) {
     if !st.requested {
         st.requested = true;
         ui.open_popup(MENU_ID);
@@ -273,7 +295,7 @@ fn menus(ui: &Ui, st: &mut MenuState, cfg: &Config, snap: &ViewSnapshot, out: &m
 
     ui.popup(MENU_ID, || match &st.kind {
         MenuKind::Actions => actions_menu(ui, cfg, snap.has_image, out),
-        MenuKind::Overflow(items) => overflow_menu(ui, snap, items, out),
+        MenuKind::Overflow(items) => overflow_menu(ui, snap, items, m, out),
     });
 
     // ImGui closes a popup on an outside click, on Esc, and when an item is picked. Whichever it was,
@@ -344,16 +366,28 @@ fn open_with(ui: &Ui, entries: &[MenuEntry], path: &mut Vec<usize>, out: &mut Fr
     }
 }
 
-/// The "»" menu: the toolbar buttons that didn't fit, each carrying the enabled/checked state it
-/// would have had on the bar, and each dispatching through the normal action path.
-fn overflow_menu(ui: &Ui, snap: &ViewSnapshot, items: &[Action], out: &mut Frame) {
-    for a in items {
-        if ui.menu_item_enabled_selected_no_shortcut(
-            snap.tooltip(*a),
-            snap.active(*a),
-            snap.enabled(*a),
-        ) {
-            out.actions.push(*a);
+/// The "»" menu: the toolbar slots that didn't fit, each carrying the enabled/checked state it
+/// would have had on the bar, and each dispatching through the normal action path. The exposure
+/// slider stays a slider — a menu item could only step it, which is what the slider replaced.
+fn overflow_menu(ui: &Ui, snap: &ViewSnapshot, items: &[Slot], m: &Metrics, out: &mut Frame) {
+    for slot in items {
+        match *slot {
+            Slot::Button(a) => {
+                if ui.menu_item_enabled_selected_no_shortcut(
+                    snap.tooltip(a),
+                    snap.active(a),
+                    snap.enabled(a),
+                ) {
+                    out.actions.push(a);
+                }
+            }
+            Slot::Exposure => exposure_slider(
+                ui,
+                "Exposure##exposure-menu",
+                snap,
+                m.exposure_slider_w,
+                out,
+            ),
         }
     }
 }
@@ -702,25 +736,29 @@ fn toolbar(
     let spacing = m.item_spacing;
     // A group divider: spacing, a 1px rule, spacing.
     let div_w = spacing * 2.0 + 1.0;
+    let slot_w = |s: Slot| match s {
+        Slot::Button(_) => bs[0],
+        Slot::Exposure => m.exposure_slider_w,
+    };
 
     // Which left slots apply at all? The HDR group is float-only, and the alpha solo has nothing to
     // isolate on a source with no alpha channel — so it is not laid out for one: not dimmed, and not
     // pushed into the overflow menu either. (The composite button stays: it is the all-channels
     // reset, and only its RGBA↔RGB half depends on alpha.)
-    let mut kept: Vec<(Action, u8, u8)> = LEFT
+    let mut kept: Vec<(Slot, u8, u8)> = LEFT
         .iter()
         .copied()
-        .filter(|(a, g, _)| match a {
-            Action::Channel(Ch::A) => snap.has_alpha,
+        .filter(|(s, g, _)| match s {
+            Slot::Button(Action::Channel(Ch::A)) => snap.has_alpha,
             _ => (*g != HDR_GROUP || snap.is_hdr) && (*g != MIP_GROUP || snap.mip_count > 1),
         })
         .collect();
 
-    let right_w = strip_width(RIGHT.iter().map(|&(_, g)| g), bs[0], spacing, div_w);
+    let right_w = strip_width(RIGHT.iter().map(|&(_, g)| (g, bs[0])), spacing, div_w);
 
     // Drop the lowest-priority left slots until the strip fits. Ties break toward the *right*, so a
     // group collapses from its tail inward — same rule the GDI chrome used.
-    let mut dropped: Vec<Action> = Vec::new();
+    let mut dropped: Vec<Slot> = Vec::new();
     let edge = m.edge_pad;
     loop {
         let more_w = if dropped.is_empty() {
@@ -728,7 +766,7 @@ fn toolbar(
         } else {
             bs[0] + spacing
         };
-        let left_w = strip_width(kept.iter().map(|&(_, g, _)| g), bs[0], spacing, div_w);
+        let left_w = strip_width(kept.iter().map(|&(s, g, _)| (g, slot_w(s))), spacing, div_w);
         if left_w + more_w + right_w + edge * 2.0 <= w || kept.is_empty() {
             break;
         }
@@ -755,16 +793,28 @@ fn toolbar(
 
             // Left strip.
             let mut prev_group: Option<u8> = None;
-            for (action, group, _) in &kept {
+            for &(slot, group, _) in &kept {
                 if let Some(pg) = prev_group {
-                    if pg != *group {
+                    if pg != group {
                         divider(ui, x + spacing, m);
                         x += div_w;
                     }
                 }
-                icon_button(ui, tex, *action, snap, [x, y], bs, icon_px, out);
-                x += bs[0] + spacing;
-                prev_group = Some(*group);
+                match slot {
+                    Slot::Button(action) => {
+                        icon_button(ui, tex, action, snap, [x, y], bs, icon_px, out)
+                    }
+                    Slot::Exposure => {
+                        // A control, so it takes the chrome's control height (the transport's
+                        // scrub slider does the same), centred on the bar like the buttons.
+                        let controls = theme::current().chrome.controls;
+                        let _p = theme::push_control(ui, controls.input_height, 0.0);
+                        ui.set_cursor_pos([x, ((m.toolbar_h - ui.frame_height()) * 0.5).round()]);
+                        exposure_slider(ui, "##exposure", snap, slot_w(slot), out);
+                    }
+                }
+                x += slot_w(slot) + spacing;
+                prev_group = Some(group);
             }
 
             // The overflow "»", immediately after the left strip.
@@ -806,19 +856,19 @@ fn toolbar(
         });
 }
 
-/// Width of a strip of buttons including the dividers between differing groups. Takes the
-/// slots' group ids as an iterator so callers measure without materializing a `Vec` — the
+/// Width of a strip of slots including the dividers between differing groups. Takes each slot's
+/// `(group, width)` as an iterator so callers measure without materializing a `Vec` — the
 /// overflow-shedding loop asks once per shed candidate, every frame.
-fn strip_width(groups: impl Iterator<Item = u8>, bw: f32, spacing: f32, div_w: f32) -> f32 {
+fn strip_width(slots: impl Iterator<Item = (u8, f32)>, spacing: f32, div_w: f32) -> f32 {
     let mut total = 0.0;
     let mut prev: Option<u8> = None;
-    for g in groups {
+    for (g, w) in slots {
         if let Some(p) = prev {
             if p != g {
                 total += div_w;
             }
         }
-        total += bw + spacing;
+        total += w + spacing;
         prev = Some(g);
     }
     total
@@ -917,6 +967,26 @@ fn button(
 }
 
 use theme::on_accent;
+
+/// The HDR exposure slider, `w` wide at the current cursor: ±[`EXPOSURE_RANGE`] stops, with the value
+/// printed on the track (Ctrl+click types one). ImGui rounds a dragged value to the format's two
+/// decimals (the status bar's `EV` precision), so a drag never leaves a `+1.2734` behind.
+fn exposure_slider(ui: &Ui, id: &str, snap: &ViewSnapshot, w: f32, out: &mut Frame) {
+    let mut ev = snap.exposure;
+    ui.set_next_item_width(w);
+    if ui
+        .slider_config(id, -EXPOSURE_RANGE, EXPOSURE_RANGE)
+        .try_display_format("%+.2f EV")
+        .expect("%+.2f is a valid float format")
+        .build(&mut ev)
+    {
+        out.exposure = Some(ev);
+    }
+    // Not mid-drag: the tip would sit on top of the value being dragged.
+    if ui.is_item_hovered() && !ui.is_item_active() {
+        ui.tooltip_text(snap.exposure_tooltip());
+    }
+}
 
 fn status_bar(ui: &Ui, snap: &ViewSnapshot, m: &Metrics, dark: bool, w: f32, h: f32) {
     let _bg = ui.push_style_color(StyleColor::WindowBg, theme::status_bg(dark));
@@ -1216,9 +1286,7 @@ fn action_id(a: Action) -> u32 {
         Action::Channel(Ch::A) => 14,
         Action::Channel(Ch::Rgba) => 15,
         Action::ToggleTonemap => 20,
-        Action::ExpUp => 21,
         Action::ExpReset => 22,
-        Action::ExpDown => 23,
         Action::MipDown => 24,
         Action::MipUp => 25,
         Action::ToggleOutline => 30,
