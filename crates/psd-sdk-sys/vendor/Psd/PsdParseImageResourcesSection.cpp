@@ -91,7 +91,9 @@ ImageResourcesSection* ParseImageResourcesSection(const Document* document, File
 				if (!imageResources->alphaChannels)
 				{
 					// note that this assumes RGB mode
-					const unsigned int channelCount = document->channelCount - 3;
+					// FIRE PATCH: a greyscale document has fewer than 3 channels, and the unsigned
+					// subtraction wrapped to ~4 billion "alpha channels" (see vendor/VENDOR.txt).
+					const unsigned int channelCount = document->channelCount > 3u ? document->channelCount - 3u : 0u;
 					imageResources->alphaChannelCount = channelCount;
 					imageResources->alphaChannels = memoryUtil::AllocateArray<AlphaChannel>(allocator, channelCount);
 				}
@@ -222,7 +224,9 @@ ImageResourcesSection* ParseImageResourcesSection(const Document* document, File
 				if (!imageResources->alphaChannels)
 				{
 					// note that this assumes RGB mode
-					const unsigned int channelCount = document->channelCount - 3;
+					// FIRE PATCH: a greyscale document has fewer than 3 channels, and the unsigned
+					// subtraction wrapped to ~4 billion "alpha channels" (see vendor/VENDOR.txt).
+					const unsigned int channelCount = document->channelCount > 3u ? document->channelCount - 3u : 0u;
 					imageResources->alphaChannelCount = channelCount;
 					imageResources->alphaChannels = memoryUtil::AllocateArray<AlphaChannel>(allocator, channelCount);
 				}

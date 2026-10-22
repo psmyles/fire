@@ -2,3 +2,18 @@ psd_sdk vendored from https://github.com/MolecularMatters/psd_sdk
 commit: f51449543273cbf12058ae92b230e0c4209f5066
 License: BSD-2-Clause (see LICENSE)
 Only src/Psd/ is vendored (the library); Samples/bin/build omitted.
+
+Local patches (search for "FIRE PATCH"):
+- Psd/PsdAssert.h: PSD_ASSERT throws psd::AssertFailure instead of calling assert().
+  The library is compiled without NDEBUG, so a failed assertion on malformed input used to
+  abort() the whole viewer process; wrapper.cpp catches every exception at the C ABI.
+- Psd/PsdDecompressRle.cpp: DecompressRle bounds every literal/run against both the source and
+  the destination, and zero-fills the rest of the destination on malformed data. Upstream wrote
+  up to 127 bytes past the destination (and read past the source) on a malformed run.
+- Psd/PsdParseImageResourcesSection.cpp: the DISPLAY_INFO resource sized its alpha-channel array
+  as `channelCount - 3` (unsigned), which wrapped for greyscale documents (1-2 channels) into an
+  allocation of ~4 billion entries.
+
+PSD layers are NOT decoded through psd_sdk: fire-decode parses the layer and mask section in
+Rust (crates/fire-decode/src/psd_layers.rs), so PsdParseLayerMaskSection.cpp is compiled but
+unreachable, like PsdExport.cpp.

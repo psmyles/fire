@@ -41,7 +41,19 @@
 /// \sa PSD_ENABLE_ASSERTIONS PSD_ASSERT
 
 #if PSD_ENABLE_ASSERTIONS
-	#define PSD_ASSERT(condition, ...)			PSD_MULTILINE_MACRO_BEGIN (condition) ? true : printf("\n***ASSERT FAILED*** " __VA_ARGS__); assert(condition); PSD_MULTILINE_MACRO_END
+	// FIRE PATCH: a failed assertion throws instead of calling assert(). The library is built
+	// without NDEBUG, so assert() would abort() the whole viewer on a malformed file; the
+	// wrapper (wrapper.cpp) catches everything at the C ABI and reports a decode error instead.
+	// See vendor/VENDOR.txt.
+	#include <exception>
+	namespace psd
+	{
+		struct AssertFailure : std::exception
+		{
+			const char* what(void) const noexcept override { return "psd_sdk assertion failed"; }
+		};
+	}
+	#define PSD_ASSERT(condition, ...)			PSD_MULTILINE_MACRO_BEGIN if (!(condition)) { printf("\n***ASSERT FAILED*** " __VA_ARGS__); throw ::psd::AssertFailure(); } PSD_MULTILINE_MACRO_END
 #else
 	#define PSD_ASSERT(condition, ...)			PSD_UNUSED(condition)
 #endif

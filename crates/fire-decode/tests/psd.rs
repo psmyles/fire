@@ -439,3 +439,94 @@ fn psd_decode_bomb_header_is_rejected() {
         "a 60000x60000 header on a 40-byte file must be refused before psd_sdk allocates"
     );
 }
+
+/// One image resource block: `8BIM`, id, empty Pascal name (padded to even), size, data (padded).
+fn resource(id: u16, data: &[u8]) -> Vec<u8> {
+    let mut r = Vec::new();
+    r.extend_from_slice(b"8BIM");
+    r.extend_from_slice(&id.to_be_bytes());
+    r.extend_from_slice(&[0, 0]); // empty name + pad
+    r.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    r.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        r.push(0);
+    }
+    r
+}
+
+/// [`psd`] with an image-resources section and a pre-encoded image-data section (compression
+/// word included), for the tests that need either.
+fn psd_raw(
+    width: u32,
+    height: u32,
+    color_mode: u16,
+    channels: u16,
+    resources: &[u8],
+    image_data: &[u8],
+) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"8BPS");
+    b.extend_from_slice(&1u16.to_be_bytes());
+    b.extend_from_slice(&[0; 6]);
+    b.extend_from_slice(&channels.to_be_bytes());
+    b.extend_from_slice(&height.to_be_bytes());
+    b.extend_from_slice(&width.to_be_bytes());
+    b.extend_from_slice(&8u16.to_be_bytes());
+    b.extend_from_slice(&color_mode.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(&(resources.len() as u32).to_be_bytes());
+    b.extend_from_slice(resources);
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(image_data);
+    b
+}
+
+/// A malformed file must come back as an error, never take the process down.
+///
+/// psd_sdk is compiled without `NDEBUG`, and its `PSD_ASSERT` used to be a plain `assert()`: a
+/// second ICC profile resource (one of several asserts reachable from file contents) called
+/// `abort()`, which no `catch_unwind` can intercept — every open window went with it. The vendored
+/// `PsdAssert.h` now throws, and `fire_psd_open`'s `catch (...)` turns that into a refusal.
+#[test]
+fn psd_failed_sdk_assertion_is_an_error_not_an_abort() {
+    let mut res = resource(1039, &[1, 2, 3, 4]);
+    res.extend(resource(1039, &[5, 6, 7, 8]));
+    let mut image = 0u16.to_be_bytes().to_vec();
+    image.extend_from_slice(&[1, 2, 3]);
+    let bytes = psd_raw(1, 1, COLOR_MODE_RGB, 3, &res, &image);
+    assert!(decode(&bytes, Some("psd"), &DecodeOptions::default()).is_err());
+}
+
+/// A greyscale document carrying a DISPLAY_INFO resource (Photoshop writes one whenever the
+/// document has an alpha channel) must decode. psd_sdk sized its alpha-channel table as
+/// `channelCount - 3` in unsigned arithmetic, which wrapped to ~4 billion entries for 1-2 channels.
+#[test]
+fn psd_grayscale_display_info_does_not_wrap_the_channel_count() {
+    // version + one 13-byte alpha-channel record.
+    let mut info = 1u32.to_be_bytes().to_vec();
+    info.extend_from_slice(&[0; 13]);
+    let res = resource(1077, &info);
+    let mut image = 0u16.to_be_bytes().to_vec();
+    image.extend_from_slice(&[50, 200]); // grey, alpha
+    let bytes = psd_raw(1, 1, COLOR_MODE_GRAYSCALE, 2, &res, &image);
+    let out = decode(&bytes, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(out.pixels, vec![50, 50, 50, 200]);
+}
+
+/// An RLE run longer than what is left of the plane must stop at the plane's end. Upstream
+/// `DecompressRle` wrote the whole run (up to 127 bytes past the heap buffer); now the overrun is
+/// refused and the rest of the plane zero-filled rather than left uninitialised.
+#[test]
+fn psd_rle_run_past_the_plane_is_bounded() {
+    let mut image = 1u16.to_be_bytes().to_vec(); // RLE
+    for _ in 0..3 {
+        image.extend_from_slice(&2u16.to_be_bytes()); // one row per channel, 2 bytes each
+    }
+    image.extend_from_slice(&[0x81, 7]); // R: a 128-byte run of 7 into a 2-byte plane
+    image.extend_from_slice(&[0xFF, 8]); // G: a 2-byte run of 8 (well-formed)
+    image.extend_from_slice(&[0xFF, 9]); // B
+    let bytes = psd_raw(2, 1, COLOR_MODE_RGB, 3, &[], &image);
+    let out = decode(&bytes, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    // R's overrunning run is dropped (zero-filled); G and B decode normally.
+    assert_eq!(out.pixels, vec![0, 8, 9, 255, 0, 8, 9, 255]);
+}
