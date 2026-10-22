@@ -3,7 +3,8 @@
 //! All format backends live behind the single [`decode`] entry point so callers
 //! never see per-format detail. Routing is by magic bytes (and, for camera raw, the file
 //! extension, since the many TIFF-structured raws can't be told from plain TIFF by header):
-//!   - PSD            -> psd_sdk (C++ FFI) : merged composite, 8-bit RGBA (+ICC)
+//!   - PSD            -> psd_sdk (C++ FFI) : merged composite, 8/16/32-bit RGBA (+ICC); and
+//!     its layers one at a time through [`PsdLayers`] (pure Rust)
 //!   - EXR            -> `exr` crate       : half or 32-bit float RGBA, as stored (linear/HDR)
 //!   - DDS            -> `ddsfile` + `bcdec_rs`: BC1-BC7 and the uncompressed layouts
 //!   - HEIC/HEIF/AVIF -> libheif (C FFI)   : 8-bit RGBA, or 16-bit RGBA for HDR (+ICC)
@@ -43,8 +44,11 @@ use std::path::Path;
 mod dds;
 mod downscale;
 mod exif;
+mod psd_layers;
 mod raw;
 mod tiff;
+
+pub use psd_layers::{BlendMode, LayerCtl, LayerError, LayerImage, LayerInfo, PsdLayers, Rect};
 
 /// Upper bound on a decoded source dimension. zune's default cap is 16384, which would
 /// reject any image larger than that on an axis before we ever get a chance to downscale
@@ -118,13 +122,38 @@ pub(crate) fn to_ne_bytes<T: bytemuck::Pod>(v: &[T]) -> Vec<u8> {
     bytemuck::cast_slice(v).to_vec()
 }
 
+thread_local! {
+    /// This thread's cap on the threads [`par_chunks`]/[`par_chunks_mut`] may use; 0 = no cap.
+    static THREAD_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f` with the parallel passes it reaches (ICC transform, alpha scan) limited to `n` threads
+/// (0 = no limit). Background work — pre-decoding PSD layers the user has not asked for yet — runs
+/// on one thread so it never competes with the image the user is waiting for.
+pub fn with_max_threads<R>(n: usize, f: impl FnOnce() -> R) -> R {
+    let prev = THREAD_CAP.replace(n);
+    let out = f();
+    THREAD_CAP.set(prev);
+    out
+}
+
+/// Threads a parallel pass may use on this thread: the core count (at most 8), under any
+/// [`with_max_threads`] cap.
+fn thread_budget() -> usize {
+    let avail = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
+    match THREAD_CAP.get() {
+        0 => avail,
+        cap => cap.min(avail),
+    }
+}
+
 /// Run `f` over `buf` split into contiguous parts, each a whole number of `unit`-byte items, on
 /// up to 8 scoped threads; `f` also gets the part's byte offset into `buf`. A buffer under 1 MiB
 /// runs on the calling thread: below that the hand-off costs more than the work.
 pub(crate) fn par_chunks_mut(buf: &mut [u8], unit: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
     const PARALLEL_MIN_BYTES: usize = 1 << 20;
     let threads = if buf.len() >= PARALLEL_MIN_BYTES {
-        std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+        thread_budget()
     } else {
         1
     };
@@ -145,7 +174,7 @@ pub(crate) fn par_chunks_mut(buf: &mut [u8], unit: usize, f: impl Fn(usize, &mut
 pub(crate) fn par_chunks(buf: &[u8], unit: usize, f: impl Fn(usize, &[u8]) + Sync) {
     const PARALLEL_MIN_BYTES: usize = 1 << 20;
     let threads = if buf.len() >= PARALLEL_MIN_BYTES {
-        std::thread::available_parallelism().map_or(1, |n| n.get().min(8))
+        thread_budget()
     } else {
         1
     };

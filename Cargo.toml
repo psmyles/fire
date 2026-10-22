@@ -128,6 +128,9 @@ lcms2 = { version = "6", features = ["static"] }
 # format table we want to own) and not `image`'s own `dds` feature (DXT1/3/5 only, no BC6H/BC7).
 ddsfile = "0.6"
 bcdec_rs = "0.2"
+# zlib inflate for ZIP-compressed PSD layer channels (`fire-decode`'s `psd_layers`). Already in
+# the build through `png`/`flate2`, so naming it adds no crate.
+miniz_oxide = "0.8"
 
 # --- config / fs ---
 serde = { version = "1", features = ["derive"] }

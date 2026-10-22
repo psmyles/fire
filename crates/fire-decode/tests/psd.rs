@@ -9,8 +9,8 @@
 //!
 //! Fixtures are built in memory rather than committed as binaries: a minimal PSD is a header plus
 //! four length-prefixed sections, and writing it out in code documents the layout the C++ side
-//! relies on. Only the merged ("Maximize Compatibility") composite is in scope — the layer stack
-//! is a v2 concern and `fire_psd_read_merged` returns error 2 without it.
+//! relies on. Only the merged ("Maximize Compatibility") composite is in scope here — layers are
+//! decoded in Rust and tested in `psd_layers.rs`.
 //!
 //! Compiled out without the `psd` feature: there is no psd_sdk to drive then, and the point of
 //! that configuration is to build and test on a machine with no vendored native trees at all.

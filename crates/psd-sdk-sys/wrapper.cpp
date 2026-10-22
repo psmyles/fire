@@ -3,8 +3,9 @@
 // clang-18/MSVC-STL STL1000 constraint only applies to bindgen's parse of wrapper.h,
 // which stays C-style.
 //
-// v1 scope (#18): the MERGED/composited image only (present when the PSD was saved with
-// "Maximize Compatibility"). Layer browsing is deferred to v2.
+// Scope: the MERGED/composited image only (present when the PSD was saved with "Maximize
+// Compatibility"). Individual layers are decoded in Rust by fire-decode's `psd_layers`, never
+// through psd_sdk's layer parser — see vendor/VENDOR.txt.
 
 #include "wrapper.h"
 

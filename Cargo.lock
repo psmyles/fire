@@ -701,6 +701,7 @@ dependencies = [
  "jxl-oxide",
  "lcms2",
  "libwebp-sys",
+ "miniz_oxide",
  "psd-sdk-sys",
  "qoi",
  "tiff",

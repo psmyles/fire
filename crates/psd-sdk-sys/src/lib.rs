@@ -1,8 +1,8 @@
 //! FFI bindings to psd_sdk (Molecular Matters, C++) via a thin `extern "C"` C-ABI
 //! wrapper (`wrapper.h`/`wrapper.cpp`), plus a small safe Rust API on top.
 //!
-//! v1 decodes the MERGED/composited image (present when the PSD was saved with
-//! "Maximize Compatibility"); layer browsing is deferred to v2 (#18).
+//! This decodes the MERGED/composited image (present when the PSD was saved with
+//! "Maximize Compatibility"). Layers are decoded in Rust by `fire-decode`'s `psd_layers`.
 //!
 //! Safety: callers in fire-decode additionally run [`decode_psd`] inside
 //! `std::panic::catch_unwind` on a decode worker, so a malformed PSD cannot take down
