@@ -584,22 +584,29 @@ impl PsdLayers {
         }
 
         let mut sources: Vec<(usize, Plane)> = Vec::with_capacity(jobs.len());
-        let threads = resolve_threads((ctl.threads)());
-        let prepared: Vec<Result<(usize, Plane), LayerError>> = if threads > 1 && jobs.len() > 1 {
+        // At most `threads` workers, each taking every `workers`-th channel.
+        let workers = resolve_threads((ctl.threads)()).min(jobs.len());
+        let prepared: Vec<Result<(usize, Plane), LayerError>> = if workers > 1 {
             std::thread::scope(|s| {
-                let handles: Vec<_> = jobs
-                    .iter()
-                    .map(|&(slot, c, r)| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|first| {
+                        let jobs = &jobs;
                         s.spawn(move || {
-                            prepare_plane(bytes, c, r, depth, ctl.cancel).map(|p| (slot, p))
+                            jobs.iter()
+                                .skip(first)
+                                .step_by(workers)
+                                .map(|&(slot, c, r)| {
+                                    prepare_plane(bytes, c, r, depth, ctl.cancel).map(|p| (slot, p))
+                                })
+                                .collect::<Vec<_>>()
                         })
                     })
                     .collect();
                 handles
                     .into_iter()
-                    .map(|h| {
+                    .flat_map(|h| {
                         h.join()
-                            .unwrap_or_else(|_| Err(malformed("channel decode panicked")))
+                            .unwrap_or_else(|_| vec![Err(malformed("channel decode panicked"))])
                     })
                     .collect()
             })
@@ -665,7 +672,7 @@ impl PsdLayers {
                 }
             }
         };
-        let row_threads = threads.min(bands.len()).max(1);
+        let row_threads = resolve_threads((ctl.threads)()).min(bands.len()).max(1);
         if row_threads > 1 {
             std::thread::scope(|s| {
                 for _ in 1..row_threads {
@@ -844,7 +851,7 @@ fn prepare_plane<'a>(
 ) -> Result<Plane<'a>, LayerError> {
     let bps = depth as usize / 8;
     let (w, h) = (rect.width() as usize, rect.height() as usize);
-    if c.len < 2 || w == 0 || h == 0 {
+    if c.len <= 2 || w == 0 || h == 0 {
         return Ok(Plane::Empty);
     }
     check_dims(w, h, bps, "PSD layer channel")?;

@@ -946,6 +946,20 @@ fn malformed_channel_data_is_an_error() {
         .is_err());
 }
 
+/// A channel that holds only its compression word has no pixels: it is the channel's default
+/// everywhere, not a short channel.
+#[test]
+fn two_byte_channel_is_its_default() {
+    for comp in [Comp::Raw, Comp::Rle] {
+        let mut l = rgb_layer("a");
+        l.chans.push((-1, Vec::new())); // transparency: encodes to the compression word alone
+        l.comp = comp;
+        let layers = open(&doc_of(vec![l]));
+        let img = decode(&layers, 0);
+        assert_eq!(img.image.pixels, [1, 2, 3, 0].repeat(4), "{comp:?}");
+    }
+}
+
 #[test]
 fn malformed_records_are_refused_at_open() {
     // A channel length pointing past the end of the file.

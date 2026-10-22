@@ -76,6 +76,9 @@ pub struct JobCtl {
     /// The user is waiting on this one: use every core. Read at each stage, so a background job
     /// the cursor lands on speeds up mid-flight.
     pub foreground: AtomicBool,
+    /// Set by the pool when it queues the job on the main lane (a foreground submit, or no
+    /// prefetch lane to send it to).
+    pub main_lane: AtomicBool,
 }
 
 /// Whether position `pos` is near enough to `cursor` (moving in `dir`) to be worth decoding.
@@ -228,8 +231,8 @@ impl<V> ByteCache<V> {
     }
 
     /// Evict until the cache fits its budget, sparing every key in `protect`. Returns what was
-    /// evicted, so the caller can free it off the UI thread.
-    pub fn trim(&mut self, cursor: u32, protect: &[u32]) -> Vec<V> {
+    /// evicted, keyed, so the caller can free it off the UI thread.
+    pub fn trim(&mut self, cursor: u32, protect: &[u32]) -> Vec<(u32, V)> {
         let mut out = Vec::new();
         while self.total() > self.budget {
             let victim = self
@@ -240,7 +243,10 @@ impl<V> ByteCache<V> {
                 .max_by_key(|(_, e)| (e.key.abs_diff(cursor), std::cmp::Reverse(e.used)))
                 .map(|(i, _)| i);
             match victim {
-                Some(i) => out.push(self.entries.swap_remove(i).value),
+                Some(i) => {
+                    let e = self.entries.swap_remove(i);
+                    out.push((e.key, e.value));
+                }
                 None => break, // everything left is protected
             }
         }
@@ -450,16 +456,16 @@ mod tests {
             c.insert(k, k, 100);
         }
         // Over budget by one entry: cursor at 1 → 4 is farthest.
-        assert_eq!(c.trim(1, &[]), [4]);
+        assert_eq!(c.trim(1, &[]), [(4, 4)]);
         c.insert(5, 5, 100);
         // Cursor at 5, but 1 (farthest) is protected → 2 goes.
-        assert_eq!(c.trim(5, &[1]), [2]);
+        assert_eq!(c.trim(5, &[1]), [(2, 2)]);
         assert!(c.contains(1) && c.contains(3) && c.contains(5));
         // A single oversized entry nobody protects is evicted outright.
         c.insert(9, 9, 1000);
         let mut gone = c.trim(9, &[]);
         gone.sort();
-        assert!(gone.contains(&1), "the far entries go first");
+        assert!(gone.contains(&(1, 1)), "the far entries go first");
         // Everything protected: trim stops rather than looping.
         let mut c = ByteCache::new(10);
         c.insert(1, (), 100);
@@ -474,7 +480,7 @@ mod tests {
         c.insert(6, 'b', 100);
         let _ = c.get(4); // 6 is now the least recently used of the two equidistant entries
         c.insert(5, 'c', 100);
-        assert_eq!(c.trim(5, &[5]), ['b']);
+        assert_eq!(c.trim(5, &[5]), [(6, 'b')]);
     }
 
     #[test]

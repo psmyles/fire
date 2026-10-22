@@ -16,7 +16,7 @@
 //! * Any new decode — another file, a reload, a close — ends the session first, putting the
 //!   composite back and handing everything big to the reaper thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -55,6 +55,9 @@ pub(super) struct LayerSession {
     sizes: HashMap<u32, u64>,
     inflight: HashMap<u32, Arc<JobCtl>>,
     failed: HashMap<u32, String>,
+    /// Neighbours the cache evicted to make room for closer ones. Not pre-decoded again until
+    /// the cursor moves, or decode, evict and resubmit would repeat for as long as it stays put.
+    dropped: HashSet<u32>,
     /// The position whose pixels are on screen.
     showing: u32,
     /// A decoded layer to upload on the next frame (see `flush_layer_upload`).
@@ -109,6 +112,7 @@ impl Viewer {
             sizes: HashMap::new(),
             inflight: HashMap::new(),
             failed: HashMap::new(),
+            dropped: HashSet::new(),
             showing: 0,
             pending_upload: None,
             last_step: Instant::now(),
@@ -153,10 +157,13 @@ impl Viewer {
         s.warm = true;
         s.last_step = Instant::now();
         s.pending_upload = None;
+        s.dropped.clear();
         let pos = s.nav.pos;
         if self.surface.show_staged(pos, s.showing) {
             s.showing = pos;
             crate::render::gpu::report_timing(&format!("psd layer {pos} shown (staged)"));
+        } else if s.failed.contains_key(&pos) {
+            self.show_failed_layer();
         } else if s.cache.contains(pos) {
             s.pending_upload = Some(pos);
         }
@@ -196,10 +203,10 @@ impl Viewer {
             return;
         };
         let t = Instant::now();
-        match self
+        let shown = self
             .surface
-            .show_layer(Arc::clone(&c.image), &c.mips, Some(c.placement), park)
-        {
+            .show_layer(Arc::clone(&c.image), &c.mips, Some(c.placement), park);
+        match shown {
             Ok(()) => {
                 s.showing = pos;
                 crate::render::gpu::report_timing(&format!(
@@ -210,6 +217,7 @@ impl Viewer {
             Err(e) => {
                 eprintln!("fire: layer {pos} upload failed: {e}");
                 s.failed.insert(pos, format!("GPU upload ({e})"));
+                self.show_failed_layer();
             }
         }
         self.trim_stash();
@@ -248,6 +256,8 @@ impl Viewer {
                 let protect = [s.nav.pos, s.showing];
                 let evicted = s.cache.trim(s.nav.pos, &protect);
                 if !evicted.is_empty() {
+                    let (keys, evicted): (Vec<u32>, Vec<CachedLayer>) = evicted.into_iter().unzip();
+                    s.dropped.extend(keys);
                     self.pool.dispose(Box::new(evicted));
                 }
                 let s = self.layers.as_mut().expect("still in a session");
@@ -325,10 +335,15 @@ impl Viewer {
         };
         let target = s.nav.pos;
         // Work the cursor has left behind stops at its next checkpoint (and replies Superseded);
-        // whatever is not the target runs at background speed.
+        // whatever is not the target runs at background speed. A target the cursor left while it
+        // was on the main lane stops too, so pre-decoding never holds a main worker: if it is
+        // still wanted, its Superseded reply brings it back on the prefetch lane.
         for (&p, c) in &s.inflight {
-            if p != target {
-                c.foreground.store(false, Ordering::Relaxed);
+            if p != target
+                && c.foreground.swap(false, Ordering::Relaxed)
+                && c.main_lane.load(Ordering::Relaxed)
+            {
+                c.cancelled.store(true, Ordering::Relaxed);
             }
             if !layers::in_window(p, target, s.nav.dir) {
                 c.cancelled.store(true, Ordering::Relaxed);
@@ -349,18 +364,21 @@ impl Viewer {
                 .count()
         };
         for p in s.nav.wanted() {
+            let fg = p == target;
             if s.cache.contains(p) || s.failed.contains_key(&p) || self.surface.is_staged(p) {
                 continue;
             }
-            if s.showing == p {
+            if s.showing == p || (!fg && s.dropped.contains(&p)) {
                 continue;
             }
-            let fg = p == target;
             // Already in flight: wanted again, so un-cancel it (if it already gave up, its
             // Superseded reply comes back and the next pass resubmits), and promote the target.
             // Never replaced while in flight — its reply is matched by position.
             if let Some(c) = s.inflight.get(&p) {
-                c.cancelled.store(false, Ordering::Relaxed);
+                // Background work stays off the main lane: a job there is left to stop.
+                if fg || !c.main_lane.load(Ordering::Relaxed) {
+                    c.cancelled.store(false, Ordering::Relaxed);
+                }
                 if fg {
                     c.foreground.store(true, Ordering::Relaxed);
                 }

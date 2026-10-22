@@ -71,8 +71,8 @@ pub struct DecodeJob {
     /// [`AppEvent::FlipbookGuess`] is sent, so no hint chip can appear.
     pub detect_flipbook: bool,
     /// The issuing window's live generation, when it has one (the launch decode does not): read
-    /// after the image is posted, so the PSD layer index — the only work done after it — is not
-    /// built for a window that has already moved on.
+    /// after the image decodes, so the PSD layer index is not built (and the file's bytes not
+    /// kept) for a window that has already moved on.
     pub gen_cell: Option<Arc<AtomicU64>>,
 }
 
@@ -107,8 +107,8 @@ pub struct FlipbookGuess {
 }
 
 /// A decoded PSD's layer stack, ready to step through — sent after its composite's `DecodeDone`
-/// (the parse is metadata only, a fraction of a millisecond, and starts only once the composite
-/// is on its way to the screen). Stale-dropped by `generation` like a decode.
+/// (the parse is metadata only, a fraction of a millisecond). Stale-dropped by `generation` like
+/// a decode.
 pub struct LayerIndex {
     pub window: Option<WindowId>,
     pub generation: u64,
@@ -270,10 +270,13 @@ impl DecodePool {
     /// (`SessionCtl`/`JobCtl`) say when they are no longer wanted.
     pub fn submit_layer(&self, job: LayerJob) {
         if job.ctl.foreground.load(Ordering::Relaxed) {
+            job.ctl.main_lane.store(true, Ordering::Relaxed);
             let _ = self.tx.send(Job::Layer(job));
         } else if let Err(e) = self.prefetch.send(job) {
             // No prefetch lane (it failed to start): run it on the main lane instead.
-            let _ = self.tx.send(Job::Layer(e.into_inner()));
+            let job = e.into_inner();
+            job.ctl.main_lane.store(true, Ordering::Relaxed);
+            let _ = self.tx.send(Job::Layer(job));
         }
     }
 
@@ -299,8 +302,8 @@ fn main_worker(rx: Receiver<Job>, latest: Arc<AtomicU64>, proxy: EventLoopProxy<
     }
 }
 
-/// Run one file decode: the image, then (off the time-to-first-pixel path) the PSD layer index
-/// and the flipbook guess. Returns false when the event loop is gone and the worker should stop.
+/// Run one file decode: the image, then the PSD layer index (parsed before the mip chain, sent
+/// after the image) and the flipbook guess. Returns false when the event loop is gone and the worker should stop.
 fn run_decode(job: DecodeJob, latest: &AtomicU64, proxy: &EventLoopProxy<AppEvent>) -> bool {
     // A superseded job's result would be stale-dropped on arrival anyway; once a newer submit
     // exists, skip the decode itself.
@@ -308,6 +311,10 @@ fn run_decode(job: DecodeJob, latest: &AtomicU64, proxy: &EventLoopProxy<AppEven
         return true;
     }
     let (mut result, psd_bytes) = decode(&job);
+    // Parsed before the mip chain is built, so a PSD with no layer index to keep its bytes for
+    // (a PSB, no steppable layers, a window that has moved on) frees them now rather than holding
+    // them through the mips as well. Sent after the image.
+    let layer_doc = psd_bytes.and_then(|bytes| open_layers(&job, bytes));
     // Take the file's own chain out of the image before it is shared: only the uploader wants it,
     // and leaving it in would keep a second copy of roughly a third of level 0 alive behind every
     // `Arc` for the life of the window.
@@ -378,35 +385,17 @@ fn run_decode(job: DecodeJob, latest: &AtomicU64, proxy: &EventLoopProxy<AppEven
         return false;
     }
 
-    // --- Then the PSD's layer index, from the bytes the composite was decoded from. Metadata
-    // only; nothing here can delay the image above, which is already on its way.
-    if let Some(bytes) = psd_bytes {
-        let stale = job
-            .gen_cell
-            .as_ref()
-            .is_some_and(|c| c.load(Ordering::Relaxed) != generation);
-        if !stale {
-            let t = Instant::now();
-            match PsdLayers::open(Arc::new(bytes)) {
-                Ok(Some(doc)) => {
-                    crate::render::gpu::report_timing(&format!(
-                        "psd layer index — {:.2} ms ({} layers)",
-                        t.elapsed().as_secs_f64() * 1e3,
-                        doc.layers().len()
-                    ));
-                    let index = Box::new(LayerIndex {
-                        window,
-                        generation,
-                        path: path.clone(),
-                        doc: Arc::new(doc),
-                    });
-                    if proxy.send_event(AppEvent::PsdLayers(index)).is_err() {
-                        return false;
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("fire: {}: layers unavailable: {e}", path.display()),
-            }
+    // --- Then the PSD's layer index. Nothing here can delay the image above, which is already
+    // on its way.
+    if let Some(doc) = layer_doc {
+        let index = Box::new(LayerIndex {
+            window,
+            generation,
+            path: path.clone(),
+            doc,
+        });
+        if proxy.send_event(AppEvent::PsdLayers(index)).is_err() {
+            return false;
         }
     }
 
@@ -429,6 +418,34 @@ fn run_decode(job: DecodeJob, latest: &AtomicU64, proxy: &EventLoopProxy<AppEven
         }
     }
     true
+}
+
+/// Parse a PSD's layer index from the bytes its composite was decoded from. `None` when it has
+/// no steppable layers, cannot be parsed, or its window has moved on — the bytes are freed then.
+fn open_layers(job: &DecodeJob, bytes: Vec<u8>) -> Option<Arc<PsdLayers>> {
+    let stale = job
+        .gen_cell
+        .as_ref()
+        .is_some_and(|c| c.load(Ordering::Relaxed) != job.generation);
+    if stale {
+        return None;
+    }
+    let t = Instant::now();
+    match PsdLayers::open(Arc::new(bytes)) {
+        Ok(Some(doc)) => {
+            crate::render::gpu::report_timing(&format!(
+                "psd layer index — {:.2} ms ({} layers)",
+                t.elapsed().as_secs_f64() * 1e3,
+                doc.layers().len()
+            ));
+            Some(Arc::new(doc))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("fire: {}: layers unavailable: {e}", job.path.display());
+            None
+        }
+    }
 }
 
 /// Run one layer job and report it. Returns false when the event loop is gone.
@@ -522,7 +539,7 @@ fn decode_layer(job: &LayerJob) -> Result<LayerData, LayerFail> {
 /// boundary around the whole pure-Rust + FFI path.
 ///
 /// Reads the file here rather than through `fire_decode::decode_path` so a PSD's bytes can be
-/// kept for its layer index (returned alongside the image when the job asks for layers and the
+/// kept for its layer index (returned alongside the image when the file is a PSD and its
 /// composite decoded). Every other file's bytes are freed right after its decode, as before.
 fn decode(job: &DecodeJob) -> (Result<DecodedImage, DecodeError>, Option<Vec<u8>>) {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

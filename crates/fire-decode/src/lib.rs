@@ -131,10 +131,16 @@ thread_local! {
 /// (0 = no limit). Background work — pre-decoding PSD layers the user has not asked for yet — runs
 /// on one thread so it never competes with the image the user is waiting for.
 pub fn with_max_threads<R>(n: usize, f: impl FnOnce() -> R) -> R {
-    let prev = THREAD_CAP.replace(n);
-    let out = f();
-    THREAD_CAP.set(prev);
-    out
+    /// Puts the previous cap back even if `f` unwinds, so a pooled worker that catches the panic
+    /// does not keep this cap for every later decode it runs.
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            THREAD_CAP.set(self.0);
+        }
+    }
+    let _restore = Restore(THREAD_CAP.replace(n));
+    f()
 }
 
 /// Threads a parallel pass may use on this thread: the core count (at most 8), under any

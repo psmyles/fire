@@ -493,9 +493,10 @@ PSD layer the user is waiting on. The prefetch lane (`fire-layer-*`, two threads
 priority) runs only layers decoded *ahead* of the user, each on one thread - so pre-decoding can
 never occupy a main worker or delay the next file's decode. A third thread, the reaper, frees what
 the UI thread lets go of (a PSD session's file bytes, evicted layers) so those frees never stall a
-frame. A PSD's decode also keeps its file bytes and, *after* posting the composite, parses the
-layer index from them (metadata only, well under a millisecond) and posts that as
-`AppEvent::PsdLayers`.
+frame. A PSD's decode also keeps its file bytes and parses the layer index from them (metadata
+only, well under a millisecond) before building the composite's mip chain, so a file with no index
+to keep its bytes for frees them straight away. The index is posted as `AppEvent::PsdLayers`
+*after* the composite.
 
 ---
 

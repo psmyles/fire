@@ -304,16 +304,16 @@ impl Fire {
                     v.flipbook_guess_done(*guess);
                 }
             }
-            AppEvent::PsdLayers(index) => {
-                if let Some(v) = self.target(index.window) {
-                    v.psd_layers_ready(*index);
-                }
-            }
-            AppEvent::LayerDecoded(outcome) => {
-                if let Some(v) = self.viewers.get_mut(&outcome.window) {
-                    v.layer_decoded(*outcome);
-                }
-            }
+            // Both can hold hundreds of megabytes (a file's bytes, a decoded layer): one for a
+            // window that has closed is freed on the reaper, not here.
+            AppEvent::PsdLayers(index) => match self.target(index.window) {
+                Some(v) => v.psd_layers_ready(*index),
+                None => self.pool.dispose(index),
+            },
+            AppEvent::LayerDecoded(outcome) => match self.viewers.get_mut(&outcome.window) {
+                Some(v) => v.layer_decoded(*outcome),
+                None => self.pool.dispose(outcome),
+            },
             AppEvent::FolderScanned(id, scan) => {
                 if let Some(v) = self.viewers.get_mut(&id) {
                     v.folder_scanned(*scan);
