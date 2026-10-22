@@ -91,6 +91,40 @@ pub fn grant_foreground_to_owner() {
     }
 }
 
+/// Lower (`background = true`) or restore the calling thread's scheduling priority. The PSD
+/// layer prefetch threads run lowered — work decoded ahead of the user must never compete with
+/// what the user is waiting for — and restore it for a job the user has since landed on. Threads
+/// a job spawns inherit it (macOS QoS propagates to new threads). Best effort: the guarantee that
+/// prefetch cannot delay a decode comes from its separate lane, not from this.
+pub fn set_current_thread_background(background: bool) {
+    // SAFETY: both calls act only on the calling thread and take plain values.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use libc::qos_class_t::{QOS_CLASS_USER_INITIATED, QOS_CLASS_UTILITY};
+        let class = if background {
+            QOS_CLASS_UTILITY
+        } else {
+            QOS_CLASS_USER_INITIATED
+        };
+        let _ = libc::pthread_set_qos_class_self_np(class, 0);
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+            THREAD_PRIORITY_NORMAL,
+        };
+        let priority = if background {
+            THREAD_PRIORITY_BELOW_NORMAL
+        } else {
+            THREAD_PRIORITY_NORMAL
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), priority);
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = background;
+}
+
 /// The system UI font, if it is where we expect it. ImGui's built-in font stands in otherwise.
 pub fn ui_font_path() -> Option<&'static Path> {
     #[cfg(windows)]

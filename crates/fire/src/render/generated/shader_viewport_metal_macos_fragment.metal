@@ -36,6 +36,7 @@ struct params
     float2 surf_origin;
     float oct_crop;
     float oct_hide;
+    float4 layer_rect;
 };
 
 struct main0_out
@@ -94,11 +95,11 @@ float4 sample_cell(thread const float2& f, thread const float2& cell, constant p
     {
         float3 param_2 = s.xyz;
         float3 _286 = srgb_to_linear(param_2);
-        float4 _671 = s;
-        _671.x = _286.x;
-        _671.y = _286.y;
-        _671.z = _286.z;
-        s = _671;
+        float4 _709 = s;
+        _709.x = _286.x;
+        _709.y = _286.y;
+        _709.z = _286.z;
+        s = _709;
     }
     return s;
 }
@@ -195,42 +196,80 @@ float4 shade(thread const float4& pos, constant params& _112, texture2d<float> t
     }
     else
     {
-        float4 _462;
-        if (_112.inv_zoom <= 1.0)
+        float2 _464 = _332 - _112.layer_rect.xy;
+        float _470 = _464.x;
+        bool _471 = _470 < 0.0;
+        bool _478;
+        if (!_471)
         {
-            float2 param_5 = _332;
-            float2 param_6 = _112.img_size;
-            _462 = tex.sample(samp_point, texel_center(param_5, param_6), level(0.0));
+            _478 = _464.y < 0.0;
         }
         else
         {
-            float2 param_7 = _112.img_size;
-            float2 param_8 = _112.img_size;
-            _462 = tex.sample(samp_aniso, (_332 / _112.img_size), gradient2d(grad_x(param_7, _112), grad_y(param_8, _112)));
+            _478 = _471;
         }
-        rgb = _462.xyz;
-        a = _462.w;
-        if (_112.linear_sample == 0)
+        bool _487;
+        if (!_478)
         {
-            float3 param_9 = rgb;
-            rgb = srgb_to_linear(param_9);
+            _487 = _470 >= _112.layer_rect.z;
+        }
+        else
+        {
+            _487 = _478;
+        }
+        bool _496;
+        if (!_487)
+        {
+            _496 = _464.y >= _112.layer_rect.w;
+        }
+        else
+        {
+            _496 = _487;
+        }
+        if (_496)
+        {
+            rgb = float3(0.0);
+            a = 0.0;
+        }
+        else
+        {
+            float4 _504;
+            if (_112.inv_zoom <= 1.0)
+            {
+                float2 param_5 = _464;
+                float2 param_6 = _112.layer_rect.zw;
+                _504 = tex.sample(samp_point, texel_center(param_5, param_6), level(0.0));
+            }
+            else
+            {
+                float2 param_7 = _112.layer_rect.zw;
+                float2 param_8 = _112.layer_rect.zw;
+                _504 = tex.sample(samp_aniso, (_464 / _112.layer_rect.zw), gradient2d(grad_x(param_7, _112), grad_y(param_8, _112)));
+            }
+            rgb = _504.xyz;
+            a = _504.w;
+            if (_112.linear_sample == 0)
+            {
+                float3 param_9 = rgb;
+                rgb = srgb_to_linear(param_9);
+            }
         }
     }
     if (_112.is_hdr != 0)
     {
         rgb *= _112.exposure;
-        float3 _520;
+        float3 _558;
         if (_112.tonemap == 1)
         {
             float3 param_10 = rgb;
-            _520 = aces(param_10);
+            _558 = aces(param_10);
         }
         else
         {
             float3 param_11 = rgb;
-            _520 = reinhard(param_11);
+            _558 = reinhard(param_11);
         }
-        rgb = _520;
+        rgb = _558;
     }
     float3 outc;
     if (_112.channel == 1)
@@ -277,11 +316,11 @@ float4 shade(thread const float4& pos, constant params& _112, texture2d<float> t
     }
     if (_112.oct_hide > 0.0)
     {
-        float2 _604 = abs((_332 / _112.img_size) - float2(0.5));
-        float _613 = _112.oct_crop / fast::max(1.0 - _112.oct_crop, 0.5);
-        float _615 = _604.x;
-        float _618 = _604.y;
-        if (fast::max(_615 + (_613 * _618), _618 + (_613 * _615)) > 0.5)
+        float2 _642 = abs((_332 / _112.img_size) - float2(0.5));
+        float _651 = _112.oct_crop / fast::max(1.0 - _112.oct_crop, 0.5);
+        float _653 = _642.x;
+        float _656 = _642.y;
+        if (fast::max(_653 + (_651 * _656), _656 + (_651 * _653)) > 0.5)
         {
             float2 param_14 = _314;
             outc = mix(outc, backdrop(param_14, _112), float3(_112.oct_hide));
@@ -300,9 +339,9 @@ fragment main0_out main0(constant params& _112 [[buffer(0)]], texture2d<float> t
 {
     main0_out out = {};
     float4 param = gl_FragCoord;
-    float4 _652 = shade(param, _112, tex, samp_point, samp_aniso);
-    float3 param_1 = fast::clamp(_652.xyz, float3(0.0), float3(1.0));
-    out.frag_color = float4(linear_to_srgb(param_1), _652.w);
+    float4 _690 = shade(param, _112, tex, samp_point, samp_aniso);
+    float3 param_1 = fast::clamp(_690.xyz, float3(0.0), float3(1.0));
+    out.frag_color = float4(linear_to_srgb(param_1), _690.w);
     return out;
 }
 

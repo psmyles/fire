@@ -29,10 +29,13 @@ pub enum TimerKind {
     Flipbook = 1,
     /// The text caret's blink, armed only while a text field is being edited.
     Caret = 2,
+    /// PSD layer stepping: first the dwell before layers pre-decode, then idle-time uploads of
+    /// decoded neighbours (see `crate::layers`).
+    Layers = 3,
 }
 
 /// The number of [`TimerKind`]s, for per-window arrays indexed by kind.
-pub const KINDS: usize = 3;
+pub const KINDS: usize = 4;
 
 /// The process-wide timer queue, shared by the event loop and every window.
 #[derive(Debug, Default)]

@@ -22,6 +22,7 @@ cbuffer params : register(b0)
     float2 _112_surf_origin : packoffset(c7);
     float _112_oct_crop : packoffset(c7.z);
     float _112_oct_hide : packoffset(c7.w);
+    float4 _112_layer_rect : packoffset(c8);
 };
 
 Texture2D<float4> tex : register(t0);
@@ -108,11 +109,11 @@ float4 sample_cell(float2 f, float2 cell)
     {
         float3 param_2 = s.xyz;
         float3 _286 = srgb_to_linear(param_2);
-        float4 _671 = s;
-        _671.x = _286.x;
-        _671.y = _286.y;
-        _671.z = _286.z;
-        s = _671;
+        float4 _709 = s;
+        _709.x = _286.x;
+        _709.y = _286.y;
+        _709.z = _286.z;
+        s = _709;
     }
     return s;
 }
@@ -204,42 +205,80 @@ float4 shade(float4 pos)
     }
     else
     {
-        float4 _462;
-        if (_112_inv_zoom <= 1.0f)
+        float2 _464 = _332 - _112_layer_rect.xy;
+        float _470 = _464.x;
+        bool _471 = _470 < 0.0f;
+        bool _478;
+        if (!_471)
         {
-            float2 param_5 = _332;
-            float2 param_6 = _112_img_size;
-            _462 = tex.SampleLevel(samp_point, texel_center(param_5, param_6), 0.0f);
+            _478 = _464.y < 0.0f;
         }
         else
         {
-            float2 param_7 = _112_img_size;
-            float2 param_8 = _112_img_size;
-            _462 = tex.SampleGrad(samp_aniso, _332 / _112_img_size, grad_x(param_7), grad_y(param_8));
+            _478 = _471;
         }
-        rgb = _462.xyz;
-        a = _462.w;
-        if (_112_linear_sample == 0)
+        bool _487;
+        if (!_478)
         {
-            float3 param_9 = rgb;
-            rgb = srgb_to_linear(param_9);
+            _487 = _470 >= _112_layer_rect.z;
+        }
+        else
+        {
+            _487 = _478;
+        }
+        bool _496;
+        if (!_487)
+        {
+            _496 = _464.y >= _112_layer_rect.w;
+        }
+        else
+        {
+            _496 = _487;
+        }
+        if (_496)
+        {
+            rgb = 0.0f.xxx;
+            a = 0.0f;
+        }
+        else
+        {
+            float4 _504;
+            if (_112_inv_zoom <= 1.0f)
+            {
+                float2 param_5 = _464;
+                float2 param_6 = _112_layer_rect.zw;
+                _504 = tex.SampleLevel(samp_point, texel_center(param_5, param_6), 0.0f);
+            }
+            else
+            {
+                float2 param_7 = _112_layer_rect.zw;
+                float2 param_8 = _112_layer_rect.zw;
+                _504 = tex.SampleGrad(samp_aniso, _464 / _112_layer_rect.zw, grad_x(param_7), grad_y(param_8));
+            }
+            rgb = _504.xyz;
+            a = _504.w;
+            if (_112_linear_sample == 0)
+            {
+                float3 param_9 = rgb;
+                rgb = srgb_to_linear(param_9);
+            }
         }
     }
     if (_112_is_hdr != 0)
     {
         rgb *= _112_exposure;
-        float3 _520;
+        float3 _558;
         if (_112_tonemap == 1)
         {
             float3 param_10 = rgb;
-            _520 = aces(param_10);
+            _558 = aces(param_10);
         }
         else
         {
             float3 param_11 = rgb;
-            _520 = reinhard(param_11);
+            _558 = reinhard(param_11);
         }
-        rgb = _520;
+        rgb = _558;
     }
     float3 outc;
     if (_112_channel == 1)
@@ -286,11 +325,11 @@ float4 shade(float4 pos)
     }
     if (_112_oct_hide > 0.0f)
     {
-        float2 _604 = abs((_332 / _112_img_size) - 0.5f.xx);
-        float _613 = _112_oct_crop / max(1.0f - _112_oct_crop, 0.5f);
-        float _615 = _604.x;
-        float _618 = _604.y;
-        if (max(_615 + (_613 * _618), _618 + (_613 * _615)) > 0.5f)
+        float2 _642 = abs((_332 / _112_img_size) - 0.5f.xx);
+        float _651 = _112_oct_crop / max(1.0f - _112_oct_crop, 0.5f);
+        float _653 = _642.x;
+        float _656 = _642.y;
+        if (max(_653 + (_651 * _656), _656 + (_651 * _653)) > 0.5f)
         {
             float2 param_14 = _314;
             outc = lerp(outc, backdrop(param_14), _112_oct_hide.xxx);
@@ -307,9 +346,9 @@ float3 linear_to_srgb(float3 c)
 void frag_main()
 {
     float4 param = gl_FragCoord;
-    float4 _652 = shade(param);
-    float3 param_1 = clamp(_652.xyz, 0.0f.xxx, 1.0f.xxx);
-    frag_color = float4(linear_to_srgb(param_1), _652.w);
+    float4 _690 = shade(param);
+    float3 param_1 = clamp(_690.xyz, 0.0f.xxx, 1.0f.xxx);
+    frag_color = float4(linear_to_srgb(param_1), _690.w);
 }
 
 SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)

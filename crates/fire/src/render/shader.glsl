@@ -51,6 +51,7 @@ layout(binding=0) uniform params {
     vec2  surf_origin;    // image sub-rect's top-left in RENDER-TARGET px (see shade)
     float oct_crop;       // octagon overlay crop factor (0 = quad, 0.5 = diamond)
     float oct_hide;       // 0..1 fade of the image outside the octagon (0 = overlay off)
+    vec4  layer_rect;     // where the texture sits on the img_size canvas: xy origin, zw size
 };
 
 // Separate texture and sampler, combined at each tap. `samp_aniso` is the filtering/mip sampler
@@ -178,15 +179,26 @@ vec4 shade(vec4 pos) {
         rgb = s.rgb;
         a = s.a;
     } else {
-        // f is inside [0, img_size) here (the letterbox branch above returned), so the point tap's
-        // floor lands on a real texel and the CLAMP address mode never comes into it.
-        vec4 s = (inv_zoom <= 1.0)
-            ? textureLod(sampler2D(tex, samp_point), texel_center(f, img_size), 0.0) // magnify
-            : textureGrad(sampler2D(tex, samp_aniso), f / img_size,                  // minify
-                          grad_x(img_size), grad_y(img_size));
-        rgb = s.rgb;
-        a = s.a;
-        if (linear_sample == 0) rgb = srgb_to_linear(rgb);
+        // The texture covers `layer_rect` of the canvas: all of it for an image (rect = 0,0 →
+        // img_size, so `t == f` and nothing below changes), only its bounds for a PSD layer, which
+        // is transparent everywhere else. The branch is per pixel, so — as everywhere in this
+        // shader — the samples inside it carry explicit LODs/gradients.
+        vec2 t = f - layer_rect.xy;
+        vec2 ls = layer_rect.zw;
+        if (t.x < 0.0 || t.y < 0.0 || t.x >= ls.x || t.y >= ls.y) {
+            rgb = vec3(0.0);
+            a = 0.0;
+        } else {
+            // t is inside [0, ls) here, so the point tap's floor lands on a real texel and the
+            // CLAMP address mode never comes into it.
+            vec4 s = (inv_zoom <= 1.0)
+                ? textureLod(sampler2D(tex, samp_point), texel_center(t, ls), 0.0)  // magnify
+                : textureGrad(sampler2D(tex, samp_aniso), t / ls,                   // minify
+                              grad_x(ls), grad_y(ls));
+            rgb = s.rgb;
+            a = s.a;
+            if (linear_sample == 0) rgb = srgb_to_linear(rgb);
+        }
     }
     if (is_hdr != 0) {
         rgb *= exposure;

@@ -55,7 +55,7 @@ pub fn complete(
         if src.len() < sw as usize * sh as usize * bpp {
             return Vec::new();
         }
-        out.push(downsample_level(src, sw, sh, dw, dh, format));
+        out.push(downsample_level(src, sw, sh, dw, dh, format, 0));
     }
     out
 }
@@ -90,6 +90,19 @@ pub fn bytes_per_texel(format: PixelFormat) -> usize {
 /// buffer is one level, in `format`, smallest last; empty for a 1×1 image. A `pixels` shorter
 /// than its dimensions declare yields an empty chain rather than a read past the end.
 pub fn build(pixels: &[u8], w: u32, h: u32, format: PixelFormat) -> Vec<Vec<u8>> {
+    build_with_threads(pixels, w, h, format, 0)
+}
+
+/// [`build`] on at most `max_threads` threads (0 = as many as the big levels want). PSD layers
+/// pre-decoded in the background build theirs on one, so they never compete with the image the
+/// user is waiting for.
+pub fn build_with_threads(
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    format: PixelFormat,
+    max_threads: usize,
+) -> Vec<Vec<u8>> {
     let bpp = bytes_per_texel(format);
     let needed = (w as usize)
         .checked_mul(h as usize)
@@ -104,7 +117,7 @@ pub fn build(pixels: &[u8], w: u32, h: u32, format: PixelFormat) -> Vec<Vec<u8>>
         let (dw, dh) = ((sw / 2).max(1), (sh / 2).max(1));
         let next = {
             let src: &[u8] = out.last().map_or(pixels, |v| v.as_slice());
-            downsample_level(src, sw, sh, dw, dh, format)
+            downsample_level(src, sw, sh, dw, dh, format, max_threads)
         };
         out.push(next);
         sw = dw;
@@ -121,12 +134,16 @@ fn downsample_level(
     dw: u32,
     dh: u32,
     format: PixelFormat,
+    max_threads: usize,
 ) -> Vec<u8> {
+    let t = max_threads;
     match format {
-        PixelFormat::Rgba8Unorm => downsample::<4>(src, sw, sh, dw, dh, load_srgb8, store_srgb8),
-        PixelFormat::Rgba16Unorm => downsample::<8>(src, sw, sh, dw, dh, load_u16, store_u16),
-        PixelFormat::Rgba16Float => downsample::<8>(src, sw, sh, dw, dh, load_f16, store_f16),
-        PixelFormat::Rgba32Float => downsample::<16>(src, sw, sh, dw, dh, load_f32, store_f32),
+        PixelFormat::Rgba8Unorm => {
+            downsample::<4>(src, (sw, sh, dw, dh), t, load_srgb8, store_srgb8)
+        }
+        PixelFormat::Rgba16Unorm => downsample::<8>(src, (sw, sh, dw, dh), t, load_u16, store_u16),
+        PixelFormat::Rgba16Float => downsample::<8>(src, (sw, sh, dw, dh), t, load_f16, store_f16),
+        PixelFormat::Rgba32Float => downsample::<16>(src, (sw, sh, dw, dh), t, load_f32, store_f32),
     }
 }
 
@@ -140,10 +157,8 @@ const PARALLEL_MIN_TEXELS: usize = 256 * 256;
 /// five indirect calls, which was most of the cost.
 fn downsample<const E: usize>(
     src: &[u8],
-    sw: u32,
-    sh: u32,
-    dw: u32,
-    dh: u32,
+    (sw, sh, dw, dh): (u32, u32, u32, u32),
+    max_threads: usize,
     load: impl Fn(&[u8]) -> [f32; 4] + Sync,
     store: impl Fn([f32; 4], &mut [u8]) + Sync,
 ) -> Vec<u8> {
@@ -176,9 +191,10 @@ fn downsample<const E: usize>(
     };
 
     let threads = if dw * dh >= PARALLEL_MIN_TEXELS {
+        let cap = if max_threads == 0 { 8 } else { max_threads };
         std::thread::available_parallelism()
             .map_or(1, |n| n.get())
-            .clamp(1, 8)
+            .clamp(1, cap)
             .min(dh)
     } else {
         1

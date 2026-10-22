@@ -31,7 +31,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::WindowId;
 
 use crate::config::{Config, OpenIn};
-use crate::decode_pool::{DecodeOutcome, DecodePool, FlipbookGuess};
+use crate::decode_pool::{DecodeOutcome, DecodePool, FlipbookGuess, LayerIndex, LayerOutcome};
 use crate::render::gpu::Gpu;
 use timers::{TimerQueue, Timers};
 use viewer::{Dialog, Viewer};
@@ -47,6 +47,10 @@ pub enum AppEvent {
     /// A finished flipbook auto-detection from a worker, sent *after* its `DecodeDone` so the
     /// per-pixel scan never delays the image.
     FlipbookGuess(Box<FlipbookGuess>),
+    /// A PSD's layer stack, parsed by the worker after its composite's `DecodeDone`.
+    PsdLayers(Box<LayerIndex>),
+    /// A finished (or abandoned) PSD layer decode.
+    LayerDecoded(Box<LayerOutcome>),
     /// A finished sibling-image scan from the folder-scan thread.
     FolderScanned(WindowId, Box<FolderScan>),
     /// The displayed image's file changed on disk (hot-reload). `generation` is the watcher's
@@ -79,6 +83,8 @@ impl std::fmt::Debug for AppEvent {
             AppEvent::Open(r) => write!(f, "Open({})", r.path.display()),
             AppEvent::DecodeDone(o) => write!(f, "DecodeDone({})", o.path.display()),
             AppEvent::FlipbookGuess(g) => write!(f, "FlipbookGuess({})", g.path.display()),
+            AppEvent::PsdLayers(i) => write!(f, "PsdLayers({})", i.path.display()),
+            AppEvent::LayerDecoded(o) => write!(f, "LayerDecoded(layer {})", o.pos),
             AppEvent::FolderScanned(w, s) => {
                 write!(f, "FolderScanned({w:?}, {} entries)", s.entries.len())
             }
@@ -296,6 +302,16 @@ impl Fire {
             AppEvent::FlipbookGuess(guess) => {
                 if let Some(v) = self.target(guess.window) {
                     v.flipbook_guess_done(*guess);
+                }
+            }
+            AppEvent::PsdLayers(index) => {
+                if let Some(v) = self.target(index.window) {
+                    v.psd_layers_ready(*index);
+                }
+            }
+            AppEvent::LayerDecoded(outcome) => {
+                if let Some(v) = self.viewers.get_mut(&outcome.window) {
+                    v.layer_decoded(*outcome);
                 }
             }
             AppEvent::FolderScanned(id, scan) => {

@@ -62,6 +62,11 @@ pub enum KeyAction {
     // Navigation
     PrevImage,
     NextImage,
+    // PSD layers
+    /// Up the layer stack, toward (and finally back to) the composite.
+    PrevLayer,
+    /// Down the layer stack, from the composite to the top layer and on to the bottom one.
+    NextLayer,
     // Window
     ToggleFullscreen,
     /// Esc: leave full-screen if in it, otherwise close the window — the closing half only when
@@ -97,6 +102,8 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::CycleBackdrop,
     KeyAction::PrevImage,
     KeyAction::NextImage,
+    KeyAction::PrevLayer,
+    KeyAction::NextLayer,
     KeyAction::ToggleFullscreen,
     KeyAction::CloseOrExitFullscreen,
     KeyAction::ToggleFlipbook,
@@ -131,6 +138,8 @@ impl KeyAction {
             KeyAction::CycleBackdrop => "cycle-backdrop",
             KeyAction::PrevImage => "previous-image",
             KeyAction::NextImage => "next-image",
+            KeyAction::PrevLayer => "previous-layer",
+            KeyAction::NextLayer => "next-layer",
             KeyAction::ToggleFullscreen => "toggle-fullscreen",
             KeyAction::CloseOrExitFullscreen => "close-or-exit-fullscreen",
             KeyAction::ToggleFlipbook => "toggle-flipbook",
@@ -164,6 +173,8 @@ impl KeyAction {
             KeyAction::CycleBackdrop => "Next backdrop",
             KeyAction::PrevImage => "Previous image",
             KeyAction::NextImage => "Next image",
+            KeyAction::PrevLayer => "Previous layer (toward the composite)",
+            KeyAction::NextLayer => "Next layer (down the stack)",
             KeyAction::ToggleFullscreen => "Full screen",
             KeyAction::CloseOrExitFullscreen => "Close window / leave full screen",
             KeyAction::ToggleFlipbook => "Flipbook mode",
@@ -192,6 +203,7 @@ impl KeyAction {
             KeyAction::MipFiner | KeyAction::MipCoarser => "Mip levels",
             KeyAction::ToggleOutline | KeyAction::CycleBackdrop => "Appearance",
             KeyAction::PrevImage | KeyAction::NextImage => "Navigation",
+            KeyAction::PrevLayer | KeyAction::NextLayer => "PSD layers",
             KeyAction::ToggleFullscreen | KeyAction::CloseOrExitFullscreen => "Window",
             KeyAction::ToggleFlipbook
             | KeyAction::FlipbookPlayPause
@@ -587,6 +599,8 @@ impl Keybinds {
                 bind(KeyAction::CycleBackdrop, &["Z"]),
                 bind(KeyAction::PrevImage, &["Left"]),
                 bind(KeyAction::NextImage, &["Right"]),
+                bind(KeyAction::PrevLayer, &["Up"]),
+                bind(KeyAction::NextLayer, &["Down"]),
                 bind(KeyAction::ToggleFullscreen, &["F11"]),
                 bind(KeyAction::CloseOrExitFullscreen, &["Esc"]),
                 bind(KeyAction::ToggleFlipbook, &["K"]),
@@ -859,6 +873,8 @@ mod tests {
             (KeyCode::NumpadSubtract, KeyAction::ZoomOut),
             (KeyCode::ArrowLeft, KeyAction::PrevImage),
             (KeyCode::ArrowRight, KeyAction::NextImage),
+            (KeyCode::ArrowUp, KeyAction::PrevLayer),
+            (KeyCode::ArrowDown, KeyAction::NextLayer),
             (KeyCode::F11, KeyAction::ToggleFullscreen),
             (KeyCode::Escape, KeyAction::CloseOrExitFullscreen),
         ];
@@ -1051,5 +1067,19 @@ mod tests {
         assert!(KeyChord::plain(KeyCode::ShiftLeft).is_reserved());
         assert!(KeyChord::plain(KeyCode::SuperLeft).is_reserved());
         assert!(!KeyChord::plain(KeyCode::KeyF).is_reserved());
+    }
+
+    /// The settings list draws a heading whenever `group()` changes while walking
+    /// `ALL_ACTIONS`, so each group's actions must be adjacent or a heading would appear twice.
+    #[test]
+    fn action_groups_are_contiguous() {
+        let mut seen: Vec<&str> = Vec::new();
+        for a in ALL_ACTIONS {
+            let g = a.group();
+            if seen.last() != Some(&g) {
+                assert!(!seen.contains(&g), "group {g} is split");
+                seen.push(g);
+            }
+        }
     }
 }

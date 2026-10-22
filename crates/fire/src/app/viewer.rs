@@ -46,6 +46,8 @@ use crate::ui::theme::Metrics;
 use crate::watcher::FileWatcher;
 use crate::window_state::WindowState;
 
+mod psd;
+
 /// Max decoded dimension on either axis — a CPU/RAM guard (the GPU limit is requested to match).
 /// An RGBA8 bitmap at 16384² is ~1 GiB; float HDR is 4×. Larger images are CPU-downscaled.
 pub const MAX_CPU_DIM: u32 = 16384;
@@ -261,6 +263,8 @@ pub struct Viewer {
     dialog: Option<Dialog>,
     /// A picker is up. One at a time: see `run_dialog`.
     dialog_running: bool,
+    /// Layer stepping for the PSD on screen, once its layer index has arrived (see [`psd`]).
+    layers: Option<psd::LayerSession>,
 }
 
 impl Viewer {
@@ -404,6 +408,7 @@ impl Viewer {
             requests: Requests::default(),
             dialog: None,
             dialog_running: false,
+            layers: None,
         };
         me.apply_min_size();
         if launcher == Some(LaunchShow::Minimized) {
@@ -492,6 +497,9 @@ impl Viewer {
     /// `reload` rides along to `decode_done` so it knows whether to preserve the view. Returns the
     /// assigned generation.
     fn begin_decode(&mut self, path: &Path, reload: bool) -> u64 {
+        // Whatever comes next — another file, or this one re-decoded — the layers of the PSD on
+        // screen are done with: put its composite back and stop their work.
+        self.end_layer_session();
         let generation = self.surface.next_generation();
         self.current_path = Some(path.to_path_buf());
         if let Some(w) = &self.watcher {
@@ -508,6 +516,7 @@ impl Viewer {
             opts,
             reload,
             detect_flipbook: self.cfg.flipbook.auto_detect,
+            gen_cell: Some(self.surface.generation_cell()),
         });
         generation
     }
@@ -632,8 +641,7 @@ impl Viewer {
                 // hot-reload at the *same* dimensions instead keeps the current view (zoom/pan/
                 // channel/exposure) so a re-export of the same canvas doesn't yank the user out
                 // of their zoomed-in detail; a reload that changed dimensions re-fits.
-                let same_dims =
-                    self.surface.current_image().map(|i| (i.width, i.height)) == Some((w, h));
+                let same_dims = self.surface.content_dims() == Some((w, h));
                 let upload = if outcome.reload && same_dims {
                     self.surface
                         .replace_image_keep_view(img, &outcome.mips, outcome.authored_mips)
@@ -721,6 +729,7 @@ impl Viewer {
     /// is identical. `shown_path` is cleared first because `apply_flipbook` reads it to decide there
     /// is no transport to keep.
     fn reset_to_empty(&mut self) {
+        self.end_layer_session();
         self.shown_path = None;
         self.surface.clear_image();
         self.surface.invalidate();
@@ -773,6 +782,7 @@ impl Viewer {
                     self.arm(TimerKind::Caret, CARET_BLINK_MS);
                 }
             }
+            TimerKind::Layers => self.layers_tick(),
         }
     }
 
@@ -881,6 +891,8 @@ impl Viewer {
         if self.surface.current_image().is_none() || self.surface.frame_delay_ms().is_some() {
             return;
         }
+        // A sprite sheet is the whole image: leave a PSD layer for its composite first.
+        self.show_composite();
         // Copy the defaults out before borrowing the per-path entry (both live on `self`).
         let defaults = self.cfg.flipbook;
         let Some(entry) = self.flipbook_entry() else {
@@ -962,6 +974,9 @@ impl Viewer {
     /// The flipbook detection hint, when the chip should be offered: the current image has an
     /// undismissed hint and flipbook mode is off. Drawn by [`crate::ui`] as a panel over the image.
     fn chip_hint(&self) -> Option<Grid> {
+        if self.showing_layer() {
+            return None; // the hint is about the whole image, not one of its layers
+        }
         let e = self.flipbook.get(self.shown_path.as_ref()?)?;
         if e.enabled || e.hint_dismissed {
             return None;
@@ -1191,6 +1206,9 @@ impl Viewer {
             // invalidate below.
             KeyAction::PrevImage => return self.navigate(-1),
             KeyAction::NextImage => return self.navigate(1),
+            // Stepping runs its own repaint (and may only queue an upload for the next frame).
+            KeyAction::PrevLayer => return self.step_layer(-1),
+            KeyAction::NextLayer => return self.step_layer(1),
             KeyAction::ToggleFullscreen => self.toggle_fullscreen(),
             // Esc leaves full-screen if in it; otherwise it closes the window — unless
             // `esc-closes-window` is off, which keeps the leave-full-screen half and drops the
@@ -1914,6 +1932,8 @@ impl Viewer {
         // belongs to this instant whatever asked for it — a hover, a resize, a drag. The advance
         // dirties the window, and this is the repaint that clears it, so it costs no extra frame.
         self.advance_playback();
+        // A PSD layer a step landed on, decoded but not yet uploaded: upload it for this frame.
+        self.flush_layer_upload();
         // The event-driven pump: draw the frame we were asked for, and stop when the debt is
         // paid. If `frames_wanted` is still positive afterwards, ask for exactly one more — never
         // a self-sustaining loop.
@@ -1947,12 +1967,29 @@ impl Viewer {
             // the user just watched fail. Show the reason whenever there is one.
             format!("{}   ·   {}", self.file_label, self.meta)
         };
+        // Stepping through a PSD's layers: the layer's name and how it composites replace the
+        // file's metadata on the left, and the counter leads the right.
+        let layer_status = if self.loading {
+            None
+        } else {
+            self.layer_status()
+        };
+        let status_left = match &layer_status {
+            Some((Some(detail), _)) => format!("{}   ·   {detail}", self.file_label),
+            _ => status_left,
+        };
         // Right side: the folder position/count (once the scan lands) followed by the zoom and,
         // for HDR, the exposure. The count shows whenever a cursor exists, even on a failed
         // decode (you can still page past a broken file).
         use std::fmt::Write as _;
         let mut status_right = String::new();
+        if let Some((_, counter)) = &layer_status {
+            status_right.push_str(counter);
+        }
         if let Some(f) = &self.folder {
+            if !status_right.is_empty() {
+                status_right.push_str("    ");
+            }
             let _ = write!(status_right, "{} / {}", f.position(), f.len());
         }
         // Which mip level is showing, and how big it is. Only when there is a chain to walk.
@@ -2168,6 +2205,8 @@ impl Viewer {
 
 impl Drop for Viewer {
     fn drop(&mut self) {
+        // Stop this window's layer jobs and hand its PSD session to the reaper.
+        self.end_layer_session();
         // Remember where/how the window was before it goes away, to restore next launch.
         self.save_window_state();
         self.persist_octagon();

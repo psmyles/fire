@@ -60,7 +60,7 @@ const ZOOM_DRAG_CLICK_SLOP: f32 = 5.0;
 
 /// Per-frame shader constants. Layout matches the HLSL `cbuffer Params` (16-byte float4
 /// registers); keep the field order/padding in lockstep with `render/shader.glsl` and the
-/// reflection `scripts/gen-shaders.sh` generates from it. 128 bytes —
+/// reflection `scripts/gen-shaders.sh` generates from it. 144 bytes —
 /// asserted below, so this comment cannot drift from the struct, and declared to sokol_gfx as the
 /// uniform block's size.
 #[repr(C)]
@@ -114,10 +114,16 @@ struct Params {
     /// the octagon fades toward the backdrop (0 = overlay off / no hiding).
     oct_crop: f32,
     oct_hide: f32,
+    /// Where the texture sits on the `img_w`×`img_h` canvas (texels): the whole canvas for an
+    /// image, a PSD layer's bounds for a layer — outside them the shader reads transparency.
+    layer_x: f32,
+    layer_y: f32,
+    layer_w: f32,
+    layer_h: f32,
 }
 
 const PARAMS_SIZE: usize = std::mem::size_of::<Params>();
-const _: () = assert!(PARAMS_SIZE == 128);
+const _: () = assert!(PARAMS_SIZE == 144);
 // The uniform block the shader actually declares, as sokol-shdc reflected it. If an edit to
 // `shader.glsl` changes the block, this stops the build here rather than at a wrong-looking image.
 const _: () = assert!(PARAMS_SIZE == std::mem::size_of::<generated_shader::Params>());
@@ -420,6 +426,28 @@ type Convert = fn(&[u8]) -> Vec<u8>;
 /// a cell boundary. `None` outside flipbook mode.
 type FlipbookCells = Option<((u32, u32), (f32, f32), (f32, f32), f32, f32)>;
 
+/// Where a texture that covers only part of the image sits: a PSD layer, uploaded at the size of
+/// its bounds rather than the canvas's. Geometry — fit, zoom, pan, the outline — stays the
+/// canvas's, so stepping between the composite and its layers never moves the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    /// Top-left of the texture on the canvas.
+    pub origin: (u32, u32),
+    /// The canvas: what the composite measures.
+    pub canvas: (u32, u32),
+}
+
+impl Placement {
+    /// The texel of a `w`×`h` texture placed here that canvas pixel `xy` falls on, or `None` where
+    /// the texture does not reach (which reads as transparent). For the pixel inspector.
+    #[allow(dead_code)] // wired to the pixel inspector (#16) with it; unit-tested now
+    pub fn texel(&self, xy: (u32, u32), w: u32, h: u32) -> Option<(u32, u32)> {
+        let x = xy.0.checked_sub(self.origin.0)?;
+        let y = xy.1.checked_sub(self.origin.1)?;
+        (x < w && y < h).then_some((x, y))
+    }
+}
+
 /// What the GPU currently holds for the displayed image: the texture, how to sample it, and the
 /// decoded source it came from. All are replaced together on every adopt and cleared together
 /// when the image goes away.
@@ -445,6 +473,8 @@ struct ImageContent {
     /// keeps a clone alive to run flipbook detection *after* the image has been posted for display
     /// (so detection never delays time-to-first-pixel); both sides only ever read it.
     current: Option<Arc<DecodedImage>>,
+    /// `Some` for a PSD layer: the texture covers only part of the canvas.
+    placement: Option<Placement>,
 }
 
 impl ImageContent {
@@ -584,6 +614,13 @@ pub struct GpuSurface {
 
     /// The displayed image's GPU residency.
     tex: ImageContent,
+    /// Textures uploaded ahead of being shown, keyed by PSD layer position (0 = the composite,
+    /// parked while a layer is on screen). Showing one is a binding swap, not an upload. The
+    /// viewer decides what stays (`crate::layers`); the surface only holds and releases.
+    stash: Vec<(u32, ImageContent)>,
+    /// The live value of [`Self::generation`], shared with the decode jobs this window issues so a
+    /// worker can tell, after posting an image, whether the window has already moved on.
+    gen_cell: Arc<std::sync::atomic::AtomicU64>,
 
     /// This window's current decode generation; a `DecodeDone` older than this is stale. Values
     /// come from the process-wide counter (see [`crate::decode_pool::fresh_generation`]).
@@ -630,6 +667,8 @@ impl GpuSurface {
                 linear_sample: 1,
                 ..ImageContent::default()
             },
+            stash: Vec::new(),
+            gen_cell: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prefs: SessionPrefs {
                 clear: 0,
                 clear_lin: [0.0, 0.0, 0.0, 1.0],
@@ -680,7 +719,14 @@ impl GpuSurface {
     /// Take a fresh decode generation for this window and return it.
     pub fn next_generation(&mut self) -> u64 {
         self.generation = crate::decode_pool::fresh_generation();
+        self.gen_cell
+            .store(self.generation, std::sync::atomic::Ordering::Relaxed);
         self.generation
+    }
+
+    /// The window's live generation, for a [`crate::decode_pool::DecodeJob`] to carry.
+    pub fn generation_cell(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.gen_cell)
     }
 
     pub fn generation(&self) -> u64 {
@@ -691,10 +737,26 @@ impl GpuSurface {
     /// window existed).
     pub fn set_generation(&mut self, generation: u64) {
         self.generation = generation;
+        self.gen_cell
+            .store(generation, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn current_image(&self) -> Option<&DecodedImage> {
         self.tex.current.as_deref()
+    }
+
+    /// The size of what is displayed at level 0: the image's, or for a PSD layer its canvas's.
+    pub fn content_dims(&self) -> Option<(u32, u32)> {
+        match self.tex.placement {
+            Some(p) => Some(p.canvas),
+            None => self.tex.current.as_ref().map(|i| (i.width, i.height)),
+        }
+    }
+
+    /// Where the displayed texture sits on its canvas: `Some` while a PSD layer is shown.
+    #[allow(dead_code)] // wired to the pixel inspector (#16) with it
+    pub fn placement(&self) -> Option<Placement> {
+        self.tex.placement
     }
 
     // --- read-only view of display state, for the chrome ---
@@ -840,6 +902,10 @@ impl GpuSurface {
     /// clamp and the flipbook sheet together.
     fn image_dims(&self) -> Option<(u32, u32)> {
         let img = self.tex.current.as_ref()?;
+        // A layer is viewed on its canvas (and only ever at level 0: see `adopt_content`).
+        if let Some(p) = self.tex.placement {
+            return Some(p.canvas);
+        }
         Some(mips::level_dims(
             img.width,
             img.height,
@@ -887,6 +953,8 @@ impl GpuSurface {
     /// Drop the displayed image so the next paint shows the placeholder. Also drops any animation
     /// frames so the viewer's next `frame_delay_ms()` returns `None` and the playback timer stops.
     pub fn clear_image(&mut self) {
+        self.clear_stage();
+        self.tex.placement = None;
         self.tex.current = None;
         self.tex.mip_count = 0;
         self.tex.authored_mips = 0;
@@ -914,6 +982,8 @@ impl GpuSurface {
         // so a failed adopt can't leave the surface half-updated. Level 0: a new file always
         // opens at full size, whatever mip the last one was left on.
         self.upload_texture(&img, mips, 0)?;
+        self.clear_stage();
+        self.tex.placement = None;
         self.tex.authored_mips = authored_mips;
         // Adopt any animation frames for playback and start from frame 0 (already uploaded above).
         // The viewer arms the timer from `frame_delay_ms()` after this.
@@ -964,6 +1034,8 @@ impl GpuSurface {
         // The viewed mip level is part of the view being kept, clamped in case the re-exported
         // file came back with a shorter chain — or with none of its own at all.
         self.upload_texture(&img, mips, self.display.mip_level.min(authored_mips))?;
+        self.clear_stage();
+        self.tex.placement = None;
         self.tex.authored_mips = authored_mips;
         // Refresh the animation frames from the re-decoded file and restart from frame 0 (the view
         // is preserved, but the animation plays from the top). The viewer re-arms the timer.
@@ -983,6 +1055,150 @@ impl GpuSurface {
             }
         }
         Ok(())
+    }
+
+    // --- PSD layers: the stash of pre-uploaded textures, and swapping between them -----------
+
+    /// Upload `img` (a PSD layer, placed on its canvas) under `key` without showing it, so a later
+    /// [`Self::show_staged`] is a binding swap. Replaces anything already staged under `key`.
+    pub fn stage(
+        &mut self,
+        key: u32,
+        img: Arc<DecodedImage>,
+        mips: &[Vec<u8>],
+        placement: Option<Placement>,
+    ) -> Result<(), String> {
+        let content = self.make_content(img, mips, placement)?;
+        self.park(key, content);
+        Ok(())
+    }
+
+    pub fn is_staged(&self, key: u32) -> bool {
+        self.stash.iter().any(|(k, _)| *k == key)
+    }
+
+    /// The keys held in the stash.
+    pub fn staged_keys(&self) -> Vec<u32> {
+        self.stash.iter().map(|(k, _)| *k).collect()
+    }
+
+    /// Release the texture staged under `key`, if any.
+    pub fn unstage(&mut self, key: u32) {
+        self.stash.retain_mut(|(k, c)| {
+            if *k == key {
+                c.release();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Release every staged texture.
+    pub fn clear_stage(&mut self) {
+        for (_, mut c) in self.stash.drain(..) {
+            c.release();
+        }
+    }
+
+    /// Show what is staged under `key`, parking what is on screen under `park_as`. Returns false
+    /// (and changes nothing) when nothing is staged under `key`.
+    pub fn show_staged(&mut self, key: u32, park_as: u32) -> bool {
+        let Some(i) = self.stash.iter().position(|(k, _)| *k == key) else {
+            return false;
+        };
+        let (_, content) = self.stash.swap_remove(i);
+        self.adopt_content(content, park_as);
+        true
+    }
+
+    /// Upload `img` and show it at once, parking what is on screen under `park_as`. On a GPU
+    /// error nothing changes.
+    pub fn show_layer(
+        &mut self,
+        img: Arc<DecodedImage>,
+        mips: &[Vec<u8>],
+        placement: Option<Placement>,
+        park_as: u32,
+    ) -> Result<(), String> {
+        let content = self.make_content(img, mips, placement)?;
+        self.adopt_content(content, park_as);
+        Ok(())
+    }
+
+    /// A texture for `img` at level 0, not yet displayed.
+    fn make_content(
+        &self,
+        img: Arc<DecodedImage>,
+        mips: &[Vec<u8>],
+        placement: Option<Placement>,
+    ) -> Result<ImageContent, String> {
+        let (image, levels, linear_sample) = create_image_texture(
+            &self.gpu,
+            &img.pixels,
+            img.width,
+            img.height,
+            img.format,
+            Some(mips),
+        )?;
+        let view = match make_level_view(image, 0) {
+            Ok(v) => v,
+            Err(e) => {
+                sg::destroy_image(image);
+                return Err(e);
+            }
+        };
+        Ok(ImageContent {
+            image: Some(image),
+            view: Some(view),
+            linear_sample,
+            mip_count: levels,
+            authored_mips: 0,
+            current: Some(img),
+            placement,
+        })
+    }
+
+    /// Hold `content` in the stash under `key`, releasing whatever was there.
+    fn park(&mut self, key: u32, content: ImageContent) {
+        self.unstage(key);
+        if content.image.is_some() {
+            self.stash.push((key, content));
+        }
+    }
+
+    /// Put `content` on screen and park the outgoing content under `park_as`. Zoom, pan, exposure
+    /// and tonemap are kept — composite and layers share a canvas, so the view stays put — while
+    /// the channel and backdrop follow what the new content can show: a composite mode tracks
+    /// whether there is alpha, and the backdrop (unless the user pinned one) is the new
+    /// content's default, so a layer's transparency reads as checker.
+    fn adopt_content(&mut self, content: ImageContent, park_as: u32) {
+        let had_alpha = self.has_alpha();
+        let Some(view) = content.view else {
+            return;
+        };
+        let outgoing = std::mem::replace(&mut self.tex, content);
+        self.bindings = make_bindings(&self.gpu, view);
+        self.park(park_as, outgoing);
+        let has_alpha = self.has_alpha();
+        if self.display.channel == Channel::composite(had_alpha) {
+            self.display.channel = Channel::composite(has_alpha);
+        } else if !has_alpha && self.display.channel == Channel::A {
+            self.display.channel = Channel::Rgb;
+        }
+        if let Some(img) = &self.tex.current {
+            self.prefs.background = self
+                .prefs
+                .background_override
+                .unwrap_or_else(|| default_background(img));
+        }
+        self.display.mip_level = 0;
+        if !self.view.fit {
+            if let Some(vd) = self.view_dims() {
+                self.view.clamp_pan(vd, &self.viewport);
+            }
+        }
+        self.invalidate();
     }
 
     /// Delay (ms) the currently displayed animation frame should be shown before advancing, or
@@ -1291,7 +1507,7 @@ impl GpuSurface {
         (img_w, img_h, has_image, fbf)
     }
 
-    /// Build the frame's 128-byte uniform block from the current view, display and session
+    /// Build the frame's 144-byte uniform block from the current view, display and session
     /// state. Pure reads — everything the shader needs for one frame, and nothing else.
     fn build_params(&self) -> Params {
         let is_hdr = self.is_hdr();
@@ -1302,6 +1518,16 @@ impl GpuSurface {
                 (sheet.0 as f32, sheet.1 as f32, ca, cb, blend, lod, 1)
             }
             None => (img_w, img_h, (0.0, 0.0), (0.0, 0.0), 0.0, f32::MAX, 0),
+        };
+        // The texture's place on the canvas: all of it, unless a PSD layer is showing.
+        let (layer_x, layer_y, layer_w, layer_h) = match (self.tex.placement, &self.tex.current) {
+            (Some(p), Some(img)) => (
+                p.origin.0 as f32,
+                p.origin.1 as f32,
+                img.width as f32,
+                img.height as f32,
+            ),
+            _ => (0.0, 0.0, img_w, img_h),
         };
         // Every field is set explicitly (no `..default()`), matching the checker note.
         Params {
@@ -1348,6 +1574,10 @@ impl GpuSurface {
             } else {
                 0.0
             },
+            layer_x,
+            layer_y,
+            layer_w,
+            layer_h,
         }
     }
 
@@ -1537,6 +1767,7 @@ impl Drop for GpuSurface {
     fn drop(&mut self) {
         if sg::isvalid() {
             self.tex.release();
+            self.clear_stage();
         }
     }
 }
@@ -1708,4 +1939,23 @@ fn make_level_view(image: sg::Image, level: u32) -> Result<sg::View, String> {
         return Err(format!("mip level {level} could not be viewed"));
     }
     Ok(view)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Placement;
+
+    /// A canvas pixel maps into a placed layer's texture only where the texture reaches.
+    #[test]
+    fn placement_texel_maps_canvas_pixels_into_the_layer() {
+        let p = Placement {
+            origin: (10, 20),
+            canvas: (100, 100),
+        };
+        assert_eq!(p.texel((10, 20), 5, 4), Some((0, 0)));
+        assert_eq!(p.texel((14, 23), 5, 4), Some((4, 3)));
+        assert_eq!(p.texel((15, 23), 5, 4), None, "right of the layer");
+        assert_eq!(p.texel((9, 20), 5, 4), None, "left of the layer");
+        assert_eq!(p.texel((12, 24), 5, 4), None, "below the layer");
+    }
 }

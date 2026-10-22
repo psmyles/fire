@@ -217,8 +217,10 @@
 #   alpha-channel = "A"                toggle-tonemap = "T"
 #   exposure-up = "]"                  exposure-down = "["
 #   exposure-reset = ""                toggle-outline = ""      (both unbound by default)
+#   mip-finer = "Shift+,"              mip-coarser = "Shift+."
 #   cycle-backdrop = "Z"
 #   previous-image = "Left"            next-image = "Right"
+#   previous-layer = "Up"              next-layer = "Down"      (step through a PSD's layers)
 #   toggle-fullscreen = "F11"          close-or-exit-fullscreen = "Esc"
 #   toggle-flipbook = "K"
 #   flipbook-play-pause = "Space"      (these three act only in flipbook mode)

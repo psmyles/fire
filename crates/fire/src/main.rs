@@ -25,6 +25,7 @@ mod hotstyle;
 mod icons;
 mod ipc_server;
 mod keybinds;
+mod layers;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod octagon;
@@ -129,6 +130,9 @@ fn main() {
             },
             reload: false,
             detect_flipbook: cfg.flipbook.auto_detect,
+            // No window yet, so no live generation to check: the launch decode's layer index is
+            // always built, and the window it lands in stale-drops it like any other result.
+            gen_cell: None,
         });
         Initial { path, generation }
     });
