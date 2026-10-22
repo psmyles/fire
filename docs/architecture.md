@@ -11,7 +11,7 @@ macOS). There is no resident background process and no separate launcher stub - 
 brought up on its own thread while the window is being created, so nothing needs to be kept warm.
 
 This shape is the result of a port from a Windows-only Win32 + Direct3D 11 shell. The decisions
-that produced it are recorded in [Appendix A](#appendix-a---the-decision-record) as **D1-D25**, and
+that produced it are recorded in [Appendix A](#appendix-a---the-decision-record) as **D1-D27**, and
 cited by number from the sections below wherever a choice needs its reasoning; the two shells that
 were built, measured and rejected on the way are in
 [Appendix B](#appendix-b---how-the-shell-was-chosen).
@@ -43,7 +43,7 @@ Three consequences shape the whole design:
   whole per-pixel pipeline on *every* pan/zoom event; on a large window at a high refresh rate
   (a 240 Hz monitor) that pegs a CPU core during fast interaction. Instead the image is
   uploaded **once** as a GPU texture with a full mip chain, and pan / zoom / exposure / channel /
-  tonemap (and flipbook cell selection) become a **128-byte uniform block** - each frame is one
+  tonemap (and flipbook cell selection) become a **144-byte uniform block** - each frame is one
   fullscreen-triangle draw that re-samples the texture (**~0 CPU per frame**). The swapchain paces
   presentation to vsync, so interaction is tear-free and smooth at the monitor's true refresh.
 
@@ -237,15 +237,22 @@ called from the forward path. macOS needs no equivalent - Launch Services activa
   `count = 0`, so that level becomes the view's level 0 while minification still walks the levels
   beneath it. sokol honours the range on both backends fire ships - D3D11 maps it to the SRV's
   `MostDetailedMip`, Metal to `newTextureViewWithPixelFormat:…levels:` - so this needs no shader
-  change, no uniform, and no second upload; the 128-byte `Params` block is untouched. `image_dims`
+  change, no uniform, and no second upload; the `Params` block is untouched. `image_dims`
   then reports the *level's* size, which is the single chokepoint every geometry path already ran
   through, so fit, zoom, 1:1, the pan clamp and the flipbook sheet all re-base together and a 1:1
   view of level 3 is one of its texels per physical pixel. The level resets to 0 on open and is
   clamped on every adopt, so a hot reload that comes back with a shorter chain lands somewhere
   real. After the upload, pan / zoom / exposure / channel /
-  tonemap (and the flipbook cell offsets + blend) are just values in a **128-byte uniform block**;
+  tonemap (and the flipbook cell offsets + blend) are just values in a **144-byte uniform block**;
   the source texture never changes until a new image is opened (flipbook playback only moves the
   cell offsets - never re-uploads).
+- **A texture need not cover the canvas.** The block's last register, `layer_rect`, says where the
+  texture sits on the `img_size` canvas: all of it for an ordinary image - `(0, 0, img_size)`,
+  which makes the sampling maths exactly what it was - and only its bounds for a PSD layer
+  (§10), outside which the shader reads transparency. `GpuSurface` keeps the canvas as the
+  geometry (`Placement`, through the same `image_dims` chokepoint), so fit, zoom, 1:1, the pan
+  clamp and the outline describe the composite whichever layer is showing, and a step never moves
+  the view (D26).
 - **Per-frame work is one draw.** A frame applies the pipeline and bindings, uploads `Params` with
   `sg_apply_uniforms`, and issues a single **fullscreen-triangle** draw; the fragment shader
   inverse-maps each output pixel into image space and samples the texture. There is no vertex
@@ -312,7 +319,7 @@ The chrome is drawn by **Dear ImGui 1.92** into the *same pass*, between the ima
 RedrawRequested → swapchain.acquire()          (None → skip the frame)
                   sg_begin_pass                clear to the chrome fill
                   image pass : viewport = the image sub-rect, one triangle,
-                               128-byte uniform block via sg_apply_uniforms
+                               144-byte uniform block via sg_apply_uniforms
                   UI pass    : simgui_render() into the same pass
                   sg_end_pass, sg_commit
                   present                      vsync-paced
@@ -360,7 +367,7 @@ checked in under `render/generated/`:
   the per-backend sources, which **`build.rs` compiles to bytecode**: `fxc` → `.dxbc` on Windows,
   `xcrun metal` + `metallib` → one `.metallib` *per stage* on macOS (per stage because
   SPIRV-Cross names every entry point `main0`, and two functions cannot share a library).
-- `shader.rs` - the sokol_gfx reflection: the 128-byte uniform block, the texture, the two
+- `shader.rs` - the sokol_gfx reflection: the 144-byte uniform block, the texture, the two
   samplers, which sampler pairs with the texture, and the per-backend entry-point names. All that
   is left in `render::gpu::make_shader` is swapping the generated desc's `source` for `build.rs`'s
   `bytecode`.
@@ -407,7 +414,7 @@ also detected by magic so a no-extension open still routes correctly.
 | DDS | **`ddsfile`** (header, incl. the DX10 extension) + **`bcdec_rs`** (blocks), both pure Rust → BC1-BC7 to RGBA8, **BC6H to RGBA16F** (the HDR path), and every uncompressed layout via the header's channel bit masks. Decompressed on the CPU rather than uploaded as blocks: `DecodedImage` is an uncompressed canvas by contract, and the mip builder, downscale guard, alpha scan and flipbook detector all read it as one |
 | AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
 | EXR | `exr` crate (pure Rust), channels read as stored and interleaved in parallel → **half-float RGBA** when every channel is half (lossless, and half the memory, mips and upload of `f32`), 32-bit float RGBA otherwise |
-| PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite, at the document's own depth (8/16/32f). `wrapper.cpp` owns the colour-mode conversion: RGB/Grey/Duotone direct, Indexed through the palette, CMYK composited **through K** (PSD stores CMYK inverted), Lab via D50 XYZ; 8/16-bit RGB and greyscale are interleaved directly, in parallel. 16-bit samples are **full-range 0…65535** - Photoshop works in 15-bit+1 (0…32768) internally but scales on save, as a Photoshop 27 file confirms (white = 65535); 1-bit Bitmap mode is refused, since psd_sdk sizes its planes `bits/8` = 0 |
+| PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite, at the document's own depth (8/16/32f). `wrapper.cpp` owns the colour-mode conversion: RGB/Grey/Duotone direct, Indexed through the palette, CMYK composited **through K** (PSD stores CMYK inverted), Lab via D50 XYZ; 8/16-bit RGB and greyscale are interleaved directly, in parallel. 16-bit samples are **full-range 0…65535** - Photoshop works in 15-bit+1 (0…32768) internally but scales on save, as a Photoshop 27 file confirms (white = 65535); 1-bit Bitmap mode is refused, since psd_sdk sizes its planes `bits/8` = 0. The vendored psd_sdk carries three local patches (`vendor/VENDOR.txt`), the important one being that `PSD_ASSERT` throws instead of `abort()`ing. **Layers** are not psd_sdk's: `fire-decode`'s `PsdLayers` parses the layer section and decodes one layer at a time in bounds-checked Rust (RAW/RLE/ZIP/ZIP+prediction, 8/16/32-bit, masks into alpha, the same colour conversion as `wrapper.cpp`), so a malformed layer is an error, never a crash (§10) |
 | Camera raw (CR2/CR3, NEF, ARW, RAF, ORF, RW2, DNG, …) | **`raw`** (pure Rust) → extract the embedded JPEG **preview**, decode via zune |
 | ICC transforms | **Little CMS** (`lcms2`) over FFI |
 
@@ -476,11 +483,19 @@ Notes:
 
 The pool itself (`decode_pool.rs`) is shared by every window in the process. Each job carries a
 process-wide monotonic `generation` plus the window it was issued for; a result is adopted only if
-it is still that window's latest generation, so a slow decode can never clobber a newer one. A
-superseded job is still decoded - its result is just dropped on arrival - which wastes a little
-work and keeps the pool dead simple. Workers never touch a window or the renderer; they send an
-`AppEvent` through the event loop's proxy, the same discipline the folder scan, the file watcher
-and the instance-socket server thread follow.
+it is still that window's latest generation, so a slow decode can never clobber a newer one. A job
+already superseded when a worker picks it up is skipped rather than decoded. Workers never touch a
+window or the renderer; they send an `AppEvent` through the event loop's proxy, the same discipline
+the folder scan, the file watcher and the instance-socket server thread follow.
+
+The pool has **two lanes** (D27). The main lane (`fire-decode-*`) runs every file decode and any
+PSD layer the user is waiting on. The prefetch lane (`fire-layer-*`, two threads at reduced OS
+priority) runs only layers decoded *ahead* of the user, each on one thread - so pre-decoding can
+never occupy a main worker or delay the next file's decode. A third thread, the reaper, frees what
+the UI thread lets go of (a PSD session's file bytes, evicted layers) so those frees never stall a
+frame. A PSD's decode also keeps its file bytes and, *after* posting the composite, parses the
+layer index from them (metadata only, well under a millisecond) and posts that as
+`AppEvent::PsdLayers`.
 
 ---
 
@@ -775,6 +790,25 @@ on with the window alive.
   stay the same length at every crop. The lines are an ImGui draw list, the "hide outside" fade is
   two uniform-block floats in the fragment shader, and the geometry itself is pure unit-tested math
   in `octagon.rs`. It tracks the image in full screen too.
+- **PSD layer stepping:** on a PSD, ↓ steps from the composite to the top layer and on down the
+  stack, ↑ back toward the composite (both rebindable; they stop at the ends). Each layer is shown
+  *alone* - its pixels, transparency and enabled masks, over the backdrop, at its place on the
+  canvas; opacity, blend mode, clipping and layer styles are not applied but named in the status
+  bar along with the layer's group path and a `Layer 3 / 12` counter. Groups, adjustment and fill
+  layers, and layers with nothing on the canvas are skipped; hidden layers are included and marked.
+  Opening is unchanged: nothing about layers happens until the composite is on its way to the
+  screen (§6), and nothing decodes until the user has stayed on the file for 300 ms or pressed a
+  layer key - flipping through a folder of PSDs costs one sub-millisecond index parse per file.
+  Then `crate::layers` (pure, unit-tested) runs the policy: decode the target on every core, two
+  layers ahead in the direction of travel and one behind on the prefetch lane, keep up to 1 GiB of
+  decoded layers in RAM (farthest from the cursor evicted first), and upload the likeliest
+  neighbours into a 512 MiB GPU stash at idle moments, so most steps are a binding swap rather than
+  an upload. Workers re-check the live cursor between stages, so when a key is held the jobs the
+  cursor has already passed stop within milliseconds ("latest wins"), and a step onto a decoded
+  but unuploaded layer uploads on the next frame, so a held key uploads only what is actually
+  shown. Each layer texture covers only the layer's bounds (D26), so a small layer on a huge canvas
+  is cheap all the way through. Navigation, reload, close and flipbook mode return to the
+  composite.
 - **Drag-and-drop open:** winit reports the drop; it goes through the same `Viewer::open` path as a
   launch or a forward. One client rect covers image and chrome alike, so there is no second surface
   to register.
@@ -965,7 +999,7 @@ decode; zune + image + tiff + exr + psd_sdk + libheif decoders; camera-raw embed
 animated GIF playback; ICC honoring via lcms2; tonemap-to-SDR HDR with exposure; downscale-to-fit
 RAM guard; content-detected **flipbook (sprite-sheet) playback** with a transport band, which
 also carries a DDS cubemap's faces / an array's layers / a volume's slices; a **mip-level
-viewer** for textures that ship a chain; the
+viewer** for textures that ship a chain; **PSD layer stepping** with background pre-decoding; the
 **octagon overlay**; folder ←/→ navigation; hot-reload of the displayed image; **DPI-aware,
 dark-mode-aware ImGui toolbar + status bar + settings window**; portable physical-key keybinds;
 open-in-editor and the clipboard actions; file association on both OSes; an unsigned Windows
@@ -977,7 +1011,10 @@ the four preset backdrops; a custom color needs a shader/uniform change); compar
 Explorer `IThumbnailProvider` / Quick Look; **full raw development** (demosaic the sensor mosaic
 instead of showing the embedded preview - a separate opt-in mode, kept off the fast path);
 hot-reload of `config.toml`; Windows code signing; an Intel/universal macOS build; tiled/virtual
-texturing for gigapixel sources.
+texturing for gigapixel sources; for PSD layers, a cumulative "stack up to here" view (it would
+mean re-implementing Photoshop's compositor: blend modes, clipping, pass-through groups,
+adjustment layers, styles), mask density/feather and fill opacity, and PSB documents (psd_sdk
+cannot open their composite either).
 
 ---
 
@@ -1012,7 +1049,13 @@ texturing for gigapixel sources.
   when it is: without the `AllowSetForegroundWindow` handoff, a forwarded open silently fails to
   come to the front.
 - **`psd_sdk` is C++.** Treat every FFI call as a panic boundary (`catch_unwind`, validated inputs)
-  so a malformed file can't take down the process.
+  so a malformed file can't take down the process. It is built without `NDEBUG`, so its
+  assertions are live: the vendored `PsdAssert.h` makes them throw (caught at the C ABI) rather
+  than `abort()`. Its layer parser is deliberately unused - see §6 and §10.
+- **PSD layer memory.** A layer session keeps the PSD's file bytes in RAM while that file is on
+  screen (they are what layers decode from), plus up to 1 GiB of decoded layers and up to 512 MiB of
+  staged textures - on Apple Silicon, VRAM is RAM. All of it is released (on the reaper thread) the
+  moment another file, a reload or a close ends the session.
 - **ICC + zune tension.** Honoring profiles forces some formats off the zune hot path onto the
   `image` decoder that exposes ICC bytes; verify which formats this affects so you know where the
   fast path actually applies.
@@ -1065,6 +1108,8 @@ numbered holes rather than renumbered, so a `D18` in this document means what it
 | D23 | **The whole dev pipeline runs on macOS** — clippy, `cargo test`, the native decoders, the TTFP harness, the release build and packaging | A platform you cannot lint, test or measure on is a platform you cannot maintain; the alternative is mac fixes only Windows CI can verify | **Shipped.** The two sys crates lost their Windows-only short-circuit, the vendor layout went per-target, CI grew a mac leg (§13) and `ttfp.ps1` gained a portable twin |
 | D24 | **Metal shaders are precompiled to a `.metallib` with `xcrun metal`**, so the macOS toolchain floor is full Xcode rather than the Command Line Tools | Keeps D4's "no shader compile on the cold-start path" on *both* OSes; the wgpu branch lost ~32 ms to exactly this | **Shipped.** Every dev machine and the CI runner need Xcode plus an 839 MB `MetalToolchain` component, and its absence is near-silent: asked for bytecode without it, sokol-shdc emits shader *source* and exits 0 (§13) |
 | D25 | **The arm64 HEIF stack is built with vcpkg (`arm64-osx` static)** mirroring `VENDOR.txt`, and the vendored tree goes per-target — one directory per target holding both its `include/` and `lib/` | One vendoring story on both OSes, one dav1d port patch, and a self-contained `.app` with no dylib embedding or per-dylib signing | **Shipped.** Headers had to be split per target too (the two landed on different libheif versions), and the mac build needs a third port patch, `ENABLE_PLUGIN_LOADING=OFF` — without it dav1d becomes an unreachable dynamic plugin and *every* AVIF silently fails to decode |
+| D26 | **A PSD layer's texture covers only the layer's bounds; the shader offsets it on the canvas** (`layer_rect`, 128 → 144-byte uniform block) | Canvas-sized layer textures would make every step pay a full-canvas fill, mip build and upload — ~340 MB on an 8k RGBA8 document — however small the layer | **Shipped.** Decode, mips, upload and cache memory scale with the layer; `Placement` keeps the canvas as the geometry so the view never moves between layers (§5) |
+| D27 | **Two decode lanes: layers decoded ahead of the user get their own low-priority threads, single-threaded jobs, and a reaper for big frees** | One FIFO pool would let pre-decoding delay the next file's decode — the metric this project is built around | **Shipped.** The guarantee comes from the separate lane; the OS priority (QoS utility / below-normal) is best effort. Superseded layer jobs stop at their next checkpoint (§6) |
 
 ---
 
