@@ -164,8 +164,8 @@ impl State {
 
 /// Build the settings window for one frame.
 ///
-/// `client` is the viewer's client size in physical px — the window centers on it and opens
-/// proportioned to it.
+/// `client` is the viewer's client size in physical px — the window centers on it, and opens at
+/// `[form] open_size` or the client's size, whichever is smaller.
 pub fn build(
     ui: &Ui,
     st: &mut State,
@@ -184,11 +184,15 @@ pub fn build(
         ui.open_popup(TITLE);
         st.requested = true;
     }
-    // A proportion of the viewport, not a size: resizable from there, and no pixel width anywhere in
-    // this module for a font or a DPI change to invalidate. (`[form] open_fraction` in theme.toml.)
-    let open = theme::current().form.open_fraction;
+    // A fixed logical size, not a proportion of the viewport: the fields stretch to the window, so a
+    // proportional window on a large monitor made every combo a bar across the screen. Clamped to the
+    // client so it always fits; resizable from there. (`[form] open_size` in theme.toml.)
+    let open = theme::current().form.open_size;
     center_next_window(client);
-    size_next_window((client.0 * open[0], client.1 * open[1]));
+    size_next_window((
+        (open[0] * scale).round().min(client.0),
+        (open[1] * scale).round().min(client.1),
+    ));
 
     // `opened` gives the title bar its × — ImGui clears it and closes the popup in one go, so we
     // don't read it back; `is_popup_open` below is the single source of "ImGui closed it".

@@ -41,9 +41,10 @@
 
 # ── Text and icons ────────────────────────────────────────────────────────────────────────────────
 [font]
-# Base UI font size (Segoe UI). Everything else that measures text — the status bar's height, the
-# settings window's label column, the transport's number fields — follows from this.
-size = 16.0
+# Base UI font size (Segoe UI / SF). Everything else that measures text — the status bar's height,
+# the settings window's label column, the transport's number fields — follows from this. A shade
+# over stock ImGui's 13: ProggyClean is a pixel font and reads larger than a system face at 13.
+size = 15.0
 # Toolbar icon edge. The atlas is re-rastered from the source SVGs at this size × the DPI scale, so
 # changing it stays crisp (and, on hot reload, re-rasters immediately).
 icon_size = 16.0
@@ -148,9 +149,9 @@ view_clear = "#969696"
 ####################################################################################################
 [chrome]
 # Bar heights.
-toolbar_h   = 38.0
-status_h    = 24.0
-transport_h = 34.0
+toolbar_h   = 30.0
+status_h    = 20.0
+transport_h = 28.0
 # Gap between the window edge and the first/last toolbar button.
 edge_pad = 4.0
 # Gap between the window edge and the status bar's text.
@@ -172,7 +173,7 @@ empty_logo_size = 128.0
 
 [chrome.geom]
 # Padding *inside* a toolbar button — so a button is icon_size + 2×frame_padding on each axis.
-frame_padding = [6.0, 5.0]
+frame_padding = [4.0, 3.0]
 # Gap between adjacent buttons ([x, y]; only x shows on a one-row bar).
 item_spacing = [3.0, 4.0]
 # Gap between a widget and its own label/parts (the transport's "24" and its "fps").
@@ -180,17 +181,17 @@ item_inner_spacing = [4.0, 4.0]
 # Padding inside a bar/popup window.
 window_padding = [8.0, 6.0]
 indent_spacing = 21.0
-scrollbar_size = 12.0
-grab_min_size  = 10.0
-# Flat and square, like the GDI chrome it replaced — bars have no corners to round.
+scrollbar_size = 14.0
+grab_min_size  = 12.0
+# Flat and square, like stock ImGui — bars have no corners to round.
 window_rounding    = 0.0
 child_rounding     = 0.0
-frame_rounding     = 2.0
-popup_rounding     = 2.0
-grab_rounding      = 2.0
-scrollbar_rounding = 2.0
-tab_rounding       = 2.0
-tab_bar_overline   = 2.0
+frame_rounding     = 0.0
+popup_rounding     = 0.0
+grab_rounding      = 0.0
+scrollbar_rounding = 9.0
+tab_rounding       = 5.0
+tab_bar_overline   = 1.0
 # Border widths, in *physical* px (not DPI-scaled — see the header). A popup needs an edge to lift
 # it off the image; a docked bar does not.
 window_border = 0.0
@@ -204,7 +205,7 @@ image_border  = 0.0
 # toolbar's exposure slider are the only real controls in the chrome. These are *separate* from the
 # form's: the two styles are separate, so a checkbox is only the same size in both windows if you say
 # so in both.
-checkbox_size = 16.0   # the "Blend" box — an exact square edge (unlike the rest, no font floor)
+checkbox_size = 0.0    # the "Blend" box — an exact square edge (unlike the rest, no font floor)
 input_height  = 0.0    # the cols/rows/count/fps fields, the scrub and exposure sliders, the play button
 
 [chrome.colors]
@@ -235,8 +236,8 @@ slider_grab_active = "accent"
 # The transport's "Blend" box. A *checked* box is filled with checkbox_selected_bg and the tick is
 # drawn on top of it in check_mark — set both, or half the box is ImGui's default and it won't match
 # the settings window's. These are the same two values [form.colors] uses, on purpose: same control,
-# same look. (The corner radius is each style's own `frame_rounding`, so it still differs — the
-# chrome is square-ish, the form is rounder. Make them equal if you'd rather.)
+# same look. (The corner radius is each style's own `frame_rounding` — both square, like stock
+# ImGui, so the two agree unless you change one of them.)
 checkbox_selected_bg = "accent"
 check_mark           = "contrast(accent)"
 scrollbar_bg           = "none"
@@ -254,28 +255,30 @@ view_clear = "view_clear"
 #  FORM — the settings window. Same palette, form geometry (see the header).
 ####################################################################################################
 [form]
-# The window opens at this fraction of the viewport and is resizable from there. A proportion rather
-# than a size, so there is no pixel width for a font or a DPI change to invalidate.
-open_fraction = [0.62, 0.78]
+# The window's opening size, in logical px (DPI-scaled like everything else), and resizable from
+# there. A size rather than a fraction of the viewport: every field stretches to the window's width,
+# so on a large monitor a proportional window turned a combo box into a bar across the screen. Clamped
+# to the viewport, so a small window still gets a settings window that fits.
+open_size = [620.0, 560.0]
 
 [form.geom]
-# A form, but a tight one: the complaint that killed the old Win32 dialog was that it was too airy.
-window_padding     = [12.0, 10.0]
-frame_padding      = [8.0, 5.0]
-item_spacing       = [8.0, 6.0]
-item_inner_spacing = [6.0, 4.0]
-indent_spacing     = 16.0
-scrollbar_size     = 12.0
+# Stock ImGui's metrics (imgui.cpp, `ImGuiStyle::ImGuiStyle`): compact, square frames.
+window_padding     = [8.0, 8.0]
+frame_padding      = [4.0, 3.0]
+item_spacing       = [8.0, 4.0]
+item_inner_spacing = [4.0, 4.0]
+indent_spacing     = 21.0
+scrollbar_size     = 14.0
 grab_min_size      = 12.0
-window_rounding    = 6.0
-child_rounding     = 4.0
-frame_rounding     = 4.0
-popup_rounding     = 4.0
-grab_rounding      = 4.0
-scrollbar_rounding = 2.0
-tab_rounding       = 0.0
+window_rounding    = 0.0
+child_rounding     = 0.0
+frame_rounding     = 0.0
+popup_rounding     = 0.0
+grab_rounding      = 0.0
+scrollbar_rounding = 9.0
+tab_rounding       = 5.0
 # Thickness of the accent rule along the selected tab's top edge.
-tab_bar_overline   = 2.0
+tab_bar_overline   = 1.0
 window_border = 1.0
 child_border  = 1.0
 # Framed widgets (checkboxes, combos, inputs, sliders) get a 1 px outline: their "field" fill is
@@ -302,11 +305,11 @@ image_border  = 0.0
 # **checkbox_size is the exception, and is exact.** A checkbox has no text in its box, so nothing
 # floors it: the box is drawn separately from its label and comes out exactly this many px, at any
 # font. Write 14 and you get a 14 px box next to 16 px text.
-checkbox_size    = 16.0
+checkbox_size    = 0.0
 input_height     = 0.0   # text boxes, combos, sliders
 button_height    = 0.0
 button_padding_x = 0.0   # padding *inside* a button — also what makes OK/Cancel/Apply wide
-tab_height       = 24.0
+tab_height       = 0.0
 tab_padding_x    = 0.0
 
 [form.colors]

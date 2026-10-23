@@ -156,8 +156,8 @@ pub struct Chrome {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Form {
-    /// The settings window's opening size, as a fraction of the viewport.
-    pub open_fraction: [f32; 2],
+    /// The settings window's opening size, in logical px.
+    pub open_size: [f32; 2],
     geom: Geom,
     pub controls: FormControls,
     colors: FormColors,
@@ -378,6 +378,8 @@ impl Theme {
         bounded("chrome.toolbar_h", theme.chrome.toolbar_h, 0.0, 500.0)?;
         bounded("chrome.status_h", theme.chrome.status_h, 0.0, 500.0)?;
         bounded("chrome.transport_h", theme.chrome.transport_h, 0.0, 500.0)?;
+        bounded("form.open_size[0]", theme.form.open_size[0], 100.0, 4000.0)?;
+        bounded("form.open_size[1]", theme.form.open_size[1], 100.0, 4000.0)?;
         for dark in [true, false] {
             let mode = if dark { "colors.dark" } else { "colors.light" };
             let cx = theme.cx(dark);
