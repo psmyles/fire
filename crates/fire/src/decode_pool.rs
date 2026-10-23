@@ -404,7 +404,7 @@ fn run_decode(job: DecodeJob, latest: &AtomicU64, proxy: &EventLoopProxy<AppEven
     // malformed sheet mustn't take the pool down).
     if let Some(img) = detect_input {
         let guess = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::flipbook::detect(&path, &img)
+            crate::flipbook::detect(&img)
         }))
         .unwrap_or(None);
         let hint = Box::new(FlipbookGuess {

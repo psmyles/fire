@@ -772,8 +772,8 @@ on with the window alive.
   is played back as an animation without ever re-uploading the texture - the whole sheet stays one
   texture and playback only moves the uniform block's cell offsets + blend. The grid is
   **content-detected** off-thread on the decode worker (`flipbook::detect`, YIN period detection
-  over luma/alpha - *the pixels decide the grid*, since filenames can be wrong or missing; a `_8x8`
-  filename token is only a last-resort fallback), sent *after* the decode so the scan never delays
+  over luma/alpha - *only the pixels decide the grid*; the filename is never consulted, since a
+  `_8x8` in a name is too often wrong), sent *after* the decode so the scan never delays
   the image, and surfaced as a dismissible hint that never enters the mode on its own. Once in
   flipbook mode a transport band (`crate::transport`, drawn in ImGui) exposes cols/rows/count, FPS,
   play/pause, scrub and cross-frame blend; a scrub drag pauses playback for its duration. Defaults
