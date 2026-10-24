@@ -81,7 +81,11 @@ pub(crate) enum ChoiceField {
     DefaultTonemap,
     DefaultFit,
     WheelAction,
+    // Only the Thumbnails tab, which is Windows-only, constructs these. They stay on every OS so
+    // the matches below, and their tests, do too — `[thumbnails]` is read and written everywhere.
+    #[cfg_attr(not(windows), allow(dead_code))]
     ThumbBackdrop,
+    #[cfg_attr(not(windows), allow(dead_code))]
     ThumbTonemap,
 }
 
@@ -173,7 +177,10 @@ pub(crate) enum NumField {
     ExposureStep,
     ZoomSnap,
     FlipbookFps,
+    // Windows-only in the UI, like the `ChoiceField::Thumb*` fields.
+    #[cfg_attr(not(windows), allow(dead_code))]
     ThumbExposure,
+    #[cfg_attr(not(windows), allow(dead_code))]
     ThumbMaxFileSize,
 }
 
