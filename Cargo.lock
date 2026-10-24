@@ -657,7 +657,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fire"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cc",
  "crossbeam-channel",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "fire-decode"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bcdec_rs",
  "bytemuck",
@@ -716,11 +716,11 @@ dependencies = [
 
 [[package]]
 name = "fire-ipc"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "fire-shellext"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "fire-decode",
  "fire-thumbs",
@@ -730,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "fire-thumbs"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dirs",
  "fire-decode",
@@ -917,7 +917,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "heif-sys"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bindgen",
  "cc",
@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "psd-sdk-sys"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bindgen",
  "cc",
