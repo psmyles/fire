@@ -1,21 +1,21 @@
 # Third-party notices
 
-Fire is a single statically-linked executable — `fire.exe` on Windows, the binary inside
-`Fire.app` on macOS. Everything it needs at runtime is compiled into that one file, so the binary
-you receive contains code from the projects listed below. Their licenses require that their
-copyright notices and license terms travel with the binary — this document, together with the
-[`../licenses/`](../licenses/) directory, is how they do.
+Fire is statically linked — `fire.exe` and the Explorer thumbnail handler `fire_shellext.dll` on
+Windows, the binary inside `Fire.app` on macOS. Everything they need at runtime is compiled into
+them, so the binaries you receive contain code from the projects listed below. Their licenses
+require that their copyright notices and license terms travel with the binaries — this document,
+together with the [`../licenses/`](../licenses/) directory, is how they do.
 
 Fire's own code is MIT licensed; see [`../LICENSE`](../LICENSE).
 
 * **Section 1** covers the native C/C++ libraries. Read this one — it is short, and it contains
   the only obligation in the whole distribution that goes beyond attribution (the LGPL relink
   right, below).
-* **Section 2** covers the Rust crates (163 of them). One of them, `option-ext`, is MPL-2.0; the
+* **Section 2** covers the Rust crates (167 of them). One of them, `option-ext`, is MPL-2.0; the
   note under the table says what that does and does not require.
 * **Section 3** notes what is *not* here, and why.
 
-Generated against Fire 0.4.0 (`Cargo.lock`, runtime dependencies only, for the union of the two
+Generated against Fire 0.6.0 (`Cargo.lock`, runtime dependencies only, for the union of the two
 shipped targets `x86_64-pc-windows-msvc` and `aarch64-apple-darwin` — a crate that appears on only
 one of them is still listed, since both binaries are built from this tree). Build-time-only
 tooling — `bindgen`, `cc`, `resvg`, `winresource`, `serde_json`, `sokol-shdc`, `fxc`, `xcrun
@@ -120,14 +120,14 @@ License text: [`licenses/Zlib.txt`](../licenses/Zlib.txt)
 
 ## 2. Rust crates
 
-163 crates are linked into the Fire binary (the union of both shipped targets). Where a crate
+167 crates are linked into the Fire binaries (the union of both shipped targets). Where a crate
 offers a choice of licenses, the column below records **the license Fire elects**, not the full
 SPDX expression — Fire elects MIT wherever MIT is offered, then the most permissive of what is
 left. Full texts:
 
 | License | Text |
 |---|---|
-| MIT (152 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
+| MIT (155 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
 | BSD-3-Clause (6) | [`licenses/BSD-3-Clause.txt`](../licenses/BSD-3-Clause.txt) |
 | 0BSD (3) | [`licenses/0BSD.txt`](../licenses/0BSD.txt) |
 | Apache-2.0 (1, plus 1 in addition to MIT) | [`licenses/Apache-2.0.txt`](../licenses/Apache-2.0.txt) |
@@ -371,7 +371,9 @@ cargo tree -p fire -e normal --target aarch64-apple-darwin   --prefix none --for
 Take the **union** of the two — both targets ship — and cross-reference
 `cargo metadata --format-version 1` for each package's `license` field, then read the copyright
 line out of each package's own `LICENSE*` file in the local cargo registry. The workspace's own
-crates (`fire`, `fire-decode`, `fire-ipc`, `psd-sdk-sys`, `heif-sys`) and the vendored `sokol`
-path dependency are excluded from the table: the first five are Fire, and sokol is section 1. The
+crates (`fire`, `fire-decode`, `fire-ipc`, `fire-thumbs`, `fire-shellext`, `psd-sdk-sys`,
+`heif-sys`) and the vendored `sokol` path dependency are excluded from the table: the first seven
+are Fire, and sokol is section 1. `fire_shellext.dll` links a subset of `fire`'s crates, so
+`-p fire` covers both binaries. The
 native libraries in section 1 change only when `crates/*/vendor/`, `vendor/sokol-rust`, or a `-sys`
 crate that vendors one (`lcms2-sys`, `libwebp-sys`, `dear-imgui-sys`) changes.
