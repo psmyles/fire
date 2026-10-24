@@ -1,15 +1,15 @@
 //! The formats Fire can draw Explorer thumbnails for, grouped the way the user switches them: one
 //! checkbox per format, covering all of that format's extensions.
 //!
-//! The groups and their ids are the installer's — `assoc\png` and `thumbs…\png` there are `png`
-//! here — so the two pages of the installer, the Settings tab and `--set-thumbnails` all speak of
-//! the same things. Tests hold this table to `fire-decode`'s extension list and to the installer.
+//! The groups and their ids are the installer's — its `assoc\png` task and the `'png'` row of its
+//! thumbnails page are `png` here — so the two pages of the installer, the Settings tab and
+//! `--set-thumbnails` all speak of the same things. Tests hold this table to `fire-decode`'s extension list and to the installer.
 
 /// One checkbox: a format and every extension it is known by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatGroup {
-    /// The stable name — the installer's task name and the `--set-thumbnails` token. Never rename
-    /// one: an installed Fire's upgrade reads them back.
+    /// The stable name: the `--set-thumbnails` token, which the installer passes for the boxes
+    /// ticked on its thumbnails page. Never rename one — scripts that pass the list would break.
     pub id: &'static str,
     /// The checkbox text.
     pub label: &'static str,
@@ -236,54 +236,50 @@ mod tests {
         assert_eq!(parse_ids(""), (vec![], vec![]));
     }
 
-    /// The installer lists one task per group under two parents, `thumbs\new\<id>` (on by default)
-    /// and `thumbs\win\<id>` (off). Read it back and compare outright, the way `fire-decode` polices
-    /// its association rows — an Inno script cannot `use` this table.
+    /// The installer's thumbnails page lists every group, in this order and in the column
+    /// `default_on` puts it in, probing its primary extension to show its state, under a caption
+    /// that starts with its label. Read the `[Code]` list back and compare outright, the way
+    /// `fire-decode` polices its association rows — an Inno script cannot `use` this table. Lines
+    /// of the form `AddThumbFormat(True, 'tga', 'tga', 'Truevision TGA (.tga)');`.
     #[test]
-    fn installer_thumbnail_tasks_match_the_table() {
+    fn installer_thumbnail_page_matches_the_table() {
         const ISS: &str = include_str!("../../../installer/fire.iss");
-        let mut tasks: Vec<(String, bool)> = Vec::new();
-        for line in ISS.lines() {
-            let Some(rest) = line.strip_prefix(r#"Name: "thumbs\"#) else {
-                continue;
-            };
-            let Some(name) = rest.split('"').next() else {
-                continue;
-            };
-            match name.split_once('\\') {
-                Some(("new", id)) => tasks.push((id.to_string(), true)),
-                Some(("win", id)) => tasks.push((id.to_string(), false)),
-                _ => {}
-            }
-        }
-        let table: Vec<(String, bool)> = GROUPS
-            .iter()
-            .map(|g| (g.id.to_string(), g.default_on))
-            .collect();
-        assert_eq!(
-            tasks, table,
-            "installer/fire.iss's thumbnail tasks differ from formats::GROUPS (ids, order, or which \
-             parent — `new` is on by default, `win` off)"
-        );
-
-        // …and its [Code] list, which ticks the tasks on an upgrade by probing each format's
-        // primary extension: lines of the form `Result.Add('new\tga=tga');`.
-        let code: Vec<String> = ISS
+        let listed: Vec<(bool, String, String, String)> = ISS
             .lines()
-            .filter_map(|l| l.trim().strip_prefix("Result.Add('"))
-            .filter_map(|l| l.split('\'').next())
-            .map(str::to_string)
-            .collect();
-        let expected: Vec<String> = GROUPS
-            .iter()
-            .map(|g| {
-                let parent = if g.default_on { "new" } else { "win" };
-                format!(r"{parent}\{}={}", g.id, g.primary_ext())
+            .filter_map(|l| l.trim().strip_prefix("AddThumbFormat("))
+            .map(|args| {
+                // The Boolean, then three quoted strings: split on the quotes.
+                let parts: Vec<&str> = args.split('\'').collect();
+                assert_eq!(parts.len(), 7, "unexpected AddThumbFormat line: {args}");
+                let windows_has_none = parts[0].trim().trim_end_matches(',').trim() == "True";
+                (
+                    windows_has_none,
+                    parts[1].to_string(),
+                    parts[3].to_string(),
+                    parts[5].to_string(),
+                )
             })
             .collect();
+        let script: Vec<(bool, &str, &str)> = listed
+            .iter()
+            .map(|(on, id, ext, _)| (*on, id.as_str(), ext.as_str()))
+            .collect();
+        let table: Vec<(bool, &str, &str)> = GROUPS
+            .iter()
+            .map(|g| (g.default_on, g.id, g.primary_ext()))
+            .collect();
         assert_eq!(
-            code, expected,
-            "installer/fire.iss's ThumbFormatList differs from formats::GROUPS"
+            script, table,
+            "installer/fire.iss's ListThumbFormats differs from formats::GROUPS (column, id, \
+             order, or the extension probed)"
         );
+        for (g, (.., caption)) in GROUPS.iter().zip(&listed) {
+            assert!(
+                caption.starts_with(g.label),
+                "the installer captions {} {caption:?}, not after its label {:?}",
+                g.id,
+                g.label
+            );
+        }
     }
 }

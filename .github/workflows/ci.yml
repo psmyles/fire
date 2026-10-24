@@ -89,7 +89,7 @@ jobs:
         run: cargo test -p fire-decode --no-default-features
 
       # Explorer thumbnails: the CPU render, the settings table, and the two drift tests that hold
-      # installer/fire.iss's thumbnail tasks and class id to the crate. On Windows also the HKCU
+      # installer/fire.iss's thumbnails page and class id to the crate. On Windows also the HKCU
       # registration round trips, on throwaway extensions they clean up after.
       - name: Test (fire-thumbs)
         run: cargo test -p fire-thumbs

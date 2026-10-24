@@ -49,15 +49,17 @@ Flags: `-SkipBuild` (reuse the existing `target/release/fire.exe` and `fire_shel
 > silently override a type the user already assigned — for those, pick Fire via the "Open with"
 > dialog or Settings → Default apps (where it now appears).
 
-- A second checkbox group, **Show Fire thumbnails in Explorer for:**, one per format and
-  independent of the associations: Fire's `fire_shellext.dll` draws those formats' thumbnails
-  whichever app opens them. Pre-ticked are the formats Windows shows no thumbnail for (TGA, DDS,
-  PSD, EXR, Radiance HDR, QOI, Netpbm, Farbfeld); the ones Windows already thumbnails are offered
-  unticked. The installer does none of the registry work itself — it runs
-  `fire.exe --set-thumbnails "<ids>"` after copying the files, and `fire.exe --remove-thumbnails`
-  on uninstall, the same code Fire's Settings ▸ Thumbnails tab uses. Whatever provider a format
-  had before is saved and put back. On an upgrade the page ticks what is on *now*, which the user
-  may have changed in Settings since.
+- An **Explorer Thumbnails** page of its own, right after the tasks: a checkbox per format,
+  independent of the associations — Fire's `fire_shellext.dll` draws those formats' thumbnails
+  whichever app opens them. Two columns, as in Settings ▸ Thumbnails: the formats Windows shows no
+  thumbnail for (TGA, DDS, PSD, EXR, Radiance HDR, QOI, Netpbm, Farbfeld), pre-ticked, and the ones
+  Windows already thumbnails, offered unticked. The installer does none of the registry work
+  itself — it runs `fire.exe --set-thumbnails "<ids>"` after copying the files, and
+  `fire.exe --remove-thumbnails` on uninstall, the same code Fire's Settings ▸ Thumbnails tab uses.
+  Whatever provider a format had before is saved and put back. On an upgrade the page ticks what
+  is on *now*, which the user may have changed in Settings since; Setup records that the choice was
+  made (`Inno Setup CodeFile: ThumbnailsChosen` in its uninstall key), so a choice of nothing stays
+  nothing. A silent install takes the same ticks without showing the page.
 - The DLL is installed whatever is ticked, so formats can be switched on later from Settings.
   Explorer's thumbnail surrogate (`dllhost.exe`) can hold it open for a few minutes after use; an
   upgrade meets that through Setup's Restart Manager page, which offers to close it.
@@ -71,7 +73,7 @@ This is the one copy of that list which cannot `use` the real one — an Inno Se
 nothing — so a test polices it: `fire-decode`'s `installer_associations_match_the_extension_table`
 parses `fire.iss` and fails if the two sets disagree.
 
-The thumbnail tasks (`thumbs\new\<id>`, `thumbs\win\<id>`) and the `ThumbFormatList` in `[Code]`
-mirror `fire-thumbs`'s `formats::GROUPS`, and its `installer_thumbnail_tasks_match_the_table` test
-holds them to it — ids, order, which group, and the extension probed on upgrade. A new format goes
-in `GROUPS` first; the test then says what the script is missing.
+The thumbnails page's rows (`ListThumbFormats` in `[Code]`) mirror `fire-thumbs`'s
+`formats::GROUPS`, and its `installer_thumbnail_page_matches_the_table` test holds them to it —
+ids, order, which column, the extension probed on upgrade, and a caption that starts with the
+table's label. A new format goes in `GROUPS` first; the test then says what the script is missing.

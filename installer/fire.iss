@@ -82,7 +82,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "{#MyExeSource}"; DestDir: "{app}"; DestName: "{#MyAppExe}"; Flags: ignoreversion
-; The Explorer thumbnail provider. Installed whatever the thumbnail tasks below say, so Settings ▸
+; The Explorer thumbnail provider. Installed whatever the thumbnails page says, so Settings ▸
 ; Thumbnails can switch formats on later without a reinstall. Explorer runs it inside a COM
 ; surrogate (dllhost.exe), which can hold it open across an upgrade: Setup's Restart Manager
 ; support (CloseApplications, on by default, *.dll in its filter) finds that surrogate and offers to
@@ -131,35 +131,8 @@ Name: "assoc\psd";      Description: "Photoshop document (.psd, .psb)"
 Name: "assoc\heif";     Description: "HEIF / HEIC image (.heic, .heif)"
 Name: "assoc\avif";     Description: "AVIF image (.avif)"
 Name: "assoc\raw";      Description: "Camera raw — embedded preview (.cr2, .cr3, .nef, .arw, .dng, .raf, .orf, .rw2, …)"
-; --- Explorer thumbnails: one per format, independent of the associations above ---------------
-; Fire can draw Explorer's thumbnails for a format whether or not it opens that format. Two groups:
-; the formats Windows draws no thumbnail for (on by default), and the ones its own photo
-; thumbnailer already covers (off — replacing those is the user's call). Whatever provider a format
-; had before is put back when it is unticked or Fire is uninstalled. The same choice lives in
-; Settings ▸ Thumbnails; on an upgrade [Code] ticks what is on *now*, which the user may have
-; changed there. The ids are fire_thumbs::formats::GROUPS's, and a test there checks this list.
-Name: "thumbs";           Description: "All supported image formats"; GroupDescription: "Show {#MyAppName} thumbnails in Explorer for:"
-Name: "thumbs\new";       Description: "Formats Windows shows no thumbnail for"
-Name: "thumbs\new\tga";   Description: "Truevision TGA (.tga)"
-Name: "thumbs\new\dds";   Description: "DirectDraw Surface (.dds) — Windows' own reads only BC1-BC3"
-Name: "thumbs\new\psd";   Description: "Photoshop (.psd, .psb)"
-Name: "thumbs\new\exr";   Description: "OpenEXR (.exr)"
-Name: "thumbs\new\hdr";   Description: "Radiance HDR (.hdr, .pic, .rgbe, .xyze)"
-Name: "thumbs\new\qoi";   Description: "QOI (.qoi)"
-Name: "thumbs\new\netpbm"; Description: "Netpbm (.ppm, .pgm, .pbm, .pnm, .pam)"
-Name: "thumbs\new\farbfeld"; Description: "Farbfeld (.ff)"
-Name: "thumbs\win";       Description: "Formats Windows already shows thumbnails for (replaces them)"; Flags: unchecked
-Name: "thumbs\win\png";   Description: "PNG (.png)"; Flags: unchecked
-Name: "thumbs\win\jpeg";  Description: "JPEG (.jpg, .jpeg, .jpe, .jfif)"; Flags: unchecked
-Name: "thumbs\win\gif";   Description: "GIF (.gif)"; Flags: unchecked
-Name: "thumbs\win\bmp";   Description: "Bitmap (.bmp, .dib)"; Flags: unchecked
-Name: "thumbs\win\tiff";  Description: "TIFF (.tif, .tiff, .tx)"; Flags: unchecked
-Name: "thumbs\win\webp";  Description: "WebP (.webp)"; Flags: unchecked
-Name: "thumbs\win\ico";   Description: "Icon and cursor (.ico, .cur)"; Flags: unchecked
-Name: "thumbs\win\jxl";   Description: "JPEG XL (.jxl)"; Flags: unchecked
-Name: "thumbs\win\heif";  Description: "HEIF / HEIC (.heic, .heif)"; Flags: unchecked
-Name: "thumbs\win\avif";  Description: "AVIF (.avif)"; Flags: unchecked
-Name: "thumbs\win\raw";   Description: "Camera raw (.cr2, .cr3, .nef, .arw, .dng, .raf, …)"; Flags: unchecked
+; (Explorer thumbnails are not tasks: they get a wizard page of their own, built in [Code], so they
+; are not lost at the bottom of this list.)
 ; --- shortcuts ---
 Name: "desktopicon";    Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
@@ -501,118 +474,190 @@ const
   FireThumbClsid = '{DA926B60-8532-4616-A98E-889545ADA4AB}';
   // The ShellEx slot Explorer looks a thumbnail provider up under (IThumbnailProvider's IID).
   ThumbSlot = '{e357fccd-a995-4576-b01f-234630154e96}';
-  // This app's uninstall key, where Setup remembers the tasks of the last install.
-  UninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8E9B2C4D-3F1A-4B6E-9C2D-7A5F1E0B8D34}_is1';
 
-var
-  ThumbTasksSeeded: Boolean;
-
-// Every thumbnail format, as '<task under thumbs\>=<extension probed for its state>'. In the order
-// of the thumbs\* tasks above; fire-thumbs' tests hold both to fire_thumbs::formats::GROUPS.
-function ThumbFormatList: TStringList;
-begin
-  Result := TStringList.Create;
-  Result.Add('new\tga=tga');
-  Result.Add('new\dds=dds');
-  Result.Add('new\psd=psd');
-  Result.Add('new\exr=exr');
-  Result.Add('new\hdr=hdr');
-  Result.Add('new\qoi=qoi');
-  Result.Add('new\netpbm=ppm');
-  Result.Add('new\farbfeld=ff');
-  Result.Add('win\png=png');
-  Result.Add('win\jpeg=jpg');
-  Result.Add('win\gif=gif');
-  Result.Add('win\bmp=bmp');
-  Result.Add('win\tiff=tif');
-  Result.Add('win\webp=webp');
-  Result.Add('win\ico=ico');
-  Result.Add('win\jxl=jxl');
-  Result.Add('win\heif=heic');
-  Result.Add('win\avif=avif');
-  Result.Add('win\raw=cr2');
-end;
-
-// 'new\tga=tga' -> 'new\tga'
-function EntryTask(Entry: String): String;
-begin
-  Result := Copy(Entry, 1, Pos('=', Entry) - 1);
-end;
-
-// 'new\tga=tga' -> 'tga' (the format id: the task's last part)
-function EntryId(Entry: String): String;
-begin
-  Result := EntryTask(Entry);
-  Result := Copy(Result, Pos('\', Result) + 1, Length(Result));
-end;
-
-// 'new\tga=tga' -> 'tga' (the extension)
-function EntryExt(Entry: String): String;
-begin
-  Result := Copy(Entry, Pos('=', Entry) + 1, Length(Entry));
-end;
-
-// Whether the last install of Fire already had the thumbnail tasks — i.e. whether the user has
-// made this choice before, so what is in the registry now is that choice (as later changed in
-// Settings ▸ Thumbnails), and not just the absence of a feature an older Fire did not have.
-function ThumbChoiceMadeBefore: Boolean;
-var
-  Selected, Deselected: String;
-begin
-  if not RegQueryStringValue(HKCU, UninstallKey, 'Inno Setup: Selected Tasks', Selected) then
-    Selected := '';
-  if not RegQueryStringValue(HKCU, UninstallKey, 'Inno Setup: Deselected Tasks', Deselected) then
-    Deselected := '';
-  Result := Pos('thumbs', Lowercase(Selected + ',' + Deselected)) > 0;
-end;
-
-// On an upgrade, tick exactly the formats Fire provides thumbnails for now. A fresh install, or an
-// upgrade from a Fire without thumbnails, keeps the defaults.
-procedure CurPageChanged(CurPageID: Integer);
-var
-  List: TStringList;
-  I: Integer;
-  Value: String;
-  Ours: Boolean;
-begin
-  if (CurPageID <> wpSelectTasks) or ThumbTasksSeeded then
-    Exit;
-  ThumbTasksSeeded := True;
-  if not ThumbChoiceMadeBefore then
-    Exit;
-  List := ThumbFormatList;
-  try
-    for I := 0 to List.Count - 1 do
-    begin
-      Ours := RegQueryStringValue(HKCU, 'Software\Classes\.' + EntryExt(List[I]) + '\ShellEx\' + ThumbSlot, '', Value)
-        and (CompareText(Value, FireThumbClsid) = 0);
-      if Ours then
-        WizardSelectTasks('thumbs\' + EntryTask(List[I]))
-      else
-        WizardSelectTasks('!thumbs\' + EntryTask(List[I]));
-    end;
-  finally
-    List.Free;
+type
+  // One checkbox on the Explorer Thumbnails page.
+  TThumbFormat = record
+    Id: String;              // fire_thumbs' group id, the token --set-thumbnails takes
+    Ext: String;             // the extension probed to tell whether Fire has the format now
+    Caption: String;
+    WindowsHasNone: Boolean; // Windows draws no thumbnail of its own: left column, on by default
+    List: TNewCheckListBox;  // the column it is in...
+    Row: Integer;            // ...and its row there
   end;
+
+var
+  ThumbFormats: array of TThumbFormat;
+
+procedure AddThumbFormat(WindowsHasNone: Boolean; Id, Ext, Caption: String);
+var
+  N: Integer;
+begin
+  N := GetArrayLength(ThumbFormats);
+  SetArrayLength(ThumbFormats, N + 1);
+  ThumbFormats[N].WindowsHasNone := WindowsHasNone;
+  ThumbFormats[N].Id := Id;
+  ThumbFormats[N].Ext := Ext;
+  ThumbFormats[N].Caption := Caption;
 end;
 
-// The ticked thumbnail formats, as fire.exe --set-thumbnails takes them: 'tga,dds,psd'.
+// Every thumbnail format: whether Windows draws none of its own, the id, the extension probed for
+// its state, and the checkbox. fire_thumbs::formats::GROUPS, in its order — a test there holds the
+// two to each other, captions included (each starts with that table's label).
+procedure ListThumbFormats;
+begin
+  AddThumbFormat(True,  'tga',      'tga',  'Truevision TGA (.tga)');
+  AddThumbFormat(True,  'dds',      'dds',  'DirectDraw Surface (.dds)');
+  AddThumbFormat(True,  'psd',      'psd',  'Photoshop (.psd, .psb)');
+  AddThumbFormat(True,  'exr',      'exr',  'OpenEXR (.exr)');
+  AddThumbFormat(True,  'hdr',      'hdr',  'Radiance HDR (.hdr, .pic, …)');
+  AddThumbFormat(True,  'qoi',      'qoi',  'QOI (.qoi)');
+  AddThumbFormat(True,  'netpbm',   'ppm',  'Netpbm (.ppm, .pgm, …)');
+  AddThumbFormat(True,  'farbfeld', 'ff',   'Farbfeld (.ff)');
+  AddThumbFormat(False, 'png',      'png',  'PNG (.png)');
+  AddThumbFormat(False, 'jpeg',     'jpg',  'JPEG (.jpg, .jpeg, …)');
+  AddThumbFormat(False, 'gif',      'gif',  'GIF (.gif)');
+  AddThumbFormat(False, 'bmp',      'bmp',  'Bitmap (.bmp, .dib)');
+  AddThumbFormat(False, 'tiff',     'tif',  'TIFF (.tif, .tiff, .tx)');
+  AddThumbFormat(False, 'webp',     'webp', 'WebP (.webp)');
+  AddThumbFormat(False, 'ico',      'ico',  'Icon and cursor (.ico, .cur)');
+  AddThumbFormat(False, 'jxl',      'jxl',  'JPEG XL (.jxl)');
+  AddThumbFormat(False, 'heif',     'heic', 'HEIF / HEIC (.heic, .heif)');
+  AddThumbFormat(False, 'avif',     'avif', 'AVIF (.avif)');
+  AddThumbFormat(False, 'raw',      'cr2',  'Camera raw (.cr2, .nef, …)');
+end;
+
+// Whether Fire is Explorer's thumbnail provider for this extension now.
+function FireHasThumbnails(Ext: String): Boolean;
+var
+  Value: String;
+begin
+  Result := RegQueryStringValue(HKCU, 'Software\Classes\.' + Ext + '\ShellEx\' + ThumbSlot, '', Value)
+    and (CompareText(Value, FireThumbClsid) = 0);
+end;
+
+// One column of the page, laid out like the tasks list: a checkbox for the whole group, with one
+// per format added under it.
+function AddThumbColumn(Page: TWizardPage; Left, Top, Width: Integer; Caption: String): TNewCheckListBox;
+begin
+  Result := TNewCheckListBox.Create(Page);
+  Result.Left := Left;
+  Result.Top := Top;
+  Result.Width := Width;
+  Result.Height := Page.SurfaceHeight - Top;
+  Result.BorderStyle := bsNone;
+  Result.ParentColor := True;
+  Result.MinItemHeight := WizardForm.TasksList.MinItemHeight;
+  Result.Parent := Page.Surface;
+  Result.AddCheckBox(Caption, '', 0, False, True, False, True, nil);
+end;
+
+// The Explorer Thumbnails page, right after the tasks: two columns, as in Settings ▸ Thumbnails.
+// A fresh install, or an upgrade from a Fire without thumbnails, ticks the formats Windows has no
+// thumbnails for. Otherwise the page shows what is on now, which the user may have changed in
+// Settings since the last install.
+procedure InitializeWizard;
+var
+  Page: TWizardPage;
+  Intro: TNewStaticText;
+  NewColumn, WinColumn: TNewCheckListBox;
+  Top, Gap, Half, I: Integer;
+  ShowCurrent: Boolean;
+begin
+  Page := CreateCustomPage(wpSelectTasks, 'Explorer Thumbnails',
+    'Which image formats should {#MyAppName} draw thumbnails for in File Explorer?');
+
+  Intro := TNewStaticText.Create(Page);
+  Intro.AutoSize := False;
+  Intro.WordWrap := True;
+  Intro.Width := Page.SurfaceWidth;
+  Intro.Anchors := [akLeft, akTop, akRight];
+  Intro.Caption := 'Select the formats {#MyAppName} should draw File Explorer''s thumbnails for, ' +
+    'then click Next. This is separate from which app opens them, and can be changed later in ' +
+    '{#MyAppName}''s Settings.';
+  Intro.Parent := Page.Surface;
+  Intro.AdjustHeight;
+
+  Top := Intro.Top + Intro.Height + ScaleY(12);
+  Gap := ScaleX(16);
+  Half := (Page.SurfaceWidth - Gap) div 2;
+  NewColumn := AddThumbColumn(Page, 0, Top, Half, 'No thumbnails from Windows');
+  NewColumn.Anchors := [akLeft, akTop, akBottom];
+  WinColumn := AddThumbColumn(Page, Half + Gap, Top, Page.SurfaceWidth - Half - Gap,
+    'Already thumbnailed by Windows');
+  WinColumn.Anchors := [akLeft, akTop, akRight, akBottom];
+
+  ListThumbFormats;
+  ShowCurrent := GetPreviousData('ThumbnailsChosen', '') <> '';
+  for I := 0 to GetArrayLength(ThumbFormats) - 1 do
+  begin
+    if ThumbFormats[I].WindowsHasNone then
+      ThumbFormats[I].List := NewColumn
+    else
+      ThumbFormats[I].List := WinColumn;
+    ThumbFormats[I].Row := ThumbFormats[I].List.AddCheckBox(ThumbFormats[I].Caption, '', 1,
+      False, True, False, True, nil);
+    // An install from before the choice was recorded, which already registered Fire.
+    ShowCurrent := ShowCurrent or FireHasThumbnails(ThumbFormats[I].Ext);
+  end;
+  // Ticked once every row exists, so each column's own checkbox follows its formats.
+  for I := 0 to GetArrayLength(ThumbFormats) - 1 do
+    if ShowCurrent then
+      ThumbFormats[I].List.Checked[ThumbFormats[I].Row] := FireHasThumbnails(ThumbFormats[I].Ext)
+    else
+      ThumbFormats[I].List.Checked[ThumbFormats[I].Row] := ThumbFormats[I].WindowsHasNone;
+end;
+
+// Records that the choice has been made, so the next upgrade shows it, even with nothing ticked,
+// instead of the defaults.
+procedure RegisterPreviousData(PreviousDataKey: Integer);
+begin
+  SetPreviousData(PreviousDataKey, 'ThumbnailsChosen', 'yes');
+end;
+
+// The ticked formats, as fire.exe --set-thumbnails takes them: 'tga,dds,psd'.
 function ThumbnailFormats(Param: String): String;
 var
-  List: TStringList;
   I: Integer;
 begin
   Result := '';
-  List := ThumbFormatList;
-  try
-    for I := 0 to List.Count - 1 do
-      if WizardIsTaskSelected('thumbs\' + EntryTask(List[I])) then
-      begin
-        if Result <> '' then
-          Result := Result + ',';
-        Result := Result + EntryId(List[I]);
-      end;
-  finally
-    List.Free;
-  end;
+  for I := 0 to GetArrayLength(ThumbFormats) - 1 do
+    if ThumbFormats[I].List.Checked[ThumbFormats[I].Row] then
+    begin
+      if Result <> '' then
+        Result := Result + ',';
+      Result := Result + ThumbFormats[I].Id;
+    end;
+end;
+
+procedure AddMemoSection(var Memo: String; Section, NewLine: String);
+begin
+  if Section = '' then
+    Exit;
+  if Memo <> '' then
+    Memo := Memo + NewLine + NewLine;
+  Memo := Memo + Section;
+end;
+
+// The Ready page: Setup's own sections, then the thumbnail formats, as it listed them when they
+// were tasks.
+function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo,
+  MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
+var
+  Formats: String;
+  I: Integer;
+begin
+  Result := '';
+  AddMemoSection(Result, MemoUserInfoInfo, NewLine);
+  AddMemoSection(Result, MemoDirInfo, NewLine);
+  AddMemoSection(Result, MemoTypeInfo, NewLine);
+  AddMemoSection(Result, MemoComponentsInfo, NewLine);
+  AddMemoSection(Result, MemoGroupInfo, NewLine);
+  AddMemoSection(Result, MemoTasksInfo, NewLine);
+  Formats := '';
+  for I := 0 to GetArrayLength(ThumbFormats) - 1 do
+    if ThumbFormats[I].List.Checked[ThumbFormats[I].Row] then
+      Formats := Formats + NewLine + Space + ThumbFormats[I].Caption;
+  if Formats <> '' then
+    AddMemoSection(Result, 'Explorer thumbnails:' + Formats, NewLine);
 end;
