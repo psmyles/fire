@@ -76,8 +76,9 @@ version="$(plutil -extract version raw -o - "$repo/product.json")"
 copyright="$(plutil -extract copyright raw -o - "$repo/product.json")"
 bundle_id="com.psmyles.fire"
 # assets/icon.png has a transparent background; the Dock, Finder and the app switcher all show it
-# against whatever is behind them, which leaves the flame floating. Composite it onto this instead.
-icon_bg="343639"
+# against whatever is behind them, which leaves the flame floating. Composite it onto this instead:
+# an sRGB colour as r,g,b components in 0..1.
+icon_bg="0.25,0.25,0.25"
 # ...inset by this much of the icon's edge on every side. The master's artwork runs corner to
 # corner, and macOS 26 masks a legacy icon like this one into the rounded-rect it draws everywhere,
 # so with no inset the flame is clipped at the top and bottom and crowds the curve at the sides.
@@ -176,18 +177,19 @@ mkdir -p "$iconset"
 # nothing installed.
 #
 # The scratch bitmap is retagged sRGB before anything is drawn into it. Without that it is
-# NSCalibratedRGB, and both the fill and the artwork come out colour-converted: #343639 lands as
-# #27292b. Retagged, the background is exactly the hex asked for and the flame's pixels match the
-# master's byte for byte.
+# NSCalibratedRGB, and both the fill and the artwork come out colour-converted (#343639, for one,
+# lands as #27292b). Retagged, the background is the value asked for, to the nearest 8-bit step,
+# and the flame's pixels match the master's byte for byte.
 cat > "$tmp/flatten-icon.js" <<'JS'
 ObjC.import('AppKit');
 
-// argv: <src.png> <rrggbb> <inset-percent> <size>:<dst.png>...
+// argv: <src.png> <r,g,b> <inset-percent> <size>:<dst.png>...
 function run(argv) {
-    var src = argv[0], hex = argv[1], inset = parseFloat(argv[2]) / 100;
+    var src = argv[0], inset = parseFloat(argv[2]) / 100;
     var img = $.NSImage.alloc.initWithContentsOfFile(src);
     if (img.isNil()) throw new Error('cannot read ' + src);
-    var rgb = [0, 2, 4].map(function (i) { return parseInt(hex.substr(i, 2), 16) / 255; });
+    var rgb = argv[1].split(',').map(parseFloat);
+    if (rgb.length !== 3 || rgb.some(isNaN)) throw new Error('bad colour ' + argv[1]);
 
     argv.slice(3).forEach(function (spec) {
         var colon = spec.indexOf(':');
@@ -230,7 +232,7 @@ osascript -l JavaScript "$tmp/flatten-icon.js" \
 
 icns="$tmp/$name.icns"
 iconutil -c icns "$iconset" -o "$icns"
-echo "  $(basename "$icns") — $(stat -f%z "$icns") bytes, on #$icon_bg, inset $icon_inset"
+echo "  $(basename "$icns") — $(stat -f%z "$icns") bytes, on rgb($icon_bg), inset $icon_inset"
 
 # ---------------------------------------------------------------------------------------------
 # 4. The bundle
@@ -403,103 +405,10 @@ if [[ $do_notarize -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------------------------
-# 8. The .dmg's own Finder icon
+# 8. Verify what actually ships
 # ---------------------------------------------------------------------------------------------
-# Without this the .dmg gets the generic disk-image document icon. What goes on instead is that
-# same generic icon with the flame composited over its disk graphic, so it still reads as a disk
-# image at a glance and is unmistakably ours. The base comes from NSWorkspace rather than a
-# checked-in PNG, so it is whatever the running macOS draws for a .dmg and cannot go stale.
-#
-# This runs *last*, after stapling, because a custom file icon is not in the file's data: it is a
-# resource fork in the `com.apple.ResourceFork` xattr plus a flag in `com.apple.FinderInfo`, and
-# codesign, notarytool and stapler all rewrite the .dmg. Applied here it costs the signature
-# nothing — section 8 re-checks all three to prove it.
-#
-# Know one limit before relying on it: xattrs travel only where the transport carries them, which
-# means AirDrop, a `ditto`-made zip, or a copy between Macs. A plain HTTPS download strips the
-# fork and the .dmg lands generic again. This is cosmetic-on-your-Mac, not branding for the web.
-
-say "dmg icon"
-dmg_iconset="$tmp/dmg.iconset"
-mkdir -p "$dmg_iconset"
-cat > "$tmp/dmg-icon.js" <<'JS'
-ObjC.import('AppKit');
-
-// The flame's edge, and its centre measured from the top-left, as fractions of the icon's edge.
-// It replaces the generic download arrow, and it has to stay inside the disk graphic drawn on the
-// document — the flame overhanging that frame reads as a mistake rather than as a badge.
-//
-// The numbers are fitted to the disk's interior, which at 512² is x 162..350 and y 150..344 (344
-// being the top of the darker bar along its bottom). The master's artwork is full-bleed
-// vertically — its ink is 1020 of 1024 tall, and 690 wide — so height is what binds: 0.34 puts
-// the ink 174 tall inside a 194-tall opening, leaving ~11px top and bottom at 512² and much more
-// at the sides. Raising it much past 0.35 starts clipping the flame's tip over the disk's edge.
-var LOGO_SCALE = 0.34, LOGO_CX = 0.5, LOGO_CY = 0.484;
-
-// argv: <logo.png> <size>:<dst.png>...
-function run(argv) {
-    var img = $.NSImage.alloc.initWithContentsOfFile(argv[0]);
-    if (img.isNil()) throw new Error('cannot read ' + argv[0]);
-    // Deprecated in favour of -iconForContentType:, which does not bridge cleanly through JXA.
-    // It still returns the current system artwork, with reps up to 2048², so 1024² is a downsample
-    // rather than an upscale.
-    var base = $.NSWorkspace.sharedWorkspace.iconForFileType('dmg');
-
-    argv.slice(1).forEach(function (spec) {
-        var colon = spec.indexOf(':');
-        var size = parseInt(spec.slice(0, colon), 10), dst = spec.slice(colon + 1);
-
-        var rep = $.NSBitmapImageRep.alloc
-            .initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(
-                $(), size, size, 8, 4, true, false, $.NSCalibratedRGBColorSpace, 0, 0);
-        rep = rep.bitmapImageRepByRetaggingWithColorSpace($.NSColorSpace.sRGBColorSpace);
-
-        $.NSGraphicsContext.saveGraphicsState;
-        $.NSGraphicsContext.setCurrentContext(
-            $.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep));
-        $.NSGraphicsContext.currentContext.setImageInterpolation(3); // .high
-        base.drawInRectFromRectOperationFraction(
-            $.NSMakeRect(0, 0, size, size), $.NSZeroRect, $.NSCompositingOperationSourceOver, 1.0);
-        var e = size * LOGO_SCALE;
-        img.drawInRectFromRectOperationFraction(
-            $.NSMakeRect(size * LOGO_CX - e / 2, size * (1 - LOGO_CY) - e / 2, e, e),
-            $.NSZeroRect, $.NSCompositingOperationSourceOver, 1.0);
-        $.NSGraphicsContext.restoreGraphicsState;
-
-        var png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));
-        if (!png.writeToFileAtomically(dst, true)) throw new Error('cannot write ' + dst);
-    });
-}
-JS
-
-dmg_renders=()
-for size in 16 32 128 256 512; do
-    dmg_renders+=("$size:$dmg_iconset/icon_${size}x${size}.png")
-    dmg_renders+=("$((size * 2)):$dmg_iconset/icon_${size}x${size}@2x.png")
-done
-osascript -l JavaScript "$tmp/dmg-icon.js" "$repo/assets/icon.png" "${dmg_renders[@]}" \
-    || die "could not render the .dmg icon"
-(( $(ls "$dmg_iconset" | wc -l) == ${#dmg_renders[@]} )) || die "the .dmg iconset is short of images"
-dmg_icns="$tmp/dmg.icns"
-iconutil -c icns "$dmg_iconset" -o "$dmg_icns"
-
-# -setIcon:forFile:options: writes the fork and sets the flag in one call, which is the whole
-# reason not to do this with Rez and SetFile.
-osascript -l JavaScript -e '
-    ObjC.import("AppKit");
-    function run(argv) {
-        var img = $.NSImage.alloc.initWithContentsOfFile(argv[0]);
-        if (img.isNil()) throw new Error("cannot read " + argv[0]);
-        if (!$.NSWorkspace.sharedWorkspace.setIconForFileOptions(img, argv[1], 0))
-            throw new Error("setIcon:forFile: refused " + argv[1]);
-    }' "$dmg_icns" "$dmg" || die "could not set the .dmg's Finder icon"
-echo "  applied to $(basename "$dmg")"
-
-# ---------------------------------------------------------------------------------------------
-# 9. Verify what actually ships
-# ---------------------------------------------------------------------------------------------
-# Deliberately after the icon, not before: these have to be true of the bytes that leave the Mac,
-# and the icon is the last thing to touch them.
+# Deliberately last: these have to be true of the bytes that leave the Mac, so they run after the
+# staple, which is the last thing to touch the .dmg.
 
 if [[ $do_sign -eq 1 ]]; then
     say "verify"
