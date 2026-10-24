@@ -12,6 +12,8 @@
 
 use crate::config::{BackgroundCfg, Config, FitCfg, MenuEntry, OpenIn, TonemapCfg, WheelActionCfg};
 use crate::flipbook::{FPS_MAX, FPS_MIN};
+use fire_thumbs::settings::{EXPOSURE_MAX, MAX_FILE_SIZE_MB_MAX};
+use fire_thumbs::{Backdrop, Tonemap};
 
 // ---------------------------------------------------------------------------------------------
 // Field accessors
@@ -79,6 +81,8 @@ pub(crate) enum ChoiceField {
     DefaultTonemap,
     DefaultFit,
     WheelAction,
+    ThumbBackdrop,
+    ThumbTonemap,
 }
 
 impl ChoiceField {
@@ -86,9 +90,12 @@ impl ChoiceField {
         match self {
             ChoiceField::OpenIn => &["New window", "Reuse window"],
             ChoiceField::Background => &["Automatic", "Black", "White", "Grey", "Checkerboard"],
-            ChoiceField::DefaultTonemap => &["Reinhard", "ACES"],
+            ChoiceField::DefaultTonemap | ChoiceField::ThumbTonemap => &["Reinhard", "ACES"],
             ChoiceField::DefaultFit => &["Fit to window", "Actual size (1:1)"],
             ChoiceField::WheelAction => &["Zooms", "Changes image"],
+            ChoiceField::ThumbBackdrop => {
+                &["Transparent", "Checkerboard", "Black", "White", "Grey"]
+            }
         }
     }
 
@@ -117,6 +124,17 @@ impl ChoiceField {
                 WheelActionCfg::Zoom => 0,
                 WheelActionCfg::NavigateFolder => 1,
             },
+            ChoiceField::ThumbBackdrop => match c.thumbnails.backdrop {
+                Backdrop::Transparent => 0,
+                Backdrop::Checker => 1,
+                Backdrop::Black => 2,
+                Backdrop::White => 3,
+                Backdrop::Grey => 4,
+            },
+            ChoiceField::ThumbTonemap => match c.thumbnails.tonemap {
+                Tonemap::Reinhard => 0,
+                Tonemap::Aces => 1,
+            },
         }
     }
 
@@ -136,6 +154,13 @@ impl ChoiceField {
             (ChoiceField::DefaultFit, 1) => c.default_fit = FitCfg::ActualSize,
             (ChoiceField::WheelAction, 0) => c.wheel_action = WheelActionCfg::Zoom,
             (ChoiceField::WheelAction, 1) => c.wheel_action = WheelActionCfg::NavigateFolder,
+            (ChoiceField::ThumbBackdrop, 0) => c.thumbnails.backdrop = Backdrop::Transparent,
+            (ChoiceField::ThumbBackdrop, 1) => c.thumbnails.backdrop = Backdrop::Checker,
+            (ChoiceField::ThumbBackdrop, 2) => c.thumbnails.backdrop = Backdrop::Black,
+            (ChoiceField::ThumbBackdrop, 3) => c.thumbnails.backdrop = Backdrop::White,
+            (ChoiceField::ThumbBackdrop, 4) => c.thumbnails.backdrop = Backdrop::Grey,
+            (ChoiceField::ThumbTonemap, 0) => c.thumbnails.tonemap = Tonemap::Reinhard,
+            (ChoiceField::ThumbTonemap, 1) => c.thumbnails.tonemap = Tonemap::Aces,
             _ => {}
         }
     }
@@ -148,6 +173,8 @@ pub(crate) enum NumField {
     ExposureStep,
     ZoomSnap,
     FlipbookFps,
+    ThumbExposure,
+    ThumbMaxFileSize,
 }
 
 impl NumField {
@@ -160,7 +187,17 @@ impl NumField {
             // Whole drag pixels — a tenth of one is not a feel anybody can dial in.
             NumField::ZoomSnap => (0.0, 100.0, 1.0, 0),
             NumField::FlipbookFps => (FPS_MIN, FPS_MAX, 1.0, 1),
+            NumField::ThumbExposure => (-EXPOSURE_MAX, EXPOSURE_MAX, 0.25, 2),
+            // Whole megabytes; the config field is an integer.
+            NumField::ThumbMaxFileSize => (0.0, MAX_FILE_SIZE_MB_MAX as f32, 1.0, 0),
         }
+    }
+
+    /// Whether the slider is logarithmic. Only the file-size limit, whose useful values run from
+    /// tens of megabytes to gigabytes — on a linear track the default would sit in its first few
+    /// percent.
+    pub(crate) fn logarithmic(self) -> bool {
+        matches!(self, NumField::ThumbMaxFileSize)
     }
 
     pub(crate) fn get(self, c: &Config) -> f32 {
@@ -169,6 +206,8 @@ impl NumField {
             NumField::ExposureStep => c.exposure_step,
             NumField::ZoomSnap => c.zoom_snap,
             NumField::FlipbookFps => c.flipbook.fps,
+            NumField::ThumbExposure => c.thumbnails.exposure,
+            NumField::ThumbMaxFileSize => c.thumbnails.max_file_size_mb as f32,
         }
     }
 
@@ -185,6 +224,8 @@ impl NumField {
             NumField::ExposureStep => c.exposure_step = v,
             NumField::ZoomSnap => c.zoom_snap = v,
             NumField::FlipbookFps => c.flipbook.fps = v,
+            NumField::ThumbExposure => c.thumbnails.exposure = v,
+            NumField::ThumbMaxFileSize => c.thumbnails.max_file_size_mb = v.round() as u32,
         }
     }
 }
@@ -656,6 +697,8 @@ mod tests {
             NumField::ExposureStep,
             NumField::ZoomSnap,
             NumField::FlipbookFps,
+            NumField::ThumbExposure,
+            NumField::ThumbMaxFileSize,
         ] {
             let (min, max, _, _) = f.spec();
             // Ctrl+click on an ImGui slider lets you *type* a value, so `set` has to survive
@@ -682,6 +725,8 @@ mod tests {
             ChoiceField::DefaultTonemap,
             ChoiceField::DefaultFit,
             ChoiceField::WheelAction,
+            ChoiceField::ThumbBackdrop,
+            ChoiceField::ThumbTonemap,
         ];
         for f in fields {
             for i in 0..f.options().len() {

@@ -27,7 +27,7 @@
 
 pub mod model;
 
-use dear_imgui_rs::{StyleColor, StyleStackToken, TabBarFlags, TabItemToken, Ui};
+use dear_imgui_rs::{SliderFlags, StyleColor, StyleStackToken, TabBarFlags, TabItemToken, Ui};
 
 use crate::config::Config;
 use crate::keybinds::{KeyAction, KeyChord, Keybinds, ALL_ACTIONS};
@@ -78,6 +78,73 @@ pub struct State {
     seeded: Option<Vec<usize>>,
     /// ImGui opens a popup by *event*, not by state, so this fires `open_popup` exactly once.
     requested: bool,
+    /// The Thumbnails tab's state that is not config (Windows).
+    #[cfg(windows)]
+    thumbs: ThumbsTab,
+}
+
+/// What the window commits — OK, Apply, or Enter — for the shell to apply.
+pub struct Commit {
+    pub config: Config,
+    /// The formats to make Fire the Explorer thumbnail provider for — every other one off — when
+    /// the user changed them; `None` when the checkboxes were left alone.
+    #[cfg(windows)]
+    pub thumbnail_formats: Option<Vec<&'static str>>,
+}
+
+/// Settings ▸ Thumbnails' format checkboxes, one per [`fire_thumbs::formats::GROUPS`] entry.
+///
+/// Which formats get Fire's thumbnails is *registry* state — what Explorer reads — not config, so
+/// it is read from the registry when the window opens and gets its own draft/applied pair rather
+/// than living in [`Config`].
+#[cfg(windows)]
+struct ThumbsTab {
+    applied: Vec<bool>,
+    draft: Vec<bool>,
+    /// Whether `fire_shellext.dll` sits beside `fire.exe`. Without it nothing can be switched on.
+    dll: bool,
+    /// Under the format list: a registration that failed.
+    formats_note: String,
+    /// Beside "Clear thumbnail cache": clearing, cleared, or why not.
+    cache_note: String,
+}
+
+#[cfg(windows)]
+impl ThumbsTab {
+    fn read() -> Self {
+        let on = fire_thumbs::registry::enabled();
+        let applied: Vec<bool> = fire_thumbs::formats::GROUPS
+            .iter()
+            .map(|g| on.contains(&g.id))
+            .collect();
+        ThumbsTab {
+            draft: applied.clone(),
+            applied,
+            dll: fire_thumbs::registry::dll_beside_exe().is_some(),
+            formats_note: String::new(),
+            cache_note: String::new(),
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        self.draft != self.applied
+    }
+
+    /// The ids to switch on, if anything changed — and the change becomes the new baseline.
+    fn commit(&mut self) -> Option<Vec<&'static str>> {
+        if !self.dirty() {
+            return None;
+        }
+        self.applied = self.draft.clone();
+        Some(
+            fire_thumbs::formats::GROUPS
+                .iter()
+                .zip(&self.draft)
+                .filter(|(_, on)| **on)
+                .map(|(g, _)| g.id)
+                .collect(),
+        )
+    }
 }
 
 impl State {
@@ -93,7 +160,33 @@ impl State {
             snap_levels: m::format_snap_levels(&cfg.zoom_snap_levels),
             seeded: None,
             requested: false,
+            #[cfg(windows)]
+            thumbs: ThumbsTab::read(),
         }
+    }
+
+    /// The shell's answer to a committed format change: on failure, say why and show the formats
+    /// as they really are now, not as the user asked.
+    #[cfg(windows)]
+    pub fn thumbnail_formats_applied(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.thumbs.formats_note.clear(),
+            Err(e) => {
+                let mut fresh = ThumbsTab::read();
+                fresh.cache_note = std::mem::take(&mut self.thumbs.cache_note);
+                fresh.formats_note = format!("Could not change the formats: {e}");
+                self.thumbs = fresh;
+            }
+        }
+    }
+
+    /// The shell's answer to "Clear thumbnail cache", which ran on a thread of its own.
+    #[cfg(windows)]
+    pub fn thumbnail_cache_cleared(&mut self, result: Result<(), String>) {
+        self.thumbs.cache_note = match result {
+            Ok(()) => "Cleared. Explorer redraws thumbnails as folders are opened.".into(),
+            Err(e) => format!("Could not clear the cache: {e}"),
+        };
     }
 
     /// Whether a keybind row is armed, i.e. the next key press is a binding and not a command.
@@ -148,17 +241,25 @@ impl State {
 
     /// Commit the draft: clamp it, make it the new baseline (so Apply greys out), and hand a copy to
     /// the shell to apply and persist. Also the Enter key's action (see `App::settings_key`).
-    pub fn commit(&mut self) -> Config {
+    pub fn commit(&mut self) -> Commit {
         self.draft.sanitize();
         // Sanitize sorted, de-duplicated and range-filtered the snap levels; show what was actually
         // kept, so an entry that was dropped doesn't sit in the box looking like it took.
         self.snap_levels = m::format_snap_levels(&self.draft.zoom_snap_levels);
         self.applied = self.draft.clone();
-        self.draft.clone()
+        Commit {
+            config: self.draft.clone(),
+            #[cfg(windows)]
+            thumbnail_formats: self.thumbs.commit(),
+        }
     }
 
     fn dirty(&self) -> bool {
-        self.draft != self.applied
+        #[cfg(windows)]
+        let thumbs = self.thumbs.dirty();
+        #[cfg(not(windows))]
+        let thumbs = false;
+        self.draft != self.applied || thumbs
     }
 }
 
@@ -321,6 +422,13 @@ fn tabs(ui: &Ui, st: &mut State, footer: f32, out: &mut Frame) {
         ui.child_window("##context")
             .size(size)
             .build(ui, || context_menu(ui, st, out));
+    }
+    // Windows only: Finder's Quick Look already thumbnails these formats on macOS.
+    #[cfg(windows)]
+    if let Some(_tab) = tab(ui, "Thumbnails") {
+        ui.child_window("##thumbnails")
+            .size(size)
+            .build(ui, || thumbnails(ui, st, out));
     }
 }
 
@@ -831,6 +939,123 @@ fn write_field(st: &mut State, path: &[usize], i: usize) {
     }
 }
 
+/// Explorer thumbnails: which formats Fire draws them for, how, and the cache that keeps the old ones.
+#[cfg(windows)]
+fn thumbnails(ui: &Ui, st: &mut State, out: &mut Frame) {
+    use fire_thumbs::formats::GROUPS;
+
+    ui.separator_with_text("Formats");
+    note(
+        ui,
+        "Fire draws Explorer's thumbnails for the formats ticked here. The rest keep whatever \
+         Windows or another program shows for them, and whatever Fire replaced is put back when a \
+         format is unticked.",
+    );
+    ui.spacing();
+    {
+        let _dis = (!st.thumbs.dll).then(|| ui.begin_disabled());
+        let split = GROUPS
+            .iter()
+            .position(|g| !g.default_on)
+            .unwrap_or(GROUPS.len());
+        for (heading, range) in [
+            ("No thumbnails from Windows", 0..split),
+            ("Already thumbnailed by Windows", split..GROUPS.len()),
+        ] {
+            ui.text_disabled(heading);
+            // Two columns: nineteen checkboxes in one would be most of the tab.
+            let x0 = ui.cursor_pos_x();
+            let half = ui.content_region_avail()[0] / 2.0;
+            for (n, i) in range.enumerate() {
+                if !n.is_multiple_of(2) {
+                    ui.same_line_with_pos(x0 + half);
+                }
+                let mut on = st.thumbs.draft[i];
+                if super::checkbox(
+                    ui,
+                    &format_label(&GROUPS[i]),
+                    &mut on,
+                    controls().checkbox_size,
+                ) {
+                    st.thumbs.draft[i] = on;
+                }
+            }
+            ui.spacing();
+        }
+    }
+    if !st.thumbs.dll {
+        note(
+            ui,
+            "fire_shellext.dll is not next to fire.exe, so nothing can be switched on — reinstall \
+             Fire to get it back.",
+        );
+    }
+    if !st.thumbs.formats_note.is_empty() {
+        ui.text_wrapped(&st.thumbs.formats_note);
+    }
+
+    let lw = label_col(
+        ui,
+        &[
+            "Transparency",
+            "HDR tone map",
+            "HDR exposure",
+            "Largest file",
+        ],
+    );
+    ui.spacing();
+    ui.separator_with_text("Appearance");
+    choice(ui, st, lw, ChoiceField::ThumbBackdrop, "Transparency");
+    row_note(ui, lw, "What shows through transparent pixels.");
+    choice(ui, st, lw, ChoiceField::ThumbTonemap, "HDR tone map");
+    num(ui, st, lw, NumField::ThumbExposure, "HDR exposure");
+    row_note(
+        ui,
+        lw,
+        "In stops, before the tone map. Both apply to EXR, Radiance HDR and float DDS files.",
+    );
+
+    ui.spacing();
+    ui.separator_with_text("Limits");
+    num(ui, st, lw, NumField::ThumbMaxFileSize, "Largest file");
+    row_note(
+        ui,
+        lw,
+        "In MB. A larger file shows its icon instead: the whole file and the decoded image have to \
+         fit in memory to draw one. 0 is no limit.",
+    );
+
+    ui.spacing();
+    ui.separator_with_text("Cache");
+    note(
+        ui,
+        "Explorer keeps every thumbnail it has made, so changes here only reach new ones until the \
+         cache is cleared. Clearing it covers every file type, and Explorer redraws thumbnails as \
+         folders are opened.",
+    );
+    if button(ui, "Clear thumbnail cache", 0.0) {
+        out.settings_clear_thumbnail_cache = true;
+        st.thumbs.cache_note = "Clearing\u{2026}".into();
+    }
+    if !st.thumbs.cache_note.is_empty() {
+        ui.same_line();
+        ui.align_text_to_frame_padding();
+        ui.text_disabled(&st.thumbs.cache_note);
+    }
+}
+
+/// A format checkbox's text: its name and extensions — the first few, for a family as large as
+/// camera raw's.
+#[cfg(windows)]
+fn format_label(g: &fire_thumbs::formats::FormatGroup) -> String {
+    const SHOWN: usize = 4;
+    let mut exts: Vec<String> = g.exts.iter().take(SHOWN).map(|e| format!(".{e}")).collect();
+    if g.exts.len() > SHOWN {
+        exts.push("\u{2026}".into());
+    }
+    format!("{} ({})", g.label, exts.join(", "))
+}
+
 /// OK / Cancel / Apply, right-aligned on the window's bottom edge. Apply is live exactly while there
 /// is something to apply.
 fn buttons(ui: &Ui, st: &mut State, out: &mut Frame) {
@@ -901,10 +1126,16 @@ fn num(ui: &Ui, st: &mut State, label_w: f32, f: NumField, label: &str) {
     let (min, max, _, dp) = f.spec();
     let mut v = f.get(&st.draft);
     ui.set_next_item_width(w);
+    let flags = if f.logarithmic() {
+        SliderFlags::LOGARITHMIC
+    } else {
+        SliderFlags::NONE
+    };
     if ui
         .slider_config(format!("##{label}"), min, max)
         .try_display_format(format!("%.{dp}f"))
         .expect("a fixed-precision float format is valid")
+        .flags(flags)
         .build(&mut v)
     {
         f.set(&mut st.draft, v);

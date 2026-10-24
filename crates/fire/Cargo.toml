@@ -19,6 +19,9 @@ heif = ["fire-decode/heif"]
 [dependencies]
 fire-ipc.workspace = true
 fire-decode.workspace = true
+# Explorer thumbnails: the `[thumbnails]` config table on every OS; on Windows also the format
+# registration behind Settings ▸ Thumbnails and `--set-thumbnails`, and the cache purge.
+fire-thumbs.workspace = true
 
 serde.workspace = true
 toml.workspace = true

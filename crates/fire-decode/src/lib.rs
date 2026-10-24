@@ -204,7 +204,8 @@ pub(crate) fn par_chunks(buf: &[u8], unit: usize, f: impl Fn(usize, &[u8]) + Syn
 /// own, and the two had already drifted apart: a `.qoi` was reachable with the arrow keys but
 /// invisible in the Open dialog. The installer's per-format associations (`installer/fire.iss`) are
 /// a fourth consumer that *cannot* import this — it is an Inno Setup script — so a test below reads
-/// the `.iss` and asserts it registers exactly this set.
+/// the `.iss` and asserts it registers exactly this set. `fire-thumbs`' format table, which groups
+/// these into the Explorer-thumbnail checkboxes, is held to it by a test of its own.
 ///
 /// Note this is a convenience for *naming* files, not the routing decision: [`decode`] sniffs magic
 /// bytes and will happily open a supported image with the wrong extension (or none).

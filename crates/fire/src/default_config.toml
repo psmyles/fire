@@ -196,6 +196,26 @@
 # hide = 0.0
 
 # ----------------------------------------------------------------------------------------------
+# [thumbnails] — how Fire draws Explorer thumbnails (Windows). Which formats get Fire's
+#                thumbnails is chosen in the installer and in Settings ▸ Thumbnails, not here.
+#                Explorer keeps thumbnails it has already made, so a change here reaches new ones
+#                only — Settings ▸ Thumbnails ▸ "Clear thumbnail cache" redraws the rest.
+#
+#   backdrop          What shows through transparent pixels: "transparent" (default — Explorer's
+#                     own background), "checker", "black", "white" or "grey".
+#   tonemap           HDR images (EXR / HDR / float DDS): "reinhard" (default) or "aces".
+#   exposure          HDR exposure, in stops, before the tonemap. Range -8 – 8. Default 0.
+#   max-file-size-mb  Files larger than this get no thumbnail from Fire, just their icon — the
+#                     whole file and the whole decoded image have to fit in memory. 0 = no limit.
+#                     Default 1024.
+#
+# [thumbnails]
+# backdrop = "transparent"
+# tonemap = "reinhard"
+# exposure = 0.0
+# max-file-size-mb = 1024
+
+# ----------------------------------------------------------------------------------------------
 # [keybinds] — keyboard shortcuts. Easiest edited in Settings ▸ Keybinds, but you can write them
 #              here too. Only the ones you CHANGE are listed: anything absent keeps its default (so
 #              you also pick up any new defaults a future version ships).

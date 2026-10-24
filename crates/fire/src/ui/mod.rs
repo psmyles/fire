@@ -118,13 +118,18 @@ pub struct Frame {
     /// The flipbook hint chip: enter flipbook mode / never ask again for this image.
     pub chip_accept: bool,
     pub chip_dismiss: bool,
-    /// The settings window committed (OK or Apply): the edited config, for `App::apply_settings`.
-    pub settings_apply: Option<Config>,
+    /// The settings window committed (OK or Apply): the edited config (and, on Windows, any change
+    /// to the thumbnail formats), for `App::apply_settings`.
+    pub settings_apply: Option<settings::Commit>,
     /// The settings window closed (OK, Cancel, Esc, or the title bar's ×).
     pub settings_close: bool,
     /// The settings window's "Browse…": the shell runs the common file dialog, which pumps its own
     /// modal loop and so must not be entered from inside `WM_PAINT`.
     pub settings_browse: bool,
+    /// Settings ▸ Thumbnails' "Clear thumbnail cache": the shell runs it on a thread of its own and
+    /// reports back, because emptying Explorer's cache takes a moment.
+    #[cfg(windows)]
+    pub settings_clear_thumbnail_cache: bool,
     /// The octagon overlay's options window changed something: the new state, for the shell to
     /// push into the surface.
     pub octagon: Option<crate::octagon::OctagonState>,

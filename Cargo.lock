@@ -666,6 +666,7 @@ dependencies = [
  "dirs",
  "fire-decode",
  "fire-ipc",
+ "fire-thumbs",
  "interprocess",
  "libc",
  "muda",
@@ -716,6 +717,28 @@ dependencies = [
 [[package]]
 name = "fire-ipc"
 version = "0.5.0"
+
+[[package]]
+name = "fire-shellext"
+version = "0.5.0"
+dependencies = [
+ "fire-decode",
+ "fire-thumbs",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "fire-thumbs"
+version = "0.5.0"
+dependencies = [
+ "dirs",
+ "fire-decode",
+ "half",
+ "serde",
+ "toml 0.8.23",
+ "windows",
+]
 
 [[package]]
 name = "flate2"

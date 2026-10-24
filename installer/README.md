@@ -17,11 +17,13 @@ That script is the entry point — don't run `ISCC` on `fire.iss` directly. It:
 1. Reads **`product.json`** (repo root) — the single source of product metadata.
 2. Syncs the Cargo workspace version to match.
 3. Regenerates `assets/fire.ico` from `assets/icon.png` (ImageMagick).
-4. Builds `fire.exe` in release (`build.rs` embeds the same `product.json` values).
+4. Builds `fire.exe` and `fire_shellext.dll` (the Explorer thumbnail provider) in release
+   (`build.rs` embeds the same `product.json` values).
 5. Writes `installer/product.generated.iss` — the `#define`s `fire.iss` `#include`s (git-ignored).
 6. Compiles `fire.iss` with `ISCC` → **`dist/Fire-<version>-Setup.exe`**.
 
-Flags: `-SkipBuild` (reuse the existing `target/release/fire.exe`), `-SkipIcon`.
+Flags: `-SkipBuild` (reuse the existing `target/release/fire.exe` and `fire_shellext.dll`),
+`-SkipIcon`.
 
 ### Prerequisites
 
@@ -47,6 +49,19 @@ Flags: `-SkipBuild` (reuse the existing `target/release/fire.exe`), `-SkipIcon`.
 > silently override a type the user already assigned — for those, pick Fire via the "Open with"
 > dialog or Settings → Default apps (where it now appears).
 
+- A second checkbox group, **Show Fire thumbnails in Explorer for:**, one per format and
+  independent of the associations: Fire's `fire_shellext.dll` draws those formats' thumbnails
+  whichever app opens them. Pre-ticked are the formats Windows shows no thumbnail for (TGA, DDS,
+  PSD, EXR, Radiance HDR, QOI, Netpbm, Farbfeld); the ones Windows already thumbnails are offered
+  unticked. The installer does none of the registry work itself — it runs
+  `fire.exe --set-thumbnails "<ids>"` after copying the files, and `fire.exe --remove-thumbnails`
+  on uninstall, the same code Fire's Settings ▸ Thumbnails tab uses. Whatever provider a format
+  had before is saved and put back. On an upgrade the page ticks what is on *now*, which the user
+  may have changed in Settings since.
+- The DLL is installed whatever is ticked, so formats can be switched on later from Settings.
+  Explorer's thumbnail surrogate (`dllhost.exe`) can hold it open for a few minutes after use; an
+  upgrade meets that through Setup's Restart Manager page, which offers to close it.
+
 ## Editing associations
 
 Supported formats and their extensions live in `fire.iss` (`[Tasks]` + `[Registry]`). When
@@ -55,3 +70,8 @@ Supported formats and their extensions live in `fire.iss` (`[Tasks]` + `[Registr
 This is the one copy of that list which cannot `use` the real one — an Inno Setup script imports
 nothing — so a test polices it: `fire-decode`'s `installer_associations_match_the_extension_table`
 parses `fire.iss` and fails if the two sets disagree.
+
+The thumbnail tasks (`thumbs\new\<id>`, `thumbs\win\<id>`) and the `ThumbFormatList` in `[Code]`
+mirror `fire-thumbs`'s `formats::GROUPS`, and its `installer_thumbnail_tasks_match_the_table` test
+holds them to it — ids, order, which group, and the extension probed on upgrade. A new format goes
+in `GROUPS` first; the test then says what the script is missing.

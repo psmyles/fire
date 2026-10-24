@@ -1297,8 +1297,8 @@ impl Viewer {
                 self.redraw();
             }
             KeyCode::Enter | KeyCode::NumpadEnter => {
-                if let Some(cfg) = self.settings.as_mut().map(|s| s.commit()) {
-                    self.apply_settings(cfg);
+                if let Some(commit) = self.settings.as_mut().map(|s| s.commit()) {
+                    self.apply_settings(commit);
                 }
                 self.settings = None;
                 self.redraw();
@@ -1338,8 +1338,22 @@ impl Viewer {
     ///     whatever they'd just set up by hand.
     ///   * **Next launch** — `open-in` is read by the owner when a forwarded open arrives, so it is
     ///     live too, but only for opens from *other* launches.
-    fn apply_settings(&mut self, new: Config) {
-        self.adopt_settings(new);
+    ///
+    /// Thumbnail *formats* (Windows) are registry state, shared by every window and every Fire, so
+    /// they are written here once rather than adopted per window. The thumbnail *settings* need no
+    /// push at all: the DLL reads them out of `config.toml`, which the save below writes.
+    fn apply_settings(&mut self, commit: crate::ui::settings::Commit) {
+        #[cfg(windows)]
+        if let Some(ids) = &commit.thumbnail_formats {
+            let result = crate::thumbnails::set_formats(ids);
+            if let Err(e) = &result {
+                eprintln!("fire: thumbnail formats: {e}");
+            }
+            if let Some(s) = &mut self.settings {
+                s.thumbnail_formats_applied(result);
+            }
+        }
+        self.adopt_settings(commit.config);
         // Opting into octagon persistence captures the overlay options as they are *right now* —
         // the settings draft only carries the checkbox; the live overlay is the authority.
         if self.cfg.octagon.remember {
@@ -1396,6 +1410,31 @@ impl Viewer {
         if self.cfg.octagon.remember && self.capture_octagon() {
             self.cfg.save();
         }
+    }
+
+    /// Settings ▸ Thumbnails' "Clear thumbnail cache". Emptying Explorer's cache takes a moment, so
+    /// it runs on a thread of its own and answers with [`AppEvent::ThumbnailCacheCleared`].
+    #[cfg(windows)]
+    fn clear_thumbnail_cache(&mut self) {
+        let (proxy, window) = (self.proxy.clone(), self.id());
+        let spawned = std::thread::Builder::new()
+            .name("fire-thumbnail-cache".into())
+            .spawn(move || {
+                let result = fire_thumbs::cache::clear();
+                let _ = proxy.send_event(AppEvent::ThumbnailCacheCleared { window, result });
+            });
+        if let Err(e) = spawned {
+            self.thumbnail_cache_cleared(Err(e.to_string()));
+        }
+    }
+
+    /// The cache-clearing thread is done: say so under the button, if the window is still open.
+    #[cfg(windows)]
+    pub fn thumbnail_cache_cleared(&mut self, result: Result<(), String>) {
+        if let Some(s) = &mut self.settings {
+            s.thumbnail_cache_cleared(result);
+        }
+        self.redraw();
     }
 
     // --- dialogs --------------------------------------------------------------------------------
@@ -2188,8 +2227,12 @@ impl Viewer {
         }
 
         // The settings window. Apply *before* close, so OK (which does both) commits.
-        if let Some(cfg) = frame.settings_apply {
-            self.apply_settings(cfg);
+        if let Some(commit) = frame.settings_apply {
+            self.apply_settings(commit);
+        }
+        #[cfg(windows)]
+        if frame.settings_clear_thumbnail_cache {
+            self.clear_thumbnail_cache();
         }
         if frame.settings_close {
             self.settings = None;

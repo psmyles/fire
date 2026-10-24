@@ -70,6 +70,12 @@ pub enum AppEvent {
         dialog: Dialog,
         path: Option<PathBuf>,
     },
+    /// Settings ▸ Thumbnails' "Clear thumbnail cache" finished on its thread (Windows).
+    #[cfg(windows)]
+    ThumbnailCacheCleared {
+        window: WindowId,
+        result: Result<(), String>,
+    },
     /// A macOS menu-bar item that Fire performs itself (D16). It carries a [`KeyAction`] rather
     /// than a command of its own so the menu and the keyboard cannot drift apart: both end in
     /// `Viewer::perform_key_action`.
@@ -99,6 +105,10 @@ impl std::fmt::Debug for AppEvent {
                 Some(p) => write!(f, "DialogDone({window:?}, {dialog:?}, {})", p.display()),
                 None => write!(f, "DialogDone({window:?}, {dialog:?}, cancelled)"),
             },
+            #[cfg(windows)]
+            AppEvent::ThumbnailCacheCleared { window, result } => {
+                write!(f, "ThumbnailCacheCleared({window:?}, {result:?})")
+            }
             AppEvent::ThemeReloaded => write!(f, "ThemeReloaded"),
             #[cfg(target_os = "macos")]
             AppEvent::MenuCommand(a) => write!(f, "MenuCommand({})", a.name()),
@@ -333,6 +343,12 @@ impl Fire {
                 // apply the answer to.
                 if let Some(v) = self.viewers.get_mut(&window) {
                     v.dialog_done(dialog, path);
+                }
+            }
+            #[cfg(windows)]
+            AppEvent::ThumbnailCacheCleared { window, result } => {
+                if let Some(v) = self.viewers.get_mut(&window) {
+                    v.thumbnail_cache_cleared(result);
                 }
             }
             AppEvent::ThemeReloaded => {

@@ -4,6 +4,8 @@ members = [
     "crates/fire-ipc",
     "crates/fire",
     "crates/fire-decode",
+    "crates/fire-thumbs",
+    "crates/fire-shellext",
     "crates/psd-sdk-sys",
     "crates/heif-sys",
 ]
@@ -131,6 +133,9 @@ bcdec_rs = "0.2"
 # zlib inflate for ZIP-compressed PSD layer channels (`fire-decode`'s `psd_layers`). Already in
 # the build through `png`/`flate2`, so naming it adds no crate.
 miniz_oxide = "0.8"
+# Half floats, for `fire-thumbs` reading half-float sources (half EXR, BC6H DDS). Already in the
+# build through `exr`, so naming it adds no crate.
+half = "2"
 
 # --- config / fs ---
 serde = { version = "1", features = ["derive"] }
@@ -147,6 +152,9 @@ crossbeam-channel = "0.5"
 windows-sys = "0.60"
 # The typed `windows` crate for the COM-heavy D3D11 device / DXGI swapchain glue (render::d3d11).
 windows = "0.61"
+# Named only so `fire-shellext` can use `#[implement]`: the macro expands to `::windows_core` paths,
+# which resolve only when the crate is a direct dependency. The same version `windows` already pulls.
+windows-core = "0.61"
 
 # --- macOS platform leaves (the CAMetalLayer sokol_gfx draws through: render::metal) ---
 # Pinned to the versions winit 0.30 already pulls, so the mac build compiles no extra crates.
@@ -169,6 +177,7 @@ fire-ipc = { path = "crates/fire-ipc" }
 # member's own `default-features = false` (with only a warning) and the psd/heif gate silently
 # does nothing. `fire` turns both back on through its own default feature.
 fire-decode = { path = "crates/fire-decode", default-features = false }
+fire-thumbs = { path = "crates/fire-thumbs" }
 psd-sdk-sys = { path = "crates/psd-sdk-sys" }
 heif-sys = { path = "crates/heif-sys" }
 

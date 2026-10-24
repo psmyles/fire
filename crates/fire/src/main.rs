@@ -34,6 +34,8 @@ mod openfiles;
 mod platform;
 mod product;
 mod render;
+#[cfg(windows)]
+mod thumbnails;
 mod transport;
 mod ttfp;
 mod ui;
@@ -58,6 +60,13 @@ fn main() {
         "process start → main — {:.2} ms",
         ttfp::ms_since_start()
     ));
+
+    // The installer's thumbnail registration (`--set-thumbnails`, `--remove-thumbnails`): a
+    // maintenance command rather than a launch, done before the instance socket or a window exist.
+    #[cfg(windows)]
+    if let Some(code) = thumbnails::run_command(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
 
     // The file manager passes the double-clicked file as the first argument.
     let path: Option<PathBuf> = std::env::args_os().nth(1).map(PathBuf::from);

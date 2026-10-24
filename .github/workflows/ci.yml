@@ -76,7 +76,7 @@ jobs:
 
       # Everything except the two FFI decoders, so this needs no vendored input and no LLVM.
       - name: Clippy (no native decoders)
-        run: cargo clippy -p fire-ipc -p fire-decode -p fire --no-default-features --all-targets -- -D warnings
+        run: cargo clippy -p fire-ipc -p fire-decode -p fire-thumbs -p fire-shellext -p fire --no-default-features --all-targets -- -D warnings
 
       # `fire-ipc` is dependency-free and holds the instance-socket wire format — the one place
       # that parses bytes from outside the process. It must always be tested.
@@ -87,6 +87,12 @@ jobs:
       # extension-table drift test that keeps installer/fire.iss honest.
       - name: Test (fire-decode, no native decoders)
         run: cargo test -p fire-decode --no-default-features
+
+      # Explorer thumbnails: the CPU render, the settings table, and the two drift tests that hold
+      # installer/fire.iss's thumbnail tasks and class id to the crate. On Windows also the HKCU
+      # registration round trips, on throwaway extensions they clean up after.
+      - name: Test (fire-thumbs)
+        run: cargo test -p fire-thumbs
 
       # The shell's pure-logic modules: view math, config round-trip, keybinds, flipbook
       # detection, folder navigation, theme parsing, icon ordering.
@@ -161,7 +167,7 @@ jobs:
             echo "::notice::Populate them per crates/*/vendor/VENDOR.txt to enable this job."
           fi
 
-      # `--workspace` covers the five crates in `[workspace] members`. `vendor/sokol-rust` is a
+      # `--workspace` covers the seven crates in `[workspace] members`. `vendor/sokol-rust` is a
       # path dependency inside the workspace directory and so was a member by default; it is
       # excluded in the root manifest, because linting a pinned upstream tree to our standard
       # fails on upstream's style and there is nothing to fix on our side.
@@ -177,4 +183,4 @@ jobs:
       # Build only. Signing, notarization and the .dmg are the dev Mac's, not CI's (D11).
       - name: Build release binary
         if: steps.have_vendor.outputs.present == 'true'
-        run: cargo build -p fire --release
+        run: cargo build -p fire -p fire-shellext --release

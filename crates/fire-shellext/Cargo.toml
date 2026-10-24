@@ -1,0 +1,37 @@
+[package]
+name = "fire-shellext"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Builds `fire_shellext.dll`, the in-process COM server Explorer loads (into its COM surrogate) to
+# get Fire's thumbnails: an `IThumbnailProvider` over `fire-decode` and `fire-thumbs`. Windows only;
+# on macOS the crate is empty and builds to nothing anyone loads.
+[lib]
+crate-type = ["cdylib"]
+
+# Pass-throughs to `fire-decode`'s native decoders, on by default like `fire`'s — the shipped DLL
+# thumbnails PSD; `--no-default-features` is what CI builds without the vendored trees.
+[features]
+default = ["psd", "heif"]
+psd = ["fire-decode/psd"]
+heif = ["fire-decode/heif"]
+
+[dependencies]
+fire-decode.workspace = true
+fire-thumbs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",               # the DIB section a thumbnail is handed back in
+    "Win32_System_Com",                 # IClassFactory, IStream
+    "Win32_UI_Shell",                   # IThumbnailProvider
+    "Win32_UI_Shell_PropertiesSystem",  # IInitializeWithStream
+] }
+# `#[implement]` expands to `::windows_core` paths, so the crate must be named here.
+windows-core.workspace = true
+
+[lints]
+workspace = true

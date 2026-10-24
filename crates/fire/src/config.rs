@@ -381,6 +381,10 @@ pub struct Config {
     pub context_menu: ContextMenuCfg,
     /// The octagon overlay's persistence opt-in and (when opted in) its saved options.
     pub octagon: OctagonCfg,
+    /// How Explorer thumbnails are drawn (Windows). Read by `fire_shellext.dll` straight out of
+    /// this file — see [`fire_thumbs::settings`]. Which formats get them is registry state, not
+    /// config: Settings ▸ Thumbnails edits that separately.
+    pub thumbnails: fire_thumbs::ThumbnailsCfg,
     /// Keyboard bindings the user has changed from the defaults. See [`KeybindsCfg`].
     pub keybinds: KeybindsCfg,
     /// User-defined entries for the toolbar's "Open in…" menu — external apps and/or nested
@@ -410,6 +414,7 @@ impl Default for Config {
             flipbook: FlipbookCfg::default(),
             context_menu: ContextMenuCfg::default(),
             octagon: OctagonCfg::default(),
+            thumbnails: fire_thumbs::ThumbnailsCfg::default(),
             keybinds: KeybindsCfg::new(),
             open_with: Vec::new(),
         }
@@ -462,6 +467,7 @@ impl Config {
         );
         self.octagon.hide = clamp_finite(self.octagon.hide, 0.0, 0.0, 1.0);
         self.octagon.line_opacity = clamp_finite(self.octagon.line_opacity, 1.0, 0.0, 1.0);
+        self.thumbnails.sanitize();
     }
 
     /// Best-effort save to `config.toml`. Written to a sibling temp file and renamed over the
@@ -681,6 +687,12 @@ mod tests {
                 line_opacity: 0.5,
                 crop: 0.3,
                 hide: 0.75,
+            },
+            thumbnails: fire_thumbs::ThumbnailsCfg {
+                backdrop: fire_thumbs::Backdrop::Checker,
+                tonemap: fire_thumbs::Tonemap::Aces,
+                exposure: -1.25,
+                max_file_size_mb: 300,
             },
             keybinds: [
                 ("fit".to_string(), KeyValue::One("Ctrl+F".into())),

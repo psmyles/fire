@@ -32,9 +32,13 @@ OS plus a handful of small leaves.
 - A customizable context menu that covers basic operations and allows for user defined behavior
 - One process, as many windows as you like: a second launch hands its path to the running Fire
   (`open-in = "new-window"` gives it its own window, `"reuse-window"` swaps it into the focused one)
+- Windows: Explorer thumbnails for the formats Windows can't show (TGA, DDS — BC1 through BC7, PSD,
+  EXR, Radiance HDR, QOI, Netpbm, Farbfeld), drawn by the same decoders as the viewer, and optionally
+  for the formats it can. Chosen per format in the installer or Settings \ Thumbnails, along with
+  the transparency backdrop, the HDR tonemap and exposure, and a file-size limit
 
 See [docs/architecture.md](docs/architecture.md) for the full design; its appendices carry the
-decision record (D1-D25) and the measurements behind the two shells that were built and rejected
+decision record (D1-D28) and the measurements behind the two shells that were built and rejected
 before this one.
 
 ## Workspace
@@ -45,6 +49,9 @@ crates/
                  instance socket (the whole app; the file manager launches it directly)
   fire-decode/   uniform decode core: bytes → (pixels, format, bit depth, ICC)
   fire-ipc/      wire format for forwarding an open to the running instance, dependency-light
+  fire-thumbs/   Explorer thumbnails minus the COM: settings, format table, CPU render, and (Windows)
+                 the HKCU registration and the thumbnail-cache purge
+  fire-shellext/ fire_shellext.dll, the IThumbnailProvider Explorer loads (Windows)
   psd-sdk-sys/   FFI to vendored psd_sdk C++ (cc + bindgen)
   heif-sys/      FFI to vendored libheif + libde265 + dav1d for AVIF / HEIF / HEIC (cc + bindgen)
 vendor/

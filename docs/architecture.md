@@ -11,7 +11,7 @@ macOS). There is no resident background process and no separate launcher stub - 
 brought up on its own thread while the window is being created, so nothing needs to be kept warm.
 
 This shape is the result of a port from a Windows-only Win32 + Direct3D 11 shell. The decisions
-that produced it are recorded in [Appendix A](#appendix-a---the-decision-record) as **D1-D27**, and
+that produced it are recorded in [Appendix A](#appendix-a---the-decision-record) as **D1-D28**, and
 cited by number from the sections below wherever a choice needs its reasoning; the two shells that
 were built, measured and rejected on the way are in
 [Appendix B](#appendix-b---how-the-shell-was-chosen).
@@ -838,12 +838,49 @@ on with the window alive.
 
 ## 11. OS integration
 
-**Windows - association only** (no thumbnail handler): the installer registers a per-format `HKCU`
+**Windows - association**: the installer registers a per-format `HKCU`
 ProgID (`Fire.png`, `Fire.tga`, …) whose friendly type name is what Explorer shows in the Type
 column, an `OpenWithProgids` entry, the `.ext` default ProgID for formats the user ticked, and a
 Default-Programs `Capabilities` block so Fire appears in Settings → Default apps. Uninstall removes
 all of it. Windows protects the per-extension default with a hashed `UserChoice`, so the installer
 can claim types with no choice set but cannot silently override one the user has already assigned.
+
+**Windows - Explorer thumbnails** (D28): `fire_shellext.dll` is an in-process COM server with one
+class, an `IThumbnailProvider` + `IInitializeWithStream`. Explorer hands it the file as a stream;
+it decodes with `fire-decode` exactly as the viewer would (same sniffing, EXIF orientation, ICC)
+and draws with `fire-thumbs`'s CPU port of the shader pipeline (§5.1): an exact box filter in
+linear, premultiplied light, then exposure → tonemap for HDR, then the configured backdrop, then
+sRGB, handed back as a top-down 32-bit DIB with *straight* alpha. The alpha convention was measured,
+not assumed: Windows' own photo thumbnailer returns a 50%-transparent red PNG through the shell as
+`(0,0,255,128)`.
+
+- **Isolated.** `IInitializeWithStream` lets Explorer run the provider out of process, in its
+  thumbnail surrogate (`dllhost.exe /Processid:{AB8902B4-…}`), and the registration leaves process
+  isolation on: a file that crashes a decoder takes down a throwaway surrogate, never Explorer. What a
+  stream costs is the file name, which camera raws are partly routed by; `IStream::Stat` returns it.
+- **Independent of the default app.** Formats are switched one by one, in the installer and in
+  Settings ▸ Thumbnails, whichever app opens them. On out of the box: the formats Windows draws no
+  thumbnail for (TGA, PSD, EXR, Radiance HDR, QOI, Netpbm, Farbfeld) and DDS, whose Windows codec
+  stops at BC3. Off: everything Windows' photo thumbnailer already covers — replacing those is the
+  user's call.
+- **Where it registers.** The shell asks the file's ProgID first, then the extension key, then
+  `SystemFileAssociations` (where Windows' thumbnailer sits) — *measured*: with a provider on both a
+  ProgID and its extension, the ProgID's runs. So Fire writes `.ext\ShellEx\{IThumbnailProvider}`
+  for every extension of a format that is on, and shadows a fronting ProgID's own provider only
+  where one exists (stock Windows has two, `jpegfile` and `icofile`) and only when every extension
+  that ProgID fronts is on — a program's catch-all ProgID would otherwise route files Fire cannot
+  read to Fire. Everything goes in `HKCU`, so a machine-wide provider is shadowed rather than
+  overwritten; a per-user one Fire displaces is saved under `HKCU\Software\Fire\Thumbnails` and put
+  back when the format goes off or Fire is uninstalled.
+- **One implementation of the registry work.** `fire_thumbs::registry` does it; the installer drives
+  it through `fire.exe --set-thumbnails "<ids>"` after copying files and `--remove-thumbnails` on
+  uninstall, and the Settings tab calls it directly. On an upgrade the installer ticks what is on
+  *now*, so a choice made in Settings survives it.
+- **Settings in `config.toml`.** The `[thumbnails]` table (backdrop, tonemap, exposure, a file-size
+  limit) is part of `Config`; the DLL reads just that table on every thumbnail. Explorer keeps what
+  it has made, so a changed setting reaches new thumbnails only — Settings ▸ Thumbnails' "Clear
+  thumbnail cache" drives Disk Cleanup's own handler (`IEmptyVolumeCache` in `thumbcache.dll`) to
+  empty it, ~30 ms with Explorer running.
 
 **macOS - document types, volunteered not claimed.** The `.app`'s `Info.plist` declares one
 `CFBundleDocumentTypes` entry listing every extension, with **`LSHandlerRank = Alternate`**: Fire
@@ -857,8 +894,9 @@ dynamic ones for formats macOS has no UTI for, like `.qoi`, `.ff`, `.x3f`). `NSS
 is pointedly *not* declared: it would let the OS skip the `atexit` that removes the instance socket
 (§3).
 
-Decoders are factored into the standalone `fire-decode` crate, so an `IThumbnailProvider` (or a
-Quick Look extension) can be added later reusing that core with no rework.
+macOS gets no thumbnail provider: Finder's Quick Look already thumbnails nearly every format here.
+Should one ever be wanted, `fire-decode` and `fire-thumbs`'s render are all of it but the Quick
+Look extension itself.
 
 ---
 
@@ -873,6 +911,8 @@ fire/
 │  │  ├─ src/ui/      #   pure immediate-mode UI + the stylesheet (theme.toml)
 │  │  └─ simgui/      #   sokol_imgui.h + cimgui.h, compiled as C by build.rs
 │  ├─ fire-decode/    # uniform decode core (zune/image/exr/psd_sdk/libheif/lcms2)
+│  ├─ fire-thumbs/    # Explorer thumbnails minus COM: settings, formats, CPU render, HKCU, cache
+│  ├─ fire-shellext/  # fire_shellext.dll — the IThumbnailProvider Explorer loads (Windows)
 │  ├─ fire-ipc/       # the instance-socket wire format (shared, dependency-free)
 │  ├─ psd-sdk-sys/    # FFI bindings + cc build of psd_sdk
 │  └─ heif-sys/       # FFI bindings + link of libheif (AVIF/HEIF/HEIC), vendored per target
@@ -919,6 +959,7 @@ nothing *else* in `fire` should mention an OS, and this is what it points at.
 | Open-file events from the OS | `argv[1]` | `openfiles.rs`: `application:openURLs:` | both call `Viewer::open` |
 | Menu bar | none | `menubar.rs`: `muda`, App / File / Window | - |
 | File association | `HKCU` ProgID (installer) | `CFBundleDocumentTypes`, `LSHandlerRank = Alternate` | both from one extension table |
+| File-manager thumbnails | `fire_shellext.dll` (`IThumbnailProvider`), registered in `HKCU` | none needed — Quick Look | `fire-decode` + `fire-thumbs` |
 | Native decoder libs | vendored `.lib` | vendored arm64 `.a` | one `VENDOR.txt` recipe |
 | Icon / metadata | `winresource` | `Info.plist` + `.icns` | both from `product.json` |
 | Packaging | Inno Setup | `build-mac.sh` → signed, notarized `.dmg` | `product.json` |
@@ -944,8 +985,11 @@ accelerator leaves AppKit to pick. The red button still closes the window.
 
 ## 13. Build and distribution
 
-- `cargo build --release` produces a **single executable**. On Windows it links only system DLLs
-  (D3D11/DXGI and friends - no redistributable, no bundled runtime, and with the shader
+- `cargo build --release` produces a **single executable** — plus, on Windows, `fire_shellext.dll`,
+  the Explorer thumbnail provider (§11), which links the same decoders and nothing the exe does not.
+  While Explorer's thumbnail surrogate has it loaded the file is locked, so a rebuild fails until
+  that `dllhost.exe` exits (it does on its own after a few idle minutes). On Windows the exe links
+  only system DLLs (D3D11/DXGI and friends - no redistributable, no bundled runtime, and with the shader
   precompiled, not even `d3dcompiler`); on macOS it links the system frameworks the vendored sokol
   tree names for itself (`Cocoa` / `QuartzCore` / `Metal`). The C++ `psd_sdk` and the
   `libheif`/`libde265`/`dav1d` decoder stack are built/linked via the `cc`/`bindgen` build scripts
@@ -1003,13 +1047,13 @@ also carries a DDS cubemap's faces / an array's layers / a volume's slices; a **
 viewer** for textures that ship a chain; **PSD layer stepping** with background pre-decoding; the
 **octagon overlay**; folder ←/→ navigation; hot-reload of the displayed image; **DPI-aware,
 dark-mode-aware ImGui toolbar + status bar + settings window**; portable physical-key keybinds;
-open-in-editor and the clipboard actions; file association on both OSes; an unsigned Windows
-installer and a signed, notarized macOS `.dmg`.
+open-in-editor and the clipboard actions; file association on both OSes; **Explorer thumbnails**
+on Windows (§11); an unsigned Windows installer and a signed, notarized macOS `.dmg`.
 
 **In progress / deferred:** pixel inspector; a custom background-color *picker* (the settings ship
 the four preset backdrops; a custom color needs a shader/uniform change); compare/tabs mode
 (anticipated as extra image sub-rects and viewports within one window, not as child windows);
-Explorer `IThumbnailProvider` / Quick Look; **full raw development** (demosaic the sensor mosaic
+an Explorer preview-pane handler (`IPreviewHandler`); **full raw development** (demosaic the sensor mosaic
 instead of showing the embedded preview - a separate opt-in mode, kept off the fast path);
 hot-reload of `config.toml`; Windows code signing; an Intel/universal macOS build; tiled/virtual
 texturing for gigapixel sources; for PSD layers, a cumulative "stack up to here" view (it would
@@ -1111,6 +1155,7 @@ numbered holes rather than renumbered, so a `D18` in this document means what it
 | D25 | **The arm64 HEIF stack is built with vcpkg (`arm64-osx` static)** mirroring `VENDOR.txt`, and the vendored tree goes per-target — one directory per target holding both its `include/` and `lib/` | One vendoring story on both OSes, one dav1d port patch, and a self-contained `.app` with no dylib embedding or per-dylib signing | **Shipped.** Headers had to be split per target too (the two landed on different libheif versions), and the mac build needs a third port patch, `ENABLE_PLUGIN_LOADING=OFF` — without it dav1d becomes an unreachable dynamic plugin and *every* AVIF silently fails to decode |
 | D26 | **A PSD layer's texture covers only the layer's bounds; the shader offsets it on the canvas** (`layer_rect`, 128 → 144-byte uniform block) | Canvas-sized layer textures would make every step pay a full-canvas fill, mip build and upload — ~340 MB on an 8k RGBA8 document — however small the layer | **Shipped.** Decode, mips, upload and cache memory scale with the layer; `Placement` keeps the canvas as the geometry so the view never moves between layers (§5) |
 | D27 | **Two decode lanes: layers decoded ahead of the user get their own low-priority threads, single-threaded jobs, and a reaper for big frees** | One FIFO pool would let pre-decoding delay the next file's decode — the metric this project is built around | **Shipped.** The guarantee comes from the separate lane; the OS priority (QoS utility / below-normal) is best effort. Superseded layer jobs stop at their next checkpoint (§6) |
+| D28 | **Explorer thumbnails come from a separate DLL, `IInitializeWithStream`, process isolation left on, registered per extension in `HKCU`** — with the registry work in `fire.exe`, which both the installer and the Settings tab drive | A thumbnail provider must be an in-process COM server, so it cannot live in the exe; a stream initializer is what lets Explorer host it in a throwaway surrogate, which keeps D7's crash exposure away from Explorer; per-extension rather than per-ProgID registration makes thumbnails independent of which app opens the format | **Shipped** (§11). A second ~9 MB binary linking the same decoders; the surrogate locks it for a few minutes after use (rebuilds and upgrades meet that — the installer through Restart Manager). The measured lookup order (ProgID before extension) means a fronting ProgID with its own provider has to be shadowed too, which reaches into other programs' keys — per user, saved and restored |
 
 ---
 

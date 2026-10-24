@@ -8,14 +8,16 @@
       1. Reads product.json.
       2. Syncs the workspace version in Cargo.toml to match (so the crate version never drifts).
       3. Regenerates assets\fire.ico from assets\icon.png with ImageMagick (the one icon source).
-      4. Builds fire.exe in release (build.rs embeds the same product.json values into the exe).
+      4. Builds fire.exe and fire_shellext.dll (the Explorer thumbnail provider) in release
+         (build.rs embeds the same product.json values into the exe).
       5. Writes installer\product.generated.iss with #define directives for the Inno script.
       6. Compiles installer\fire.iss with ISCC, emitting the setup .exe into dist\.
 
     Bump the version (or any field) in product.json, re-run this script, and it flows everywhere.
 
 .PARAMETER SkipBuild
-    Skip the cargo release build (use an already-built target\release\fire.exe).
+    Skip the cargo release build (use the already-built target\release\fire.exe and
+    fire_shellext.dll).
 
 .PARAMETER SkipIcon
     Skip regenerating fire.ico from icon.png.
@@ -41,6 +43,7 @@ $IconIco      = Join-Path $RepoRoot 'assets\fire.ico'
 $IssScript    = Join-Path $RepoRoot 'installer\fire.iss'
 $GeneratedIss = Join-Path $RepoRoot 'installer\product.generated.iss'
 $ExePath      = Join-Path $RepoRoot 'target\release\fire.exe'
+$ShellExtPath = Join-Path $RepoRoot 'target\release\fire_shellext.dll'
 $DistDir      = Join-Path $RepoRoot 'dist'
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
@@ -88,13 +91,14 @@ if (-not $SkipIcon) {
 
 # --- 4. build the release exe ------------------------------------------------
 if (-not $SkipBuild) {
-    Write-Step "Building fire.exe (cargo build -p fire --release)"
-    & cargo build -p fire --release
+    Write-Step "Building fire.exe + fire_shellext.dll (cargo build -p fire -p fire-shellext --release)"
+    & cargo build -p fire -p fire-shellext --release
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
 } else {
     Write-Step "Skipping cargo build (-SkipBuild)"
 }
 if (-not (Test-Path $ExePath)) { throw "Built exe not found at $ExePath (did the build run?)" }
+if (-not (Test-Path $ShellExtPath)) { throw "Built thumbnail provider not found at $ShellExtPath (did the build run?)" }
 
 # --- 4b. verify the license notices are present ------------------------------
 # fire.iss installs these alongside the exe. A statically-linked fire.exe carries code from ~160
@@ -126,6 +130,7 @@ $lines = @(
     ("#define MyAppCopyright " + (ConvertTo-IssString $product.copyright)),
     ("#define MyAppExe "       + (ConvertTo-IssString 'fire.exe')),
     ("#define MyExeSource "    + (ConvertTo-IssString $ExePath)),
+    ("#define MyShellExtSource " + (ConvertTo-IssString $ShellExtPath)),
     ("#define MyIconSource "   + (ConvertTo-IssString $IconIco)),
     ("#define MyOutputDir "    + (ConvertTo-IssString $DistDir))
 )
