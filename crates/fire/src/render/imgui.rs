@@ -110,17 +110,20 @@ extern "C" {
     fn simgui_setup(desc: *const SimguiDesc);
     fn simgui_render();
     fn simgui_imtextureid(tex_view: sg::View) -> u64;
+    fn simgui_imtextureid_with_sampler(tex_view: sg::View, smp: sg::Sampler) -> u64;
 }
 
 /// Whether `simgui_setup` has run: its sokol_gfx resources are process-wide, created by the first
 /// window and shared by every later one.
 static SIMGUI_UP: AtomicBool = AtomicBool::new(false);
 
-/// A texture the UI draws from, owned here: the sokol image and the view its `TextureId` names.
-/// Both must outlive every frame that references the id, so they are only ever replaced wholesale.
+/// A texture the UI draws from, owned here: the sokol image, the view its `TextureId` names, and
+/// its own sampler when it doesn't use sokol_imgui's (nearest) default. All must outlive every
+/// frame that references the id, so they are only ever replaced wholesale.
 struct UiTexture {
     image: sg::Image,
     view: sg::View,
+    sampler: Option<sg::Sampler>,
 }
 
 impl UiTexture {
@@ -128,6 +131,9 @@ impl UiTexture {
         if sg::isvalid() {
             sg::destroy_view(self.view);
             sg::destroy_image(self.image);
+            if let Some(s) = self.sampler {
+                sg::destroy_sampler(s);
+            }
         }
     }
 }
@@ -461,7 +467,9 @@ impl Imgui {
         let scales = self.icon_scales();
         let (pixels, w) = icons::atlas(n, &scales);
         let old = self.icon.take();
-        let (texture, id) = register_texture(old, &pixels, w as u32, n as u32, c"icon atlas");
+        // Rastered at the exact drawn size, so the default nearest sampler is pixel-exact.
+        let (texture, id) =
+            register_texture(old, &[&pixels], w as u32, n as u32, false, c"icon atlas");
         self.icon = texture;
         self.icon_id = id;
         self.icon_built_px = px;
@@ -474,7 +482,14 @@ impl Imgui {
     pub fn logo(&mut self) -> TextureId {
         if !self.logo_built {
             self.logo_built = true;
-            let (texture, id) = register_texture(None, LOGO_RGBA, LOGO_EDGE, LOGO_EDGE, c"logo");
+            // Drawn at the stylesheet's edge × DPI, not at its raster size — so it is minified,
+            // and needs mips and a filtering sampler or its rim aliases.
+            let chain = mip_chain(LOGO_RGBA, LOGO_EDGE as usize);
+            let levels: Vec<&[u8]> = std::iter::once(LOGO_RGBA)
+                .chain(chain.iter().map(Vec::as_slice))
+                .collect();
+            let (texture, id) =
+                register_texture(None, &levels, LOGO_EDGE, LOGO_EDGE, true, c"logo");
             self.logo = texture;
             self.logo_id = id;
         }
@@ -621,15 +636,18 @@ fn simgui_setup_once(c: &mut Context) {
     }
 }
 
-/// Upload an RGBA8 texture and name it for ImGui (destroying `old` first). On failure the missing
-/// pieces come back `None` / zero id (logged) and the caller draws without the texture rather than
-/// the app failing. Straight sRGB bytes in a UNORM image: the UI pass writes through the UNORM
-/// swapchain view, so nothing is decoded on the way through.
+/// Upload an RGBA8 texture and name it for ImGui (destroying `old` first). `mips` is the chain
+/// from level 0 down; `smooth` gives it a trilinear sampler of its own instead of sokol_imgui's
+/// nearest default. On failure the missing pieces come back `None` / zero id (logged) and the
+/// caller draws without the texture rather than the app failing. Straight sRGB bytes in a UNORM
+/// image: the UI pass writes through the UNORM swapchain view, so nothing is decoded on the way
+/// through.
 fn register_texture(
     old: Option<UiTexture>,
-    pixels: &[u8],
+    mips: &[&[u8]],
     w: u32,
     h: u32,
+    smooth: bool,
     what: &std::ffi::CStr,
 ) -> (Option<UiTexture>, TextureId) {
     if let Some(old) = old {
@@ -639,17 +657,30 @@ fn register_texture(
     desc._type = sg::ImageType::Dim2;
     desc.width = w as i32;
     desc.height = h as i32;
-    desc.num_mipmaps = 1;
+    desc.num_mipmaps = mips.len() as i32;
     desc.pixel_format = sg::PixelFormat::Rgba8;
-    desc.data.mip_levels[0] = sg::slice_as_range(pixels);
+    for (level, pixels) in mips.iter().enumerate() {
+        desc.data.mip_levels[level] = sg::slice_as_range(pixels);
+    }
     desc.label = what.as_ptr();
     let image = sg::make_image(&desc);
     let mut vd = sg::ViewDesc::new();
     vd.texture.image = image;
     vd.label = what.as_ptr();
     let view = sg::make_view(&vd);
+    let sampler = smooth.then(|| {
+        let mut sd = sg::SamplerDesc::new();
+        sd.min_filter = sg::Filter::Linear;
+        sd.mag_filter = sg::Filter::Linear;
+        sd.mipmap_filter = sg::Filter::Linear;
+        sd.wrap_u = sg::Wrap::ClampToEdge;
+        sd.wrap_v = sg::Wrap::ClampToEdge;
+        sd.label = what.as_ptr();
+        sg::make_sampler(&sd)
+    });
     if sg::query_image_state(image) != sg::ResourceState::Valid
         || sg::query_view_state(view) != sg::ResourceState::Valid
+        || sampler.is_some_and(|s| sg::query_sampler_state(s) != sg::ResourceState::Valid)
     {
         eprintln!(
             "fire: {} could not be uploaded for the UI",
@@ -657,9 +688,61 @@ fn register_texture(
         );
         sg::destroy_view(view);
         sg::destroy_image(image);
+        if let Some(s) = sampler {
+            sg::destroy_sampler(s);
+        }
         return (None, TextureId::new(0));
     }
-    // SAFETY: a plain id computation over two valid handles.
-    let id = unsafe { simgui_imtextureid(view) };
-    (Some(UiTexture { image, view }), TextureId::new(id))
+    // SAFETY: a plain id computation over valid handles.
+    let id = unsafe {
+        match sampler {
+            Some(s) => simgui_imtextureid_with_sampler(view, s),
+            None => simgui_imtextureid(view),
+        }
+    };
+    (
+        Some(UiTexture {
+            image,
+            view,
+            sampler,
+        }),
+        TextureId::new(id),
+    )
+}
+
+/// The mip chain below a square straight-alpha RGBA8 level 0 of `edge` px, down to 1×1. Each
+/// texel is its 2×2 block averaged alpha-weighted (premultiplied), so clear texels don't wash the
+/// rim out; a block that is clear throughout keeps its plain average, which build.rs's bleed has
+/// made the neighbouring visible color.
+fn mip_chain(level0: &[u8], edge: usize) -> Vec<Vec<u8>> {
+    let mut chain: Vec<Vec<u8>> = Vec::new();
+    let mut src_edge = edge;
+    while src_edge > 1 {
+        let src = chain.last().map_or(level0, Vec::as_slice);
+        let dst_edge = src_edge / 2;
+        let mut dst = vec![0u8; dst_edge * dst_edge * 4];
+        for y in 0..dst_edge {
+            for x in 0..dst_edge {
+                let (mut rgb_a, mut rgb, mut a) = ([0u32; 3], [0u32; 3], 0u32);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let p = &src[((y * 2 + dy) * src_edge + x * 2 + dx) * 4..][..4];
+                    for c in 0..3 {
+                        rgb_a[c] += p[c] as u32 * p[3] as u32;
+                        rgb[c] += p[c] as u32;
+                    }
+                    a += p[3] as u32;
+                }
+                let d = &mut dst[(y * dst_edge + x) * 4..][..4];
+                for c in 0..3 {
+                    d[c] = (rgb_a[c] + a / 2)
+                        .checked_div(a)
+                        .unwrap_or((rgb[c] + 2) / 4) as u8;
+                }
+                d[3] = ((a + 2) / 4) as u8;
+            }
+        }
+        chain.push(dst);
+        src_edge = dst_edge;
+    }
+    chain
 }

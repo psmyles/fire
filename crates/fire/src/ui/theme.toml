@@ -276,7 +276,7 @@ frame_rounding     = 0.0
 popup_rounding     = 0.0
 grab_rounding      = 0.0
 scrollbar_rounding = 9.0
-tab_rounding       = 5.0
+tab_rounding       = 0.0
 # Thickness of the accent rule along the selected tab's top edge.
 tab_bar_overline   = 1.0
 window_border = 1.0

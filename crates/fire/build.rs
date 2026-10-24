@@ -126,9 +126,52 @@ fn decode_logo() {
         let c = px.demultiply();
         rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
     }
+    bleed(&mut rgba, LOGO_EDGE as usize);
     let out = Path::new(&out_dir).join("logo.rgba");
     std::fs::write(&out, &rgba)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", out.display()));
+}
+
+/// Fill every fully transparent texel's color from its visible neighbours, growing outward a ring
+/// per pass. The logo is drawn filtered and straight-alpha, so a clear texel's color is blended
+/// into the rim — left black (what demultiplying gives), it would draw a dark fringe on a light
+/// background. Alpha is untouched, so the window icon is unaffected.
+fn bleed(rgba: &mut [u8], edge: usize) {
+    let mut known: Vec<bool> = rgba.as_chunks::<4>().0.iter().map(|p| p[3] != 0).collect();
+    loop {
+        let mut next = known.clone();
+        for y in 0..edge {
+            for x in 0..edge {
+                let i = y * edge + x;
+                if known[i] {
+                    continue;
+                }
+                let (mut sum, mut n) = ([0u32; 3], 0);
+                for ny in y.saturating_sub(1)..(y + 2).min(edge) {
+                    for nx in x.saturating_sub(1)..(x + 2).min(edge) {
+                        let j = ny * edge + nx;
+                        if known[j] {
+                            for c in 0..3 {
+                                sum[c] += rgba[j * 4 + c] as u32;
+                            }
+                            n += 1;
+                        }
+                    }
+                }
+                if n == 0 {
+                    continue;
+                }
+                for c in 0..3 {
+                    rgba[i * 4 + c] = (sum[c] / n) as u8;
+                }
+                next[i] = true;
+            }
+        }
+        if next == known {
+            break;
+        }
+        known = next;
+    }
 }
 
 /// Master rasterization size (px) for each toolbar icon. The icon module embeds these square A8
