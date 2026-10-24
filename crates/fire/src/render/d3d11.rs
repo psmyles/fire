@@ -24,10 +24,13 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
-    D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
+    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_IMMUTABLE,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R8G8B8A8_TYPELESS,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIAdapter, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
@@ -36,6 +39,8 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
+
+use crate::render::mips::Convert;
 
 /// What every window's backbuffer is created as, and what sokol_gfx is told to expect of a
 /// swapchain pass, so the viewport and ImGui pipelines match it. Plain `RGBA8`: flip-model chains
@@ -115,6 +120,154 @@ impl Device {
             device_context: self.raw_context(),
         };
     }
+
+    /// A handle for building image textures on other threads.
+    pub fn uploader(&self) -> Uploader {
+        Uploader {
+            device: self.device.clone(),
+        }
+    }
+}
+
+/// Builds image textures off the main thread — on the decode worker that decoded the image, so a
+/// large upload never stalls the window.
+///
+/// Only the device is touched, which is free-threaded (it is created without
+/// `D3D11_CREATE_DEVICE_SINGLETHREADED`); never the immediate context, and never sokol_gfx. The
+/// finished texture is handed to sokol_gfx on the main thread ([`make_image`]).
+#[derive(Clone)]
+pub struct Uploader {
+    device: ID3D11Device,
+}
+
+// SAFETY: a D3D11 device is free-threaded by specification; see `Device`.
+unsafe impl Send for Uploader {}
+unsafe impl Sync for Uploader {}
+
+/// An image texture built by an [`Uploader`], owned until [`make_image`] hands it to sokol_gfx —
+/// or until it is dropped, which frees it (a decode that was superseded on its way to the window).
+pub struct NativeTexture(ID3D11Texture2D);
+
+// SAFETY: D3D11 resources are free-threaded objects; nothing uses this one until it reaches the
+// main thread.
+unsafe impl Send for NativeTexture {}
+
+/// sokol_gfx's pixel formats that image textures use, as the texture formats sokol_gfx itself
+/// creates them with (`_sg_d3d11_texture_pixel_format`). sRGB8 is created *typeless*: sokol's
+/// shader view names the sRGB format, and a view may only rename a typeless texture's format.
+fn texture_format(format: sg::PixelFormat) -> Option<DXGI_FORMAT> {
+    Some(match format {
+        sg::PixelFormat::Srgb8a8 => DXGI_FORMAT_R8G8B8A8_TYPELESS,
+        sg::PixelFormat::Rgba16 => DXGI_FORMAT_R16G16B16A16_UNORM,
+        sg::PixelFormat::Rgba16f => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        sg::PixelFormat::Rgba32f => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        _ => return None,
+    })
+}
+
+impl Uploader {
+    /// Build a `width`×`height` texture of `format` with a full mip chain: level 0 from `level0`
+    /// and the rest from `chain`, run here. `bpp` is bytes per texel *as uploaded*; `convert`, if
+    /// any, turns source bytes into that format.
+    ///
+    /// The Metal twin overlaps level 0's copy with the chain's build. D3D11 cannot: the texture is
+    /// immutable, as sokol_gfx's own are, so every level goes in at creation and the chain is
+    /// built first. Whatever `chain` returned comes back alongside, so a caller whose texture
+    /// failed can still upload the old way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload<R: Send>(
+        &self,
+        width: u32,
+        height: u32,
+        format: sg::PixelFormat,
+        bpp: usize,
+        level0: &[u8],
+        convert: Option<Convert>,
+        chain: impl FnOnce() -> (Vec<Vec<u8>>, R) + Send,
+    ) -> (Result<NativeTexture, String>, Vec<Vec<u8>>, R) {
+        let (built, r) = chain();
+        let tex = self.create(width, height, format, bpp, level0, &built, convert);
+        (tex, built, r)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        &self,
+        width: u32,
+        height: u32,
+        format: sg::PixelFormat,
+        bpp: usize,
+        level0: &[u8],
+        chain: &[Vec<u8>],
+        convert: Option<Convert>,
+    ) -> Result<NativeTexture, String> {
+        let fmt = texture_format(format).ok_or_else(|| format!("no DXGI format for {format:?}"))?;
+        let levels = crate::render::mips::level_count(width, height);
+        if chain.len() + 1 != levels as usize {
+            return Err("the mip chain is incomplete".into());
+        }
+        let converted: Vec<Vec<u8>> = match convert {
+            Some(f) => std::iter::once(level0)
+                .chain(chain.iter().map(Vec::as_slice))
+                .map(f)
+                .collect(),
+            None => Vec::new(),
+        };
+        let data: Vec<&[u8]> = if convert.is_some() {
+            converted.iter().map(Vec::as_slice).collect()
+        } else {
+            std::iter::once(level0)
+                .chain(chain.iter().map(Vec::as_slice))
+                .collect()
+        };
+        let init: Vec<D3D11_SUBRESOURCE_DATA> = data
+            .iter()
+            .enumerate()
+            .map(|(level, bytes)| D3D11_SUBRESOURCE_DATA {
+                pSysMem: bytes.as_ptr().cast(),
+                SysMemPitch: ((width >> level).max(1) as usize * bpp) as u32,
+                SysMemSlicePitch: 0,
+            })
+            .collect();
+        // The description sokol_gfx gives an immutable image of its own (`_sg_d3d11_create_image`).
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: levels,
+            ArraySize: 1,
+            Format: fmt,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex: Option<ID3D11Texture2D> = None;
+        // SAFETY: `desc` and `init` (one entry per level, each pointing into a level that outlives
+        // the call) are live locals; D3D11 copies the initial data before returning.
+        let r = unsafe {
+            self.device
+                .CreateTexture2D(&desc, Some(init.as_ptr()), Some(&mut tex))
+        };
+        match (r, tex) {
+            (Ok(()), Some(t)) => Ok(NativeTexture(t)),
+            (Err(e), _) => Err(format!(
+                "the GPU refused a {width}×{height} {format:?} texture with {levels} mip levels: {e}"
+            )),
+            (Ok(()), None) => Err("CreateTexture2D returned no texture".into()),
+        }
+    }
+}
+
+/// Hand `tex` to sokol_gfx as the image `desc` describes (its size, format and mip count must be
+/// the texture's). sokol_gfx AddRefs an injected texture (`_sg_d3d11_create_image`), so ours is
+/// released here and the image owns the texture from now on.
+pub fn make_image(tex: NativeTexture, desc: &mut sg::ImageDesc) -> sg::Image {
+    desc.d3d11_texture = tex.0.as_raw().cast_const();
+    sg::make_image(desc)
 }
 
 /// One window's flip-model swapchain and the render-target view of its current backbuffer.

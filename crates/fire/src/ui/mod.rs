@@ -239,6 +239,11 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
     } = inp;
     let (w, h) = client;
 
+    // The fade to black between files: over the image, under every window.
+    if snap.fade > 0.0 {
+        fade(ui, image, snap.fade);
+    }
+
     // Full-screen hides the chrome entirely — the image owns the monitor.
     if !fullscreen {
         toolbar(ui, tex, snap, m, icon_px, w, &mut out);
@@ -264,6 +269,18 @@ pub fn build(ui: &Ui, tex: TextureId, inp: Inputs<'_>) -> Frame {
     // the shell still sees the double-click that opens the file picker.
     if !snap.has_image && !snap.loading {
         empty_hint(ui, m, image, logo);
+    }
+
+    // The loading card, once a load has run long enough to deserve one. Not chrome — it is about
+    // the image — so full-screen shows it too.
+    if let Some(p) = snap.loading_progress {
+        // It sits on black once a fade has run, and on the bare backdrop for a first load.
+        let under = if snap.fade > 0.0 {
+            [0.0, 0.0, 0.0, 1.0]
+        } else {
+            theme::view_clear(dark)
+        };
+        loading_card(ui, m, image, p, on_accent(under));
     }
 
     // The popups last, and outside any window — which is where ImGui expects them to live.
@@ -1062,6 +1079,59 @@ fn empty_hint(ui: &Ui, m: &Metrics, image: (f32, f32, f32, f32), logo: TextureId
                 line(HINT1, cy, false);
                 line(HINT2, cy + step, true);
             }
+        });
+}
+
+/// Black over the image region at `alpha`, on the background draw list: over the image (its pass
+/// ran first) but under every ImGui window.
+fn fade(ui: &Ui, image: (f32, f32, f32, f32), alpha: f32) {
+    let (x, y, w, h) = image;
+    ui.get_background_draw_list()
+        .add_rect([x, y], [x + w, y + h], [0.0, 0.0, 0.0, alpha])
+        .filled(true)
+        .build();
+}
+
+/// The loading card: "Loading" over a progress bar, centered on the image region. No backdrop of
+/// its own — it sits straight on the region, so its label is drawn in `text`, a color picked to
+/// read on what is underneath. Takes no mouse input, like the empty hint.
+fn loading_card(ui: &Ui, m: &Metrics, image: (f32, f32, f32, f32), progress: f32, text: [f32; 4]) {
+    const LABEL: &str = "Loading";
+    let (x, y, w, h) = image;
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let [bar_w, bar_h] = m.loading_bar;
+    let style = ui.clone_style();
+    let accent = style.color(StyleColor::ButtonActive);
+    // ImGui's live font size is `FontSizeBase × FontScaleMain × FontScaleDpi`, and
+    // `push_font_with_size` sets the base — so the logical size goes in with the main scale divided
+    // back out, and the DPI applies on top as it does to every other glyph (see `checkbox`).
+    let font_base = m.loading_font / style.font_scale_main().max(0.01);
+
+    let _bg = ui.push_style_color(StyleColor::WindowBg, [0.0, 0.0, 0.0, 0.0]);
+    let _border = ui.push_style_color(StyleColor::Border, [0.0, 0.0, 0.0, 0.0]);
+    render::imgui::anchor_next_window((x + w * 0.5, y + h * 0.5), (0.5, 0.5));
+    ui.window("##loading")
+        .flags(OVERLAY | WindowFlags::ALWAYS_AUTO_RESIZE)
+        .build(|| {
+            let [cx, cy] = ui.cursor_pos();
+            let label_h = {
+                let _font = ui.push_font_with_size(None, font_base);
+                let lw = text_w(ui, LABEL);
+                ui.set_cursor_pos([cx + ((bar_w - lw) * 0.5).max(0.0).round(), cy]);
+                ui.text_colored(text, LABEL);
+                ui.text_line_height()
+            };
+            // Placed by hand rather than left to the item spacing, so the stylesheet's gap is the
+            // gap.
+            ui.set_cursor_pos([cx, (cy + label_h + m.loading_gap).round()]);
+            let _fill = ui.push_style_color(StyleColor::PlotHistogram, accent);
+            // An empty overlay, not none: none draws a "42%" that a bar this thin cannot hold.
+            ui.progress_bar(progress)
+                .size([bar_w, bar_h])
+                .overlay_text("")
+                .build();
         });
 }
 

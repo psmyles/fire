@@ -148,6 +148,9 @@ pub struct Chrome {
     exposure_slider_w: f32,
     empty_hint_line_gap: f32,
     empty_logo_size: f32,
+    loading_font_size: f32,
+    loading_gap: f32,
+    loading_bar_size: [f32; 2],
     geom: Geom,
     pub controls: ChromeControls,
     colors: ChromeColors,
@@ -453,6 +456,12 @@ pub struct Metrics {
     pub empty_hint_line_gap: f32,
     /// Edge of the empty-window card's logo.
     pub empty_logo: f32,
+    /// The loading card's label font size, in **logical** px (ImGui applies the DPI to glyphs).
+    pub loading_font: f32,
+    /// Gap between the loading card's label and its progress bar.
+    pub loading_gap: f32,
+    /// Width and height of the loading card's progress bar.
+    pub loading_bar: [f32; 2],
 }
 
 impl Metrics {
@@ -476,6 +485,9 @@ impl Metrics {
             exposure_slider_w: s(c.exposure_slider_w),
             empty_hint_line_gap: c.empty_hint_line_gap,
             empty_logo: s(c.empty_logo_size),
+            loading_font: c.loading_font_size,
+            loading_gap: s(c.loading_gap),
+            loading_bar: [s(c.loading_bar_size[0]), s(c.loading_bar_size[1]).max(1.0)],
         }
     }
 }
@@ -678,10 +690,15 @@ pub fn chrome_bg(dark: bool) -> [f32; 4] {
 
 /// The viewport backdrop (letterbox / no image), as the `0x00RRGGBB` the GPU surface's clear wants.
 pub fn view_clear_packed(dark: bool) -> u32 {
-    let t = current();
-    let c = t.cx(dark).c(&t.chrome.colors.view_clear);
+    let c = view_clear(dark);
     let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
     (q(c[0]) << 16) | (q(c[1]) << 8) | q(c[2])
+}
+
+/// The image region's backdrop with no image up, as RGBA.
+pub fn view_clear(dark: bool) -> [f32; 4] {
+    let t = current();
+    t.cx(dark).c(&t.chrome.colors.view_clear)
 }
 
 /// Black or white, whichever stays readable **on** `c` — the tint for an icon sitting on an

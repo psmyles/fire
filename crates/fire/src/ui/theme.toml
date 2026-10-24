@@ -170,6 +170,11 @@ empty_hint_line_gap = 1.5
 # Logical edge of the logo on the empty-window card (drawn from an embedded 256 px raster,
 # so it stays crisp up to 200 % DPI).
 empty_logo_size = 128.0
+# The loading card: the "Loading" label's font size, the gap between it and the progress bar,
+# and the bar's [width, height]. The bar's fill is the accent; the track is frame_bg.
+loading_font_size = 20.0
+loading_gap = 12.0
+loading_bar_size = [240.0, 8.0]
 
 [chrome.geom]
 # Padding *inside* a toolbar button — so a button is icon_size + 2×frame_padding on each axis.

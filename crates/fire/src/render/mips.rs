@@ -5,7 +5,8 @@
 //! as a texture in the pass that renders into it. So the chain is what sokol's documentation says
 //! it should be — supplied by the application, every level as data, on the immutable image. It is
 //! built here, on the decode worker, right after the decode and before the image is posted, so the
-//! UI thread never pays for it and the upload is one `sg_make_image`.
+//! UI thread never pays for it — and while level 0 is being copied to the GPU, where the backend
+//! allows (see [`crate::render::gpu::Uploader`]).
 //!
 //! Each level is a 2×2 box filter of the level above (what a hardware `GenerateMips` does), with
 //! the 8-bit sRGB source averaged in *linear* light — also what the hardware does for an `*_SRGB`
@@ -391,6 +392,10 @@ pub fn u16_to_f16(bytes: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+/// A conversion of a level's bytes into the format it is uploaded as ([`u16_to_f16`],
+/// [`f32_to_f16`]), for a device that lacks the source's own.
+pub type Convert = fn(&[u8]) -> Vec<u8>;
 
 /// Narrow float32 samples to float16.
 pub fn f32_to_f16(bytes: &[u8]) -> Vec<u8> {

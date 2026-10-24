@@ -634,6 +634,20 @@ pub fn decode(
     ext_hint: Option<&str>,
     opts: &DecodeOptions,
 ) -> Result<DecodedImage, DecodeError> {
+    decode_with_progress(bytes, ext_hint, opts, &|_| {})
+}
+
+/// [`decode`], reporting how far the backend has got: `progress` is called on the decoding thread
+/// with a fraction in `0.0..=1.0` that only ever rises. Only the backends that can say — OpenEXR
+/// (per chunk) and Radiance HDR (per scanline read) — call it at all; for every other format the
+/// decode is one opaque step and `progress` is never called. The passes after the backend
+/// (orientation, ICC, downscale) are not counted.
+pub fn decode_with_progress(
+    bytes: &[u8],
+    ext_hint: Option<&str>,
+    opts: &DecodeOptions,
+    progress: &dyn Fn(f32),
+) -> Result<DecodedImage, DecodeError> {
     let backend = sniff(bytes, ext_hint);
     // Camera raw resolves its own orientation while walking the container for the preview
     // (`decode_raw`), and the preview it hands back is already upright — reading the file's TIFF
@@ -642,7 +656,7 @@ pub fn decode(
 
     let mut img = match backend {
         Backend::Psd => decode_psd(bytes)?,
-        Backend::Exr => decode_exr(bytes)?,
+        Backend::Exr => decode_exr(bytes, progress)?,
         Backend::Heif(label) => decode_heif(bytes, label)?,
         Backend::Raw(label) => decode_raw(bytes, label)?,
         Backend::Gif => decode_gif(bytes)?,
@@ -655,7 +669,7 @@ pub fn decode(
                 None => decode_image(&patched, ext_hint)?,
             }
         }
-        Backend::Hdr => decode_hdr(bytes)?,
+        Backend::Hdr => decode_hdr(bytes, progress)?,
         Backend::Dds => dds::decode(bytes)?,
         Backend::Cur => decode_cur(bytes)?,
         // Sniffed from its header, so it needs no extension hint to name itself.
@@ -840,7 +854,7 @@ fn decode_psd(_bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
 /// on that 16K HDRI that was ~1.2 s of a ~1.5 s open. `None` sends the file there anyway: a first
 /// layer without plain `R`, `G`, `B` channels (the names it requires), a subsampled channel, or
 /// anything this reader fails on.
-fn decode_exr_planes(bytes: &[u8]) -> Option<DecodedImage> {
+fn decode_exr_planes(bytes: &[u8], progress: &dyn Fn(f32)) -> Option<DecodedImage> {
     use exr::prelude::*;
 
     let image = read()
@@ -849,6 +863,7 @@ fn decode_exr_planes(bytes: &[u8]) -> Option<DecodedImage> {
         .all_channels()
         .first_valid_layer()
         .all_attributes()
+        .on_progress(|p| progress(p as f32))
         .from_buffered(Cursor::new(bytes))
         .ok()?;
     let layer = &image.layer_data;
@@ -928,7 +943,7 @@ fn decode_exr_planes(bytes: &[u8]) -> Option<DecodedImage> {
 /// cannot fail: it allocates 16 bytes per declared pixel and hands the buffer back by value, so a
 /// crafted header would abort the process there ([`check_dims`]) with nothing able to intercept
 /// it. Reading the metadata separately is the only place a dimension check *can* refuse.
-fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+fn decode_exr(bytes: &[u8], progress: &dyn Fn(f32)) -> Result<DecodedImage, DecodeError> {
     use exr::prelude::*;
 
     struct Buf {
@@ -947,7 +962,7 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         check_dims(size.width(), size.height(), 16, "OpenEXR")?;
     }
 
-    if let Some(img) = decode_exr_planes(bytes) {
+    if let Some(img) = decode_exr_planes(bytes, progress) {
         return Ok(img);
     }
 
@@ -971,6 +986,7 @@ fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         )
         .first_valid_layer()
         .all_attributes()
+        .on_progress(|p| progress(p as f32))
         .from_buffered(Cursor::new(bytes))
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
 
@@ -1077,10 +1093,13 @@ fn decode_raw(bytes: &[u8], label: &'static str) -> Result<DecodedImage, DecodeE
 /// Non-strict mode accepts the `#?RGBE` signature variant and old signature-less `.pic`
 /// files that the strict `#?RADIANCE` check would reject. Radiance carries no ICC profile;
 /// the data is linear RGB, so the HDR exposure/tonemap path applies downstream.
-fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+fn decode_hdr(bytes: &[u8], progress: &dyn Fn(f32)) -> Result<DecodedImage, DecodeError> {
     use image::ImageDecoder;
 
-    let decoder = image::codecs::hdr::HdrDecoder::with_strictness(Cursor::new(bytes), false)
+    // RGBE is read front to back, scanline by scanline, so how far into the file the decoder has
+    // read is how far through the image it is.
+    let reader = ProgressReader::new(bytes, progress);
+    let decoder = image::codecs::hdr::HdrDecoder::with_strictness(reader, false)
         .map_err(|e| DecodeError::Malformed(e.to_string()))?;
     // Constructed directly (not via `ImageReader`), so the reader's default memory limits don't
     // apply — the header guard is ours to make, exactly as in `decode_png`. `into_rgba32f_bytes` below
@@ -1109,6 +1128,64 @@ fn decode_hdr(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         layout: None,
         animation: None,
     })
+}
+
+/// An in-memory reader that reports the fraction of `bytes` read so far, for a backend that
+/// consumes its input front to back.
+///
+/// The RGBE reader asks for a byte at a time, ~200M times for a 16k panorama, so anything added to
+/// a read is paid that often — a wrapper that so much as compared a position per read measured
+/// 5–8% slower than the bare `Cursor`. Here a read is served by the standard `&[u8]` reader over a
+/// *window* that ends where the next report is due, so the hot path is exactly the slice reader;
+/// only running off the window's end (every 1/256th of the input) reports and moves it on.
+struct ProgressReader<'a> {
+    bytes: &'a [u8],
+    /// The unread rest of the current window.
+    window: &'a [u8],
+    /// Where `window` ends in `bytes`.
+    end: usize,
+    progress: &'a dyn Fn(f32),
+}
+
+impl<'a> ProgressReader<'a> {
+    fn new(bytes: &'a [u8], progress: &'a dyn Fn(f32)) -> Self {
+        Self {
+            bytes,
+            window: &[],
+            end: 0,
+            progress,
+        }
+    }
+
+    /// Report the position, and open a window from it that holds at least `want` bytes (as far as
+    /// the input goes) and reaches the next report.
+    #[cold]
+    #[inline(never)]
+    fn next_window(&mut self, want: usize) {
+        let len = self.bytes.len();
+        let pos = self.end - self.window.len();
+        (self.progress)(pos as f32 / len.max(1) as f32);
+        self.end = (pos + want.max(len / 256).max(1)).min(len);
+        self.window = &self.bytes[pos..self.end];
+    }
+}
+
+impl std::io::Read for ProgressReader<'_> {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.window.is_empty() {
+            self.next_window(buf.len());
+        }
+        self.window.read(buf)
+    }
+
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        if buf.len() > self.window.len() {
+            self.next_window(buf.len());
+        }
+        self.window.read_exact(buf)
+    }
 }
 
 /// `DynamicImage::into_rgba8`, as a raw buffer — minus the `image` crate's slow paths.

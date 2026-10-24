@@ -27,8 +27,11 @@
 //! method touches it, and its math already lives in [`crate::render::view`].
 //!
 //! The mip chain is the app's to supply (sokol_gfx has no `GenerateMips` and its rules rule out
-//! building one in place); [`crate::render::mips`] builds it on the decode worker and the adopt
-//! uploads every level in one `sg_make_image`.
+//! building one in place); [`crate::render::mips`] builds it on the decode worker. The texture is
+//! built there too, on the backend's device directly ([`Uploader`]), and handed to sokol_gfx
+//! ready-made, so adopting even a 16k float image moves no pixels on the main thread. Only when
+//! that is unavailable (a decode that finished before the GPU was up) does the adopt upload every
+//! level itself, in one `sg_make_image`.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -38,7 +41,7 @@ use fire_decode::{AnimationFrame, DecodedImage, PixelFormat};
 use sokol::gfx as sg;
 use winit::window::Window;
 
-use crate::render::mips;
+use crate::render::mips::{self, Convert};
 use crate::render::view::{
     Background, Channel, DisplayState, Tonemap, ViewState, Viewport, ZoomDetent,
 };
@@ -275,6 +278,15 @@ impl Gpu {
         Self::pipeline_state(device)
     }
 
+    /// A handle for building image textures on the decode workers.
+    pub fn uploader(&self) -> Uploader {
+        Uploader {
+            native: self.device.uploader(),
+            float32_filterable: self.float32_filterable,
+            norm16: self.norm16,
+        }
+    }
+
     /// A flip-model swapchain on `window`'s client, for a [`GpuSurface`].
     fn create_swapchain(
         &self,
@@ -417,9 +429,6 @@ fn make_shader() -> Result<sg::Shader, String> {
     }
     Ok(shader)
 }
-
-/// A pixel conversion applied to every level when the device lacks the source format.
-type Convert = fn(&[u8]) -> Vec<u8>;
 
 /// The flipbook cells one frame samples: the sheet size (texels), the two cell origins to blend
 /// between, the blend factor, and the mip-LOD clamp that stops a minified sample bleeding across
@@ -975,13 +984,14 @@ impl GpuSurface {
         &mut self,
         img: Arc<DecodedImage>,
         mips: &[Vec<u8>],
+        prepared: Option<Prepared>,
         authored_mips: u32,
     ) -> Result<(), String> {
         let (w, h) = (img.width, img.height);
         // Upload first: if the GPU rejects the texture we bail here, before mutating any state,
         // so a failed adopt can't leave the surface half-updated. Level 0: a new file always
         // opens at full size, whatever mip the last one was left on.
-        self.upload_texture(&img, mips, 0)?;
+        self.upload_texture(&img, mips, prepared, 0)?;
         self.clear_stage();
         self.tex.placement = None;
         self.tex.authored_mips = authored_mips;
@@ -1029,11 +1039,13 @@ impl GpuSurface {
         &mut self,
         img: Arc<DecodedImage>,
         mips: &[Vec<u8>],
+        prepared: Option<Prepared>,
         authored_mips: u32,
     ) -> Result<(), String> {
         // The viewed mip level is part of the view being kept, clamped in case the re-exported
         // file came back with a shorter chain — or with none of its own at all.
-        self.upload_texture(&img, mips, self.display.mip_level.min(authored_mips))?;
+        let level = self.display.mip_level.min(authored_mips);
+        self.upload_texture(&img, mips, prepared, level)?;
         self.clear_stage();
         self.tex.placement = None;
         self.tex.authored_mips = authored_mips;
@@ -1243,22 +1255,27 @@ impl GpuSurface {
         self.anim.delay_ms()
     }
 
-    /// Upload `img`'s (frame-0) pixels as a texture with its full mip chain. Returns the GPU
-    /// error rather than panicking if creation fails — this runs synchronously on the UI thread.
+    /// Install `img`'s texture: the one a decode worker already built (`prepared`), or else its
+    /// (frame-0) pixels uploaded here with their full mip chain. Returns the GPU error rather than
+    /// panicking if creation fails — this runs synchronously on the UI thread.
     fn upload_texture(
         &mut self,
         img: &DecodedImage,
         mips: &[Vec<u8>],
+        prepared: Option<Prepared>,
         level: u32,
     ) -> Result<(), String> {
-        let (image, levels, linear_sample) = create_image_texture(
-            &self.gpu,
-            &img.pixels,
-            img.width,
-            img.height,
-            img.format,
-            Some(mips),
-        )?;
+        let (image, levels, linear_sample) = match prepared {
+            Some(p) => adopt_prepared(p)?,
+            None => create_image_texture(
+                &self.gpu,
+                &img.pixels,
+                img.width,
+                img.height,
+                img.format,
+                Some(mips),
+            )?,
+        };
         self.adopt_texture(image, levels, linear_sample, level)
     }
 
@@ -1826,6 +1843,129 @@ fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
+/// How a source format is uploaded on a device with these capabilities: the texture's format, the
+/// shader's decode flag (1 if the sample is already linear — 8-bit sRGB / float — 0 if the shader
+/// must sRGB-decode 16-bit unorm), and a conversion for the pixels when the device lacks the
+/// feature the source format needs.
+fn device_format(
+    format: PixelFormat,
+    float32_filterable: bool,
+    norm16: bool,
+) -> (sg::PixelFormat, i32, Option<Convert>) {
+    match format {
+        // 8-bit sources are sRGB-encoded; the sRGB format decodes to linear on sample.
+        PixelFormat::Rgba8Unorm => (sg::PixelFormat::Srgb8a8, 1, None),
+        // 16-bit unorm is treated as sRGB-encoded (matches the CPU path) → decode in shader.
+        // Without a 16-bit-norm format it rides as float16 of the same 0..1 values.
+        PixelFormat::Rgba16Unorm if norm16 => (sg::PixelFormat::Rgba16, 0, None),
+        PixelFormat::Rgba16Unorm => (sg::PixelFormat::Rgba16f, 0, Some(mips::u16_to_f16)),
+        // Float sources are already linear.
+        PixelFormat::Rgba16Float => (sg::PixelFormat::Rgba16f, 1, None),
+        PixelFormat::Rgba32Float if float32_filterable => (sg::PixelFormat::Rgba32f, 1, None),
+        // No float32 filtering on this device: float16 keeps the pipeline (and the mips)
+        // filtered, at the cost of range above 65504.
+        PixelFormat::Rgba32Float => (sg::PixelFormat::Rgba16f, 1, Some(mips::f32_to_f16)),
+    }
+}
+
+/// Bytes per texel of the formats [`device_format`] uploads as.
+fn device_bpp(format: sg::PixelFormat) -> usize {
+    match format {
+        sg::PixelFormat::Rgba32f => 16,
+        sg::PixelFormat::Rgba16 | sg::PixelFormat::Rgba16f => 8,
+        _ => 4,
+    }
+}
+
+/// Builds an image's texture off the main thread, ready for the surface to adopt with no upload of
+/// its own ([`GpuSurface::set_image`]). Made from the [`Gpu`] once it is up and handed to the decode
+/// workers: the texture is built by the backend's device alone — sokol_gfx, which is
+/// single-threaded, only meets it on the main thread.
+#[derive(Clone)]
+pub struct Uploader {
+    native: backend::Uploader,
+    float32_filterable: bool,
+    norm16: bool,
+}
+
+/// A texture built by an [`Uploader`], waiting for the main thread to adopt it. Dropping it frees
+/// it.
+pub struct Prepared {
+    tex: backend::NativeTexture,
+    width: u32,
+    height: u32,
+    levels: u32,
+    format: sg::PixelFormat,
+    linear_sample: i32,
+}
+
+impl Uploader {
+    /// Build `img`'s texture, its mip chain coming from `chain` — run here, alongside the upload
+    /// where the backend can overlap the two. Returns the texture, or why there is none, together
+    /// with what `chain` returned: on failure the caller still has the chain to upload the old
+    /// way, on the main thread.
+    pub fn upload<R: Send>(
+        &self,
+        img: &DecodedImage,
+        chain: impl FnOnce() -> (Vec<Vec<u8>>, R) + Send,
+    ) -> (Result<Prepared, String>, Vec<Vec<u8>>, R) {
+        let (width, height) = (img.width, img.height);
+        // The same guard as `create_image_texture`: never read past a short buffer.
+        let needed = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(mips::bytes_per_texel(img.format)));
+        let Some(level0) = needed.and_then(|n| img.pixels.get(..n)) else {
+            let (built, r) = chain();
+            return (
+                Err("pixel buffer is shorter than its dimensions declare".into()),
+                built,
+                r,
+            );
+        };
+        let (format, linear_sample, convert) =
+            device_format(img.format, self.float32_filterable, self.norm16);
+        let (tex, built, r) = self.native.upload(
+            width,
+            height,
+            format,
+            device_bpp(format),
+            level0,
+            convert,
+            chain,
+        );
+        let prepared = tex.map(|tex| Prepared {
+            tex,
+            width,
+            height,
+            levels: mips::level_count(width, height),
+            format,
+            linear_sample,
+        });
+        (prepared, built, r)
+    }
+}
+
+/// Hand a [`Prepared`] texture to sokol_gfx: the image, its mip count and its `linear_sample`.
+/// Cheap — no pixels move; the texture is already on the GPU.
+fn adopt_prepared(p: Prepared) -> Result<(sg::Image, u32, i32), String> {
+    let mut desc = sg::ImageDesc::new();
+    desc._type = sg::ImageType::Dim2;
+    desc.width = p.width as i32;
+    desc.height = p.height as i32;
+    desc.num_mipmaps = p.levels as i32;
+    desc.pixel_format = p.format;
+    desc.label = c"fire image".as_ptr();
+    let image = backend::make_image(p.tex, &mut desc);
+    if sg::query_image_state(image) != sg::ResourceState::Valid {
+        sg::destroy_image(image);
+        return Err(format!(
+            "sokol_gfx refused a prepared {}×{} {:?} texture",
+            p.width, p.height, p.format
+        ));
+    }
+    Ok((image, p.levels, p.linear_sample))
+}
+
 /// Build an immutable image (+ its texture view) from one RGBA frame and its mip chain — `mips`
 /// as [`crate::render::mips::build`] makes it, or `None` to build it here — returning the image,
 /// its view, and the `linear_sample` flag for `format` (1 if the sample is already linear — 8-bit
@@ -1865,23 +2005,8 @@ fn create_image_texture(
         return Err("the mip chain is incomplete".into());
     }
 
-    // The device format, the shader's decode flag, and a conversion for the pixels when the
-    // device lacks the feature the source format needs.
-    let (tex_format, linear_sample, convert): (sg::PixelFormat, i32, Option<Convert>) = match format
-    {
-        // 8-bit sources are sRGB-encoded; the sRGB format decodes to linear on sample.
-        PixelFormat::Rgba8Unorm => (sg::PixelFormat::Srgb8a8, 1, None),
-        // 16-bit unorm is treated as sRGB-encoded (matches the CPU path) → decode in shader.
-        // Without a 16-bit-norm format it rides as float16 of the same 0..1 values.
-        PixelFormat::Rgba16Unorm if gpu.norm16 => (sg::PixelFormat::Rgba16, 0, None),
-        PixelFormat::Rgba16Unorm => (sg::PixelFormat::Rgba16f, 0, Some(mips::u16_to_f16)),
-        // Float sources are already linear.
-        PixelFormat::Rgba16Float => (sg::PixelFormat::Rgba16f, 1, None),
-        PixelFormat::Rgba32Float if gpu.float32_filterable => (sg::PixelFormat::Rgba32f, 1, None),
-        // No float32 filtering on this device: float16 keeps the pipeline (and the mips)
-        // filtered, at the cost of range above 65504.
-        PixelFormat::Rgba32Float => (sg::PixelFormat::Rgba16f, 1, Some(mips::f32_to_f16)),
-    };
+    let (tex_format, linear_sample, convert) =
+        device_format(format, gpu.float32_filterable, gpu.norm16);
     let converted: Vec<Vec<u8>> = match convert {
         Some(f) => std::iter::once(level0)
             .chain(chain.iter().map(Vec::as_slice))

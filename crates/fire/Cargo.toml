@@ -88,8 +88,9 @@ objc2-metal = { workspace = true, features = [
     "MTLDevice",                        # MTLCreateSystemDefaultDevice, the device sokol runs on
     "MTLPixelFormat",                   # the layer's BGRA8Unorm backbuffer format
     "MTLDrawable",                      # CAMetalDrawable's base protocol
-    "MTLTexture",                       # the drawable's texture (sokol reads it, we don't)
+    "MTLTexture",                       # the drawable's texture, and image textures built off-thread
     "MTLResource",
+    "MTLTypes",                         # MTLRegion, for writing an image texture's rows
 ] }
 objc2-quartz-core = { workspace = true, features = [
     "CALayer",                          # contentsScale, the layer the view hosts

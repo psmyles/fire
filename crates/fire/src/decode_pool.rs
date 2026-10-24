@@ -22,9 +22,10 @@
 //! The pool is shared by every window in the process (there is one process — see `main.rs`).
 
 use std::any::Any;
+use std::io::Read as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Instant;
 
@@ -35,6 +36,7 @@ use winit::window::WindowId;
 
 use crate::app::AppEvent;
 use crate::layers::{JobCtl, SessionCtl};
+use crate::render::gpu::{Prepared, Uploader};
 
 /// Plan-adopted default pool size: `min(num_cpus, 4)`.
 const MAX_WORKERS: usize = 4;
@@ -51,6 +53,37 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// The next decode generation. Strictly increasing for the life of the process.
 pub fn fresh_generation() -> u64 {
     GENERATION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Where each stage of a file decode ends on [`Progress`]'s 0..1 scale. Reading the file comes
+/// first, then the backend's decode; the mip chain and the GPU upload, which overlap, are the
+/// rest. Fixed weights, not measured ones: a warm-cache read of a 1.5 GB EXR is a quarter of its
+/// decode, a cold one can be several times it, and a bar that moves steadily matters more than one
+/// whose stages are to scale.
+const READ_END: f32 = 0.3;
+const DECODE_END: f32 = 0.8;
+
+/// The file is read in pieces this big, so the read can report as it goes.
+const READ_CHUNK: usize = 8 << 20;
+
+/// How far one file decode has got, `0.0..=1.0`: written by the worker running it, read by the UI
+/// thread for the loading bar. A plain shared cell rather than events — the UI samples it while it
+/// is drawing the bar, so a decode that reports thousands of times costs nothing extra.
+#[derive(Debug, Default)]
+pub struct Progress(AtomicU32);
+
+impl Progress {
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Raise the value to `v`. Never lowers it: the bar only moves forward, even if a backend's
+    /// reports arrive out of order from its worker threads.
+    fn advance(&self, v: f32) {
+        // Non-negative floats order the same as their bit patterns.
+        self.0
+            .fetch_max(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
 }
 
 /// A unit of decode work handed to a worker thread.
@@ -74,6 +107,8 @@ pub struct DecodeJob {
     /// after the image decodes, so the PSD layer index is not built (and the file's bytes not
     /// kept) for a window that has already moved on.
     pub gen_cell: Option<Arc<AtomicU64>>,
+    /// Where the worker reports how far it has got, for the loading bar.
+    pub progress: Arc<Progress>,
 }
 
 /// A finished decode, delivered back to the UI thread. The image is `Arc`-wrapped so the worker
@@ -84,8 +119,13 @@ pub struct DecodeOutcome {
     pub generation: u64,
     pub path: PathBuf,
     pub result: Result<Arc<DecodedImage>, DecodeError>,
+    /// The image's texture, already on the GPU (see [`Uploader`]), so the UI thread's adopt moves
+    /// no pixels. `None` when the worker could not build it — the GPU was not up yet (a launch
+    /// decode that beat it), or the device refused — and then `mips` is filled instead.
+    pub texture: Option<Prepared>,
     /// Levels `1..` of the image's mip chain (see [`crate::render::mips`]), built here on the
-    /// worker so the UI thread's adopt is one upload; empty on failure.
+    /// worker, for the UI thread to upload with level 0 when there is no `texture`. Empty
+    /// otherwise, and on failure.
     pub mips: Vec<Vec<u8>>,
     /// How many of `mips` (from level 1) came from the file itself rather than being computed
     /// here. Only a DDS carries its own chain, so this is 0 for every other format — and the
@@ -172,6 +212,9 @@ pub struct DecodePool {
     /// superseded job decoded in full is a wasted allocation (up to ~1 GiB at `MAX_CPU_DIM`)
     /// parked in the event queue until the UI thread drains it.
     latest: Arc<AtomicU64>,
+    /// Builds each decoded image's texture on the worker. Empty until the GPU is up (it comes up
+    /// alongside the launch decode, not before it — see [`DecodePool::set_uploader`]).
+    uploader: Arc<OnceLock<Uploader>>,
 }
 
 impl std::fmt::Debug for DecodePool {
@@ -185,15 +228,17 @@ impl DecodePool {
     pub fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
         let (tx, rx) = unbounded::<Job>();
         let latest = Arc::new(AtomicU64::new(0));
+        let uploader = Arc::new(OnceLock::new());
         let workers = worker_count();
         let mut started = 0usize;
         for i in 0..workers {
             let rx = rx.clone();
             let latest = Arc::clone(&latest);
+            let uploader = Arc::clone(&uploader);
             let proxy = proxy.clone();
             let spawned = thread::Builder::new()
                 .name(format!("fire-decode-{i}"))
-                .spawn(move || main_worker(rx, latest, proxy));
+                .spawn(move || main_worker(rx, latest, uploader, proxy));
             // A thread the OS refused to start must not abort the viewer before its window
             // exists (the folder-scan and watcher threads already degrade this way); any
             // workers that did start carry the load.
@@ -253,7 +298,14 @@ impl DecodePool {
             prefetch,
             reaper,
             latest,
+            uploader,
         }
+    }
+
+    /// Give the workers the GPU to build textures on, once it is up. Decodes that finish before
+    /// this leave their upload to the UI thread, as every decode used to.
+    pub fn set_uploader(&self, uploader: Uploader) {
+        let _ = self.uploader.set(uploader);
     }
 
     /// Enqueue a decode. The unbounded channel only fails to send once every worker
@@ -290,10 +342,15 @@ impl DecodePool {
 }
 
 /// A main-lane worker: file decodes and foreground layer decodes, until the pool is dropped.
-fn main_worker(rx: Receiver<Job>, latest: Arc<AtomicU64>, proxy: EventLoopProxy<AppEvent>) {
+fn main_worker(
+    rx: Receiver<Job>,
+    latest: Arc<AtomicU64>,
+    uploader: Arc<OnceLock<Uploader>>,
+    proxy: EventLoopProxy<AppEvent>,
+) {
     while let Ok(job) = rx.recv() {
         let keep_going = match job {
-            Job::Decode(job) => run_decode(job, &latest, &proxy),
+            Job::Decode(job) => run_decode(job, &latest, &uploader, &proxy),
             Job::Layer(job) => run_layer(job, &proxy),
         };
         if !keep_going {
@@ -304,7 +361,12 @@ fn main_worker(rx: Receiver<Job>, latest: Arc<AtomicU64>, proxy: EventLoopProxy<
 
 /// Run one file decode: the image, then the PSD layer index (parsed before the mip chain, sent
 /// after the image) and the flipbook guess. Returns false when the event loop is gone and the worker should stop.
-fn run_decode(job: DecodeJob, latest: &AtomicU64, proxy: &EventLoopProxy<AppEvent>) -> bool {
+fn run_decode(
+    job: DecodeJob,
+    latest: &AtomicU64,
+    uploader: &OnceLock<Uploader>,
+    proxy: &EventLoopProxy<AppEvent>,
+) -> bool {
     // A superseded job's result would be stale-dropped on arrival anyway; once a newer submit
     // exists, skip the decode itself.
     if job.generation < latest.load(Ordering::Relaxed) {
@@ -320,41 +382,78 @@ fn run_decode(job: DecodeJob, latest: &AtomicU64, proxy: &EventLoopProxy<AppEven
     // `Arc` for the life of the window.
     let source_mips = result.as_mut().ok().and_then(|img| img.source_mips.take());
     let result = result.map(Arc::new);
+    job.progress.advance(DECODE_END);
     // The mip chain, completed here so the UI thread's adopt is one upload.
-    let (mips, authored_mips) = match &result {
+    let (mips, authored_mips, texture) = match &result {
         Ok(img) => {
-            let t = Instant::now();
-            // Counted before `complete` consumes the levels: only the run it adopts is the
-            // file's, everything past it is computed.
-            let authored = source_mips.as_deref().map_or(0, |src| {
-                crate::render::mips::authored_levels(src, img.width, img.height, img.format)
-            });
-            let chain = match source_mips {
-                // A DDS brings its own, and those levels were authored — with a filter and a
-                // gamma a box filter does not reproduce. Keep what the file supplied and compute
-                // only the tail it stopped short of.
-                Some(src) => crate::render::mips::complete(
-                    src,
-                    &img.pixels,
+            let chain = || {
+                let t = Instant::now();
+                // Counted before `complete` consumes the levels: only the run it adopts is the
+                // file's, everything past it is computed.
+                let authored = source_mips.as_deref().map_or(0, |src| {
+                    crate::render::mips::authored_levels(src, img.width, img.height, img.format)
+                });
+                let chain = match source_mips {
+                    // A DDS brings its own, and those levels were authored — with a filter and a
+                    // gamma a box filter does not reproduce. Keep what the file supplied and compute
+                    // only the tail it stopped short of.
+                    Some(src) => crate::render::mips::complete(
+                        src,
+                        &img.pixels,
+                        img.width,
+                        img.height,
+                        img.format,
+                    ),
+                    None => {
+                        crate::render::mips::build(&img.pixels, img.width, img.height, img.format)
+                    }
+                };
+                crate::render::gpu::report_timing(&format!(
+                    "mips — {:.2} ms ({} levels, {authored} from the file, {}×{})",
+                    t.elapsed().as_secs_f64() * 1e3,
+                    chain.len() + 1,
                     img.width,
-                    img.height,
-                    img.format,
-                ),
-                None => crate::render::mips::build(&img.pixels, img.width, img.height, img.format),
+                    img.height
+                ));
+                // `complete` hands back nothing for a short level 0, and then none of the file's
+                // levels reach the texture either.
+                let authored = if chain.is_empty() { 0 } else { authored };
+                (chain, authored as u32)
             };
-            crate::render::gpu::report_timing(&format!(
-                "mips — {:.2} ms ({} levels, {authored} from the file, {}×{})",
-                t.elapsed().as_secs_f64() * 1e3,
-                chain.len() + 1,
-                img.width,
-                img.height
-            ));
-            // `complete` hands back nothing for a short level 0, and then none of the file's
-            // levels reach the texture either.
-            let authored = if chain.is_empty() { 0 } else { authored };
-            (chain, authored as u32)
+            // Superseded while it decoded: the texture would only be freed again on arrival.
+            let wanted = job.generation >= latest.load(Ordering::Relaxed);
+            // Looked up now, not when the job was picked up: the launch decode starts before the
+            // GPU is up, and is usually still decoding when it comes up.
+            match uploader.get().filter(|_| wanted) {
+                Some(up) => {
+                    let t = Instant::now();
+                    let (texture, chain, authored) = up.upload(img, chain);
+                    crate::render::gpu::report_timing(&format!(
+                        "mips + upload — {:.2} ms ({}×{})",
+                        t.elapsed().as_secs_f64() * 1e3,
+                        img.width,
+                        img.height
+                    ));
+                    match texture {
+                        // The chain is in the texture now: free it here, not on the UI thread.
+                        Ok(tex) => (Vec::new(), authored, Some(tex)),
+                        Err(e) => {
+                            eprintln!(
+                                "fire: {}: texture not built off-thread ({e}); uploading on the \
+                                 main thread",
+                                job.path.display()
+                            );
+                            (chain, authored, None)
+                        }
+                    }
+                }
+                None => {
+                    let (chain, authored) = chain();
+                    (chain, authored, None)
+                }
+            }
         }
-        Err(_) => (Vec::new(), 0),
+        Err(_) => (Vec::new(), 0, None),
     };
     // Keep a clone to run flipbook detection *after* the image is posted, so a large sheet
     // reaches the screen without waiting on the per-pixel scan. Skipped for animated sources (a
@@ -376,6 +475,7 @@ fn run_decode(job: DecodeJob, latest: &AtomicU64, proxy: &EventLoopProxy<AppEven
         generation,
         path: job.path,
         result,
+        texture,
         mips,
         authored_mips,
         reload: job.reload,
@@ -543,16 +643,43 @@ fn decode_layer(job: &LayerJob) -> Result<LayerData, LayerFail> {
 /// composite decoded). Every other file's bytes are freed right after its decode, as before.
 fn decode(job: &DecodeJob) -> (Result<DecodedImage, DecodeError>, Option<Vec<u8>>) {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let bytes = match std::fs::read(&job.path) {
+        let bytes = match read_file(job) {
             Ok(b) => b,
             Err(e) => return (Err(DecodeError::Other(e.to_string())), None),
         };
         let ext = job.path.extension().and_then(|e| e.to_str());
-        let result = fire_decode::decode(&bytes, ext, &job.opts);
+        let progress = |f: f32| job.progress.advance(READ_END + f * (DECODE_END - READ_END));
+        let result = fire_decode::decode_with_progress(&bytes, ext, &job.opts, &progress);
         let keep = result.is_ok() && bytes.starts_with(b"8BPS");
         (result, keep.then_some(bytes))
     }))
     .unwrap_or_else(|_| (Err(DecodeError::Other("decoder panicked".into())), None))
+}
+
+/// `std::fs::read`, a [`READ_CHUNK`] at a time so the loading bar can follow it. The buffer is
+/// sized from the file's length up front, as `fs::read` does; a file that turns out longer (it is
+/// being written) still reads to its end.
+fn read_file(job: &DecodeJob) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(&job.path)?;
+    let len = file.metadata().map_or(0, |m| m.len()) as usize;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len)?;
+    loop {
+        // Grow by a chunk when full, and read into the spare capacity without zeroing it first —
+        // `take` + `read_to_end` does both, and stops at the chunk or at EOF.
+        let before = bytes.len();
+        let n = (&mut file)
+            .take(READ_CHUNK as u64)
+            .read_to_end(&mut bytes)?;
+        if n == 0 {
+            break;
+        }
+        if len > 0 {
+            job.progress
+                .advance(READ_END * (before + n).min(len) as f32 / len as f32);
+        }
+    }
+    Ok(bytes)
 }
 
 fn worker_count() -> usize {

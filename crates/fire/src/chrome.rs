@@ -76,6 +76,12 @@ pub struct ViewSnapshot {
     /// True between an open request and its decode landing. With `!has_image` it distinguishes
     /// "still loading" (show nothing) from "empty" (show the drop hint).
     pub loading: bool,
+    /// The loading card: how far the load has got (`0.0..=1.0`), once it has run long enough to be
+    /// worth showing. `None` while there is no load, and for its first moments.
+    pub loading_progress: Option<f32>,
+    /// How far the image region has faded to black (`0.0..=1.0`) on its way to the next file: the
+    /// outgoing image fades, then the region stays black until the incoming one lands.
+    pub fade: f32,
     /// Source carries a real alpha channel: drives the composite button's RGB↔RGBA icon and toggle,
     /// and gates the alpha-solo button — which isn't laid out at all for a source with no alpha.
     pub has_alpha: bool,
@@ -309,6 +315,8 @@ mod tests {
             exposure: 0.0,
             has_image: true,
             loading: false,
+            loading_progress: None,
+            fade: 0.0,
             has_alpha: false,
             background: Background::Black,
             outline: false,

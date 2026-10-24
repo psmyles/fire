@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use fire_ipc::OpenRequest;
@@ -31,7 +32,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::WindowId;
 
 use crate::config::{Config, OpenIn};
-use crate::decode_pool::{DecodeOutcome, DecodePool, FlipbookGuess, LayerIndex, LayerOutcome};
+use crate::decode_pool::{
+    DecodeOutcome, DecodePool, FlipbookGuess, LayerIndex, LayerOutcome, Progress,
+};
 use crate::render::gpu::Gpu;
 use timers::{TimerQueue, Timers};
 use viewer::{Dialog, Viewer};
@@ -132,6 +135,8 @@ pub struct FolderScan {
 pub struct Initial {
     pub path: PathBuf,
     pub generation: u64,
+    /// The launch decode's progress cell, for the loading card.
+    pub progress: Arc<Progress>,
 }
 
 /// The application: the event-loop handler and everything shared between windows.
@@ -210,6 +215,8 @@ impl Fire {
             "gpu join wait — {:.2} ms",
             t.elapsed().as_secs_f64() * 1e3
         ));
+        // From here the decode workers build each image's texture themselves.
+        self.pool.set_uploader(gpu.uploader());
         let gpu = Rc::new(gpu);
         self.gpu = Some(Rc::clone(&gpu));
         Ok(gpu)

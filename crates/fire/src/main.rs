@@ -44,12 +44,13 @@ mod watcher;
 mod window_state;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use winit::event_loop::EventLoop;
 
 use app::{AppEvent, Fire, Initial, MAX_CPU_DIM};
 use config::Config;
-use decode_pool::{fresh_generation, DecodeJob, DecodePool};
+use decode_pool::{fresh_generation, DecodeJob, DecodePool, Progress};
 
 fn main() {
     // What it cost to reach the first line of `main`: the loader, the runtime, and nothing of
@@ -129,6 +130,7 @@ fn main() {
     let pool = DecodePool::new(proxy.clone());
     let initial = path.map(|path| {
         let generation = fresh_generation();
+        let progress = Arc::new(Progress::default());
         pool.submit(DecodeJob {
             window: None,
             generation,
@@ -142,8 +144,13 @@ fn main() {
             // No window yet, so no live generation to check: the launch decode's layer index is
             // always built, and the window it lands in stale-drops it like any other result.
             gen_cell: None,
+            progress: Arc::clone(&progress),
         });
-        Initial { path, generation }
+        Initial {
+            path,
+            generation,
+            progress,
+        }
     });
 
     if let Some(listener) = listener {

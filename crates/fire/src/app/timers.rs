@@ -32,10 +32,16 @@ pub enum TimerKind {
     /// PSD layer stepping: first the dwell before layers pre-decode, then idle-time uploads of
     /// decoded neighbours (see `crate::layers`).
     Layers = 3,
+    /// A file load: first the grace period before the loading card shows, then the repaints that
+    /// keep its progress bar moving (see `Viewer::LOADING_DELAY_MS`).
+    Loading = 4,
+    /// The outgoing image's fade to black when another file is asked for (see
+    /// `Viewer::FADE_MS`).
+    Fade = 5,
 }
 
 /// The number of [`TimerKind`]s, for per-window arrays indexed by kind.
-pub const KINDS: usize = 4;
+pub const KINDS: usize = 6;
 
 /// The process-wide timer queue, shared by the event loop and every window.
 #[derive(Debug, Default)]

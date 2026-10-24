@@ -33,7 +33,7 @@ use crate::app::timers::{TimerKind, Timers, KINDS};
 use crate::app::{AppEvent, FolderScan, Initial};
 use crate::chrome::{self, Action, ViewSnapshot};
 use crate::config::{Config, WheelActionCfg};
-use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool, FlipbookGuess};
+use crate::decode_pool::{DecodeJob, DecodeOutcome, DecodePool, FlipbookGuess, Progress};
 use crate::flipbook::{self, FlipbookState, Grid, PerPath};
 use crate::folder::{self, Folder};
 use crate::keybinds::{KeyAction, KeyChord, Keybinds, ShortcutLabels};
@@ -73,6 +73,34 @@ const MAX_FLIPBOOK_STEP: f32 = 0.25;
 /// Caret blink tick. ImGui blinks on a wall-clock schedule; this only has to be frequent enough that
 /// the phase changes look continuous.
 const CARET_BLINK_MS: u64 = 33;
+
+/// How long a load runs before the loading card (the "Loading" label and its progress bar) comes
+/// up. Most files land well inside it, and a card flashing up for a frame on every arrow-key press
+/// would be noise rather than news.
+const LOADING_DELAY_MS: u64 = 250;
+
+/// How often the loading card repaints to follow its progress bar.
+const LOADING_TICK_MS: u64 = 33;
+
+/// How long the outgoing image takes to fade to black when another file is asked for. Short: the
+/// fade says "that one is gone", it is not a transition to watch. An incoming image that lands
+/// sooner cuts the fade short.
+const FADE: Duration = Duration::from_millis(120);
+
+/// The fade's repaint tick. Finer than any refresh rate; the present's vsync paces the frames.
+const FADE_TICK_MS: u64 = 4;
+
+/// The most one frame advances the fade. The first frames after the window has sat idle can stall
+/// (~60 ms with a 16k float image up, as the GPU wakes); stepping by wall-clock time would spend
+/// half the fade inside that one frame and show it as a cut.
+const MAX_FADE_STEP: Duration = Duration::from_millis(17);
+
+/// The fade to black between files: how far it has got (`0.0..=1.0`), and when it last stepped.
+#[derive(Clone, Copy)]
+struct Fade {
+    level: f32,
+    last: Instant,
+}
 
 /// Two presses closer than this in time and space are a double-click (winit reports presses only;
 /// the OS's own double-click synthesis is a Win32 class flag winit does not set). 500 ms is the
@@ -185,6 +213,13 @@ pub struct Viewer {
     meta: String,
     /// True between an open request and its decode landing (status shows "loading…").
     loading: bool,
+    /// The latest decode's progress, as its worker reports it — what the loading card's bar shows.
+    load_progress: Arc<Progress>,
+    /// Whether the load has outlasted [`LOADING_DELAY_MS`] and the loading card is up.
+    loading_card: bool,
+    /// The image region's fade to black for the file being loaded. `None` when there is no fade;
+    /// held, at full black, from the end of the fade until the incoming image lands.
+    fade: Option<Fade>,
     /// Sibling-image cursor for ←/→ navigation + the status-bar count. `None` until the
     /// background folder scan for the current image lands (lazy: image first, count after).
     folder: Option<Folder>,
@@ -384,6 +419,9 @@ impl Viewer {
             file_label: String::new(),
             meta: String::new(),
             loading: false,
+            load_progress: Arc::default(),
+            loading_card: false,
+            fade: None,
             folder: None,
             current_path: None,
             shown_path: None,
@@ -435,7 +473,8 @@ impl Viewer {
     pub fn adopt_initial(&mut self, init: Initial) {
         let name = file_name(&init.path);
         self.file_label.clone_from(&name);
-        self.loading = true;
+        self.begin_loading();
+        self.load_progress = init.progress;
         self.set_title(&format!("{}: {name} (loading…)", crate::product::NAME));
         self.surface.set_generation(init.generation);
         self.current_path = Some(init.path.clone());
@@ -467,17 +506,19 @@ impl Viewer {
     }
 
     /// Show the window for `path`, raise it if `activate`, and enqueue the decode off-thread. The
-    /// currently displayed image is *kept on screen* until the new one lands (swapped in by
-    /// [`Viewer::decode_done`]), so navigating between folder siblings doesn't flash the empty
-    /// backdrop between frames — the same no-blank-flash discipline hot-reload uses. A failed
-    /// decode clears it. Returns the generation assigned to this load. Shared by `open` (which
-    /// also rescans the folder) and `navigate` (which reuses the existing cursor).
+    /// image on screen fades to black at once ([`Viewer::begin_fade`]) rather than staying up
+    /// while the next one decodes: what the window shows is the file asked for, or nothing. The
+    /// new image pops in when it lands ([`Viewer::decode_done`]). Hot-reload is the exception — it
+    /// keeps the image up, since it is the same file. Returns the generation assigned to this load.
+    /// Shared by `open` (which also rescans the folder) and `navigate` (which reuses the existing
+    /// cursor).
     fn load(&mut self, path: &Path, activate: bool) -> u64 {
         let name = file_name(path);
         // clone_from reuses file_label's existing allocation; this runs on every navigation.
         self.file_label.clone_from(&name);
         self.meta.clear();
-        self.loading = true;
+        self.begin_loading();
+        self.begin_fade();
         self.set_title(&format!("{}: {name} (loading…)", crate::product::NAME));
         if activate {
             // Spend the one-shot foreground grant promptly (architecture §4.1).
@@ -509,6 +550,7 @@ impl Viewer {
             max_dim: MAX_CPU_DIM,
             honor_icc: true,
         };
+        self.load_progress = Arc::default();
         self.pool.submit(DecodeJob {
             window: Some(self.id()),
             generation,
@@ -517,6 +559,7 @@ impl Viewer {
             reload,
             detect_flipbook: self.cfg.flipbook.auto_detect,
             gen_cell: Some(self.surface.generation_cell()),
+            progress: Arc::clone(&self.load_progress),
         });
         generation
     }
@@ -626,7 +669,7 @@ impl Viewer {
             return; // superseded by a newer open
         }
         let name = file_name(&outcome.path);
-        self.loading = false;
+        self.end_loading();
         match outcome.result {
             Ok(img) => {
                 let (w, h, fmt) = (img.width, img.height, img.source_format);
@@ -643,11 +686,19 @@ impl Viewer {
                 // of their zoomed-in detail; a reload that changed dimensions re-fits.
                 let same_dims = self.surface.content_dims() == Some((w, h));
                 let upload = if outcome.reload && same_dims {
-                    self.surface
-                        .replace_image_keep_view(img, &outcome.mips, outcome.authored_mips)
+                    self.surface.replace_image_keep_view(
+                        img,
+                        &outcome.mips,
+                        outcome.texture,
+                        outcome.authored_mips,
+                    )
                 } else {
-                    self.surface
-                        .set_image(img, &outcome.mips, outcome.authored_mips)
+                    self.surface.set_image(
+                        img,
+                        &outcome.mips,
+                        outcome.texture,
+                        outcome.authored_mips,
+                    )
                 };
                 // The image decoded fine but the GPU may still reject the upload (e.g. out of
                 // memory on a very large texture). Treat that like a decode failure rather than
@@ -751,6 +802,61 @@ impl Viewer {
         self.reset_to_empty();
     }
 
+    /// Mark a load in flight. The loading card is not up yet: the [`TimerKind::Loading`] timer puts
+    /// it up once the load has outlasted [`LOADING_DELAY_MS`]. A load replacing one still in flight
+    /// (key-repeat through a folder of big files) leaves the card as it is, rather than blinking it
+    /// off for each file's grace period; its bar simply starts over.
+    fn begin_loading(&mut self) {
+        if !self.loading {
+            self.loading = true;
+            self.loading_card = false;
+            self.arm(TimerKind::Loading, LOADING_DELAY_MS);
+        }
+    }
+
+    /// The load landed (or was abandoned): take the card down and stop its repaints, and end the
+    /// fade — the incoming image (or the empty state) replaces the black.
+    fn end_loading(&mut self) {
+        self.loading = false;
+        self.loading_card = false;
+        self.kill(TimerKind::Loading);
+        self.fade = None;
+        self.kill(TimerKind::Fade);
+    }
+
+    /// Start fading the image on screen to black, for a file that has just been asked for. Nothing
+    /// to fade with no image up, and a fade already under way (key-repeat through a folder) simply
+    /// carries on rather than starting over.
+    fn begin_fade(&mut self) {
+        if self.fade.is_some() || self.surface.current_image().is_none() {
+            return;
+        }
+        self.fade = Some(Fade {
+            level: 0.0,
+            last: Instant::now(),
+        });
+        self.arm(TimerKind::Fade, FADE_TICK_MS);
+    }
+
+    /// One frame of the fade. Once it is fully black the outgoing image is dropped — its texture
+    /// freed before the incoming one is built, rather than both held at once — and the region
+    /// stays black until the incoming image lands.
+    fn tick_fade(&mut self) {
+        let Some(fade) = &mut self.fade else { return };
+        let now = Instant::now();
+        let step = (now - fade.last).min(MAX_FADE_STEP);
+        fade.last = now;
+        fade.level = (fade.level + step.as_secs_f32() / FADE.as_secs_f32()).min(1.0);
+        if fade.level < 1.0 {
+            self.request_frames(1);
+            self.arm(TimerKind::Fade, FADE_TICK_MS);
+        } else if self.surface.current_image().is_some() {
+            self.reset_to_empty();
+        } else {
+            self.redraw();
+        }
+    }
+
     // --- timers --------------------------------------------------------------------------------
 
     /// Arm (or re-arm) the timer of `kind` to fire in `ms`. Replaces any pending one of that kind.
@@ -783,6 +889,16 @@ impl Viewer {
                 }
             }
             TimerKind::Layers => self.layers_tick(),
+            // The grace period is over: up goes the card, and from then on each tick repaints it
+            // so the bar follows the worker. A frame is all it costs, and only while loading.
+            TimerKind::Fade => self.tick_fade(),
+            TimerKind::Loading => {
+                if self.loading {
+                    self.loading_card = true;
+                    self.request_frames(1);
+                    self.arm(TimerKind::Loading, LOADING_TICK_MS);
+                }
+            }
         }
     }
 
@@ -1639,7 +1755,7 @@ impl Viewer {
         self.folder = None;
         self.file_label.clear();
         self.meta.clear();
-        self.loading = false;
+        self.end_loading();
         self.set_title(crate::product::NAME);
         self.reset_to_empty();
     }
@@ -2080,6 +2196,8 @@ impl Viewer {
             exposure: s.exposure(),
             has_image,
             loading: self.loading,
+            loading_progress: self.loading_card.then(|| self.load_progress.get()),
+            fade: self.fade.map_or(0.0, |f| f.level),
             has_alpha: s.has_alpha(),
             background: s.background(),
             outline: s.outline(),

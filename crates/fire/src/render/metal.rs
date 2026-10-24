@@ -25,17 +25,23 @@
 //! is.
 
 use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::NSView;
 use objc2_foundation::CGSize;
-use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat};
+use objc2_metal::{
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLOrigin, MTLPixelFormat, MTLRegion,
+    MTLResourceOptions, MTLSize, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+};
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use sokol::gfx as sg;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
+
+use crate::render::mips::Convert;
 
 /// What every window's backbuffer is created as, and what sokol_gfx is told to expect of a
 /// swapchain pass, so the viewport and ImGui pipelines match it. `BGRA8`, not the D3D11 side's
@@ -86,6 +92,216 @@ impl Device {
             device: self.raw_device(),
         };
     }
+
+    /// A handle for building image textures on other threads.
+    pub fn uploader(&self) -> Uploader {
+        // The storage mode sokol_gfx gives an immutable image of its own (`_sg_mtl_init_texdesc`),
+        // so a texture built here samples exactly as one built there: shared on Apple GPUs,
+        // managed on Intel ones, which sokol keeps off shared textures.
+        let storage = if self.device.supportsFamily(MTLGPUFamily::Apple1) {
+            MTLResourceOptions::MTLResourceStorageModeShared
+        } else {
+            MTLResourceOptions::MTLResourceStorageModeManaged
+        };
+        Uploader {
+            device: self.device.clone(),
+            storage,
+        }
+    }
+}
+
+/// Rows of a large level are written by this many threads at once. The copy into a texture is
+/// bound by memory bandwidth, not by any one core: a 16384×8192 float level takes ~196 ms on one
+/// thread and ~95 ms on four, and more than four only contend (eight ~104 ms, twelve ~170 ms, on
+/// an M-series Mac).
+const WRITE_THREADS: usize = 4;
+
+/// Below this many bytes a level is written on one thread; the split is not worth its spawns.
+const WRITE_SPLIT_MIN: usize = 8 << 20;
+
+/// Builds image textures off the main thread — on the decode worker that decoded the image, so a
+/// large upload (a 16k float panorama is 2.7 GB with its mips) never stalls the window.
+///
+/// Nothing here goes near sokol_gfx, which is single-threaded: this is the Metal device alone,
+/// and the finished texture is handed to sokol_gfx on the main thread ([`make_image`]).
+#[derive(Clone)]
+pub struct Uploader {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    storage: MTLResourceOptions,
+}
+
+// SAFETY: an `MTLDevice` is thread-safe by specification; see `Device`.
+unsafe impl Send for Uploader {}
+unsafe impl Sync for Uploader {}
+
+/// An image texture built by an [`Uploader`], owned until [`make_image`] hands it to sokol_gfx —
+/// or until it is dropped, which frees it (a decode that was superseded on its way to the window).
+pub struct NativeTexture(Retained<ProtocolObject<dyn MTLTexture>>);
+
+// SAFETY: a texture is a thread-safe Metal object; the only access before it reaches sokol_gfx is
+// `replaceRegion`, from the threads of one `Uploader::upload`, into disjoint rows.
+unsafe impl Send for NativeTexture {}
+unsafe impl Sync for NativeTexture {}
+
+/// sokol_gfx's pixel formats that image textures use, as Metal's — the same mapping as sokol's
+/// own `_sg_mtl_pixel_format`.
+fn pixel_format(format: sg::PixelFormat) -> Option<MTLPixelFormat> {
+    Some(match format {
+        sg::PixelFormat::Srgb8a8 => MTLPixelFormat::RGBA8Unorm_sRGB,
+        sg::PixelFormat::Rgba16 => MTLPixelFormat::RGBA16Unorm,
+        sg::PixelFormat::Rgba16f => MTLPixelFormat::RGBA16Float,
+        sg::PixelFormat::Rgba32f => MTLPixelFormat::RGBA32Float,
+        _ => return None,
+    })
+}
+
+impl Uploader {
+    /// Build a `width`×`height` texture of `format` with a full mip chain: level 0 from `level0`
+    /// and the rest from `chain`, run here. `bpp` is bytes per texel *as uploaded*; `convert`, if
+    /// any, turns source bytes into that format (applied per row band, so it runs in parallel too).
+    ///
+    /// Level 0 — three quarters of the bytes — is written by [`WRITE_THREADS`] threads *while*
+    /// `chain` builds the mips on this one, so the chain costs the upload nothing but its own
+    /// levels' copy. Whatever `chain` returned comes back alongside, so a caller whose texture
+    /// failed can still upload the old way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload<R: Send>(
+        &self,
+        width: u32,
+        height: u32,
+        format: sg::PixelFormat,
+        bpp: usize,
+        level0: &[u8],
+        convert: Option<Convert>,
+        chain: impl FnOnce() -> (Vec<Vec<u8>>, R) + Send,
+    ) -> (Result<NativeTexture, String>, Vec<Vec<u8>>, R) {
+        let levels = crate::render::mips::level_count(width, height);
+        let tex = match self.create(width, height, levels, format) {
+            Ok(t) => t,
+            Err(e) => {
+                let (built, r) = chain();
+                return (Err(e), built, r);
+            }
+        };
+        let src_bpp = level0.len() / (width as usize * height as usize).max(1);
+        let (built, r) = std::thread::scope(|s| {
+            s.spawn(|| write_level(&tex, 0, width, height, level0, src_bpp, bpp, convert));
+            chain()
+        });
+        if built.len() + 1 != levels as usize {
+            return (Err("the mip chain is incomplete".into()), built, r);
+        }
+        for (i, data) in built.iter().enumerate() {
+            let level = i as u32 + 1;
+            let (w, h) = ((width >> level).max(1), (height >> level).max(1));
+            write_level(&tex, level, w, h, data, src_bpp, bpp, convert);
+        }
+        (Ok(tex), built, r)
+    }
+
+    fn create(
+        &self,
+        width: u32,
+        height: u32,
+        levels: u32,
+        format: sg::PixelFormat,
+    ) -> Result<NativeTexture, String> {
+        let fmt = pixel_format(format).ok_or_else(|| format!("no Metal format for {format:?}"))?;
+        // SAFETY: a fresh descriptor, configured through documented properties; the device is
+        // thread-safe (see `Uploader`).
+        let tex = unsafe {
+            let desc =
+                MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                    fmt,
+                    width as usize,
+                    height as usize,
+                    false,
+                );
+            desc.setMipmapLevelCount(levels as usize);
+            desc.setUsage(MTLTextureUsage::ShaderRead);
+            desc.setResourceOptions(self.storage);
+            self.device.newTextureWithDescriptor(&desc)
+        };
+        tex.map(NativeTexture).ok_or_else(|| {
+            format!(
+                "the GPU refused a {width}×{height} {format:?} texture with {levels} mip levels"
+            )
+        })
+    }
+}
+
+/// Write one whole mip level, in row bands across threads when it is big enough to be worth it.
+#[allow(clippy::too_many_arguments)]
+fn write_level(
+    tex: &NativeTexture,
+    level: u32,
+    width: u32,
+    height: u32,
+    src: &[u8],
+    src_bpp: usize,
+    bpp: usize,
+    convert: Option<Convert>,
+) {
+    let src_row = width as usize * src_bpp;
+    let threads = if src.len() >= WRITE_SPLIT_MIN {
+        WRITE_THREADS
+    } else {
+        1
+    };
+    let band = (height as usize).div_ceil(threads);
+    let rows = |y0: usize| {
+        let y1 = (y0 + band).min(height as usize);
+        let bytes = &src[y0 * src_row..y1 * src_row];
+        let converted = convert.map(|f| f(bytes));
+        let bytes = converted.as_deref().unwrap_or(bytes);
+        let region = MTLRegion {
+            origin: MTLOrigin { x: 0, y: y0, z: 0 },
+            size: MTLSize {
+                width: width as usize,
+                height: y1 - y0,
+                depth: 1,
+            },
+        };
+        // SAFETY: `bytes` holds exactly `region`'s rows at `width * bpp` bytes each, and lives
+        // across the call; `replaceRegion` copies them before returning. Concurrent calls write
+        // disjoint rows of a texture no GPU work can reference yet (it is not in sokol_gfx).
+        unsafe {
+            tex.0.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region,
+                level as usize,
+                NonNull::new_unchecked(bytes.as_ptr().cast_mut().cast()),
+                width as usize * bpp,
+            );
+        }
+    };
+    if threads == 1 {
+        rows(0);
+    } else {
+        std::thread::scope(|s| {
+            for y0 in (0..height as usize).step_by(band).skip(1) {
+                s.spawn(move || rows(y0));
+            }
+            rows(0);
+        });
+    }
+}
+
+/// Hand `tex` to sokol_gfx as the image `desc` describes (its size, format and mip count must be
+/// the texture's). sokol_gfx takes the texture over and frees it with the image.
+pub fn make_image(tex: NativeTexture, desc: &mut sg::ImageDesc) -> sg::Image {
+    // sokol_gfx is built without ARC, and for an injected texture it keeps the reference it is
+    // given: it adds the pointer to its resource pool (a retain) and then releases its local one
+    // (`_sg_mtl_create_image`). So the +1 we own is handed over rather than released here.
+    let raw = Retained::into_raw(tex.0);
+    desc.mtl_textures[0] = raw.cast::<c_void>().cast_const();
+    let image = sg::make_image(desc);
+    if sg::query_image_state(image) != sg::ResourceState::Valid {
+        // Refused before sokol_gfx reached the texture (validation, or a format it could not
+        // map), so the reference is still ours to release.
+        // SAFETY: `raw` came from `Retained::into_raw` above and nothing else has released it.
+        drop(unsafe { Retained::from_raw(raw) });
+    }
+    image
 }
 
 /// One window's `CAMetalLayer` and the drawable it is currently rendering into.
