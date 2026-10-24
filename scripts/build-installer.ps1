@@ -156,7 +156,7 @@ Write-Step "Compiling installer\fire.iss"
 & $iscc $IssScript
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
 
-$setup = Join-Path $DistDir ("{0}-{1}-Setup.exe" -f $product.productName, $product.version)
+$setup = Join-Path $DistDir ("{0}-{1}.exe" -f $product.productName, $product.version)
 Write-Host ""
 Write-Step "Done"
 if (Test-Path $setup) {

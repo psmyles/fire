@@ -77,7 +77,7 @@ HEIF/AVIF), which is how CI checks the whole shell on a runner that has no vendo
 **Packaging.**
 
 ```pwsh
-pwsh scripts/build-installer.ps1       # Windows: dist/Fire-<version>-Setup.exe (Inno Setup)
+pwsh scripts/build-installer.ps1       # Windows: dist/Fire-<version>.exe (Inno Setup)
 ```
 
 ```sh
