@@ -76,7 +76,7 @@ jobs:
 
       # Everything except the two FFI decoders, so this needs no vendored input and no LLVM.
       - name: Clippy (no native decoders)
-        run: cargo clippy -p fire-ipc -p fire-decode -p fire-thumbs -p fire-shellext -p fire --no-default-features --all-targets -- -D warnings
+        run: cargo clippy -p fire-ipc -p fire-decode -p fire-thumbs -p fire-shellext -p fire -p fire-cli --no-default-features --all-targets -- -D warnings
 
       # `fire-ipc` is dependency-free and holds the instance-socket wire format — the one place
       # that parses bytes from outside the process. It must always be tested.
@@ -98,6 +98,12 @@ jobs:
       # detection, folder navigation, theme parsing, icon ordering.
       - name: Test (fire, no native decoders)
         run: cargo test -p fire --no-default-features
+
+      # Asset Check's image checker: its rules, the results it writes, and `--staged` in a scratch
+      # git repository (git is on every runner). The PSD fixture needs the native decoder and runs
+      # in `full`.
+      - name: Test (fire-cli, no native decoders)
+        run: cargo test -p fire-cli --no-default-features
 
   full:
     name: clippy + tests (full workspace, ${{ matrix.os }})
@@ -183,4 +189,4 @@ jobs:
       # Build only. Signing, notarization and the .dmg are the dev Mac's, not CI's (D11).
       - name: Build release binary
         if: steps.have_vendor.outputs.present == 'true'
-        run: cargo build -p fire -p fire-shellext --release
+        run: cargo build -p fire -p fire-cli -p fire-shellext --release

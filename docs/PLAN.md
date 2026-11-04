@@ -1,6 +1,7 @@
 # fire - Work Plan
 
-**Status, November 2026:** A1 is done; the rest hasn't started. asset-rules is tagged `v0.1.0`.
+**Status, November 2026:** A1 and A2 are done (A2's Mac packaging still needs a run on the Mac);
+B hasn't started. asset-rules is tagged `v0.1.0`.
 The work is ordered for a stretch on a Mac; items that need Windows are collected at the end.
 
 ## Context
@@ -70,74 +71,63 @@ Each addition has tests. The workspace tests pass with default features and with
 - TTFP wasn't re-measured. The added work is a 14-byte header read for PNG and a resource-section
   walk for PSD, with no pixel work.
 
-### A2. `fire-cli`
+### A2. `fire-cli` - done, except the Mac checks below
 
-A new crate, `crates/fire-cli`, with a console binary named `fire-cli` (no `windows_subsystem`). It is
-installed beside the viewer, the way `3d-review-cli` sits beside `3d-review.exe` (AC12).
+`crates/fire-cli`, a console binary installed beside the viewer (AC12). [`docs/cli.md`](cli.md)
+documents it in full.
 
-- **Dependencies:**
-  - `fire-decode` from the workspace, with `psd` and `heif`;
-  - `asset-rules` by git tag once `v0.1.0` exists. Until then, an untracked `.cargo/config.toml`:
-
-    ```toml
-    [patch."https://github.com/psmyles/asset-rules"]
-    asset-rules = { path = "../asset-rules" }
-    ```
-
-- **Commands:**
-  - `fire-cli check <files>... | --staged | --files-from <list>`, with `--rules <rules.json>` or
-    `--profile <file>`, and `--results <file>`;
-  - `fire-cli info <file>` - prints what fire-decode sees;
-  - `fire-cli rules check <rules.json>` and `fire-cli rules explain <file>`, from asset-rules;
-  - `--version` and `--help`.
-  - `--files-from` exists because Windows limits a command line to about 32,000 characters.
-- **Exit codes:** the same as 3d-review-cli's - 0 when nothing at warning level or worse was found, 1
-  when something was found or a file couldn't be checked, 2 when the command line can't be followed.
-- **Decoding:**
-  - full size (`max_dim: 0`) with ICC conversion off (`honor_icc: false`), so the alpha scan and the
-    colour-profile test see the real image;
-  - files decoded in parallel on a small pool. The decode itself already threads its big passes, so
-    don't run more files at once than there are cores.
-- **Rules for v1** (AC12 has the full table):
-  - `texture.format`
-  - `texture.max_size` / `texture.min_size`
-  - `texture.power_of_two` / `texture.multiple_of_4` / `texture.square`
-  - `texture.unused_alpha` / `texture.alpha_required`
-  - `texture.bit_depth`
-  - `texture.color_profile`
-  - `texture.generation_metadata` (AI prompts or workflows in PNG `tEXt`/`iTXt`/`zTXt` chunks, such as
-    `parameters`, `prompt` and `workflow`, and in XMP; read by fire-cli itself)
-  - `texture.file_size`
-  - `texture.psd_composite` / `texture.psb`
-- **Rules file format:** 3d-review-cli's profile envelope,
-  `{version, generator, profile: {name, rules: {<id>: {enabled, severity, params, note}}}}`. Loaded
-  leniently: unknown rules are skipped, and a missing rule takes the tool's default.
-- **Messages** (AC11):
-  - every rule has a title and what / why / how text;
-  - "what" carries the measured value and the limit;
-  - "how" names steps in the artist's tools (e.g. Photoshop: Image > Image Size).
-  - Fire has no message catalogue, so keep every string in one module, so that a catalogue can replace
-    it later.
-- **Results:** written through asset-rules (shared format, AC10), with its cache used for `--staged`.
-- **Tests:** generated fixtures, including:
-  - opaque alpha;
-  - 16-bit;
-  - a Display P3 ICC profile;
-  - PNG text chunks;
-  - a WebP;
-  - a PSD without a merged image (fire-decode's tests already build synthetic PSDs).
+- **Dependencies:** `fire-decode` (with `psd`/`heif` pass-through features, on by default, so CI's
+  decoder-free job builds it), and `asset-rules` by tag `v0.1.0`. asset-rules is public, so CI fetches
+  it without credentials.
+- **Commands:** `check <files>... | --staged | --files-from <list>` with `--rules`, `--profile` or
+  neither, and `--results`; `info`; `rules check` / `rules explain`; `--version` / `--help`.
+  - The contract, exit codes and option rules are 3d-review-cli's, matched against its in-progress
+    AC13 work.
+  - With `--rules`, other tools' files are left out of the results. `--staged` reads the staged
+    content and, with `--rules`, uses the cache.
+- **Decoding:** full size, no ICC conversion, at most 4 files at once (never more than the cores),
+  each decode limited to its share of the cores (`with_max_threads`).
+- **Rules:** all 14 v1 rules.
+  - A PSB, or a PSD with no merged image, can't be decoded. It is checked on its header: size, depth,
+    format and file size.
+- **Rules files:** the 3d-review-cli envelope, read leniently. A listed rule is on; omitted fields
+  take the defaults; unknown or malformed rules are skipped with a warning.
+- **Decision: rules a file doesn't list take the tool's default.** The defaults are on only for what
+  Unity gets wrong whatever the team's policy is:
+  - `texture.format`: Unity's importable formats that Fire decodes;
+  - `texture.psd_composite`;
+  - `texture.color_profile`.
+  - Everything else is off until listed. The same defaults apply with neither `--rules` nor
+    `--profile`.
+- **Messages:** all of them in `src/messages.rs` (AC11).
+- **Tests:**
+  - 33 unit tests, and 7 end-to-end tests of the binary on generated fixtures: opaque alpha, 16-bit,
+    Display P3, a `parameters` text chunk, WebP, and a PSD without a merged image;
+  - `--staged` in a scratch git repository, with a partially staged file read as staged, and the
+    cache;
+  - all of them in CI's decoder-free job too, except the PSD fixture.
 - **Packaging:**
-  - macOS: `scripts/build-mac.sh` copies `fire-cli` into `Fire.app/Contents/MacOS/` and signs it with
-    the hardened runtime, like the main binary.
-  - Windows: `installer/fire.iss` and `scripts/build-installer.ps1` install `fire-cli.exe` beside
-    `fire.exe`. Edit on the Mac; verify on Windows.
-  - Neither installer puts it on PATH; Asset Check's setup tool records where it is (AC16).
-- **Docs:** `docs/cli.md`, modelled on 3D Review's.
+  - Windows: `fire.iss` and `build-installer.ps1` install `fire-cli.exe` beside `fire.exe`, not on
+    PATH. ISCC compiles the installer with it included (verified on Windows).
+  - macOS: `build-mac.sh` builds `fire-cli`, copies it to `Fire.app/Contents/MacOS/`, and signs it on
+    its own with the hardened runtime before signing the bundle. `dev-app.sh` copies it too.
+  - CI lints and tests it in both jobs, and builds it in the release step.
+- **Notices:** the 17 crates it adds are in `THIRD-PARTY-NOTICES.md` (184 crates now) and
+  `CREDITS.md`. `serde_json` is now linked, no longer build-time only.
 
-*Done when* Asset Check step 2's gate passes for fire's half:
-- it gives the same file the same profile and stage as 3d-review-cli;
-- its results validate against the schema;
-- a 20-asset commit is checked in a few seconds, and almost instantly when cached.
+*The gate* (Asset Check step 2, fire's half):
+- **Results validate:** every test reads its results back through asset-rules' `Results::read`,
+  which checks the schema and version.
+- **Speed:** 20 real 1K-4K textures (146 MB) staged in a scratch repository took 0.3 s cold and
+  0.13 s cached, on a 24-core PC with a release build.
+- **The same profile and stage as 3d-review-cli:** true by construction (both call asset-rules'
+  `resolve`), and covered by asset-rules' own step-1 test. It still needs an end-to-end check once
+  3d-review-cli's AC13 work lands.
+
+**Still to do on the Mac:**
+- Run `scripts/build-mac.sh`: the nested `fire-cli` signature, notarization, and `codesign --verify`.
+- Run `scripts/dev-app.sh`.
+- Run `fire-cli` from inside the bundle.
 
 ## B. The fire-decode migration: fire's side, after A
 

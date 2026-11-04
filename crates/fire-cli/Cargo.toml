@@ -1,0 +1,37 @@
+[package]
+name = "fire-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `fire-cli`, Asset Check's image checker (AC12): a console program installed beside the viewer
+# that checks images against a technical artist's rules, on fire-decode. The default bin needs no
+# [[bin]] section, and there is no `windows_subsystem`: it is a console program.
+
+# Pass-throughs to `fire-decode`'s native decoders, on by default, as in `fire`.
+# `--no-default-features` builds without the vendored native trees, for CI's decoder-free job.
+[features]
+default = ["psd", "heif"]
+psd = ["fire-decode/psd"]
+heif = ["fire-decode/heif"]
+
+[dependencies]
+fire-decode.workspace = true
+asset-rules.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The embedded ICC profile's description, for the colour-profile finding.
+lcms2.workspace = true
+# zTXt / compressed iTXt chunks, read for generation metadata.
+miniz_oxide.workspace = true
+memchr.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+# Test fixtures: images written by the `image` crate, and a WebP by `image-webp`.
+image.workspace = true
+image-webp.workspace = true
+
+[lints]
+workspace = true

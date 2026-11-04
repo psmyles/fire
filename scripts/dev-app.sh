@@ -40,9 +40,9 @@ version="$(plutil -extract version raw -o - "$repo/product.json")"
 
 if [[ $build -eq 1 ]]; then
     if [[ $profile == release ]]; then
-        cargo build --manifest-path "$repo/Cargo.toml" -p fire --release
+        cargo build --manifest-path "$repo/Cargo.toml" -p fire -p fire-cli --release
     else
-        cargo build --manifest-path "$repo/Cargo.toml" -p fire
+        cargo build --manifest-path "$repo/Cargo.toml" -p fire -p fire-cli
     fi
 fi
 
@@ -53,6 +53,10 @@ app="$repo/target/$name.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 cp "$bin" "$app/Contents/MacOS/$name"
+# fire-cli beside it, where the shipped bundle has it. Skipped quietly if it wasn't built.
+if [[ -x "$repo/target/$profile/fire-cli" ]]; then
+    cp "$repo/target/$profile/fire-cli" "$app/Contents/MacOS/fire-cli"
+fi
 
 # NSHighResolutionCapable is not optional: without it macOS runs the window through 1x scaling and
 # every pixel is blurry on a Retina display, which makes D15's "1:1 is one texel per *physical*

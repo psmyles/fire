@@ -26,6 +26,9 @@
 #ifndef MyShellExtSource
   #error product.generated.iss did not define MyShellExtSource — re-run scripts\build-installer.ps1
 #endif
+#ifndef MyCliSource
+  #error product.generated.iss did not define MyCliSource — re-run scripts\build-installer.ps1
+#endif
 #ifndef MyOutputDir
   #define MyOutputDir "dist"
 #endif
@@ -88,6 +91,10 @@ Source: "{#MyExeSource}"; DestDir: "{app}"; DestName: "{#MyAppExe}"; Flags: igno
 ; support (CloseApplications, on by default, *.dll in its filter) finds that surrogate and offers to
 ; close it. `restartreplace` would not help — it needs admin rights, and this install has none.
 Source: "{#MyShellExtSource}"; DestDir: "{app}"; Flags: ignoreversion
+; fire-cli.exe, Asset Check's image checker: a console program beside fire.exe, as 3d-review-cli.exe
+; sits beside 3d-review.exe. Deliberately not put on PATH: Asset Check's setup records where it
+; is (.git/asset-check/tools.env), so the hook never depends on a PATH it doesn't control.
+Source: "{#MyCliSource}"; DestDir: "{app}"; Flags: ignoreversion
 
 ; --- license notices -----------------------------------------------------------------------
 ; fire.exe is statically linked, so the binary installed above contains code from ~160 other

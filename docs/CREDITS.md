@@ -105,6 +105,14 @@ see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 - **[serde](https://github.com/serde-rs/serde)** and **[toml](https://github.com/toml-rs/toml)** -
   Erick Tryzelaar, David Tolnay, Ed Page and contributors. The config file.
+- **[serde_json](https://github.com/serde-rs/json)** - Erick Tryzelaar, David Tolnay and
+  contributors. `fire-cli`'s rules and results files, and `product.json` at build time.
+- **[asset-rules](https://github.com/psmyles/asset-rules)**, with
+  **[globset](https://github.com/BurntSushi/ripgrep/tree/master/crates/globset)** and
+  **[memchr](https://github.com/BurntSushi/memchr)** (Andrew Gallant) and
+  **[sha2](https://github.com/RustCrypto/hashes)** (the RustCrypto developers) - which Asset Check
+  rules apply to a file, the results format and the cache, shared by `fire-cli` and 3D Review's
+  `3d-review-cli`.
 - **[crossbeam-channel](https://github.com/crossbeam-rs/crossbeam)** - the Crossbeam project
   developers. Channels from the decode pool and file watcher to the UI thread.
 - **[rayon](https://github.com/rayon-rs/rayon)** - Josh Stone, Niko Matsakis and contributors.
@@ -121,7 +129,7 @@ see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
   **[parking_lot](https://github.com/Amanieu/parking_lot)**,
   **[smallvec](https://github.com/servo/rust-smallvec)**,
   **[hashbrown](https://github.com/rust-lang/hashbrown)** and others - see
-  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the complete list of 167 crates.
+  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the complete list of 184 crates.
 
 ## Build tooling
 
@@ -136,8 +144,6 @@ Used to build Fire; not linked into the binary.
   compilers.
 - **[resvg](https://github.com/linebender/resvg)** - Yevhenii Reizner and the Linebender project.
   Rasterizes the toolbar SVGs and decodes the logo at build time.
-- **[serde_json](https://github.com/serde-rs/json)** - Erick Tryzelaar, David Tolnay and
-  contributors. Reads `product.json` at build time.
 - **[winresource](https://github.com/BenjaminRi/winresource)** - Benjamin Richner. Windows version
   resource and icon.
 - **[ImageMagick](https://imagemagick.org)** - ImageMagick Studio LLC. `fire.ico`, at packaging

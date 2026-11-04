@@ -47,6 +47,8 @@ before this one.
 crates/
   fire/          the viewer app - winit window + event loop, sokol_gfx render, decode pool,
                  instance socket (the whole app; the file manager launches it directly)
+  fire-cli/      fire-cli, Asset Check's image checker: a console program that checks images
+                 against a technical artist's rules (docs/cli.md)
   fire-decode/   uniform decode core: bytes → (pixels, format, bit depth, ICC)
   fire-ipc/      wire format for forwarding an open to the running instance, dependency-light
   fire-thumbs/   Explorer thumbnails minus the COM: settings, format table, CPU render, and (Windows)

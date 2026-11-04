@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/fire-ipc",
     "crates/fire",
+    "crates/fire-cli",
     "crates/fire-decode",
     "crates/fire-thumbs",
     "crates/fire-shellext",
@@ -144,6 +145,18 @@ notify = "8"
 # Build-time only: fire's build.rs parses product.json (the single source of product
 # metadata: name/version/publisher/copyright/homepage). Not linked into the binary.
 serde_json = "1"
+
+# --- Asset Check (fire-cli) ---
+# Which rules apply to a file, the results format, the git helpers and the cache, shared with
+# 3D Review's `3d-review-cli` so both checkers answer the same way (Asset Check AC9). Used by tag;
+# to build against an unreleased checkout, give this repository an untracked `.cargo/config.toml`
+# with `[patch."https://github.com/psmyles/asset-rules"] asset-rules = { path = "../asset-rules" }`.
+asset-rules = { git = "https://github.com/psmyles/asset-rules", tag = "v0.1.0" }
+# Byte-string search for generation metadata in XMP. Already in the build through `globset`.
+memchr = "2"
+# The digest results record for fire-cli's built-in rules. The version and features asset-rules
+# uses, so it adds no crate.
+sha2 = { version = "0.11", default-features = false }
 
 # --- worker messaging ---
 crossbeam-channel = "0.5"

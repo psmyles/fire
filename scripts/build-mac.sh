@@ -149,11 +149,16 @@ fi
 
 if [[ $do_build -eq 1 ]]; then
     say "cargo build --release"
-    cargo build --manifest-path "$repo/Cargo.toml" -p fire --release
+    cargo build --manifest-path "$repo/Cargo.toml" -p fire -p fire-cli --release
 fi
 
 bin="$repo/target/release/fire"
 [[ -x "$bin" ]] || die "no release binary at $bin — drop --no-build?"
+# fire-cli, Asset Check's image checker: a console program shipped inside the bundle, beside the
+# viewer, as 3d-review-cli is in 3D Review's. Asset Check's setup records where it is; it is not
+# linked onto the PATH.
+cli="$repo/target/release/fire-cli"
+[[ -x "$cli" ]] || die "no release binary at $cli — drop --no-build?"
 
 archs="$(lipo -archs "$bin")"
 [[ "$archs" == *arm64* ]] || die "the binary is '$archs', not arm64 (D10 is Apple Silicon only)"
@@ -243,6 +248,7 @@ say "bundle → $app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/$name"
+cp "$cli" "$app/Contents/MacOS/fire-cli"
 cp "$icns" "$app/Contents/Resources/$name.icns"
 # The four-byte type/creator file. Vestigial, but its absence still confuses some tools.
 printf 'APPL????' > "$app/Contents/PkgInfo"
@@ -340,6 +346,10 @@ if [[ $do_sign -eq 1 ]]; then
     # a secure timestamp from Apple, which it also requires and which is what keeps the signature
     # valid after the certificate expires. No entitlements: Fire needs none, and every entitlement
     # is a hole to justify.
+    # Nested code is signed first and on its own (`--deep` is not a supported way to sign it), with
+    # the same hardened runtime and timestamp the main binary gets: notarization checks each one.
+    codesign --force --options runtime --timestamp \
+        --sign "$sign_id" "$app/Contents/MacOS/fire-cli"
     codesign --force --options runtime --timestamp \
         --sign "$sign_id" "$app"
     codesign --verify --deep --strict --verbose=2 "$app"

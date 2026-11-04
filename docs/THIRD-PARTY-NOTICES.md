@@ -1,7 +1,7 @@
 # Third-party notices
 
-Fire is statically linked — `fire.exe` and the Explorer thumbnail handler `fire_shellext.dll` on
-Windows, the binary inside `Fire.app` on macOS. Everything they need at runtime is compiled into
+Fire is statically linked — `fire.exe`, the console checker `fire-cli.exe` and the Explorer
+thumbnail handler `fire_shellext.dll` on Windows, the binaries inside `Fire.app` on macOS. Everything they need at runtime is compiled into
 them, so the binaries you receive contain code from the projects listed below. Their licenses
 require that their copyright notices and license terms travel with the binaries — this document,
 together with the [`../licenses/`](../licenses/) directory, is how they do.
@@ -11,15 +11,15 @@ Fire's own code is MIT licensed; see [`../LICENSE`](../LICENSE).
 * **Section 1** covers the native C/C++ libraries. Read this one — it is short, and it contains
   the only obligation in the whole distribution that goes beyond attribution (the LGPL relink
   right, below).
-* **Section 2** covers the Rust crates (167 of them). One of them, `option-ext`, is MPL-2.0; the
+* **Section 2** covers the Rust crates (184 of them). One of them, `option-ext`, is MPL-2.0; the
   note under the table says what that does and does not require.
 * **Section 3** notes what is *not* here, and why.
 
 Generated against Fire 0.6.0 (`Cargo.lock`, runtime dependencies only, for the union of the two
 shipped targets `x86_64-pc-windows-msvc` and `aarch64-apple-darwin` — a crate that appears on only
 one of them is still listed, since both binaries are built from this tree). Build-time-only
-tooling — `bindgen`, `cc`, `resvg`, `winresource`, `serde_json`, `sokol-shdc`, `fxc`, `xcrun
-metal` — is excluded: it produces the binary but no part of it is linked into the binary.
+tooling — `bindgen`, `cc`, `resvg`, `winresource`, `sokol-shdc`, `fxc`, `xcrun metal` — is
+excluded: it produces the binary but no part of it is linked into the binary.
 
 ---
 
@@ -120,14 +120,14 @@ License text: [`licenses/Zlib.txt`](../licenses/Zlib.txt)
 
 ## 2. Rust crates
 
-167 crates are linked into the Fire binaries (the union of both shipped targets). Where a crate
+184 crates are linked into the Fire binaries (the union of both shipped targets). Where a crate
 offers a choice of licenses, the column below records **the license Fire elects**, not the full
 SPDX expression — Fire elects MIT wherever MIT is offered, then the most permissive of what is
 left. Full texts:
 
 | License | Text |
 |---|---|
-| MIT (155 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
+| MIT (172 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
 | BSD-3-Clause (6) | [`licenses/BSD-3-Clause.txt`](../licenses/BSD-3-Clause.txt) |
 | 0BSD (3) | [`licenses/0BSD.txt`](../licenses/0BSD.txt) |
 | Apache-2.0 (1, plus 1 in addition to MIT) | [`licenses/Apache-2.0.txt`](../licenses/Apache-2.0.txt) |
@@ -142,15 +142,19 @@ rows name the authors the crate itself declares.
 | Crate | Version | License | Copyright |
 |---|---|---|---|
 | `adler2` | 2.0.1 | MIT | Copyright (C) Jonas Schievink <jonasschievink@gmail.com> |
+| `aho-corasick` | 1.1.4 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant |
 | `alloc-no-stdlib` | 2.0.4 | BSD-3-Clause | Copyright (c) 2016 Dropbox, Inc. |
 | `alloc-stdlib` | 0.2.4 | BSD-3-Clause | (no notice in crate; authors: Daniel Reiter Horn <danielrh@dropbox.com>) |
+| `asset-rules` | 0.1.0 | MIT | Copyright (c) 2026 Chandan Singh |
 | `bit_field` | 0.10.3 | MIT | Copyright (c) 2016 Philipp Oppermann |
 | `bitflags` | 1.3.2 | MIT | Copyright (c) 2014 The Rust Project Developers |
 | `bitflags` | 2.13.0 | MIT | Copyright (c) 2014 The Rust Project Developers |
 | `bcdec_rs` | 0.2.0 | MIT | (no notice in crate; authors: ScanMountGoat) |
+| `block-buffer` | 0.12.1 | MIT | Copyright (c) 2018-2025 The RustCrypto Project Developers |
 | `block2` | 0.5.1 | MIT | (no notice in crate; authors: Steven Sheldon, Mads Marquart <mads@marquart.dk>) |
 | `block2` | 0.6.2 | MIT | (no notice in crate; authors: Mads Marquart <mads@marquart.dk>) |
 | `brotli-decompressor` | 5.0.3 | MIT | Copyright (c) 2016 Dropbox, Inc. |
+| `bstr` | 1.13.1 | MIT | Copyright (c) 2018-2019 Andrew Gallant |
 | `bytemuck` | 1.25.0 | MIT | Copyright (c) 2019 Daniel "Lokathor" Gee. |
 | `byteorder` | 1.5.0 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant |
 | `bytemuck_derive` | 1.10.2 | MIT | Copyright (c) 2019 Daniel "Lokathor" Gee. |
@@ -161,16 +165,19 @@ rows name the authors the crate itself declares.
 | `core-foundation-sys` | 0.8.7 | MIT | Copyright (c) 2012-2013 Mozilla Foundation |
 | `core-graphics` | 0.23.2 | MIT | Copyright (c) 2012-2013 Mozilla Foundation |
 | `core-graphics-types` | 0.1.3 | MIT | Copyright (c) 2012-2013 Mozilla Foundation |
+| `cpufeatures` | 0.3.1 | MIT | Copyright (c) 2020-2026 The RustCrypto Project Developers |
 | `crc32fast` | 1.5.0 | MIT | Copyright (c) 2018 Sam Rijs, Alex Crichton and contributors |
 | `crossbeam-channel` | 0.5.15 | MIT | Copyright (c) 2019 The Crossbeam Project Developers |
 | `crossbeam-deque` | 0.8.6 | MIT | Copyright (c) 2019 The Crossbeam Project Developers |
 | `crossbeam-epoch` | 0.9.18 | MIT | Copyright (c) 2019 The Crossbeam Project Developers |
 | `crossbeam-utils` | 0.8.21 | MIT | Copyright (c) 2019 The Crossbeam Project Developers |
+| `crypto-common` | 0.2.2 | MIT | Copyright (c) 2021-2026 RustCrypto Developers |
 | `cursor-icon` | 1.2.0 | MIT | Copyright (c) 2023 Kirill Chibisov |
 | `dear-imgui-rs` | 0.17.0 | MIT | (no notice in crate; authors: Mingzhen Zhuang <superfrankie621@gmail.com>) |
 | `dear-imgui-sys` | 0.17.0 | MIT | (no notice in crate; authors: Mingzhen Zhuang <superfrankie621@gmail.com>) |
 | `dear-imgui-winit` | 0.17.0 | MIT | (no notice in crate; authors: Mingzhen Zhuang <superfrankie621@gmail.com>) |
 | `ddsfile` | 0.6.0 | MIT | Copyright (c) Michael Dilger & Connor Fitzgerald |
+| `digest` | 0.11.3 | MIT | Copyright (c) 2017-2025 RustCrypto Developers; Copyright (c) 2017 Artyom Pavlov |
 | `dirs` | 6.0.0 | MIT | Copyright (c) 2018-2019 dirs-rs contributors |
 | `dirs-sys` | 0.5.0 | MIT | Copyright (c) 2018-2019 dirs-rs contributors |
 | `dispatch` | 0.2.0 | MIT | (no notice in crate; authors: Steven Sheldon) |
@@ -189,12 +196,15 @@ rows name the authors the crate itself declares.
 | `foreign-types-shared` | 0.3.1 | MIT | Copyright (c) 2017 The foreign-types Developers |
 | `fsevent-sys` | 4.1.0 | MIT | Copyright (c) 2015 Pierre Baillet |
 | `gif` | 0.14.2 | MIT | Copyright (c) 2015 nwin |
+| `globset` | 0.4.21 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant |
 | `half` | 2.7.1 | MIT | (no notice in crate; authors: Kathryn Long <squeeself@gmail.com>) |
 | `hashbrown` | 0.17.1 | MIT | Copyright (c) 2016 Amanieu d'Antras |
+| `hybrid-array` | 0.4.15 | MIT | Copyright (c) 2022-2026 The RustCrypto Project Developers |
 | `image` | 0.25.10 | MIT | (no notice in crate; authors: The image-rs Developers) |
 | `image-webp` | 0.2.4 | MIT | (no copyright notice supplied by the crate) |
 | `indexmap` | 2.14.0 | MIT | Copyright (c) 2016--2017 |
 | `interprocess` | 2.4.4 | 0BSD | Copyright (c) 2020-2026 Goat |
+| `itoa` | 1.0.18 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>) |
 | `jpeg-encoder` | 0.7.0 | (MIT OR Apache-2.0) AND IJG | Copyright (c) 2021 Volker Ströbel <volkerstroebel@mysurdity.de> |
 | `jxl-bitstream` | 1.1.0 | MIT | (no notice in crate; authors: Wonwoo Choi <chwo9843@gmail.com>) |
 | `jxl-coding` | 1.0.1 | MIT | (no notice in crate; authors: Wonwoo Choi <chwo9843@gmail.com>) |
@@ -217,6 +227,7 @@ rows name the authors the crate itself declares.
 | `libwebp-sys` | 0.14.4 | MIT | (no notice in crate; authors: XianYou <xianyou.cyq@alibaba-inc.com>, Kornel Lesiński <kornel@geekhood.net>) |
 | `lock_api` | 0.4.14 | MIT | Copyright (c) 2016 The Rust Project Developers |
 | `log` | 0.4.33 | MIT | Copyright (c) 2014 The Rust Project Developers |
+| `memchr` | 2.8.2 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant |
 | `miniz_oxide` | 0.8.9 | MIT | Copyright 2013-2014 RAD Game Tools and Valve Software; Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC; Copyright 2016 Martin Molzer |
 | `mint` | 0.5.9 | MIT | Copyright (c) 2017 Dzmitry Malyshau |
 | `moxcms` | 0.8.1 | BSD-3-Clause | Copyright (c) Radzivon Bartoshyk. All rights reserved. |
@@ -250,13 +261,17 @@ rows name the authors the crate itself declares.
 | `rayon` | 1.12.0 | MIT | Copyright (c) 2010 The Rust Project Developers |
 | `rayon-core` | 1.13.0 | MIT | Copyright (c) 2010 The Rust Project Developers |
 | `recvmsg` | 1.0.0 | 0BSD | Copyright (c) 2023 kotauskas |
+| `regex-automata` | 0.4.18 | MIT | Copyright (c) 2014 The Rust Project Developers |
+| `regex-syntax` | 0.8.11 | MIT | Copyright (c) 2014 The Rust Project Developers |
 | `rfd` | 0.17.2 | MIT | Copyright (c) 2022 Bartłomiej Maryńczak |
 | `same-file` | 1.0.6 | MIT | Copyright (c) 2017 Andrew Gallant |
 | `scopeguard` | 1.2.0 | MIT | Copyright (c) 2016-2019 Ulrik Sverdrup "bluss" and scopeguard developers |
 | `serde` | 1.0.228 | MIT | (no notice in crate; authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com>) |
 | `serde_core` | 1.0.228 | MIT | (no notice in crate; authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com>) |
 | `serde_derive` | 1.0.228 | MIT | (no notice in crate; authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com>) |
+| `serde_json` | 1.0.150 | MIT | (no notice in crate; authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com>) |
 | `serde_spanned` | 0.6.9 | MIT | Copyright (c) Individual contributors |
+| `sha2` | 0.11.1 | MIT | Copyright (c) 2016-2026 The RustCrypto Project Developers; Copyright (c) 2016 Artyom Pavlov; Copyright (c) 2009-2013 Mozilla Foundation; Copyright (c) 2006-2009 Graydon Hoare |
 | `simd-adler32` | 0.3.9 | MIT | Copyright (c) [2021] [Marvin Countryman] |
 | `smallvec` | 1.15.2 | MIT | Copyright (c) 2018 The Servo Project Developers |
 | `smol_str` | 0.2.2 | MIT | (no notice in crate; authors: Aleksey Kladov <aleksey.kladov@gmail.com>) |
@@ -270,6 +285,7 @@ rows name the authors the crate itself declares.
 | `toml_write` | 0.1.2 | MIT | Copyright (c) Individual contributors |
 | `tracing` | 0.1.44 | MIT | Copyright (c) 2019 Tokio Contributors |
 | `tracing-core` | 0.1.36 | MIT | Copyright (c) 2019 Tokio Contributors |
+| `typenum` | 1.20.1 | MIT | Copyright (c) 2014 Paho Lurie-Gregg |
 | `unicode-ident` | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>) |
 | `unicode-segmentation` | 1.13.3 | MIT | Copyright (c) 2015 The Rust Project Developers |
 | `walkdir` | 2.5.0 | MIT | Copyright (c) 2015 Andrew Gallant |
@@ -299,6 +315,7 @@ rows name the authors the crate itself declares.
 | `winnow` | 0.7.15 | MIT | (no copyright notice supplied by the crate) |
 | `zerocopy` | 0.8.52 | MIT | Copyright 2023 The Fuchsia Authors |
 | `zerocopy-derive` | 0.8.52 | MIT | Copyright 2023 The Fuchsia Authors |
+| `zmij` | 1.0.21 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>) |
 | `zune-bmp` | 0.5.2 | MIT | Copyright (c) zune-image developers |
 | `zune-core` | 0.5.1 | MIT | Copyright (c) zune-image developers |
 | `zune-farbfeld` | 0.5.2 | MIT | Copyright (c) zune-image developers |
@@ -348,8 +365,8 @@ affected. Full text: [`licenses/MPL-2.0.txt`](../licenses/MPL-2.0.txt).
   `advapi32`, `shell32`, `ole32` and friends from the Windows SDK. On macOS it links the `Cocoa`,
   `QuartzCore`, `Metal` and `Foundation` frameworks. These are operating-system components
   licensed to the user by Microsoft and by Apple as part of the OS, not redistributed by Fire.
-* **Build-time tooling.** `bindgen`, `cc`, `resvg`, `winresource`, `serde_json`, `sokol-shdc`,
-  `fxc.exe` and `xcrun metal` run during the build and contribute no code to the binary. Inno
+* **Build-time tooling.** `bindgen`, `cc`, `resvg`, `winresource`, `sokol-shdc`, `fxc.exe` and
+  `xcrun metal` run during the build and contribute no code to the binary. Inno
   Setup builds the Windows installer; its license permits distributing the installers it produces
   without attribution. The macOS `.dmg` is built with Apple's own `codesign` / `notarytool` /
   `hdiutil`.
@@ -364,16 +381,16 @@ The tables above are derived from `Cargo.lock` plus the license files in the loc
 Re-derive them after a dependency change with:
 
 ```sh
-cargo tree -p fire -e normal --target x86_64-pc-windows-msvc --prefix none --format "{p}"
-cargo tree -p fire -e normal --target aarch64-apple-darwin   --prefix none --format "{p}"
+cargo tree -p fire -p fire-cli -e normal --target x86_64-pc-windows-msvc --prefix none --format "{p}"
+cargo tree -p fire -p fire-cli -e normal --target aarch64-apple-darwin   --prefix none --format "{p}"
 ```
 
 Take the **union** of the two — both targets ship — and cross-reference
 `cargo metadata --format-version 1` for each package's `license` field, then read the copyright
 line out of each package's own `LICENSE*` file in the local cargo registry. The workspace's own
-crates (`fire`, `fire-decode`, `fire-ipc`, `fire-thumbs`, `fire-shellext`, `psd-sdk-sys`,
-`heif-sys`) and the vendored `sokol` path dependency are excluded from the table: the first seven
-are Fire, and sokol is section 1. `fire_shellext.dll` links a subset of `fire`'s crates, so
+crates (`fire`, `fire-cli`, `fire-decode`, `fire-ipc`, `fire-thumbs`, `fire-shellext`,
+`psd-sdk-sys`, `heif-sys`) and the vendored `sokol` path dependency are excluded from the table: the
+first eight are Fire, and sokol is section 1. `fire_shellext.dll` links a subset of `fire`'s crates, so
 `-p fire` covers both binaries. The
 native libraries in section 1 change only when `crates/*/vendor/`, `vendor/sokol-rust`, or a `-sys`
 crate that vendors one (`lcms2-sys`, `libwebp-sys`, `dear-imgui-sys`) changes.

@@ -911,6 +911,7 @@ fire/
 │  │  ├─ src/render/  #   view math, gpu.rs, d3d11.rs | metal.rs, mips.rs, imgui.rs, the shader
 │  │  ├─ src/ui/      #   pure immediate-mode UI + the stylesheet (theme.toml)
 │  │  └─ simgui/      #   sokol_imgui.h + cimgui.h, compiled as C by build.rs
+│  ├─ fire-cli/       # fire-cli — Asset Check's image checker, a console program (docs/cli.md)
 │  ├─ fire-decode/    # uniform decode core (zune/image/exr/psd_sdk/libheif/lcms2)
 │  ├─ fire-thumbs/    # Explorer thumbnails minus COM: settings, formats, CPU render, HKCU, cache
 │  ├─ fire-shellext/  # fire_shellext.dll — the IThumbnailProvider Explorer loads (Windows)
