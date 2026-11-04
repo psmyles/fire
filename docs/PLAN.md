@@ -10,8 +10,9 @@ Open items, in order:
    stage. This waits for 3D Review's AC13 work, which is in progress but not committed.
 3. **Merge `asset-check` into `main`** before the fire-decode extraction, so A1 travels with the
    crate's history.
-4. **Commit the synced `fire-decode-plan.md` in psmyles/fire-decode.** A1 changed FD4 and FD10 here;
-   the canonical copy has the same edit, not yet committed.
+4. **Merge psmyles/fire-decode's `asset-check` branch into its `main`.** It holds the canonical
+   `fire-decode-plan.md` with the same edits as this copy: A1's to FD4 and FD10, and `fire-cli.exe`
+   added to FD20 and the step-1 gate.
 5. **Next by the order below:** the Launcher's results table (another repository), then B. B's step 2,
    the tonemap fix, can be done at any time.
 
@@ -161,8 +162,7 @@ documents it in full.
 - The static CRT for fire, fire-shellext and fire-cli (FD20), checked by an import table with no
   `MSVCP140` / `VCRUNTIME140*` entries.
   - `fire-cli.exe` links psd_sdk and the HEIF stack too, and imports `MSVCP140.dll` today, as
-    `fire.exe` does. FD20 and the step-1 gate in `fire-decode-plan.md` name only `fire.exe` and
-    `fire_shellext.dll`; add `fire-cli.exe` to both copies.
+    `fire.exe` does. FD20 and the step-1 gate in `fire-decode-plan.md` now name it.
 - Verifying the installer changes:
   - run the installer and check that `fire-cli.exe` lands beside `fire.exe` and runs. A2 only
     compiled the installer with ISCC.
