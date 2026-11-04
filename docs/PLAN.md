@@ -1,7 +1,7 @@
 # fire - Work Plan
 
-**Status, November 2026:** planning done; the work below hasn't started. It's ordered for a stretch of
-work on a Mac. Items that need Windows are collected at the end.
+**Status, November 2026:** A1 is done; the rest hasn't started. asset-rules is tagged `v0.1.0`.
+The work is ordered for a stretch on a Mac; items that need Windows are collected at the end.
 
 ## Context
 
@@ -43,26 +43,32 @@ crate's history.
 
 ## A. Asset Check
 
-### A1. Three small fire-decode additions
+### A1. Three small fire-decode additions - done
 
-All in `crates/fire-decode`, needed by `fire-cli`'s rules (AC12). None of them waits for the
-migration.
+All in `crates/fire-decode`, needed by `fire-cli`'s rules (AC12).
 
-1. **Expose the sRGB test.** `is_srgb_equivalent` (`src/lib.rs`, around line 2254, inside the private
-   ICC module) already decides whether an ICC profile is equivalent to sRGB. Make it reachable, e.g.
-   `pub fn icc_is_srgb(profile: &[u8]) -> bool`, so `texture.color_profile` can tell a Display P3 or
-   Adobe RGB profile from an sRGB one.
-2. **True PNG bit depth.** The PNG path (`src/lib.rs`, around line 1335) reports 8 or 16 only.
-   1/2/4-bit and palette PNGs report 8. Report the file's real depth, and whether it's a palette image,
-   without changing the decoded buffer. `texture.bit_depth` needs the real value.
-3. **A distinct "PSD has no merged image" error.** psd-sdk-sys already returns
-   `PsdError::NoMergedImage` (`crates/psd-sdk-sys/src/lib.rs:45`), but fire-decode turns every PSD error
-   into `DecodeError::Malformed(String)` (`src/lib.rs:799`). Make this case matchable without parsing
-   text, so `texture.psd_composite` can say "save with Maximize Compatibility".
-   - Pick the form with the fire-decode plan's FD10 in mind, either a variant now or the FD10 variant
-     set early, and record the choice in FD10.
+1. **`pub fn icc_is_srgb(profile: &[u8]) -> bool`.** It runs the ICC pass's sRGB probe with the
+   relative colorimetric intent, so `texture.color_profile` can tell a Display P3 or Adobe RGB profile
+   from an sRGB one.
+   - Greyscale profiles are probed too: sRGB when the tone curve is sRGB's.
+   - Every other colour space returns `false`.
+2. **True PNG bit depth.** `DecodedImage::bit_depth` is the IHDR depth (1/2/4/8/16), and the new
+   `DecodedImage::palette` is set for colour type 3. The decoded buffer is unchanged.
+   - Only PNG sets `palette` so far.
+   - The viewer's status bar now shows a 4-bit PNG as 4-bit.
+3. **`DecodeError::NoMergedImage`**, a plain variant now; recorded in FD10.
+   - The plan's premise was only half right. psd_sdk's `NoMergedImage` fires only when the image
+     data section is missing, and none of 2,029 PSDs on the dev machine lacks one.
+   - Photoshop, saved without Maximize Compatibility, writes a **white placeholder** and clears
+     `hasRealMergedData` in the Version Info resource (1057). fire-decode reads that flag before
+     psd_sdk runs, at about 0.1 µs a file. Both cases return the new variant.
+   - In the viewer such a file is now an error with that message, not a white canvas. Its layers
+     can't be browsed, since layer browsing starts from a decoded composite.
 
-*Done when* each addition has a test, and fire's existing tests and TTFP are unchanged.
+Each addition has tests. The workspace tests pass with default features and with
+`--no-default-features`.
+- TTFP wasn't re-measured. The added work is a 14-byte header read for PNG and a resource-section
+  walk for PSD, with no pixel work.
 
 ### A2. `fire-cli`
 

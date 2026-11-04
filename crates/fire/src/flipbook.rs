@@ -911,6 +911,7 @@ mod tests {
             format: PixelFormat::Rgba8Unorm,
             bit_depth: 8,
             channels: 4,
+            palette: false,
             alpha_opaque: true,
             icc: None,
             source_format: "TEST",
@@ -1223,6 +1224,7 @@ mod tests {
             format: PixelFormat::Rgba8Unorm,
             bit_depth: 8,
             channels: 4,
+            palette: false,
             alpha_opaque: false, // gate the alpha pass on
             icc: None,
             source_format: "TEST",

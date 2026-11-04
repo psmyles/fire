@@ -317,13 +317,20 @@ pub struct DecodedImage {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
-    /// Bits per channel of the *source* (for the status bar), independent of `format`.
+    /// Bits per channel of the *source* (for the status bar), independent of `format`. A PNG
+    /// reports its IHDR depth, so a 1-, 2- or 4-bit file says so even though it decodes to 8 bits;
+    /// for a palette image that is the width of an index (see [`palette`](Self::palette)).
     pub bit_depth: u8,
     /// The source's true channel count (1=gray, 2=gray+A, 3=RGB, 4=RGBA), for the status bar and
     /// the RGB↔RGBA toolbar icon. Reported faithfully even when an alpha channel is fully opaque —
     /// a 32-bit PNG screenshot still reads "RGBA" and keeps an inspectable alpha channel; whether
     /// that alpha actually carries transparency is a separate signal ([`alpha_opaque`](Self::alpha_opaque)).
     pub channels: u8,
+    /// Whether the source stores palette indices rather than colours. `bit_depth` is then the
+    /// index width (1, 2, 4 or 8) and `channels` what the palette expands to: 3, or 4 when the
+    /// palette carries transparency. Only PNG reports it today; the other formats that can hold a
+    /// palette (GIF, BMP, TGA, TIFF, PSD's Indexed mode) say `false`.
+    pub palette: bool,
     /// Whether a declared alpha channel (`channels` 2 or 4) is entirely opaque — every sample
     /// fully opaque, so there is no transparency to composite. Set by [`decode`] from a scan of the
     /// final (post-ICC, post-downscale) buffer; the viewer uses it to skip the default checker
@@ -457,6 +464,14 @@ pub enum DecodeError {
     /// JPEG that zune correctly refused get handed to the `image` crate, which obligingly
     /// allocated it.
     TooLarge(String),
+    /// A PSD with no merged image: Photoshop saved it without "Maximize Compatibility". The layers
+    /// are all there, but the flattened picture other tools read is not — Photoshop writes a
+    /// white placeholder in its place and says so in the Version Info resource, and some writers
+    /// leave the section out altogether. Both come back as this.
+    ///
+    /// Its own variant so a caller can act on it without reading the message: a Unity import takes
+    /// the merged image, so Asset Check tells the artist to re-save with Maximize Compatibility.
+    NoMergedImage,
     /// An FFI backend (psd_sdk/lcms2) failed; surfaced so the viewer survives.
     Ffi(String),
     /// I/O or unexpected backend error.
@@ -468,6 +483,10 @@ impl std::fmt::Display for DecodeError {
         match self {
             DecodeError::Malformed(m) => write!(f, "malformed image: {m}"),
             DecodeError::TooLarge(m) => write!(f, "image too large: {m}"),
+            DecodeError::NoMergedImage => write!(
+                f,
+                "PSD has no merged image (re-save it with Maximize Compatibility)"
+            ),
             DecodeError::Ffi(m) => write!(f, "decoder FFI error: {m}"),
             DecodeError::Other(m) => write!(f, "{m}"),
         }
@@ -788,15 +807,38 @@ pub fn decode_path(path: &Path, opts: &DecodeOptions) -> Result<DecodedImage, De
     decode(&bytes, ext, opts)
 }
 
+/// Whether an ICC profile is sRGB in effect: converting from it to sRGB moves no colour by more
+/// than one 8-bit code. That is true of the many sRGB profiles in circulation, whatever their
+/// description or byte layout, and false of Display P3, Adobe RGB and the like, whose colours an
+/// app that ignores ICC (Unity, for one) shows shifted.
+///
+/// An RGB profile gets the probe the ICC pass uses to skip sRGB-tagged images (a 17³ lattice plus
+/// a full ramp per primary, ~0.1 ms), here with the relative colorimetric intent, because the
+/// question is what the profile's colours *are*. A greyscale profile is sRGB when its tone curve
+/// is: every grey level lands on the same sRGB grey. Any other colour space, and a profile lcms2
+/// cannot parse, is not.
+pub fn icc_is_srgb(profile: &[u8]) -> bool {
+    icc::is_srgb(profile)
+}
+
 // --- backends ---------------------------------------------------------------
 
 /// PSD via psd_sdk (C++ FFI). Runs inside catch_unwind so a Rust-side panic in the
 /// thin wrapper cannot escape; the C++ side additionally guards against C++ exceptions.
 #[cfg(feature = "psd")]
 fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
+    // Checked before psd_sdk runs, because psd_sdk cannot tell: the placeholder Photoshop writes
+    // is a well-formed image section that decodes to a white canvas. One walk over the image
+    // resources, no pixel work.
+    if psd_layers::merged_image_is_placeholder(bytes) {
+        return Err(DecodeError::NoMergedImage);
+    }
     let result = std::panic::catch_unwind(|| psd_sdk_sys::decode_psd(bytes))
         .map_err(|_| DecodeError::Ffi("psd_sdk panicked".into()))?;
-    let psd = result.map_err(|e| DecodeError::Malformed(e.to_string()))?;
+    let psd = result.map_err(|e| match e {
+        psd_sdk_sys::PsdError::NoMergedImage => DecodeError::NoMergedImage,
+        e => DecodeError::Malformed(e.to_string()),
+    })?;
     // The buffer is already allocated (psd-sdk-sys sizes it, bounded by the C++ guard and
     // its own cap — it cannot wait for us, the dimensions live behind the FFI), so this
     // check_dims is enforcement of the shared policy rather than the allocation guard the
@@ -819,6 +861,7 @@ fn decode_psd(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         format,
         bit_depth: psd.bits_per_channel.min(255) as u8,
         channels: psd.channels.min(255) as u8,
+        palette: false,
         icc: psd.icc,
         source_format: "PSD",
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -1004,6 +1047,7 @@ fn decode_exr(bytes: &[u8], progress: &dyn Fn(f32)) -> Result<DecodedImage, Deco
         // alpha UI over a channel the file never had — the same untruth a 24-bit TGA must not
         // tell (see `decode_image`).
         channels: if buf.has_alpha { 4 } else { 3 },
+        palette: false,
         icc: None,
         source_format: "OpenEXR",
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -1041,6 +1085,7 @@ fn decode_heif(bytes: &[u8], label: &'static str) -> Result<DecodedImage, Decode
         bit_depth,
         // Report the source channel count for the status bar (4 with alpha, else 3).
         channels: if img.has_alpha { 4 } else { 3 },
+        palette: false,
         icc: img.icc,
         source_format: label,
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -1120,6 +1165,7 @@ fn decode_hdr(bytes: &[u8], progress: &dyn Fn(f32)) -> Result<DecodedImage, Deco
         format: PixelFormat::Rgba32Float,
         bit_depth: 32,
         channels: 3, // RGBE is always RGB; the alpha lane is added by normalization
+        palette: false,
         icc: None,
         source_format: "Radiance HDR",
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -1332,11 +1378,17 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
             | DynamicImage::ImageRgb16(_)
             | DynamicImage::ImageRgba16(_)
     );
-    let (pixels, format, bit_depth) = if is_16bit {
+    // `image` reports a 1/2/4-bit or palette PNG as the 8-bit colour it expands to; the file's own
+    // depth comes from its header.
+    let (bit_depth, palette) = match png_ihdr(bytes) {
+        Some((depth, colour_type)) => (depth, colour_type == 3),
+        None => (if is_16bit { 16 } else { 8 }, false),
+    };
+    let (pixels, format) = if is_16bit {
         // The CPU shader reads Rgba16Unorm back as native-endian u16.
-        (into_rgba16_bytes(dynimg), PixelFormat::Rgba16Unorm, 16u8)
+        (into_rgba16_bytes(dynimg), PixelFormat::Rgba16Unorm)
     } else {
-        (into_rgba8(dynimg), PixelFormat::Rgba8Unorm, 8)
+        (into_rgba8(dynimg), PixelFormat::Rgba8Unorm)
     };
 
     Ok(DecodedImage {
@@ -1346,6 +1398,7 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         format,
         bit_depth,
         channels: src_channels,
+        palette,
         icc,
         source_format: "PNG",
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -1354,6 +1407,14 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         layout: None,
         animation: None,
     })
+}
+
+/// The bit depth and colour type a PNG's header declares. IHDR is always the first chunk — after
+/// the 8-byte signature, its length and type, then width and height — and `PngDecoder::new` has
+/// already validated it by the time this is read.
+fn png_ihdr(bytes: &[u8]) -> Option<(u8, u8)> {
+    let ihdr = bytes.get(12..26)?;
+    (&ihdr[..4] == b"IHDR").then_some((ihdr[12], ihdr[13]))
 }
 
 /// Refuse an oversized zune source *before* [`decode_zune`]'s `Image::read` allocates from its
@@ -1463,6 +1524,7 @@ fn still(
         format,
         bit_depth,
         channels,
+        palette: false,
         icc,
         source_format,
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -1913,6 +1975,7 @@ fn decode_zune_image(
         format: pixel_format,
         bit_depth,
         channels: src_channels,
+        palette: false,
         icc,
         source_format: zune_format_name(fmt),
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -2013,6 +2076,7 @@ fn decode_gif(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         // GIF is palette-indexed with an optional transparent index → report RGBA (frames can
         // carry transparency); the opaque-alpha scan in `decode` flags the fully-opaque case.
         channels: 4,
+        palette: false,
         icc: None,
         source_format: "GIF",
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -2099,6 +2163,7 @@ fn decode_image(bytes: &[u8], ext_hint: Option<&str>) -> Result<DecodedImage, De
         format: fmt,
         bit_depth,
         channels: src_channels,
+        palette: false,
         icc,
         source_format: format.map_or("image", format_name),
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -2287,6 +2352,55 @@ mod icc {
             .all(|(a, b)| (0..3).all(|c| a[c].abs_diff(b[c]) <= 1))
     }
 
+    /// [`crate::icc_is_srgb`]. Inside `catch_unwind` for the same reason [`apply`] is: the profile
+    /// comes from the file.
+    pub fn is_srgb(profile: &[u8]) -> bool {
+        use lcms2::{ColorSpaceSignature, Intent, Profile, ThreadContext};
+
+        std::panic::catch_unwind(|| {
+            let ctx = ThreadContext::new();
+            let Ok(src) = Profile::new_icc_context(&ctx, profile) else {
+                return false;
+            };
+            let dst = Profile::new_srgb_context(&ctx);
+            let intent = Intent::RelativeColorimetric;
+            match src.color_space() {
+                ColorSpaceSignature::RgbData => is_srgb_equivalent(&ctx, &src, &dst, intent),
+                ColorSpaceSignature::GrayData => grey_is_srgb(&ctx, &src, &dst, intent),
+                _ => false,
+            }
+        })
+        .unwrap_or(false)
+    }
+
+    /// Whether every 8-bit grey level of a greyscale profile converts to the same sRGB grey, within
+    /// one code.
+    fn grey_is_srgb(
+        ctx: &lcms2::ThreadContext,
+        src: &lcms2::Profile<lcms2::ThreadContext>,
+        dst: &lcms2::Profile<lcms2::ThreadContext>,
+        intent: lcms2::Intent,
+    ) -> bool {
+        use lcms2::{PixelFormat as Fmt, Transform};
+
+        let Ok(t) = Transform::<u8, [u8; 3], _>::new_context(
+            ctx,
+            src,
+            Fmt::GRAY_8,
+            dst,
+            Fmt::RGB_8,
+            intent,
+        ) else {
+            return false;
+        };
+        let ramp: Vec<u8> = (0..=255).collect();
+        let mut out = vec![[0u8; 3]; ramp.len()];
+        t.transform_pixels(&ramp, &mut out);
+        ramp.iter()
+            .zip(&out)
+            .all(|(&v, rgb)| rgb.iter().all(|&c| c.abs_diff(v) <= 1))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -2300,6 +2414,7 @@ mod icc {
                 format: PixelFormat::Rgba8Unorm,
                 bit_depth: 8,
                 channels: 4,
+                palette: false,
                 icc: None,
                 source_format: "test",
                 alpha_opaque: false,
@@ -2476,6 +2591,68 @@ mod icc {
             assert_eq!(img.pixels[1], img.pixels[2]);
             assert_eq!(img.pixels[3], 200);
         }
+
+        /// The sRGB transfer curve as an ICC parametric curve (type 4).
+        fn srgb_trc() -> lcms2::ToneCurve {
+            lcms2::ToneCurve::new_parametric(
+                4,
+                &[2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045],
+            )
+            .unwrap()
+        }
+
+        /// An RGB profile with D65 white and the given primaries and tone curve.
+        fn rgb_profile([r, g, b]: [(f64, f64); 3], trc: &lcms2::ToneCurve) -> Vec<u8> {
+            use lcms2::{CIExyY, CIExyYTRIPLE, Profile};
+            let xy = |(x, y): (f64, f64)| CIExyY { x, y, Y: 1.0 };
+            let primaries = CIExyYTRIPLE {
+                Red: xy(r),
+                Green: xy(g),
+                Blue: xy(b),
+            };
+            Profile::new_rgb(&xy((0.3127, 0.3290)), &primaries, &[trc, trc, trc])
+                .unwrap()
+                .icc()
+                .unwrap()
+        }
+
+        #[test]
+        fn srgb_profiles_are_srgb() {
+            assert!(crate::icc_is_srgb(
+                &lcms2::Profile::new_srgb().icc().unwrap()
+            ));
+            let srgb = [(0.640, 0.330), (0.300, 0.600), (0.150, 0.060)];
+            assert!(crate::icc_is_srgb(&rgb_profile(srgb, &srgb_trc())));
+        }
+
+        /// Display P3 shares sRGB's tone curve and differs only in its primaries, so this is the
+        /// case the colour probe exists for. Adobe RGB differs in both.
+        #[test]
+        fn wide_gamut_profiles_are_not_srgb() {
+            let p3 = [(0.680, 0.320), (0.265, 0.690), (0.150, 0.060)];
+            assert!(!crate::icc_is_srgb(&rgb_profile(p3, &srgb_trc())));
+            let adobe = [(0.640, 0.330), (0.210, 0.710), (0.150, 0.060)];
+            let gamma = lcms2::ToneCurve::new(563.0 / 256.0);
+            assert!(!crate::icc_is_srgb(&rgb_profile(adobe, &gamma)));
+        }
+
+        /// A greyscale profile is sRGB when its curve is sRGB's; a plain gamma 2.2 is not, and
+        /// neither is a colour space we have no probe for.
+        #[test]
+        fn grey_and_other_profiles() {
+            use lcms2::{CIExyY, Profile, ToneCurve};
+            let d65 = CIExyY {
+                x: 0.3127,
+                y: 0.3290,
+                Y: 1.0,
+            };
+            let grey = |trc: &ToneCurve| Profile::new_gray(&d65, trc).unwrap().icc().unwrap();
+            assert!(crate::icc_is_srgb(&grey(&srgb_trc())));
+            assert!(!crate::icc_is_srgb(&grey(&ToneCurve::new(2.2))));
+            assert!(!crate::icc_is_srgb(&Profile::new_xyz().icc().unwrap()));
+            assert!(!crate::icc_is_srgb(&[0, 1, 2, 3, 4, 5]));
+            assert!(!crate::icc_is_srgb(&[]));
+        }
     }
 }
 
@@ -2616,6 +2793,101 @@ mod tests {
             .map(|c| u16::from_ne_bytes(*c))
             .collect();
         assert_eq!(px, vec![0xFFFF, 0x8000, 0x0001, 0xFFFF]);
+    }
+
+    /// A PNG in the layouts the `image` encoder cannot write — palette, and 1/2/4-bit — built by
+    /// hand: IHDR, then PLTE and tRNS when given, one IDAT holding `rows` (each already packed,
+    /// written with filter type 0), and IEND.
+    fn raw_png(
+        (width, height): (u32, u32),
+        depth: u8,
+        colour_type: u8,
+        plte: &[u8],
+        trns: &[u8],
+        rows: &[&[u8]],
+    ) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let start = out.len();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            let crc = crc32(&out[start..]);
+            out.extend_from_slice(&crc.to_be_bytes());
+        }
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[depth, colour_type, 0, 0, 0]);
+        let raw: Vec<u8> = rows.iter().flat_map(|r| [&[0u8][..], r].concat()).collect();
+
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        chunk(&mut out, b"IHDR", &ihdr);
+        if !plte.is_empty() {
+            chunk(&mut out, b"PLTE", plte);
+        }
+        if !trns.is_empty() {
+            chunk(&mut out, b"tRNS", trns);
+        }
+        let idat = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
+        chunk(&mut out, b"IDAT", &idat);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    /// A palette PNG reports the file's index width and that it is a palette image, while the
+    /// buffer is the same expanded RGBA8 as before. `bit_depth` used to say 8 for every one.
+    #[test]
+    fn palette_png_reports_its_index_depth() {
+        // Three colours, indices 0 1 2 packed two to a byte; the last nibble is padding.
+        let plte = [255, 0, 0, 0, 255, 0, 0, 0, 255];
+        let bytes = raw_png((3, 1), 4, 3, &plte, &[], &[&[0x01, 0x20]]);
+
+        let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.bit_depth, out.palette), (4, true));
+        assert_eq!(out.channels, 3);
+        assert_eq!(out.format, PixelFormat::Rgba8Unorm);
+        assert_eq!(
+            out.pixels,
+            vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255]
+        );
+    }
+
+    /// An 8-bit palette with transparency (tRNS) expands to RGBA and still reads as a palette.
+    #[test]
+    fn palette_png_with_transparency_keeps_its_alpha() {
+        let plte = [10, 20, 30, 40, 50, 60];
+        let bytes = raw_png((2, 1), 8, 3, &plte, &[128], &[&[0, 1]]);
+
+        let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.bit_depth, out.palette), (8, true));
+        assert_eq!(out.channels, 4);
+        assert_eq!(out.pixels, vec![10, 20, 30, 128, 40, 50, 60, 255]);
+        assert!(!out.alpha_opaque);
+    }
+
+    /// Low-depth greyscale reports its own depth too, scaled to full range in the buffer.
+    #[test]
+    fn low_depth_grey_png_reports_its_depth() {
+        let one = raw_png((4, 1), 1, 0, &[], &[], &[&[0b1010_0000]]);
+        let out = decode(&one, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.bit_depth, out.palette, out.channels), (1, false, 1));
+        let grey: Vec<u8> = out.pixels.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+        assert_eq!(grey, vec![255, 0, 255, 0]);
+
+        let two = raw_png((4, 1), 2, 0, &[], &[], &[&[0b00_01_10_11]]);
+        let out = decode(&two, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.bit_depth, out.palette), (2, false));
+        let grey: Vec<u8> = out.pixels.as_chunks::<4>().0.iter().map(|p| p[0]).collect();
+        assert_eq!(grey, vec![0, 85, 170, 255]);
+    }
+
+    /// An ordinary truecolour PNG is unchanged: 8 bits, no palette.
+    #[test]
+    fn truecolour_png_is_not_a_palette() {
+        let bytes = raw_png((1, 1), 8, 2, &[], &[], &[&[1, 2, 3]]);
+        let out = decode(&bytes, Some("png"), &DecodeOptions::default()).unwrap();
+        assert_eq!((out.bit_depth, out.palette, out.channels), (8, false, 3));
+        assert_eq!(out.pixels, vec![1, 2, 3, 255]);
     }
 
     /// A PNG's embedded ICC profile is surfaced by the `image`-crate PNG path (zune-png

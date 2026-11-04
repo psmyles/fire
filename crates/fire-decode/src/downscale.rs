@@ -132,6 +132,7 @@ mod tests {
             format: PixelFormat::Rgba8Unorm,
             bit_depth: 8,
             channels: 4,
+            palette: false,
             icc: None,
             source_format: "test",
             alpha_opaque: false,

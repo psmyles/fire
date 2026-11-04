@@ -16,7 +16,7 @@
 //! that configuration is to build and test on a machine with no vendored native trees at all.
 #![cfg(feature = "psd")]
 
-use fire_decode::{decode, DecodeOptions, PixelFormat};
+use fire_decode::{decode, DecodeError, DecodeOptions, PixelFormat};
 
 const COLOR_MODE_GRAYSCALE: u16 = 1;
 const COLOR_MODE_RGB: u16 = 3;
@@ -529,4 +529,48 @@ fn psd_rle_run_past_the_plane_is_bounded() {
     let out = decode(&bytes, Some("psd"), &DecodeOptions::default()).expect("should decode");
     // R's overrunning run is dropped (zero-filled); G and B decode normally.
     assert_eq!(out.pixels, vec![0, 8, 9, 255, 0, 8, 9, 255]);
+}
+
+/// The Version Info resource (1057) as Photoshop writes it: version, `hasRealMergedData`, writer
+/// and reader names (Unicode strings), file version.
+fn version_info(has_real_merged_data: bool) -> Vec<u8> {
+    let unicode = |s: &str| -> Vec<u8> {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let mut v = (units.len() as u32).to_be_bytes().to_vec();
+        v.extend(units.iter().flat_map(|u| u.to_be_bytes()));
+        v
+    };
+    let mut d = 1u32.to_be_bytes().to_vec();
+    d.push(has_real_merged_data as u8);
+    d.extend(unicode("Adobe Photoshop"));
+    d.extend(unicode("Adobe Photoshop 2026"));
+    d.extend_from_slice(&1u32.to_be_bytes());
+    resource(1057, &d)
+}
+
+/// Saved without Maximize Compatibility, Photoshop still writes a merged image, but a white one,
+/// and clears `hasRealMergedData`. That is reported as `NoMergedImage`, not decoded as a white
+/// canvas: a real Photoshop file (`flux.psd`, 1044×511) is laid out exactly like this.
+#[test]
+fn psd_placeholder_merged_image_is_reported_not_decoded() {
+    let mut image = 0u16.to_be_bytes().to_vec();
+    image.extend_from_slice(&[255, 255, 255]);
+    let bytes = psd_raw(1, 1, COLOR_MODE_RGB, 3, &version_info(false), &image);
+    let err = decode(&bytes, Some("psd"), &DecodeOptions::default()).unwrap_err();
+    assert!(matches!(err, DecodeError::NoMergedImage), "{err:?}");
+    assert!(err.to_string().contains("Maximize Compatibility"), "{err}");
+
+    // The flag alone decides it: the same file with the flag set decodes.
+    let bytes = psd_raw(1, 1, COLOR_MODE_RGB, 3, &version_info(true), &image);
+    let out = decode(&bytes, Some("psd"), &DecodeOptions::default()).expect("should decode");
+    assert_eq!(out.pixels, vec![255, 255, 255, 255]);
+}
+
+/// A document with no image data section at all — psd_sdk's own "no merged image" — is the same
+/// error, not `Malformed`.
+#[test]
+fn psd_without_an_image_data_section_is_no_merged_image() {
+    let bytes = psd_raw(1, 1, COLOR_MODE_RGB, 3, &[], &[]);
+    let err = decode(&bytes, Some("psd"), &DecodeOptions::default()).unwrap_err();
+    assert!(matches!(err, DecodeError::NoMergedImage), "{err:?}");
 }

@@ -335,6 +335,7 @@ mod tests {
             format,
             bit_depth: 8,
             channels: 4,
+            palette: false,
             alpha_opaque: false,
             icc: None,
             source_format: "test",

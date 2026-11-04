@@ -173,6 +173,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<Result<DecodedImage, DecodeError>> 
         format,
         bit_depth,
         channels: src_channels,
+        palette: false,
         icc,
         source_format: "TIFF",
         alpha_opaque: false, // set by `decode` after the final buffer is built
@@ -564,6 +565,7 @@ fn read_palette(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         format: PixelFormat::Rgba8Unorm,
         bit_depth: 8,
         channels: 3,
+        palette: false,
         icc,
         source_format: "TIFF",
         alpha_opaque: false, // set by `decode` after the final buffer is built

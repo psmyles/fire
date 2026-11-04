@@ -587,6 +587,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage, DecodeError> {
         format: fmt.out,
         bit_depth: fmt.bit_depth,
         channels: fmt.channels,
+        palette: false,
         icc: None,
         source_format: fmt.label,
         alpha_opaque: false, // set by `decode` after the final buffer is built

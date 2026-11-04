@@ -703,6 +703,7 @@ impl PsdLayers {
             },
             bit_depth: depth as u8,
             channels: if grey { 2 } else { 4 },
+            palette: false,
             alpha_opaque: false,
             icc: self.icc.clone(),
             source_format: "PSD",
@@ -1349,15 +1350,15 @@ impl<'a> Cur<'a> {
     }
 }
 
-/// The first ICC profile (resource 1039) in the image resources section.
-fn find_icc(b: &[u8], start: usize, end: usize) -> Option<Vec<u8>> {
+/// The data of the first image resource `id` in the image resources section `b[start..end]`.
+fn find_resource(b: &[u8], start: usize, end: usize, id: u16) -> Option<&[u8]> {
     let mut c = Cur::new(b, start, end);
     while c.remaining() >= 12 {
         let sig = c.take(4).ok()?;
         if sig != b"8BIM" && sig != b"psdM" {
             return None;
         }
-        let id = c.u16().ok()?;
+        let this = c.u16().ok()?;
         let name_len = c.u8().ok()? as usize;
         c.skip((name_len + 1).div_ceil(2) * 2 - 1).ok()?;
         let size = c.u32().ok()? as usize;
@@ -1365,11 +1366,39 @@ fn find_icc(b: &[u8], start: usize, end: usize) -> Option<Vec<u8>> {
         if size % 2 == 1 {
             let _ = c.skip(1);
         }
-        if id == 1039 {
-            return (size > 0 && size <= MAX_ICC_LEN).then(|| data.to_vec());
+        if this == id {
+            return Some(data);
         }
     }
     None
+}
+
+/// The first ICC profile (resource 1039) in the image resources section.
+fn find_icc(b: &[u8], start: usize, end: usize) -> Option<Vec<u8>> {
+    find_resource(b, start, end, 1039)
+        .filter(|data| !data.is_empty() && data.len() <= MAX_ICC_LEN)
+        .map(<[u8]>::to_vec)
+}
+
+/// Whether the document's merged image is a stand-in. Saved without "Maximize Compatibility",
+/// Photoshop still writes an image data section, but fills it with white and clears
+/// `hasRealMergedData` in the Version Info resource (1057: a `u32` version, then that flag), so
+/// the flag is the only way to tell. A document with no Version Info, or one too short to read,
+/// is taken at its word. PSB shares the header and resources layout, so it is read the same way.
+#[cfg(feature = "psd")]
+pub(crate) fn merged_image_is_placeholder(b: &[u8]) -> bool {
+    fn version_info(b: &[u8]) -> Option<&[u8]> {
+        let mut c = Cur::new(b, 0, b.len());
+        if c.take(4).ok()? != b"8BPS" {
+            return None;
+        }
+        c.skip(22).ok()?; // the rest of the 26-byte header
+        let mode_data_len = c.u32().ok()? as usize;
+        c.skip(mode_data_len).ok()?;
+        let res_len = c.u32().ok()? as usize;
+        find_resource(b, c.pos, c.pos.saturating_add(res_len), 1057)
+    }
+    version_info(b).and_then(|v| v.get(4)) == Some(&0)
 }
 
 /// Additional-info keys of layers that have no pixels to show: adjustment and fill layers.
