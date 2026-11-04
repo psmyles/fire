@@ -1,7 +1,20 @@
 # fire - Work Plan
 
-**Status, November 2026:** A1 and A2 are done (A2's Mac packaging still needs a run on the Mac);
-B hasn't started. asset-rules is tagged `v0.1.0`.
+**Status, 4 November 2026:** A1 and A2 are done, committed on the `asset-check` branch, which isn't
+merged into `main` yet. B hasn't started. asset-rules is tagged `v0.1.0`.
+
+Open items, in order:
+1. **A2 on the Mac:** run `build-mac.sh` and `dev-app.sh`, and `fire-cli` inside the bundle (A2's
+   last section).
+2. **A2 against 3d-review-cli:** check end to end that both tools give a file the same profile and
+   stage. This waits for 3D Review's AC13 work, which is in progress but not committed.
+3. **Merge `asset-check` into `main`** before the fire-decode extraction, so A1 travels with the
+   crate's history.
+4. **Commit the synced `fire-decode-plan.md` in psmyles/fire-decode.** A1 changed FD4 and FD10 here;
+   the canonical copy has the same edit, not yet committed.
+5. **Next by the order below:** the Launcher's results table (another repository), then B. B's step 2,
+   the tonemap fix, can be done at any time.
+
 The work is ordered for a stretch on a Mac; items that need Windows are collected at the end.
 
 ## Context
@@ -24,12 +37,12 @@ the artist pilot. The migration comes after, starting with what a Mac can do.
 
 **Order across repositories:**
 1. `asset-rules` - its `docs/PLAN.md`;
-2. this repo's A1-A2, alongside 3D Review's `3d-review-cli` changes;
+2. this repo's A1-A2 (done), alongside 3D Review's `3d-review-cli` changes (in progress);
 3. the Launcher's results table;
 4. the migration.
 
 **Do A1 before the fire-decode extraction** (`git filter-repo`), so the additions travel with the
-crate's history.
+crate's history. A1 is done but on the `asset-check` branch: merge it into `main` before extracting.
 
 ## Before you start on the Mac
 
@@ -145,9 +158,15 @@ documents it in full.
 ## Needs Windows (later)
 
 - Windows TTFP baselines; fire's switch to the fire-decode tag (step 1).
-- The static CRT for fire and fire-shellext (FD20), checked by an import table with no `MSVCP140` /
-  `VCRUNTIME140*` entries.
-- Verifying the installer changes (`fire-cli.exe` installed; FD20).
+- The static CRT for fire, fire-shellext and fire-cli (FD20), checked by an import table with no
+  `MSVCP140` / `VCRUNTIME140*` entries.
+  - `fire-cli.exe` links psd_sdk and the HEIF stack too, and imports `MSVCP140.dll` today, as
+    `fire.exe` does. FD20 and the step-1 gate in `fire-decode-plan.md` name only `fire.exe` and
+    `fire_shellext.dll`; add `fire-cli.exe` to both copies.
+- Verifying the installer changes:
+  - run the installer and check that `fire-cli.exe` lands beside `fire.exe` and runs. A2 only
+    compiled the installer with ISCC.
+  - FD20's: no runtime DLL needed on a clean machine.
 - Moving the installer-association test out of fire-decode into a fire crate (FD2, FD9).
 
 ## References
