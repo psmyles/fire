@@ -6,8 +6,9 @@ against 3d-review-cli has passed on Windows. B hasn't started. asset-rules is ta
 Open items, in order:
 1. **A2 on the Mac:** run `build-mac.sh` and `dev-app.sh`, and `fire-cli` inside the bundle (A2's
    last section).
-2. **Next by the order below:** the Launcher's results table (another repository), then B. B's step 2,
-   the tonemap fix, can be done at any time.
+2. **Next by the order below:** the Launcher's results table is done (5 November). Asset Check's
+   rules repo comes next (another repository), then B. B's step 2, the tonemap fix, can be done at
+   any time.
 
 The work is ordered for a stretch on a Mac; items that need Windows are collected at the end.
 
@@ -32,7 +33,7 @@ the artist pilot. The migration comes after, starting with what a Mac can do.
 **Order across repositories:**
 1. `asset-rules` - its `docs/PLAN.md`;
 2. this repo's A1-A2 (done), alongside 3D Review's `3d-review-cli` changes (done);
-3. the Launcher's results table;
+3. the Launcher's results table (done), then Asset Check's rules repo;
 4. the migration.
 
 **Do A1 before the fire-decode extraction** (`git filter-repo`), so the additions travel with the
