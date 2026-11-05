@@ -220,7 +220,7 @@ it.
 {
   "schema": "asset-check.results",
   "version": 1,
-  "tool": { "name": "fire-cli", "version": "0.6.1" },
+  "tool": { "name": "fire-cli", "version": "0.7.0" },
   "rules": { "commit": "1a2b3c4", "digest": "sha256:…" },
   "context": { "branch": "main", "mode": "advise" },
   "findings": [],
