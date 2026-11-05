@@ -1,19 +1,12 @@
 # fire - Work Plan
 
-**Status, 4 November 2026:** A1 and A2 are done, committed on the `asset-check` branch, which isn't
-merged into `main` yet. B hasn't started. asset-rules is tagged `v0.1.0`.
+**Status, 5 November 2026:** A1 and A2 are done and merged into `main`, and A2's end-to-end check
+against 3d-review-cli has passed on Windows. B hasn't started. asset-rules is tagged `v0.1.0`.
 
 Open items, in order:
 1. **A2 on the Mac:** run `build-mac.sh` and `dev-app.sh`, and `fire-cli` inside the bundle (A2's
    last section).
-2. **A2 against 3d-review-cli:** check end to end that both tools give a file the same profile and
-   stage. This waits for 3D Review's AC13 work, which is in progress but not committed.
-3. **Merge `asset-check` into `main`** before the fire-decode extraction, so A1 travels with the
-   crate's history.
-4. **Merge psmyles/fire-decode's `asset-check` branch into its `main`.** It holds the canonical
-   `fire-decode-plan.md` with the same edits as this copy: A1's to FD4 and FD10, and `fire-cli.exe`
-   added to FD20 and the step-1 gate.
-5. **Next by the order below:** the Launcher's results table (another repository), then B. B's step 2,
+2. **Next by the order below:** the Launcher's results table (another repository), then B. B's step 2,
    the tonemap fix, can be done at any time.
 
 The work is ordered for a stretch on a Mac; items that need Windows are collected at the end.
@@ -38,12 +31,12 @@ the artist pilot. The migration comes after, starting with what a Mac can do.
 
 **Order across repositories:**
 1. `asset-rules` - its `docs/PLAN.md`;
-2. this repo's A1-A2 (done), alongside 3D Review's `3d-review-cli` changes (in progress);
+2. this repo's A1-A2 (done), alongside 3D Review's `3d-review-cli` changes (done);
 3. the Launcher's results table;
 4. the migration.
 
 **Do A1 before the fire-decode extraction** (`git filter-repo`), so the additions travel with the
-crate's history. A1 is done but on the `asset-check` branch: merge it into `main` before extracting.
+crate's history. A1 is done and in `main`, so the extraction can start from `main`.
 
 ## Before you start on the Mac
 
@@ -135,8 +128,16 @@ documents it in full.
 - **Speed:** 20 real 1K-4K textures (146 MB) staged in a scratch repository took 0.3 s cold and
   0.13 s cached, on a 24-core PC with a release build.
 - **The same profile and stage as 3d-review-cli:** true by construction (both call asset-rules'
-  `resolve`), and covered by asset-rules' own step-1 test. It still needs an end-to-end check once
-  3d-review-cli's AC13 work lands.
+  `resolve`), covered by asset-rules' own step-1 test, and checked end to end on Windows on
+  5 November 2026 with both release builds:
+  - **The setup:** a scratch repository with asset-rules' fixture `rules.json`, four models (environment
+    prop by path, prop, character, and a name matching no profile) and three textures (normal map,
+    texture, no match).
+  - **`rules explain`:** both tools printed identical output for every file, on `main`, `proto/x`, a
+    feature branch and a detached HEAD. That covers each stage source (branch, profile, project) and
+    `file.no_profile`.
+  - **`check --staged` / `audit --staged`:** on new staged files, both gave the same profile, stage and
+    `stage_from`; both filled the cache. Each run took about 140 ms.
 
 **Still to do on the Mac:**
 - Run `scripts/build-mac.sh`: the nested `fire-cli` signature, notarization, and `codesign --verify`.
@@ -152,8 +153,10 @@ documents it in full.
      `crates/fire-thumbs/src/render.rs`) returns infinity at −1 and a large positive value below it.
    - Clamp negatives before tonemapping, and add a test with negative inputs and inputs below −1.
    - This is independent of everything else, so it can be done any time.
-3. **Develop fire against the new fire-decode repo** on a branch, through an untracked
-   `.cargo/config.toml` `[patch]`. fire's `main` keeps its in-tree crates until migration step 1's gate
+3. **Develop fire against the new fire-decode repo** on a branch, through a `[patch]` in a
+   `.cargo/config.toml` in the folder that holds both checkouts. fire's own `.cargo/config.toml` is
+   committed, so it isn't the place (3D Review's `docs/cli.md`, "Building against unreleased
+   asset-rules", shows the pattern). fire's `main` keeps its in-tree crates until migration step 1's gate
    passes on **both** platforms; that needs the Windows HEIF libraries.
 
 ## Needs Windows (later)
