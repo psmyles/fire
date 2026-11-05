@@ -1,0 +1,342 @@
+# fire-cli's rules catalog: every rule fire-cli checks textures against, as rules files set them
+# and as artists read their findings. The format is asset-rules' catalog format 1, specified in
+# the rules repo (SandboxVR/exp-content-rules, docs/rule-editor-plan.md, "The catalog file").
+#
+# Rules are listed in the order findings of equal severity are reported; categories follow that
+# order. Texts are what the artist sees: `{name}` is a parameter or one of the rule's `measures`,
+# which the check works out and words.
+
+catalog = 1
+tool = "fire-cli"
+
+[[category]]
+id = "format"
+title = "File format"
+
+[[category]]
+id = "size"
+title = "Size and shape"
+
+[[category]]
+id = "depth"
+title = "Bit depth"
+
+[[category]]
+id = "alpha"
+title = "Alpha"
+
+[[category]]
+id = "colour"
+title = "Colour"
+
+[[category]]
+id = "file"
+title = "File"
+
+# --- File format ---------------------------------------------------------------------------------
+
+[[rule]]
+id = "texture.psd_composite"
+category = "format"
+since = "0.7.0"
+title = "PSD has no merged image"
+what = "This PSD has no merged image: it was saved without Maximize Compatibility."
+why = "Unity reads only a PSD's merged image. Without it the texture imports blank."
+how = "In Photoshop, set Preferences > File Handling > Maximize PSD and PSB File Compatibility to Always. Then open the file and save it again."
+
+[rule.default]
+enabled = true
+severity = "error"
+
+[[rule]]
+id = "texture.psb"
+category = "format"
+since = "0.7.0"
+title = "PSB file"
+what = "This is a PSB (Large Document Format) file."
+why = "Unity's texture importer doesn't read PSB files, and a PSB is usually far larger than the texture needs."
+how = "Save it as a PSD instead: in Photoshop, File > Save a Copy, with the format Photoshop. If Photoshop refuses because the image is too large, scale it down first (Image > Image Size)."
+
+[rule.default]
+enabled = false
+severity = "error"
+
+[[rule]]
+id = "texture.format"
+category = "format"
+since = "0.7.0"
+title = "Format not allowed"
+what = "This is {a_label} file. Allowed formats: {allowed_formats}."
+why = "The project keeps its textures in a few agreed formats, so every texture goes through the same import settings."
+how = "Save it as {target} instead: in Photoshop, File > Save a Copy, and pick {target} as the format. Then stage the new file in place of this one."
+# a_label: the format's name with its article, "a PNG" or "an AVIF".
+# allowed_formats: the allowed formats in capitals, joined with ", " ("PNG, TGA, PSD").
+# target: the first allowed format in capitals, or PNG when none is allowed.
+measures = ["a_label", "allowed_formats", "target"]
+
+[rule.default]
+enabled = true
+severity = "error"
+
+[[rule.param]]
+key = "allowed"
+kind = "choices"
+# The formats Unity's texture importer reads that Fire also decodes.
+options = [
+  { value = "png", label = "PNG" },
+  { value = "jpg", label = "JPEG" },
+  { value = "tga", label = "TGA" },
+  { value = "psd", label = "PSD" },
+  { value = "tiff", label = "TIFF" },
+  { value = "exr", label = "OpenEXR" },
+  { value = "hdr", label = "Radiance HDR" },
+  { value = "bmp", label = "BMP" },
+  { value = "gif", label = "GIF" },
+]
+default = ["png", "jpg", "tga", "psd", "tiff", "exr", "hdr", "bmp", "gif"]
+label = "Allowed formats"
+help = "The formats a texture may be saved in. The format is read from the file's contents, not its extension."
+
+# The finding's why when Unity's importer can't read the format at all (WebP, AVIF, HEIF...).
+[rule.case.unity_cant_read]
+why = "Unity's texture importer can't read this format, so the texture would be missing in the game."
+
+# --- Size and shape ------------------------------------------------------------------------------
+
+[[rule]]
+id = "texture.max_size"
+category = "size"
+since = "0.7.0"
+title = "Too large"
+what = "This image is {width}×{height}. The most allowed is {max}×{max}."
+why = "Every doubling of width and height takes four times the memory and download size in the game."
+how = "Scale it down so neither side is more than {max} pixels: in Photoshop, Image > Image Size. Then save it again."
+measures = ["width", "height"]
+
+[rule.default]
+enabled = false
+severity = "error"
+
+[[rule.param]]
+key = "max"
+kind = "count"
+unit = "px"
+min = 1
+max = 16384
+default = 4096
+label = "Largest side"
+help = "Neither width nor height may be more than this."
+
+[[rule]]
+id = "texture.min_size"
+category = "size"
+since = "0.7.0"
+title = "Too small"
+what = "This image is {width}×{height}. The least allowed is {min}×{min}."
+why = "A texture this small looks blurred or blocky on screen."
+how = "Make it at least {min} pixels on each side, ideally by exporting it again from the source at a larger size rather than scaling it up."
+measures = ["width", "height"]
+
+[rule.default]
+enabled = false
+severity = "warning"
+
+[[rule.param]]
+key = "min"
+kind = "count"
+unit = "px"
+min = 1
+max = 16384
+default = 16
+label = "Smallest side"
+help = "Neither width nor height may be less than this."
+
+[[rule]]
+id = "texture.power_of_two"
+category = "size"
+since = "0.7.0"
+title = "Not a power of two"
+what = "This image is {width}×{height}. Both sides must be a power of two (… 256, 512, 1024, 2048 …)."
+why = "Unity rescales a texture that isn't a power of two, or can't compress it or make mipmaps for it on every platform, so it ends up blurrier or takes more memory."
+how = "Resize it to powers of two, for example {suggested_width}×{suggested_height}: in Photoshop, Image > Image Size (or Image > Canvas Size to add or trim space instead of scaling). Then save it again."
+# suggested_width, suggested_height: the nearest power of two to each side.
+measures = ["width", "height", "suggested_width", "suggested_height"]
+
+[rule.default]
+enabled = false
+severity = "warning"
+
+[[rule]]
+id = "texture.multiple_of_4"
+category = "size"
+since = "0.7.0"
+title = "Not a multiple of 4"
+what = "This image is {width}×{height}. Both sides must be a multiple of 4."
+why = "Texture compression works on 4×4 blocks. A texture whose sides aren't multiples of 4 can't be compressed on every platform, so it stays uncompressed and takes far more memory."
+how = "Resize it to multiples of 4, for example {suggested_width}×{suggested_height}: in Photoshop, Image > Canvas Size. Then save it again."
+# suggested_width, suggested_height: the nearest multiple of 4 to each side.
+measures = ["width", "height", "suggested_width", "suggested_height"]
+
+[rule.default]
+enabled = false
+severity = "warning"
+
+[[rule]]
+id = "texture.square"
+category = "size"
+since = "0.7.0"
+title = "Not square"
+what = "This image is {width}×{height}. It must be square."
+why = "Textures of this type are expected to be square, and some platforms compress only square textures."
+how = "Make it square, for example {side}×{side}: in Photoshop, Image > Canvas Size. Then save it again."
+# side: the longer of width and height.
+measures = ["width", "height", "side"]
+
+[rule.default]
+enabled = false
+severity = "warning"
+
+# --- Bit depth -----------------------------------------------------------------------------------
+
+[[rule]]
+id = "texture.bit_depth"
+category = "depth"
+since = "0.7.0"
+title = "Bit depth not allowed"
+what = "This image is {depth}. Allowed: {allowed_depths} bits per channel."
+why = "A deeper image takes more memory and download size, and for most textures the extra precision is lost when Unity compresses it anyway."
+how = "Convert it: in Photoshop, Image > Mode > {convert_to} Bits/Channel. Then save it again."
+# depth: "8 bits per channel", or "16-bit float" for a float image.
+# allowed_depths: the allowed depths joined with "or" ("8 or 16").
+# convert_to: the first allowed depth.
+# bits, colours: a palette image's bits per pixel and its most colours (the palette case).
+measures = ["depth", "allowed_depths", "convert_to", "bits", "colours"]
+
+[rule.default]
+enabled = false
+severity = "warning"
+
+[[rule.param]]
+key = "allowed"
+kind = "choices"
+options = [
+  { value = 1, label = "1 bit" },
+  { value = 2, label = "2 bits" },
+  { value = 4, label = "4 bits" },
+  { value = 8, label = "8 bits" },
+  { value = 16, label = "16 bits" },
+  { value = 32, label = "32 bits" },
+]
+default = [8]
+label = "Allowed bit depths"
+help = "Bits per channel an image may have. A float image counts as 16 or 32."
+
+[[rule.param]]
+key = "palette"
+kind = "flag"
+default = false
+label = "Allow palette images"
+help = "Whether a palette (\"indexed\" or \"PNG-8\") image is allowed, whatever its bit depth."
+
+# A palette image when `palette` is off: a finding of its own, besides any bit-depth one.
+[rule.case.palette]
+title = "Palette image"
+what = "This is a {bits}-bit palette image, so it has {colours} colours at most."
+why = "A palette keeps only a few colours, so gradients band. Unity expands it to full colour when it imports it, but the banding stays."
+how = "Export it again from the source as full colour, not as a palette (\"indexed\" or \"PNG-8\") image. In Photoshop, Image > Mode > RGB Color converts it, but it can't bring back colours that were lost."
+
+# --- Alpha ---------------------------------------------------------------------------------------
+
+[[rule]]
+id = "texture.unused_alpha"
+category = "alpha"
+since = "0.7.0"
+title = "Alpha channel not used"
+what = "It has an alpha channel, but every pixel is fully opaque."
+why = "An alpha channel makes Unity pick a format that stores it, which takes up to twice the memory, for no visible difference."
+how = "Remove the alpha channel: in Photoshop, delete it in the Channels panel (or flatten the image with Layer > Flatten Image), then save it again. In Export As, untick Transparency."
+
+[rule.default]
+enabled = false
+severity = "warning"
+
+[[rule]]
+id = "texture.alpha_required"
+category = "alpha"
+since = "0.7.0"
+title = "Alpha channel needed"
+what = "It has no alpha channel, but this type of texture needs one."
+why = "The material reads transparency or a mask from the alpha channel. Without it the whole surface shows as solid."
+how = "Add the alpha: in Photoshop, keep the transparent areas on a layer, or add an alpha channel in the Channels panel, and save as PNG, or as 32-bit TGA."
+
+[rule.default]
+enabled = false
+severity = "error"
+
+# It has an alpha channel, but every pixel in it is fully opaque.
+[rule.case.alpha_opaque]
+what = "Its alpha channel is fully opaque, but this type of texture needs transparency or a mask in alpha."
+
+# --- Colour --------------------------------------------------------------------------------------
+
+[[rule]]
+id = "texture.color_profile"
+category = "colour"
+since = "0.7.0"
+title = "Not sRGB"
+what = "It has the colour profile \"{profile}\" embedded, not sRGB."
+why = "Unity ignores embedded colour profiles and treats every texture as sRGB, so its colours in the game won't match what you saw in Photoshop."
+how = "Convert it to sRGB: in Photoshop, Edit > Convert to Profile, with the destination sRGB IEC61966-2.1. Then save it again."
+# profile: the embedded profile's description, e.g. "Display P3".
+measures = ["profile"]
+
+[rule.default]
+enabled = true
+severity = "warning"
+
+# The embedded profile has no description.
+[rule.case.unnamed]
+what = "It has a colour profile embedded that isn't sRGB."
+
+# --- File ----------------------------------------------------------------------------------------
+
+[[rule]]
+id = "texture.generation_metadata"
+category = "file"
+since = "0.7.0"
+title = "AI generation data"
+what = "It carries data from the tool that generated it: {found}."
+why = "Prompts, settings and workflows stay inside the file, so they travel into the repository and the game with it. The project's policy is to strip them."
+how = "Remove it: in Photoshop, File > Export > Export As, with Metadata set to None. Or turn off saving metadata in the generator and export it again."
+# found: what was found, joined with ", " (e.g. "XMP marking it as made by generative AI").
+measures = ["found"]
+
+[rule.default]
+enabled = false
+severity = "warning"
+
+[[rule]]
+id = "texture.file_size"
+category = "file"
+since = "0.7.0"
+title = "File too large"
+what = "The file is {size}. The most allowed is {limit}."
+why = "Large files make the repository slower to clone and pull for everyone, and they stay in its history even after they're replaced."
+how = "Make it smaller: delete hidden or unused layers, crop away unused canvas, or save it with compression (PNG, or RLE-compressed TGA)."
+# size, limit: the file's size and `max_mb`, in KB, MB or GB to one decimal; in exact bytes when
+# both would round to the same figure.
+measures = ["size", "limit"]
+
+[rule.default]
+enabled = false
+severity = "warning"
+
+[[rule.param]]
+key = "max_mb"
+kind = "number"
+unit = "MB"
+min = 0.1
+max = 4096
+default = 50
+label = "Largest file"
+help = "The most a file may take on disk. 1 MB is 1024 × 1024 bytes."
