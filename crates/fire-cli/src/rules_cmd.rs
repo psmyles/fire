@@ -2,8 +2,9 @@
 //! technical artist who writes `rules.json` and the rules files (AC9).
 //!
 //! `check` and `explain` are asset-rules' own, so `3d-review-cli`'s `rules` commands say the same
-//! thing about the same file. `check` lists the problems in a configuration; `explain` says which
-//! type, profile, stage and rules file apply to a file, and why. `check` exits 1 on any problem,
+//! thing about the same file. `check` lists the problems in a configuration, and in the texture
+//! rules files it names, read against this tool's catalog (3d-review-cli checks the model rules
+//! files); `explain` says which type, profile, stage and rules file apply to a file, and why. `check` exits 1 on any problem,
 //! warnings included, as every Asset Check exit status does (AC10), so a CI step that runs it stops
 //! on one. `catalog` prints this tool's rules catalog, which Rule Editor reads.
 
@@ -31,7 +32,8 @@ pub fn load_problem(path: &Path, error: &RulesError) -> String {
     problem
 }
 
-/// `rules check`: `true` when the configuration has no problems.
+/// `rules check`: `true` when the configuration, and the texture rules files it names, have no
+/// problems.
 pub fn check(path: &Path) -> bool {
     let rules = match load(path) {
         Ok(rules) => rules,
@@ -40,7 +42,8 @@ pub fn check(path: &Path) -> bool {
             return false;
         }
     };
-    let problems = rules.check();
+    let mut problems = rules.check();
+    problems.extend(rules.check_rules_files(crate::rules::catalog()));
     for problem in &problems {
         say(&problem.to_string());
     }

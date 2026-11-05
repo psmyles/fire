@@ -574,6 +574,23 @@ fn rules_check_and_explain() {
         code(&fire_cli(dir.path(), &["rules", "check", "bad.json"])),
         1
     );
+
+    // The texture rules files are read against fire-cli's catalog.
+    dir.write(
+        "rules/textures/normal.json",
+        br#"{ "version": 1, "profile": { "name": "Normal map", "rules": {
+              "texture.unused_alpha": { "severity": "error" },
+              "texture.max_sise": { "params": { "max": 1024 } } } } }"#,
+    );
+    let check = fire_cli(dir.path(), &["rules", "check", "rules/rules.json"]);
+    assert_eq!(code(&check), 1, "{}", stdout(&check));
+    assert!(
+        stdout(&check).contains(
+            r#"error: textures/normal.json rules["texture.max_sise"]: fire-cli has no rule "texture.max_sise""#
+        ),
+        "{}",
+        stdout(&check)
+    );
 }
 
 /// `rules.json` version 2: files outside `check`, or matching `skip`, aren't checked or reported.
