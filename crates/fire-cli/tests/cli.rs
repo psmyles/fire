@@ -575,3 +575,60 @@ fn rules_check_and_explain() {
         1
     );
 }
+
+/// `rules.json` version 2: files outside `check`, or matching `skip`, aren't checked or reported.
+#[test]
+fn files_the_rules_skip_are_left_out() {
+    let dir = project();
+    let rules = std::fs::read_to_string(dir.path().join("rules/rules.json")).unwrap();
+    let rules = rules
+        .replacen("\"version\": 1,", "\"version\": 2,", 1)
+        .replacen(
+            "\"types\":",
+            r#""check": ["Assets/**"],
+          "skip": [{ "label": "Third-party", "paths": ["Assets/Plugins/**"] }],
+          "types":"#,
+            1,
+        );
+    dir.write("rules/rules.json", rules.as_bytes());
+    dir.write("Assets/T_Crate_D.png", &rgb8(400, 400));
+    dir.write("Assets/Plugins/T_Lib_D.png", &rgb8(400, 400));
+    dir.write("Docs/T_Diagram_D.png", &rgb8(400, 400));
+    git(dir.path(), &["add", "."]);
+
+    let staged = fire_cli(
+        dir.path(),
+        &[
+            "check",
+            "--staged",
+            "--rules",
+            "rules/rules.json",
+            "--results",
+            "results.json",
+        ],
+    );
+    assert_eq!(code(&staged), 1, "{}", stdout(&staged));
+    let results = Results::read(&dir.path().join("results.json")).unwrap();
+    let paths: Vec<&str> = results.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["Assets/T_Crate_D.png"], "{}", stdout(&staged));
+
+    let named = fire_cli(
+        dir.path(),
+        &[
+            "check",
+            "Assets/Plugins/T_Lib_D.png",
+            "Docs/T_Diagram_D.png",
+            "--rules",
+            "rules/rules.json",
+        ],
+    );
+    let out = stdout(&named);
+    assert!(
+        out.contains("Assets/Plugins/T_Lib_D.png: left out: the rules skip it (Third-party)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Docs/T_Diagram_D.png: left out: it isn't in the paths the rules check"),
+        "{out}"
+    );
+}

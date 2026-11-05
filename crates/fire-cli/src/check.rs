@@ -21,7 +21,7 @@ use asset_rules::git::{Repo, StagedFile};
 use asset_rules::results::{
     ContextInfo, FileResult, Finding, Results, RulesInfo, Severity, Status,
 };
-use asset_rules::{resolve, Context, Mode, Resolution, Resolved, Rules};
+use asset_rules::{resolve, Context, Mode, Resolution, Resolved, Rules, SkippedBy};
 
 use crate::args::{CheckArgs, Judge, PROGRAM};
 use crate::console::{say, warn};
@@ -219,8 +219,9 @@ pub fn run(args: &CheckArgs) -> bool {
             .collect()
     };
 
-    // What each is checked against. Files the rules leave to another tool, or to none, drop out
-    // here: a staged one silently, a named one with a line saying why.
+    // What each is checked against. Files the rules leave to another tool, to none, or skip
+    // (`check` and `skip`) drop out here: a staged one silently, a named one with a line saying
+    // why.
     let mut plans: Vec<(Subject, Plan)> = Vec::new();
     for subject in subjects {
         match plan(&mut judging, &ctx, staged.as_ref(), &subject) {
@@ -372,6 +373,12 @@ fn plan(
     let ours = |kind: &str| rules.types()[kind].tool == PROGRAM;
     let resolved: Resolved = match resolution {
         Resolution::Ignored => return Err(m::left_out_ignored()),
+        Resolution::Skipped { by, .. } => {
+            return Err(match by {
+                SkippedBy::Check => m::left_out_not_in_check(),
+                SkippedBy::Skip(index) => m::left_out_skipped(rules.skip()[index].label.as_deref()),
+            });
+        }
         Resolution::Unmatched { kind } | Resolution::Resolved(Resolved { kind, .. })
             if !ours(&kind) =>
         {

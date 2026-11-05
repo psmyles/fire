@@ -276,6 +276,17 @@ pub fn left_out_other_tool(kind: &str, tool: &str) -> String {
     format!("left out: it is a {kind} file, which {tool} checks")
 }
 
+pub fn left_out_not_in_check() -> String {
+    "left out: it isn't in the paths the rules check (\"check\")".to_owned()
+}
+
+pub fn left_out_skipped(label: Option<&str>) -> String {
+    match label {
+        Some(label) => format!("left out: the rules skip it ({label})"),
+        None => "left out: the rules skip it".to_owned(),
+    }
+}
+
 pub fn not_a_file() -> String {
     "it is a folder, not a file".to_owned()
 }
