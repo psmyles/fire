@@ -81,13 +81,14 @@ severity = "error"
 [[rule.param]]
 key = "allowed"
 kind = "choices"
-# The formats Unity's texture importer reads that Fire also decodes.
+# The formats Unity's texture importer reads that Fire also decodes. fire-cli also takes the
+# aliases, and any spelling in capitals.
 options = [
   { value = "png", label = "PNG" },
-  { value = "jpg", label = "JPEG" },
-  { value = "tga", label = "TGA" },
+  { value = "jpg", label = "JPEG", aliases = ["jpeg", "jpe", "jfif"] },
+  { value = "tga", label = "TGA", aliases = ["targa"] },
   { value = "psd", label = "PSD" },
-  { value = "tiff", label = "TIFF" },
+  { value = "tiff", label = "TIFF", aliases = ["tif"] },
   { value = "exr", label = "OpenEXR" },
   { value = "hdr", label = "Radiance HDR" },
   { value = "bmp", label = "BMP" },
@@ -209,8 +210,9 @@ how = "Convert it: in Photoshop, Image > Mode > {convert_to} Bits/Channel. Then 
 # depth: "8 bits per channel", or "16-bit float" for a float image.
 # allowed_depths: the allowed depths joined with "or" ("8 or 16").
 # convert_to: the first allowed depth.
-# bits, colours: a palette image's bits per pixel and its most colours (the palette case).
-measures = ["depth", "allowed_depths", "convert_to", "bits", "colours"]
+# a_bits, colours: a palette image's bits per pixel with its article ("a 4-bit", "an 8-bit") and
+# its most colours (the palette case).
+measures = ["depth", "allowed_depths", "convert_to", "a_bits", "colours"]
 
 [rule.default]
 enabled = false
@@ -241,7 +243,7 @@ help = "Whether a palette (\"indexed\" or \"PNG-8\") image is allowed, whatever 
 # A palette image when `palette` is off: a finding of its own, besides any bit-depth one.
 [rule.case.palette]
 title = "Palette image"
-what = "This is a {bits}-bit palette image, so it has {colours} colours at most."
+what = "This is {a_bits} palette image, so it has {colours} colours at most."
 why = "A palette keeps only a few colours, so gradients band. Unity expands it to full colour when it imports it, but the banding stays."
 how = "Export it again from the source as full colour, not as a palette (\"indexed\" or \"PNG-8\") image. In Photoshop, Image > Mode > RGB Color converts it, but it can't bring back colours that were lost."
 
