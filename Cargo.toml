@@ -19,7 +19,8 @@ members = [
 exclude = ["vendor/sokol-rust"]
 
 [workspace.package]
-version = "0.7.0"
+# No `version`: the product's version is set only in product.json, and build.rs hands it to each
+# binary (FIRE_VERSION). The crates' own versions are unused (Cargo calls them 0.0.0).
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false

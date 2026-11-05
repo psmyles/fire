@@ -1,6 +1,5 @@
 [package]
 name = "fire-cli"
-version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -27,6 +26,10 @@ lcms2.workspace = true
 miniz_oxide.workspace = true
 memchr.workspace = true
 sha2.workspace = true
+
+[build-dependencies]
+# build.rs reads the version from ../../product.json, the one place it's edited.
+serde_json.workspace = true
 
 [dev-dependencies]
 # Test fixtures: images written by the `image` crate, and a WebP by `image-webp`.

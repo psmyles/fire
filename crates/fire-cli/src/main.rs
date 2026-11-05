@@ -28,7 +28,7 @@ use crate::args::{Parsed, PROGRAM};
 pub fn tool() -> ToolInfo {
     ToolInfo {
         name: PROGRAM.to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        version: env!("FIRE_VERSION").to_owned(),
     }
 }
 
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
             true
         }
         Parsed::Version => {
-            console::say(&messages::version(env!("CARGO_PKG_VERSION")));
+            console::say(&messages::version(env!("FIRE_VERSION")));
             true
         }
         Parsed::Check(args) => check::run(&args),

@@ -104,10 +104,10 @@ median / mean / sd of the milliseconds from _kernel process creation_ to the fir
 present. The binary measures itself when `FIRE_TTFP_OUT` is set; `FIRE_TIMING=1` prints a
 launch-path phase breakdown.
 
-Product metadata (name/version/publisher/…) lives in `product.json` at the repo root - `build.rs`
-reads it into the exe's version resource and `FIRE_*` env vars, and both packaging scripts read the
-same file, so bumping the version there flows into the app, the installer and the `.app` bundle
-alike.
+Product metadata (name/version/publisher/…) lives in `product.json` at the repo root, and only there:
+the Cargo manifests carry no version. `build.rs` reads it into the exe's version resource and
+`FIRE_*` env vars (`fire-cli` too), and both packaging scripts read the same file, so bumping the
+version there flows into the app, `fire-cli`, the installer and the `.app` bundle alike.
 
 Settings live in a per-user directory - `%APPDATA%\fire` on Windows,
 `~/Library/Application Support/fire` on macOS - as a commented `config.toml` Fire writes on first

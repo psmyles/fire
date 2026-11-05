@@ -14,13 +14,13 @@ pwsh scripts/build-installer.ps1
 
 That script is the entry point — don't run `ISCC` on `fire.iss` directly. It:
 
-1. Reads **`product.json`** (repo root) — the single source of product metadata.
-2. Syncs the Cargo workspace version to match.
-3. Regenerates `assets/fire.ico` from `assets/icon.png` (ImageMagick).
-4. Builds `fire.exe` and `fire_shellext.dll` (the Explorer thumbnail provider) in release
-   (`build.rs` embeds the same `product.json` values).
-5. Writes `installer/product.generated.iss` — the `#define`s `fire.iss` `#include`s (git-ignored).
-6. Compiles `fire.iss` with `ISCC` → **`dist/Fire-<version>.exe`**.
+1. Reads **`product.json`** (repo root) — the single source of product metadata. The Cargo
+   manifests carry no version, so there is nothing to keep in sync.
+2. Regenerates `assets/fire.ico` from `assets/icon.png` (ImageMagick).
+3. Builds `fire.exe`, `fire-cli.exe` and `fire_shellext.dll` (the Explorer thumbnail provider) in
+   release (`build.rs` reads the same `product.json`).
+4. Writes `installer/product.generated.iss` — the `#define`s `fire.iss` `#include`s (git-ignored).
+5. Compiles `fire.iss` with `ISCC` → **`dist/Fire-<version>.exe`**.
 
 Flags: `-SkipBuild` (reuse the existing `target/release/fire.exe` and `fire_shellext.dll`),
 `-SkipIcon`.

@@ -6,13 +6,12 @@
     product.json is the single source of truth for the product name, version, publisher, etc.
     This script:
       1. Reads product.json.
-      2. Syncs the workspace version in Cargo.toml to match (so the crate version never drifts).
-      3. Regenerates assets\fire.ico from assets\icon.png with ImageMagick (the one icon source).
-      4. Builds fire.exe, fire-cli.exe (Asset Check's image checker) and fire_shellext.dll (the
-         Explorer thumbnail provider) in release (build.rs embeds the same product.json values
-         into the exe).
-      5. Writes installer\product.generated.iss with #define directives for the Inno script.
-      6. Compiles installer\fire.iss with ISCC, emitting the setup .exe into dist\.
+      2. Regenerates assets\fire.ico from assets\icon.png with ImageMagick (the one icon source).
+      3. Builds fire.exe, fire-cli.exe (Asset Check's image checker) and fire_shellext.dll (the
+         Explorer thumbnail provider) in release (build.rs reads the same product.json, so the
+         binaries report its version and fire.exe embeds its values).
+      4. Writes installer\product.generated.iss with #define directives for the Inno script.
+      5. Compiles installer\fire.iss with ISCC, emitting the setup .exe into dist\.
 
     Bump the version (or any field) in product.json, re-run this script, and it flows everywhere.
 
@@ -38,7 +37,6 @@ Set-StrictMode -Version Latest
 # --- paths -------------------------------------------------------------------
 $RepoRoot     = Split-Path -Parent $PSScriptRoot
 $ProductJson  = Join-Path $RepoRoot 'product.json'
-$CargoToml    = Join-Path $RepoRoot 'Cargo.toml'
 $IconPng      = Join-Path $RepoRoot 'assets\icon.png'
 $IconIco      = Join-Path $RepoRoot 'assets\fire.ico'
 $IssScript    = Join-Path $RepoRoot 'installer\fire.iss'
@@ -63,20 +61,7 @@ $missing = foreach ($field in 'productName','version','publisher','copyright','h
 if ($missing) { throw "product.json is missing required field(s): $($missing -join ', ')" }
 Write-Host "    $($product.productName) $($product.version) — $($product.publisher)"
 
-# --- 2. sync Cargo.toml workspace version ------------------------------------
-Write-Step "Syncing Cargo.toml [workspace.package] version to $($product.version)"
-$cargo = Get-Content -Raw -LiteralPath $CargoToml
-# The only line-anchored `version = "..."` belongs to [workspace.package]; dependency versions
-# are either `name = "x"` or live inside inline tables, so this regex targets it uniquely.
-$cargoNew = [regex]::Replace($cargo, '(?m)^version\s*=\s*"[^"]*"', "version = `"$($product.version)`"")
-if ($cargoNew -ne $cargo) {
-    Set-Content -LiteralPath $CargoToml -Value $cargoNew -NoNewline -Encoding utf8
-    Write-Host "    Cargo.toml updated."
-} else {
-    Write-Host "    Cargo.toml already in sync."
-}
-
-# --- 3. regenerate fire.ico from icon.png ------------------------------------
+# --- 2. regenerate fire.ico from icon.png ------------------------------------
 if (-not $SkipIcon) {
     Write-Step "Generating fire.ico from icon.png (ImageMagick)"
     $magickCmd = Get-Command magick -ErrorAction SilentlyContinue
@@ -91,7 +76,7 @@ if (-not $SkipIcon) {
     Write-Step "Skipping icon regeneration (-SkipIcon)"
 }
 
-# --- 4. build the release exe ------------------------------------------------
+# --- 3. build the release exe ------------------------------------------------
 if (-not $SkipBuild) {
     Write-Step "Building fire.exe + fire-cli.exe + fire_shellext.dll (cargo build -p fire -p fire-cli -p fire-shellext --release)"
     & cargo build -p fire -p fire-cli -p fire-shellext --release
@@ -103,7 +88,7 @@ if (-not (Test-Path $ExePath)) { throw "Built exe not found at $ExePath (did the
 if (-not (Test-Path $CliPath)) { throw "Built fire-cli not found at $CliPath (did the build run?)" }
 if (-not (Test-Path $ShellExtPath)) { throw "Built thumbnail provider not found at $ShellExtPath (did the build run?)" }
 
-# --- 4b. verify the license notices are present ------------------------------
+# --- 3b. verify the license notices are present ------------------------------
 # fire.iss installs these alongside the exe. A statically-linked fire.exe carries code from ~160
 # other projects whose licenses require their notices to travel with the binary, so shipping an
 # installer without them is a compliance bug, not a cosmetic one. Fail here with a clear message
@@ -117,7 +102,7 @@ $licenseTexts = @(Get-ChildItem -Path (Join-Path $RepoRoot 'licenses') -Filter '
 if ($licenseTexts.Count -eq 0) { throw "No license texts found in $RepoRoot\licenses\ (installer expects licenses\*.txt)" }
 Write-Host "    $($noticeFiles.Count) notice files + $($licenseTexts.Count) license texts."
 
-# --- 5. write the generated ISPP include -------------------------------------
+# --- 4. write the generated ISPP include -------------------------------------
 Write-Step "Writing installer\product.generated.iss"
 # Escape double quotes for ISPP string literals (doubled), so values with quotes survive.
 function ConvertTo-IssString([string] $s) { '"' + ($s -replace '"', '""') + '"' }
@@ -140,7 +125,7 @@ $lines = @(
 )
 Set-Content -LiteralPath $GeneratedIss -Value ($lines -join "`r`n") -Encoding utf8
 
-# --- 6. compile the installer ------------------------------------------------
+# --- 5. compile the installer ------------------------------------------------
 Write-Step "Locating ISCC (Inno Setup compiler)"
 $isccCmd = Get-Command iscc.exe -ErrorAction SilentlyContinue
 $iscc = if ($isccCmd) { $isccCmd.Source } else { $null }

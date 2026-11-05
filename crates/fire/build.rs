@@ -447,7 +447,7 @@ fn embed_resources(p: &Product) {
     res.set("OriginalFilename", "fire.exe");
     res.set("InternalName", "fire");
     // Override winresource's Cargo-derived version strings + the numeric VS_FIXEDFILEINFO so the
-    // file-properties version matches product.json regardless of the crate's Cargo version.
+    // file-properties version is product.json's (the crates carry no version of their own).
     res.set("FileVersion", &p.version);
     res.set("ProductVersion", &p.version);
     let packed = packed_version(&p.version);
