@@ -1,10 +1,11 @@
-//! `fire-cli rules check` and `rules explain`: Asset Check's two commands for the technical artist
-//! who writes `rules.json` (AC9).
+//! `fire-cli rules check`, `rules explain` and `rules catalog`: Asset Check's commands for the
+//! technical artist who writes `rules.json` and the rules files (AC9).
 //!
-//! Both are asset-rules' own, so `3d-review-cli`'s `rules` commands say the same thing about the
-//! same file. `check` lists the problems in a configuration; `explain` says which type, profile,
-//! stage and rules file apply to a file, and why. `check` exits 1 on any problem, warnings
-//! included, as every Asset Check exit status does (AC10), so a CI step that runs it stops on one.
+//! `check` and `explain` are asset-rules' own, so `3d-review-cli`'s `rules` commands say the same
+//! thing about the same file. `check` lists the problems in a configuration; `explain` says which
+//! type, profile, stage and rules file apply to a file, and why. `check` exits 1 on any problem,
+//! warnings included, as every Asset Check exit status does (AC10), so a CI step that runs it stops
+//! on one. `catalog` prints this tool's rules catalog, which Rule Editor reads.
 
 use std::path::{Path, PathBuf};
 
@@ -61,6 +62,14 @@ pub fn check(path: &Path) -> bool {
         say(&m::rules_check_problems(&file, errors, warnings));
         false
     }
+}
+
+/// `rules catalog`: every rule this tool checks, as JSON, with this tool's version.
+pub fn catalog() -> bool {
+    say(crate::rules::catalog()
+        .to_json(env!("FIRE_VERSION"))
+        .trim_end());
+    true
 }
 
 /// `rules explain`: always `true` once the rules load.

@@ -58,11 +58,15 @@ pub fn usage_info_no_files() -> String {
 }
 
 pub fn usage_rules_no_command() -> String {
-    "rules needs a command: check or explain".to_owned()
+    "rules needs a command: check, explain or catalog".to_owned()
 }
 
 pub fn usage_rules_unknown(word: &str) -> String {
-    format!("\"{word}\" isn't a rules command; they are check and explain")
+    format!("\"{word}\" isn't a rules command; they are check, explain and catalog")
+}
+
+pub fn usage_rules_catalog_alone() -> String {
+    "rules catalog takes no files and no --rules".to_owned()
 }
 
 pub fn usage_rules_check_one() -> String {
@@ -93,6 +97,7 @@ Usage:
   {PROGRAM} info <files>...
   {PROGRAM} rules check <rules.json>
   {PROGRAM} rules explain <files>... --rules <rules.json>
+  {PROGRAM} rules catalog
   {PROGRAM} --version | --help
 
 check
@@ -112,6 +117,8 @@ info
 rules
   check     Lists the problems in a rules.json.
   explain   Says which type, profile, stage and rules file apply to each file, and why.
+  catalog   Prints every rule {PROGRAM} checks, with its settings, defaults and texts, as JSON
+            (asset-rules' catalog format), for Rule Editor.
 
 Exit status: 0 when nothing at warning level or worse was found, 1 when something was found or a
 file couldn't be checked, 2 when the command line couldn't be followed.

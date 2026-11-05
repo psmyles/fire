@@ -64,6 +64,7 @@ fn main() -> ExitCode {
         Parsed::Info(files) => info::run(&files),
         Parsed::RulesCheck(rules) => rules_cmd::check(&rules),
         Parsed::RulesExplain { rules, files } => rules_cmd::explain(&rules, &files),
+        Parsed::RulesCatalog => rules_cmd::catalog(),
     };
     if ok {
         ExitCode::SUCCESS

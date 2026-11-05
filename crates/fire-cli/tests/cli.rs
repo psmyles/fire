@@ -632,3 +632,16 @@ fn files_the_rules_skip_are_left_out() {
         "{out}"
     );
 }
+
+/// `rules catalog` prints the catalog fire-cli was built with, as asset-rules reads it back.
+#[test]
+fn rules_catalog_prints_every_rule() {
+    let dir = TempDir::new();
+    let output = fire_cli(dir.path(), &["rules", "catalog"]);
+    assert_eq!(code(&output), 0);
+    let catalog = asset_rules::catalog::Catalog::from_json(&stdout(&output)).expect("its JSON");
+    assert_eq!(catalog.tool, "fire-cli");
+    assert_eq!(catalog.version.as_deref(), Some(env!("FIRE_VERSION")));
+    assert_eq!(catalog.rules.len(), 14);
+    assert!(catalog.check(catalog.version.as_deref()).is_empty());
+}

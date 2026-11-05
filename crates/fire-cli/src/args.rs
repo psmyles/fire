@@ -30,6 +30,7 @@ pub enum Parsed {
     Info(Vec<PathBuf>),
     RulesCheck(PathBuf),
     RulesExplain { rules: PathBuf, files: Vec<PathBuf> },
+    RulesCatalog,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -150,7 +151,8 @@ fn check(given: Given) -> Result<Parsed, String> {
     }))
 }
 
-/// `rules check <rules.json>` (or `--rules`), or `rules explain <files>... --rules <rules.json>`.
+/// `rules check <rules.json>` (or `--rules`), `rules explain <files>... --rules <rules.json>`, or
+/// `rules catalog`.
 fn rules(given: Given) -> Result<Parsed, String> {
     if given.flag(HELP) {
         return Ok(Parsed::Help);
@@ -177,6 +179,10 @@ fn rules(given: Given) -> Result<Parsed, String> {
                 files: rest.iter().map(PathBuf::from).collect(),
             })
         }
+        "catalog" => match (rules, rest) {
+            (None, []) => Ok(Parsed::RulesCatalog),
+            _ => Err(m::usage_rules_catalog_alone()),
+        },
         other => Err(m::usage_rules_unknown(other)),
     }
 }
@@ -358,6 +364,9 @@ mod tests {
                 files: vec![PathBuf::from("a.png"), PathBuf::from("b.png")],
             })
         );
+        assert_eq!(parse_line("rules catalog"), Ok(Parsed::RulesCatalog));
+        assert!(parse_line("rules catalog r.json").is_err());
+        assert!(parse_line("rules catalog --rules r.json").is_err());
     }
 
     #[test]
