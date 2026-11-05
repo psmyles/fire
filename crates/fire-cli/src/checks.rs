@@ -1,138 +1,182 @@
-//! The v1 rules (AC12): each one measures a fact about an image against its settings, and says
-//! what it found in the artist's words.
+//! The rules' checks (AC12): each one measures a fact about an image against its rule's settings.
+//! The rules themselves, their settings and their texts are in `rules-catalog.toml`
+//! ([`crate::rules`]); a check says whether its rule found something, and hands the rule's texts
+//! what they name ([`found`]). Matching on [`RuleId`] makes a rule added to the catalog fail the
+//! build until its check is here.
 //!
 //! A rule that needs what only a decode tells (the alpha channel, the colour profile) doesn't run
-//! for an image that couldn't be decoded: a PSB, or a PSD with no merged image. A rule whose
-//! limit is set to something it can't use (`"max": 0`) doesn't run either.
+//! for an image that couldn't be decoded: a PSB, or a PSD with no merged image.
 
+use asset_rules::catalog::RuleSettings;
 use asset_rules::results::Finding;
 use serde_json::{json, Map, Value};
 
 use crate::facts::{normalize_format, Facts};
-use crate::messages::{self as m, Text};
-use crate::profile::{Profile, RuleId, UNITY_FORMATS};
+use crate::messages as m;
+use crate::profile::Profile;
+use crate::rules::{found, params, Found, RuleId};
 
 /// Every finding for `facts` under `profile`: worst first, then in rule order.
 pub fn evaluate(facts: &Facts, profile: &Profile) -> Vec<Finding> {
-    let mut found: Vec<(RuleId, Finding)> = Vec::new();
+    let mut out: Vec<(RuleId, Finding)> = Vec::new();
     for rule in RuleId::ALL {
-        let config = profile.rule(rule);
-        if !config.enabled {
+        let settings = profile.rule(rule);
+        if !settings.enabled {
             continue;
         }
-        for (text, measured, limit) in measure(rule, facts, profile) {
+        for (what, measured, limit) in measure(rule, facts, settings) {
+            debug_assert_eq!(what.rule(), rule, "a check hands its own rule's texts");
+            let texts = what.texts(None, settings);
             let mut finding = Finding::new(
                 rule.id(),
-                config.severity,
-                text.title,
-                text.what,
-                text.why,
-                text.how,
+                settings.severity,
+                texts.title,
+                texts.what,
+                texts.why,
+                texts.how,
             );
-            finding.note = config.note.clone();
+            finding.note = settings.note.clone();
             finding.measured = object(measured);
             finding.limit = object(limit);
-            found.push((rule, finding));
+            out.push((rule, finding));
         }
     }
-    found.sort_by_key(|(rule, finding)| (std::cmp::Reverse(finding.severity), *rule));
-    found.into_iter().map(|(_, finding)| finding).collect()
+    out.sort_by_key(|(rule, finding)| (std::cmp::Reverse(finding.severity), *rule));
+    out.into_iter().map(|(_, finding)| finding).collect()
 }
 
-/// What `rule` finds: the text, the figures measured and the limit they were held to. Most
-/// rules find one thing or nothing; `texture.bit_depth` can find two.
-fn measure(rule: RuleId, facts: &Facts, profile: &Profile) -> Vec<(Text, Value, Value)> {
-    let config = profile.rule(rule);
+/// What `rule` finds: what it hands its texts, the figures measured and the limit they were held
+/// to. Most rules find one thing or nothing; `texture.bit_depth` can find two.
+fn measure(rule: RuleId, facts: &Facts, settings: &RuleSettings) -> Vec<(Found, Value, Value)> {
     let (w, h) = (facts.width, facts.height);
     let size = json!({ "width": w, "height": h });
-    let one = |found: Option<(Text, Value, Value)>| found.into_iter().collect();
+    let one = |found: Option<(Found, Value, Value)>| found.into_iter().collect();
     match rule {
         RuleId::PsdComposite => one(facts.no_merged_image.then(|| {
             (
-                m::psd_composite(),
+                found::PsdComposite.into(),
                 json!({ "merged_image": false }),
                 Value::Null,
             )
         })),
         RuleId::Psb => one(facts.psb.then(|| {
             (
-                m::psb(),
+                found::Psb.into(),
                 json!({ "format": "psb" }),
                 json!({ "format": "psd" }),
             )
         })),
         RuleId::Format => {
-            let allowed: Vec<String> = config
-                .words("allowed")
-                .unwrap_or_default()
+            let allowed: Vec<String> = params::Format::read(settings)
+                .allowed
                 .iter()
                 .map(|id| normalize_format(id))
                 .collect();
             let id = normalize_format(&facts.format.id);
             one((!allowed.contains(&id)).then(|| {
-                let unity_reads = UNITY_FORMATS.contains(&id.as_str());
+                let upper: Vec<String> = allowed.iter().map(|f| f.to_uppercase()).collect();
+                let found = found::Format {
+                    case: (!unity_reads(&id)).then_some(found::FormatCase::UnityCantRead),
+                    a_label: m::a_format(&facts.format.name),
+                    allowed_formats: upper.join(", "),
+                    target: upper.first().cloned().unwrap_or_else(|| "PNG".to_owned()),
+                };
                 (
-                    m::format(&facts.format.name, &allowed, unity_reads),
+                    found.into(),
                     json!({ "format": id }),
                     json!({ "allowed": allowed }),
                 )
             }))
         }
-        RuleId::MaxSize => one(config.count("max").and_then(|max| {
-            (w > max || h > max).then(|| (m::max_size(w, h, max), size, json!({ "max": max })))
-        })),
-        RuleId::MinSize => one(config.count("min").and_then(|min| {
-            (w < min || h < min).then(|| (m::min_size(w, h, min), size, json!({ "min": min })))
-        })),
+        RuleId::MaxSize => {
+            let max = params::MaxSize::read(settings).max;
+            one((w > max || h > max).then(|| {
+                let found = found::MaxSize {
+                    width: w.to_string(),
+                    height: h.to_string(),
+                };
+                (found.into(), size, json!({ "max": max }))
+            }))
+        }
+        RuleId::MinSize => {
+            let min = params::MinSize::read(settings).min;
+            one((w < min || h < min).then(|| {
+                let found = found::MinSize {
+                    width: w.to_string(),
+                    height: h.to_string(),
+                };
+                (found.into(), size, json!({ "min": min }))
+            }))
+        }
         RuleId::PowerOfTwo => one((!(w.is_power_of_two() && h.is_power_of_two())).then(|| {
-            let suggested = (nearest_power_of_two(w), nearest_power_of_two(h));
-            (
-                m::power_of_two(w, h, suggested),
-                size,
-                json!({ "power_of_two": true }),
-            )
+            let found = found::PowerOfTwo {
+                width: w.to_string(),
+                height: h.to_string(),
+                suggested_width: nearest_power_of_two(w).to_string(),
+                suggested_height: nearest_power_of_two(h).to_string(),
+            };
+            (found.into(), size, json!({ "power_of_two": true }))
         })),
         RuleId::MultipleOf4 => one((w % 4 != 0 || h % 4 != 0).then(|| {
-            let suggested = (nearest_multiple_of_4(w), nearest_multiple_of_4(h));
-            (
-                m::multiple_of_4(w, h, suggested),
-                size,
-                json!({ "multiple_of": 4 }),
-            )
+            let found = found::MultipleOf4 {
+                width: w.to_string(),
+                height: h.to_string(),
+                suggested_width: nearest_multiple_of_4(w).to_string(),
+                suggested_height: nearest_multiple_of_4(h).to_string(),
+            };
+            (found.into(), size, json!({ "multiple_of": 4 }))
         })),
-        RuleId::Square => one((w != h).then(|| (m::square(w, h), size, json!({ "square": true })))),
+        RuleId::Square => one((w != h).then(|| {
+            let found = found::Square {
+                width: w.to_string(),
+                height: h.to_string(),
+                side: w.max(h).to_string(),
+            };
+            (found.into(), size, json!({ "square": true }))
+        })),
         RuleId::BitDepth => {
-            let allowed = config
-                .depths("allowed")
-                .filter(|depths| !depths.is_empty())
-                .unwrap_or_else(|| vec![8]);
-            let palette_ok = config.flag("palette").unwrap_or(false);
+            let params = params::BitDepth::read(settings);
+            let allowed: Vec<u8> = params
+                .allowed
+                .iter()
+                .filter_map(|&depth| u8::try_from(depth).ok())
+                .collect();
+            let allowed = if allowed.is_empty() { vec![8] } else { allowed };
             let measured = json!({
                 "bit_depth": facts.bit_depth,
                 "float": facts.float,
                 "palette": facts.palette,
             });
-            let mut found = Vec::new();
+            // Both findings name the same values; each texts uses its own.
+            let named = found::BitDepth {
+                case: None,
+                depth: m::depth(facts.bit_depth, facts.float),
+                allowed_depths: m::depths(&allowed),
+                convert_to: allowed[0].to_string(),
+                a_bits: m::a_bits(facts.bit_depth),
+                colours: m::palette_colours(facts.bit_depth).to_string(),
+            };
+            let mut out = Vec::new();
             if !allowed.contains(&facts.bit_depth) {
-                found.push((
-                    m::bit_depth(facts.bit_depth, facts.float, &allowed),
+                out.push((
+                    named.clone().into(),
                     measured.clone(),
                     json!({ "allowed": allowed }),
                 ));
             }
-            if facts.palette && !palette_ok {
-                found.push((
-                    m::palette(facts.bit_depth),
-                    measured,
-                    json!({ "palette": false }),
-                ));
+            if facts.palette && !params.palette {
+                let palette = found::BitDepth {
+                    case: Some(found::BitDepthCase::Palette),
+                    ..named
+                };
+                out.push((palette.into(), measured, json!({ "palette": false })));
             }
-            found
+            out
         }
         RuleId::UnusedAlpha => one(facts.pixels.as_ref().and_then(|pixels| {
             (has_alpha(pixels.channels) && pixels.alpha_opaque).then(|| {
                 (
-                    m::unused_alpha(),
+                    found::UnusedAlpha.into(),
                     json!({ "channels": pixels.channels, "alpha_opaque": true }),
                     Value::Null,
                 )
@@ -141,8 +185,11 @@ fn measure(rule: RuleId, facts: &Facts, profile: &Profile) -> Vec<(Text, Value, 
         RuleId::AlphaRequired => one(facts.pixels.as_ref().and_then(|pixels| {
             let has_channel = has_alpha(pixels.channels);
             (!has_channel || pixels.alpha_opaque).then(|| {
+                let found = found::AlphaRequired {
+                    case: has_channel.then_some(found::AlphaRequiredCase::AlphaOpaque),
+                };
                 (
-                    m::alpha_required(has_channel),
+                    found.into(),
                     json!({
                         "channels": pixels.channels,
                         "alpha_opaque": has_channel && pixels.alpha_opaque,
@@ -157,33 +204,53 @@ fn measure(rule: RuleId, facts: &Facts, profile: &Profile) -> Vec<(Text, Value, 
             .and_then(|pixels| pixels.icc.as_ref())
             .filter(|icc| !icc.srgb)
             .map(|icc| {
+                let found = found::ColorProfile {
+                    case: icc
+                        .description
+                        .is_none()
+                        .then_some(found::ColorProfileCase::Unnamed),
+                    profile: icc.description.clone().unwrap_or_default(),
+                };
                 (
-                    m::color_profile(icc.description.as_deref()),
+                    found.into(),
                     json!({ "profile": icc.description }),
                     json!({ "profile": "sRGB" }),
                 )
             })),
         RuleId::GenerationMetadata => one((!facts.generation.is_empty()).then(|| {
+            let found = found::GenerationMetadata {
+                found: facts.generation.join(", "),
+            };
             (
-                m::generation_metadata(&facts.generation),
+                found.into(),
                 json!({ "found": facts.generation }),
                 Value::Null,
             )
         })),
-        RuleId::FileSize => one(config
-            .number("max_mb")
-            .filter(|mb| *mb > 0.0)
-            .and_then(|mb| {
-                let max_bytes = (mb * 1024.0 * 1024.0) as u64;
-                (facts.file_size > max_bytes).then(|| {
-                    (
-                        m::file_size_too_big(facts.file_size, max_bytes),
-                        json!({ "bytes": facts.file_size }),
-                        json!({ "max_mb": mb }),
-                    )
-                })
-            })),
+        RuleId::FileSize => {
+            let mb = params::FileSize::read(settings).max_mb;
+            let max_bytes = (mb * 1024.0 * 1024.0) as u64;
+            one((facts.file_size > max_bytes).then(|| {
+                let (size, limit) = m::file_sizes(facts.file_size, max_bytes);
+                (
+                    found::FileSize { size, limit }.into(),
+                    json!({ "bytes": facts.file_size }),
+                    json!({ "max_mb": mb }),
+                )
+            }))
+        }
     }
+}
+
+/// Whether Unity's texture importer reads the format `id`: the catalog lists the formats it reads
+/// (that Fire decodes too) as `texture.format`'s options.
+fn unity_reads(id: &str) -> bool {
+    RuleId::Format.rule().param("allowed").is_some_and(|param| {
+        param
+            .options
+            .iter()
+            .any(|option| option.value.as_str() == Some(id))
+    })
 }
 
 fn has_alpha(channels: u8) -> bool {

@@ -18,6 +18,13 @@ mod metadata;
 mod profile;
 mod rules_cmd;
 
+/// The rules, generated from `rules-catalog.toml` by `build.rs`: `RuleId`, each rule's parameters
+/// (`params`), and what each rule's check hands its texts (`found`, `Found`).
+mod rules {
+    #![allow(dead_code)]
+    include!(concat!(env!("OUT_DIR"), "/rules.rs"));
+}
+
 use std::process::ExitCode;
 
 use asset_rules::results::ToolInfo;

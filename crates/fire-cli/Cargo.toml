@@ -30,6 +30,8 @@ sha2.workspace = true
 [build-dependencies]
 # build.rs reads the version from ../../product.json, the one place it's edited.
 serde_json.workspace = true
+# ...and generates the rule code from ../../rules-catalog.toml, after checking it.
+asset-rules.workspace = true
 
 [dev-dependencies]
 # Test fixtures: images written by the `image` crate, and a WebP by `image-webp`.

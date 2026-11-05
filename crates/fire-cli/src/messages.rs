@@ -1,12 +1,13 @@
-//! Every line `fire-cli` says, and every finding's text.
+//! Every line `fire-cli` says, and the measured values its findings name, worded.
 //!
 //! All of it is here, and only here, so a message catalogue can replace this module later
 //! without a hunt through the code (Asset Check AC11). Fire has no catalogue yet, and the text is
 //! English only for now.
 //!
-//! The findings follow AC11: **what** gives the measured value and the limit; **why** gives the
-//! consequence in the game or the pipeline; **how** names the steps in the artist's own tool.
-//! Plain language and short sentences.
+//! The findings' own texts are in `rules-catalog.toml`, with the rules: **what** gives the
+//! measured value and the limit; **why** gives the consequence in the game or the pipeline;
+//! **how** names the steps in the artist's own tool (AC11). A value the catalog's texts name that
+//! needs words of its own ("an AVIF", "8 or 16", "3.0 MB") is worded here, under *Measures*.
 
 use asset_rules::results::Severity;
 use asset_rules::StageFrom;
@@ -240,12 +241,11 @@ pub fn profile_no_version() -> String {
     "it has no \"version\"; texture rules files say \"version\": 1".to_owned()
 }
 
-pub fn unknown_rule(file: &str, rule: &str) -> String {
-    format!("{file}: \"{rule}\" isn't a rule {PROGRAM} knows; it is ignored")
-}
-
-pub fn malformed_rule(file: &str, rule: &str) -> String {
-    format!("{file}: the settings of \"{rule}\" can't be read; it takes its defaults")
+/// Heads the lines saying what a texture rules file sets that this tool can't use.
+pub fn passed_over(file: &str) -> String {
+    format!(
+        "{file}: {PROGRAM} passes over what it can't use here, and goes by the defaults instead:"
+    )
 }
 
 pub fn no_rules_file(profile: &str, stage: &str) -> String {
@@ -401,7 +401,8 @@ pub fn file_size(bytes: u64) -> String {
     }
 }
 
-fn palette_colours(bits: u8) -> u32 {
+/// How many colours a palette of `bits` bits per pixel holds.
+pub fn palette_colours(bits: u8) -> u32 {
     1u32 << bits.min(8)
 }
 
@@ -413,265 +414,48 @@ fn list(items: &[String]) -> String {
     }
 }
 
-// --- findings -----------------------------------------------------------------------------------
+// --- measures --------------------------------------------------------------------------------
 
-/// The text of one finding: title, what, why, how.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Text {
-    pub title: String,
-    pub what: String,
-    pub why: String,
-    pub how: String,
+/// A format's name with its article: "a PNG", "an AVIF", "an OpenEXR". Of the names Fire gives
+/// formats, those starting with a vowel letter are said with a vowel (AVIF, ICO, OpenEXR) and the
+/// rest with a consonant (HEIF, PNG, TGA).
+pub fn a_format(name: &str) -> String {
+    let an = name
+        .chars()
+        .next()
+        .is_some_and(|c| "AEIOUaeiou".contains(c));
+    format!("{} {name}", if an { "an" } else { "a" })
 }
 
-fn text(title: &str, what: String, why: &str, how: String) -> Text {
-    Text {
-        title: title.to_owned(),
-        what,
-        why: why.to_owned(),
-        how,
-    }
+/// A bit depth with its article: "a 4-bit", "an 8-bit".
+pub fn a_bits(bits: u8) -> String {
+    let an = matches!(bits, 8 | 11 | 18 | 80..=89);
+    format!("{} {bits}-bit", if an { "an" } else { "a" })
 }
 
-/// `texture.format`. `unity_reads` is whether Unity's texture importer reads the format at all.
-pub fn format(label: &str, allowed: &[String], unity_reads: bool) -> Text {
-    let allowed_upper: Vec<String> = allowed.iter().map(|f| f.to_uppercase()).collect();
-    let target = allowed_upper
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "PNG".to_owned());
-    let why = if unity_reads {
-        "The project keeps its textures in a few agreed formats, so every texture goes through \
-         the same import settings."
-    } else {
-        "Unity's texture importer can't read this format, so the texture would be missing in \
-         the game."
-    };
-    text(
-        "Format not allowed",
-        format!(
-            "This is a {label} file. Allowed formats: {}.",
-            allowed_upper.join(", ")
-        ),
-        why,
-        format!(
-            "Save it as {target} instead: in Photoshop, File > Save a Copy, and pick {target} as \
-             the format. Then stage the new file in place of this one."
-        ),
-    )
-}
-
-pub fn max_size(width: u32, height: u32, max: u32) -> Text {
-    text(
-        "Too large",
-        format!("This image is {width}×{height}. The most allowed is {max}×{max}."),
-        "Every doubling of width and height takes four times the memory and download size in \
-         the game.",
-        format!(
-            "Scale it down so neither side is more than {max} pixels: in Photoshop, \
-             Image > Image Size. Then save it again."
-        ),
-    )
-}
-
-pub fn min_size(width: u32, height: u32, min: u32) -> Text {
-    text(
-        "Too small",
-        format!("This image is {width}×{height}. The least allowed is {min}×{min}."),
-        "A texture this small looks blurred or blocky on screen.",
-        format!(
-            "Make it at least {min} pixels on each side, ideally by exporting it again from the \
-             source at a larger size rather than scaling it up."
-        ),
-    )
-}
-
-pub fn power_of_two(width: u32, height: u32, suggested: (u32, u32)) -> Text {
-    let (w, h) = suggested;
-    text(
-        "Not a power of two",
-        format!(
-            "This image is {width}×{height}. Both sides must be a power of two \
-             (… 256, 512, 1024, 2048 …)."
-        ),
-        "Unity rescales a texture that isn't a power of two, or can't compress it or make \
-         mipmaps for it on every platform, so it ends up blurrier or takes more memory.",
-        format!(
-            "Resize it to powers of two, for example {w}×{h}: in Photoshop, Image > Image Size \
-             (or Image > Canvas Size to add or trim space instead of scaling). Then save it again."
-        ),
-    )
-}
-
-pub fn multiple_of_4(width: u32, height: u32, suggested: (u32, u32)) -> Text {
-    let (w, h) = suggested;
-    text(
-        "Not a multiple of 4",
-        format!("This image is {width}×{height}. Both sides must be a multiple of 4."),
-        "Texture compression works on 4×4 blocks. A texture whose sides aren't multiples of 4 \
-         can't be compressed on every platform, so it stays uncompressed and takes far more \
-         memory.",
-        format!(
-            "Resize it to multiples of 4, for example {w}×{h}: in Photoshop, Image > Canvas Size. \
-             Then save it again."
-        ),
-    )
-}
-
-pub fn square(width: u32, height: u32) -> Text {
-    let side = width.max(height);
-    text(
-        "Not square",
-        format!("This image is {width}×{height}. It must be square."),
-        "Textures of this type are expected to be square, and some platforms compress only \
-         square textures.",
-        format!(
-            "Make it square, for example {side}×{side}: in Photoshop, Image > Canvas Size. Then \
-             save it again."
-        ),
-    )
-}
-
-pub fn unused_alpha() -> Text {
-    text(
-        "Alpha channel not used",
-        "It has an alpha channel, but every pixel is fully opaque.".to_owned(),
-        "An alpha channel makes Unity pick a format that stores it, which takes up to twice the \
-         memory, for no visible difference.",
-        "Remove the alpha channel: in Photoshop, delete it in the Channels panel (or flatten the \
-         image with Layer > Flatten Image), then save it again. In Export As, untick \
-         Transparency."
-            .to_owned(),
-    )
-}
-
-pub fn alpha_required(has_channel: bool) -> Text {
-    let what = if has_channel {
-        "Its alpha channel is fully opaque, but this type of texture needs transparency or a \
-         mask in alpha."
-    } else {
-        "It has no alpha channel, but this type of texture needs one."
-    };
-    text(
-        "Alpha channel needed",
-        what.to_owned(),
-        "The material reads transparency or a mask from the alpha channel. Without it the whole \
-         surface shows as solid.",
-        "Add the alpha: in Photoshop, keep the transparent areas on a layer, or add an alpha \
-         channel in the Channels panel, and save as PNG, or as 32-bit TGA."
-            .to_owned(),
-    )
-}
-
-pub fn bit_depth(bits: u8, float: bool, allowed: &[u8]) -> Text {
-    let allowed: Vec<String> = allowed.iter().map(|b| format!("{b}")).collect();
-    let kind = if float {
+/// An image's depth: "8 bits per channel", or "16-bit float".
+pub fn depth(bits: u8, float: bool) -> String {
+    if float {
         format!("{bits}-bit float")
     } else {
         format!("{bits} bits per channel")
-    };
-    text(
-        "Bit depth not allowed",
-        format!(
-            "This image is {kind}. Allowed: {} bits per channel.",
-            list(&allowed)
-        ),
-        "A deeper image takes more memory and download size, and for most textures the extra \
-         precision is lost when Unity compresses it anyway.",
-        format!(
-            "Convert it: in Photoshop, Image > Mode > {} Bits/Channel. Then save it again.",
-            allowed.first().map_or("8", String::as_str)
-        ),
-    )
+    }
 }
 
-pub fn palette(bits: u8) -> Text {
-    text(
-        "Palette image",
-        format!(
-            "This is a {bits}-bit palette image, so it has {} colours at most.",
-            palette_colours(bits)
-        ),
-        "A palette keeps only a few colours, so gradients band. Unity expands it to full colour \
-         when it imports it, but the banding stays.",
-        "Export it again from the source as full colour, not as a palette (\"indexed\" or \
-         \"PNG-8\") image. In Photoshop, Image > Mode > RGB Color converts it, but it can't bring \
-         back colours that were lost."
-            .to_owned(),
-    )
+/// Bit depths as a choice: "8", "8 or 16", "8, 16 or 32".
+pub fn depths(allowed: &[u8]) -> String {
+    let allowed: Vec<String> = allowed.iter().map(u8::to_string).collect();
+    list(&allowed)
 }
 
-pub fn color_profile(description: Option<&str>) -> Text {
-    let what = match description {
-        Some(name) => format!("It has the colour profile \"{name}\" embedded, not sRGB."),
-        None => "It has a colour profile embedded that isn't sRGB.".to_owned(),
-    };
-    text(
-        "Not sRGB",
-        what,
-        "Unity ignores embedded colour profiles and treats every texture as sRGB, so its colours \
-         in the game won't match what you saw in Photoshop.",
-        "Convert it to sRGB: in Photoshop, Edit > Convert to Profile, with the destination \
-         sRGB IEC61966-2.1. Then save it again."
-            .to_owned(),
-    )
-}
-
-pub fn generation_metadata(found: &[String]) -> Text {
-    text(
-        "AI generation data",
-        format!(
-            "It carries data from the tool that generated it: {}.",
-            found.join(", ")
-        ),
-        "Prompts, settings and workflows stay inside the file, so they travel into the \
-         repository and the game with it. The project's policy is to strip them.",
-        "Remove it: in Photoshop, File > Export > Export As, with Metadata set to None. Or turn \
-         off saving metadata in the generator and export it again."
-            .to_owned(),
-    )
-}
-
-pub fn file_size_too_big(bytes: u64, max_bytes: u64) -> Text {
-    // Just over the limit, both round to the same figure; the exact bytes then show the difference.
-    let (size, limit) = if file_size(bytes) == file_size(max_bytes) {
+/// A file's size and its limit, as `texture.file_size` names them. Just over the limit, both
+/// round to the same figure; the exact bytes then show the difference.
+pub fn file_sizes(bytes: u64, max_bytes: u64) -> (String, String) {
+    if file_size(bytes) == file_size(max_bytes) {
         (format!("{bytes} bytes"), format!("{max_bytes} bytes"))
     } else {
         (file_size(bytes), file_size(max_bytes))
-    };
-    text(
-        "File too large",
-        format!("The file is {size}. The most allowed is {limit}."),
-        "Large files make the repository slower to clone and pull for everyone, and they stay \
-         in its history even after they're replaced.",
-        "Make it smaller: delete hidden or unused layers, crop away unused canvas, or save it \
-         with compression (PNG, or RLE-compressed TGA)."
-            .to_owned(),
-    )
-}
-
-pub fn psd_composite() -> Text {
-    text(
-        "PSD has no merged image",
-        "This PSD has no merged image: it was saved without Maximize Compatibility.".to_owned(),
-        "Unity reads only a PSD's merged image. Without it the texture imports blank.",
-        "In Photoshop, set Preferences > File Handling > Maximize PSD and PSB File Compatibility \
-         to Always. Then open the file and save it again."
-            .to_owned(),
-    )
-}
-
-pub fn psb() -> Text {
-    text(
-        "PSB file",
-        "This is a PSB (Large Document Format) file.".to_owned(),
-        "Unity's texture importer doesn't read PSB files, and a PSB is usually far larger than \
-         the texture needs.",
-        "Save it as a PSD instead: in Photoshop, File > Save a Copy, with the format Photoshop. \
-         If Photoshop refuses because the image is too large, scale it down first \
-         (Image > Image Size)."
-            .to_owned(),
-    )
+    }
 }
 
 #[cfg(test)]
@@ -681,14 +465,38 @@ mod tests {
     #[test]
     fn a_file_just_over_its_limit_reads_as_over_it() {
         let mb = 1024 * 1024;
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(file_sizes(3 * mb, 2 * mb), pair("3.0 MB", "2.0 MB"));
         assert_eq!(
-            file_size_too_big(3 * mb, 2 * mb).what,
-            "The file is 3.0 MB. The most allowed is 2.0 MB."
+            file_sizes(16 * mb + 18, 16 * mb),
+            pair("16777234 bytes", "16777216 bytes")
         );
+    }
+
+    #[test]
+    fn articles() {
+        let formats: Vec<String> = ["PNG", "AVIF", "OpenEXR", "HEIF", "ICO", "image", "JPEG"]
+            .into_iter()
+            .map(a_format)
+            .collect();
         assert_eq!(
-            file_size_too_big(16 * mb + 18, 16 * mb).what,
-            "The file is 16777234 bytes. The most allowed is 16777216 bytes."
+            formats,
+            [
+                "a PNG",
+                "an AVIF",
+                "an OpenEXR",
+                "a HEIF",
+                "an ICO",
+                "an image",
+                "a JPEG"
+            ]
         );
+        let bits: Vec<String> = [1, 2, 4, 8, 16].into_iter().map(a_bits).collect();
+        assert_eq!(
+            bits,
+            ["a 1-bit", "a 2-bit", "a 4-bit", "an 8-bit", "a 16-bit"]
+        );
+        assert_eq!(depths(&[8, 16, 32]), "8, 16 or 32");
     }
 
     #[test]
