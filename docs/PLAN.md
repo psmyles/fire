@@ -1,7 +1,8 @@
 # fire - Work Plan
 
 **Status, 5 November 2026:** A1 and A2 are done and merged into `main`, and A2's end-to-end check
-against 3d-review-cli has passed on Windows. B hasn't started. asset-rules is tagged `v0.1.0`.
+against 3d-review-cli has passed on Windows. A3, the rules catalog, is built on the branch `catalog`
+and waits for asset-rules `v0.2.0`. B hasn't started. asset-rules is tagged `v0.1.0`.
 
 Open items, in order:
 1. **A2 on the Mac:** run `build-mac.sh` and `dev-app.sh`, and `fire-cli` inside the bundle (A2's
@@ -108,7 +109,8 @@ documents it in full.
   - `texture.color_profile`.
   - Everything else is off until listed. The same defaults apply with neither `--rules` nor
     `--profile`.
-- **Messages:** all of them in `src/messages.rs` (AC11).
+- **Messages:** all of them in `src/messages.rs` (AC11); since A3, the findings' texts are in
+  `rules-catalog.toml`, with the rules.
 - **Tests:**
   - 33 unit tests, and 7 end-to-end tests of the binary on generated fixtures: opaque alpha, 16-bit,
     Display P3, a `parameters` text chunk, WebP, and a PSD without a merged image;
@@ -145,6 +147,35 @@ documents it in full.
 - Run `scripts/build-mac.sh`: the nested `fire-cli` signature, notarization, and `codesign --verify`.
 - Run `scripts/dev-app.sh`.
 - Run `fire-cli` from inside the bundle.
+
+### A3. The rules catalog - built on the branch `catalog`
+
+The rules repo's `docs/rule-editor-plan.md`, step 2: every rule is described once, in
+`rules-catalog.toml` at the repository root, so adding or changing one is easy and Rule Editor
+learns the rules from `fire-cli rules catalog`. Fire 0.7.0 ships with it.
+
+- **The catalog:** 14 rules in 6 categories, their parameters, defaults and texts (title, what,
+  why, how, and the cases a check picks).
+- **`build.rs`** has asset-rules check the catalog (no rule newer than `product.json`'s version) and
+  generate the rule code: `RuleId`, typed parameters (`params::MaxSize { max }`), and what each
+  check hands its texts (`found::MaxSize { width, height }`). The checks in `checks.rs` stay
+  hand-written; a rule added to the catalog fails the build until its check exists.
+- **Rules files** are read as asset-rules' `Rule::settings` reads them. One change: a parameter value
+  out of range keeps its default, where it used to switch the rule off.
+- **`rules catalog`** prints the catalog; **`rules check`** reads each texture rules file against it.
+- **`rules.json` version 2:** files `check` and `skip` leave out are left out.
+- **Two wording fixes:** "an 8-bit palette image" and "an OpenEXR file" (also AVIF and ICO).
+
+*The gate:* CrimeCrew's 496 textures, checked before and after with release builds: the same
+results and output against its `rules.json` and against the defaults (digest included); with every
+rule on, only the two wording fixes differ (6 findings).
+
+**Still to do:** depend on asset-rules by tag `v0.2.0` once it's tagged, with `Cargo.lock`. Until
+then the branch builds against a local checkout, patched in on the command line:
+
+```sh
+cargo build -p fire-cli --config "patch.'https://github.com/psmyles/asset-rules'.asset-rules.path='../asset-rules'"
+```
 
 ## B. The fire-decode migration: fire's side, after A
 

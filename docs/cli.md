@@ -13,6 +13,7 @@ fire-cli check --files-from <list> [--rules <rules.json> | --profile <file>] [--
 fire-cli info <files>...
 fire-cli rules check <rules.json>
 fire-cli rules explain <files>... --rules <rules.json>
+fire-cli rules catalog
 fire-cli --version | --help
 ```
 
@@ -75,8 +76,9 @@ PNGs and TGAs (146 MB) measured 0.3 s, and 0.13 s from the cache, on a 24-core P
 **With `--rules`:**
 
 - A file whose type belongs to another tool (a `.fbx` is `3d-review-cli`'s), or whose extension no
-  type lists, is left out: not checked and not in the results. A file named on the command line
-  gets a line saying why; a staged one is passed over silently.
+  type lists, is left out: not checked and not in the results. So is a file a version-2 `rules.json`
+  leaves out with `check` or `skip`. A file named on the command line gets a line saying why; a
+  staged one is passed over silently.
 - A file of this tool's type whose name matches no profile gets the `file.no_profile` finding: a
   warning, or an error in enforce mode, whose "how" lists the name patterns that would match.
 - Each texture rules file is read once per run, however many images use it.
@@ -134,20 +136,29 @@ The rules file a profile names in `rules.json` (and the file `--profile` takes) 
 }
 ```
 
-It is read leniently, since these files are written by hand:
+It is read leniently, since these files are written by hand, as asset-rules reads rules files for
+both checkers:
 
 - A rule listed is on, unless it says `"enabled": false`.
-- Whatever a rule leaves out (`severity`, any parameter) is the tool's default for it. A parameter of
-  the wrong kind (`"max": "big"`) keeps its default too.
-- A rule this tool doesn't know is skipped, with a warning on standard error, so a misspelt id is
-  noticed. A rule whose settings can't be read takes its defaults, also with a warning.
-- A rule the file doesn't list takes the tool's default. Only the rules about something Unity gets
+- Whatever a rule leaves out (`severity`, any parameter) is its default. A parameter value the rule
+  can't take (`"max": "big"`, `"min": 0`) keeps its default too.
+- A rule whose settings can't be read (`"severity": "catastrophic"`) takes its defaults whole.
+- A rule this tool doesn't have is passed over. Everything passed over is listed on standard error,
+  under one line naming the file, so a misspelt id is noticed; `rules check` lists the same as
+  errors.
+- A rule the file doesn't list takes its default. Only the rules about something Unity gets
   wrong whatever the team's policy are on by default: `texture.format`, `texture.psd_composite` and
   `texture.color_profile`. Every other rule is off until a file lists it.
 - `note` is the technical artist's note, shown under the tool's own text.
 - A `version` other than 1 is refused: the file is newer than this tool.
 
 ## The rules
+
+Every rule, with its parameters, defaults and texts, is defined in `rules-catalog.toml` at the
+repository root (asset-rules' catalog format; see `asset-rules` and the rules repo's
+`docs/rule-editor-plan.md`). The build checks the catalog and generates the code that refers to
+rules from it, so a rule added there fails the build until its check exists in
+`crates/fire-cli/src/checks.rs`. `fire-cli rules catalog` prints it. In short:
 
 | Rule | Finds | Parameters (default) | Default |
 |---|---|---|---|
@@ -196,19 +207,24 @@ T_Crate_D.png
 
 Exit status 1 if a file couldn't be read.
 
-## rules check and rules explain
+## rules check, rules explain and rules catalog
 
-For the technical artist who writes `rules.json`. Both are the `asset-rules` crate's own, so
-`3d-review-cli rules ...` says the same thing about the same file.
+For the technical artist who writes `rules.json` and the rules files. `check` and `explain` are the
+`asset-rules` crate's own, so `3d-review-cli rules ...` says the same thing about the same file.
 
 - **`rules check <rules.json>`** lists the problems in a configuration: an unknown type, stage or
   tool, a stage with no rules file, a rules file that doesn't exist, an invalid pattern, a profile
-  that can never match, duplicate ids, and a tool older than `requires` asks for. Exit status 1 on
-  any problem, warnings included, so a CI step that runs it stops on one.
+  that can never match, duplicate ids, and a tool older than `requires` asks for. It also reads each
+  texture rules file the configuration names against fire-cli's catalog: a rule fire-cli doesn't
+  have, a parameter of the wrong kind or out of range, or a field it doesn't know is an error
+  (`3d-review-cli` checks the model rules files). Exit status 1 on any problem, warnings included,
+  so a CI step that runs it stops on one.
 - **`rules explain <files>... --rules <rules.json>`** says, for each file, which type, profile,
   stage and rules file apply and why: every profile tried and why it did or didn't match, and where
   the stage came from. Files are resolved against the repository the current folder is in, and its
   branch.
+- **`rules catalog`** prints fire-cli's rules catalog as JSON, with its version, for Rule Editor:
+  every rule, its category, parameters, defaults and texts.
 
 ## Results
 
