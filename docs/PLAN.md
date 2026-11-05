@@ -7,8 +7,8 @@ Open items, in order:
 1. **A2 on the Mac:** run `build-mac.sh` and `dev-app.sh`, and `fire-cli` inside the bundle (A2's
    last section).
 2. **Next by the order below:** the Launcher's results table is done (5 November). Asset Check's
-   rules repo comes next (another repository), then B. B's step 2, the tonemap fix, can be done at
-   any time.
+   rules repo, SandboxVR/exp-content-rules, comes next, then B. B's step 2, the tonemap fix, can be
+   done at any time.
 
 The work is ordered for a stretch on a Mac; items that need Windows are collected at the end.
 
@@ -19,8 +19,9 @@ Two designs touch this repository:
 - **Asset Check** checks art assets committed to a Unity project against a technical artist's rules,
   and shows artists what is wrong, why, and how to fix it. Fire's part is a new console tool,
   **`fire-cli`**, that checks images using fire-decode.
-  - Design: `asset-check-plan.md` in [psmyles/fire-decode](https://github.com/psmyles/fire-decode)
-    (private; it moves to the rules repo later). Decisions are numbered AC1-AC19.
+  - Design: `docs/asset-check-plan.md` in the rules repo,
+    [SandboxVR/exp-content-rules](https://github.com/SandboxVR/exp-content-rules) (private).
+    Decisions are numbered AC1-AC19.
 - **The fire-decode migration** moves `crates/fire-decode`, `crates/psd-sdk-sys` and
   `crates/heif-sys` into their own repository, as the decoder shared by fire, 3D Review and bite.
   - Design: [`docs/fire-decode-plan.md`](fire-decode-plan.md). This is a copy of the canonical plan in
@@ -177,7 +178,7 @@ documents it in full.
 
 - [`docs/fire-decode-plan.md`](fire-decode-plan.md): the migration design (a copy; canonical in
   psmyles/fire-decode).
-- `asset-check-plan.md` in psmyles/fire-decode: the Asset Check design.
+- `docs/asset-check-plan.md` in SandboxVR/exp-content-rules: the Asset Check design.
 - [`docs/architecture.md`](architecture.md): fire's architecture.
-- `docs/PLAN.md` in psmyles/fire-decode, psmyles/asset-rules, psmyles/3d-review and psmyles/launcher:
-  the related work there.
+- `docs/PLAN.md` in psmyles/fire-decode, psmyles/asset-rules, psmyles/3d-review, psmyles/launcher
+  and SandboxVR/exp-content-rules: the related work there.
