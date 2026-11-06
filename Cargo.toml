@@ -152,7 +152,7 @@ serde_json = "1"
 # 3D Review's `review3d-cli` so both checkers answer the same way (Asset Check AC9). Used by tag;
 # to build against an unreleased checkout, give this repository an untracked `.cargo/config.toml`
 # with `[patch."https://github.com/psmyles/asset-rules"] asset-rules = { path = "../asset-rules" }`.
-asset-rules = { git = "https://github.com/psmyles/asset-rules", tag = "v0.2.0" }
+asset-rules = { git = "https://github.com/psmyles/asset-rules", tag = "v0.2.1" }
 # Byte-string search for generation metadata in XMP. Already in the build through `globset`.
 memchr = "2"
 # The digest results record for fire-cli's built-in rules. The version and features asset-rules

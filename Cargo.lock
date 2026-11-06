@@ -106,8 +106,8 @@ checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
 
 [[package]]
 name = "asset-rules"
-version = "0.2.0"
-source = "git+https://github.com/psmyles/asset-rules?tag=v0.2.0#05b0b77ab56ebab50082fce014fa75c8ae6ffcde"
+version = "0.2.1"
+source = "git+https://github.com/psmyles/asset-rules?tag=v0.2.1#9079318095994758303dfa9d891db333ddc481c6"
 dependencies = [
  "globset",
  "serde",

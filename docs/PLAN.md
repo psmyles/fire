@@ -2,7 +2,7 @@
 
 **Status, 5 November 2026:** A1 and A2 are done and merged into `main`, and A2's end-to-end check
 against review3d-cli has passed on Windows. A3, the rules catalog, is done and merged. B hasn't
-started. fire-cli depends on asset-rules `v0.2.0`.
+started. fire-cli depends on asset-rules `v0.2.1`.
 
 Open items, in order:
 1. **A2 on the Mac:** run `build-mac.sh` and `dev-app.sh`, and `fire-cli` inside the bundle (A2's
@@ -87,7 +87,7 @@ Each addition has tests. The workspace tests pass with default features and with
 documents it in full.
 
 - **Dependencies:** `fire-decode` (with `psd`/`heif` pass-through features, on by default, so CI's
-  decoder-free job builds it), and `asset-rules` by tag (`v0.2.0` since A3). asset-rules is public,
+  decoder-free job builds it), and `asset-rules` by tag (`v0.2.0` since A3, `v0.2.1` since 3D Review's checker became `review3d-cli`). asset-rules is public,
   so CI fetches it without credentials.
 - **Commands:** `check <files>... | --staged | --files-from <list>` with `--rules`, `--profile` or
   neither, and `--results`; `info`; `rules check` / `rules explain`; `--version` / `--help`.
@@ -171,7 +171,7 @@ learns the rules from `fire-cli rules catalog`. Fire 0.7.0 ships with it.
 results and output against its `rules.json` and against the defaults (digest included); with every
 rule on, only the two wording fixes differ (6 findings).
 
-It depends on asset-rules `v0.2.0`, tagged 5 November 2026.
+It depends on asset-rules `v0.2.0`, tagged 5 November 2026; `v0.2.1` since 6 November, which names 3D Review's checker `review3d-cli`.
 
 ## B. The fire-decode migration: fire's side, after A
 
