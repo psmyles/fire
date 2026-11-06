@@ -149,7 +149,7 @@ serde_json = "1"
 
 # --- Asset Check (fire-cli) ---
 # Which rules apply to a file, the results format, the git helpers and the cache, shared with
-# 3D Review's `3d-review-cli` so both checkers answer the same way (Asset Check AC9). Used by tag;
+# 3D Review's `review3d-cli` so both checkers answer the same way (Asset Check AC9). Used by tag;
 # to build against an unreleased checkout, give this repository an untracked `.cargo/config.toml`
 # with `[patch."https://github.com/psmyles/asset-rules"] asset-rules = { path = "../asset-rules" }`.
 asset-rules = { git = "https://github.com/psmyles/asset-rules", tag = "v0.2.0" }

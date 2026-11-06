@@ -1,6 +1,6 @@
 //! The command line.
 //!
-//! 3d-review-cli's contract, so a tool that drives one drives the other the same way: long options
+//! review3d-cli's contract, so a tool that drives one drives the other the same way: long options
 //! only, no prompts, no standard input. A value is written `--name value` or `--name=value`, and an
 //! empty value is the same as leaving the option out, so a form can always pass every option. `--`
 //! ends the options. Relative paths resolve against the working folder.

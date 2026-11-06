@@ -1,7 +1,7 @@
 # fire - Work Plan
 
 **Status, 5 November 2026:** A1 and A2 are done and merged into `main`, and A2's end-to-end check
-against 3d-review-cli has passed on Windows. A3, the rules catalog, is done and merged. B hasn't
+against review3d-cli has passed on Windows. A3, the rules catalog, is done and merged. B hasn't
 started. fire-cli depends on asset-rules `v0.2.0`.
 
 Open items, in order:
@@ -34,7 +34,7 @@ the artist pilot. The migration comes after, starting with what a Mac can do.
 
 **Order across repositories:**
 1. `asset-rules` - its `docs/PLAN.md`;
-2. this repo's A1-A2 (done), alongside 3D Review's `3d-review-cli` changes (done);
+2. this repo's A1-A2 (done), alongside 3D Review's `review3d-cli` changes (done);
 3. the Launcher's results table (done), then Asset Check's rules repo;
 4. the migration.
 
@@ -91,7 +91,7 @@ documents it in full.
   so CI fetches it without credentials.
 - **Commands:** `check <files>... | --staged | --files-from <list>` with `--rules`, `--profile` or
   neither, and `--results`; `info`; `rules check` / `rules explain`; `--version` / `--help`.
-  - The contract, exit codes and option rules are 3d-review-cli's, matched against its in-progress
+  - The contract, exit codes and option rules are review3d-cli's, matched against its in-progress
     AC13 work.
   - With `--rules`, other tools' files are left out of the results. `--staged` reads the staged
     content and, with `--rules`, uses the cache.
@@ -100,7 +100,7 @@ documents it in full.
 - **Rules:** all 14 v1 rules.
   - A PSB, or a PSD with no merged image, can't be decoded. It is checked on its header: size, depth,
     format and file size.
-- **Rules files:** the 3d-review-cli envelope, read leniently. A listed rule is on; omitted fields
+- **Rules files:** the review3d-cli envelope, read leniently. A listed rule is on; omitted fields
   take the defaults; unknown or malformed rules are skipped with a warning.
 - **Decision: rules a file doesn't list take the tool's default.** The defaults are on only for what
   Unity gets wrong whatever the team's policy is:
@@ -118,8 +118,9 @@ documents it in full.
     cache;
   - all of them in CI's decoder-free job too, except the PSD fixture.
 - **Packaging:**
-  - Windows: `fire.iss` and `build-installer.ps1` install `fire-cli.exe` beside `fire.exe`, not on
-    PATH. ISCC compiles the installer with it included (verified on Windows).
+  - Windows: `fire.iss` and `build-installer.ps1` install `fire-cli.exe` beside `fire.exe`. The
+    "Add fire-cli to PATH" task, on by default, puts that folder on the user's PATH; Asset Check
+    doesn't rely on it. ISCC compiles the installer with it included (verified on Windows).
   - macOS: `build-mac.sh` builds `fire-cli`, copies it to `Fire.app/Contents/MacOS/`, and signs it on
     its own with the hardened runtime before signing the bundle. `dev-app.sh` copies it too.
   - CI lints and tests it in both jobs, and builds it in the release step.
@@ -131,7 +132,7 @@ documents it in full.
   which checks the schema and version.
 - **Speed:** 20 real 1K-4K textures (146 MB) staged in a scratch repository took 0.3 s cold and
   0.13 s cached, on a 24-core PC with a release build.
-- **The same profile and stage as 3d-review-cli:** true by construction (both call asset-rules'
+- **The same profile and stage as review3d-cli:** true by construction (both call asset-rules'
   `resolve`), covered by asset-rules' own step-1 test, and checked end to end on Windows on
   5 November 2026 with both release builds:
   - **The setup:** a scratch repository with asset-rules' fixture `rules.json`, four models (environment

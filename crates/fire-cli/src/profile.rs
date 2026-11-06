@@ -1,7 +1,7 @@
 //! A texture rules file: which rules apply, how serious each is, its limits, and the technical
 //! artist's note (Asset Check AC8, AC12).
 //!
-//! The envelope is 3d-review-cli's profile format, so both checkers' rules files look alike:
+//! The envelope is review3d-cli's profile format, so both checkers' rules files look alike:
 //!
 //! ```json
 //! { "version": 1, "generator": "hand-written",
@@ -11,7 +11,7 @@
 //! ```
 //!
 //! Every rule, its parameters and its defaults are in `rules-catalog.toml` ([`crate::rules`]). A
-//! file is read leniently, as asset-rules' `Rule::settings` and 3d-review-cli read one, since these
+//! file is read leniently, as asset-rules' `Rule::settings` and review3d-cli read one, since these
 //! files are written by hand:
 //! - a listed rule is on unless it says `"enabled": false`;
 //! - whatever a rule leaves out (severity, any parameter) is its default;

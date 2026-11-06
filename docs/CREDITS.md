@@ -112,7 +112,7 @@ see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
   **[memchr](https://github.com/BurntSushi/memchr)** (Andrew Gallant) and
   **[sha2](https://github.com/RustCrypto/hashes)** (the RustCrypto developers) - which Asset Check
   rules apply to a file, the results format and the cache, shared by `fire-cli` and 3D Review's
-  `3d-review-cli`.
+  `review3d-cli`.
 - **[crossbeam-channel](https://github.com/crossbeam-rs/crossbeam)** - the Crossbeam project
   developers. Channels from the decode pool and file watcher to the UI thread.
 - **[rayon](https://github.com/rayon-rs/rayon)** - Josh Stone, Niko Matsakis and contributors.

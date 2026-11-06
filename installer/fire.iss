@@ -70,6 +70,9 @@ UninstallDisplayIcon={app}\{#MyAppExe}
 SetupIconFile={#MyIconSource}
 ; Tell the shell to refresh icons/associations when our [Registry] entries change.
 ChangesAssociations=yes
+; And to reload the environment once [Code] has changed the user's Path (the "addtopath" task), so
+; a terminal opened after Setup finds fire-cli without signing out. The uninstaller does the same.
+ChangesEnvironment=yes
 WizardStyle=modern
 
 ; Fire's own MIT license, shown on the wizard's license page. Paths here are relative to this
@@ -91,9 +94,10 @@ Source: "{#MyExeSource}"; DestDir: "{app}"; DestName: "{#MyAppExe}"; Flags: igno
 ; support (CloseApplications, on by default, *.dll in its filter) finds that surrogate and offers to
 ; close it. `restartreplace` would not help — it needs admin rights, and this install has none.
 Source: "{#MyShellExtSource}"; DestDir: "{app}"; Flags: ignoreversion
-; fire-cli.exe, Asset Check's image checker: a console program beside fire.exe, as 3d-review-cli.exe
-; sits beside 3d-review.exe. Deliberately not put on PATH: Asset Check's setup records where it
-; is (.git/asset-check/tools.env), so the hook never depends on a PATH it doesn't control.
+; fire-cli.exe, Asset Check's image checker: a console program beside fire.exe, as review3d-cli.exe
+; sits beside 3d-review.exe. The "addtopath" task puts this folder on the user's PATH so it can be
+; typed in a terminal. Asset Check does not rely on that: its setup records where fire-cli is
+; (.git/asset-check/tools.env), so the hook never depends on a PATH it doesn't control.
 Source: "{#MyCliSource}"; DestDir: "{app}"; Flags: ignoreversion
 
 ; --- license notices -----------------------------------------------------------------------
@@ -142,6 +146,12 @@ Name: "assoc\raw";      Description: "Camera raw — embedded preview (.cr2, .cr
 ; are not lost at the bottom of this list.)
 ; --- shortcuts ---
 Name: "desktopicon";    Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+; --- command line ---
+; Checked by default: fire-cli is a console program, and a terminal is where it gets run. The
+; work is in [Code] (UpdateUserPath): the install folder goes on the user's Path (HKCU, no admin),
+; which puts fire.exe there too. Unticking it on a reinstall takes the folder back off; uninstall
+; always does.
+Name: "addtopath";      Description: "Add fire-cli to PATH"; GroupDescription: "Command line:"
 
 [Registry]
 ; --- remove the legacy single shared ProgID from older installs -------------------------
@@ -667,4 +677,93 @@ begin
       Formats := Formats + NewLine + Space + ThumbFormats[I].Caption;
   if Formats <> '' then
     AddMemoSection(Result, 'Explorer thumbnails:' + Formats, NewLine);
+end;
+
+// --- the "addtopath" task ---------------------------------------------------------------------
+// The user's Path lives under HKCU\Environment, which a per-user install may write. Read as stored
+// (%VARIABLES% unexpanded) and written back as REG_EXPAND_SZ, the type Windows gives it, so those
+// entries keep working. [Registry] can't do this: on uninstall it could only delete the whole value.
+const
+  UserEnvKey = 'Environment';
+
+// Whether a Path entry names Dir. Case, surrounding blanks and a trailing \ don't matter.
+function SameDir(Entry, Dir: String): Boolean;
+begin
+  Result := CompareText(RemoveBackslashUnlessRoot(Trim(Entry)), RemoveBackslashUnlessRoot(Dir)) = 0;
+end;
+
+// Puts Dir at the end of the user's Path (Wanted), or takes every entry naming it off. The rest of
+// the value is kept exactly as it was, and a Path that already says what is wanted isn't written.
+procedure UpdateUserPath(Dir: String; Wanted: Boolean);
+var
+  Path, Rest, Entry, Kept, NewPath: String;
+  P: Integer;
+  Found, First: Boolean;
+begin
+  if not RegQueryStringValue(HKCU, UserEnvKey, 'Path', Path) then
+    Path := '';
+
+  // Every entry but Dir's, in order. Empty entries are kept too, so a trailing ';' survives.
+  Kept := '';
+  Found := False;
+  First := True;
+  Rest := Path;
+  while True do
+  begin
+    P := Pos(';', Rest);
+    if P = 0 then
+      Entry := Rest
+    else
+      Entry := Copy(Rest, 1, P - 1);
+    if SameDir(Entry, Dir) then
+      Found := True
+    else
+    begin
+      if not First then
+        Kept := Kept + ';';
+      Kept := Kept + Entry;
+      First := False;
+    end;
+    if P = 0 then
+      Break;
+    Rest := Copy(Rest, P + 1, Length(Rest));
+  end;
+
+  if Wanted then
+  begin
+    if Found then
+      Exit;
+    if Path = '' then
+      NewPath := Dir
+    else if Path[Length(Path)] = ';' then
+      NewPath := Path + Dir
+    else
+      NewPath := Path + ';' + Dir;
+  end else
+  begin
+    if not Found then
+      Exit;
+    NewPath := Kept;
+  end;
+
+  if NewPath = '' then
+    RegDeleteValue(HKCU, UserEnvKey, 'Path')
+  else if not RegWriteExpandStringValue(HKCU, UserEnvKey, 'Path', NewPath) then
+    Log('Could not write the user''s Path: ' + NewPath);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  // Setup's environment broadcast (ChangesEnvironment) comes after this step, so it carries the
+  // change. Unticked on a reinstall means off the Path, not "leave it as it was".
+  if CurStep = ssPostInstall then
+    UpdateUserPath(ExpandConstant('{app}'), WizardIsTaskSelected('addtopath'));
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  // The folder is about to go, so its Path entry goes too, however it got there. usUninstall comes
+  // before the uninstaller's own environment broadcast.
+  if CurUninstallStep = usUninstall then
+    UpdateUserPath(ExpandConstant('{app}'), False);
 end;

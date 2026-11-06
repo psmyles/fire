@@ -1,9 +1,9 @@
 //! `fire-cli rules check`, `rules explain` and `rules catalog`: Asset Check's commands for the
 //! technical artist who writes `rules.json` and the rules files (AC9).
 //!
-//! `check` and `explain` are asset-rules' own, so `3d-review-cli`'s `rules` commands say the same
+//! `check` and `explain` are asset-rules' own, so `review3d-cli`'s `rules` commands say the same
 //! thing about the same file. `check` lists the problems in a configuration, and in the texture
-//! rules files it names, read against this tool's catalog (3d-review-cli checks the model rules
+//! rules files it names, read against this tool's catalog (review3d-cli checks the model rules
 //! files); `explain` says which type, profile, stage and rules file apply to a file, and why. `check` exits 1 on any problem,
 //! warnings included, as every Asset Check exit status does (AC10), so a CI step that runs it stops
 //! on one. `catalog` prints this tool's rules catalog, which Rule Editor reads.

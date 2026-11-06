@@ -34,6 +34,10 @@ Flags: `-SkipBuild` (reuse the existing `target/release/fire.exe` and `fire_shel
 
 - Per-user install (no admin) to `%LOCALAPPDATA%\Programs\Fire`, with a Start Menu shortcut and an
   optional desktop shortcut.
+- An **Add fire-cli to PATH** task, ticked by default: `[Code]` (`UpdateUserPath`) appends the
+  install folder to the user's `Path` (`HKCU\Environment`, kept `REG_EXPAND_SZ`), and Setup
+  broadcasts the change (`ChangesEnvironment`) so new terminals see it. Unticked on a reinstall, the
+  folder comes off again; uninstall always takes it off. Nothing else in the value is touched.
 - A wizard page to set Fire as the default viewer, with a checkbox **per format** plus an **"All
   supported image formats"** master toggle. All off by default — an install never silently steals
   associations the user didn't pick.

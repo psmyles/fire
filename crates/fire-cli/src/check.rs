@@ -1,7 +1,7 @@
 //! `fire-cli check`: every image checked against its rules (AC12).
 //!
 //! With `--rules`, Asset Check's `rules.json` picks each image's profile and stage from its name,
-//! its folder and the branch, through asset-rules, so `3d-review-cli` resolves a file the same
+//! its folder and the branch, through asset-rules, so `review3d-cli` resolves a file the same
 //! way. With `--profile`, one texture rules file applies to every image; with neither, the
 //! built-in defaults do. `--staged` checks the images staged in the current folder's repository,
 //! as staged; there, with `--rules`, each result is cached against the staged content, the rules

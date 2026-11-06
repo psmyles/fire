@@ -439,7 +439,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 /// A project on `main` with its rules in `rules/`: textures go to fire-cli, models to
-/// 3d-review-cli; `T_*_N` is a normal map, `T_*` any other texture; `main` is production.
+/// review3d-cli; `T_*_N` is a normal map, `T_*` any other texture; `main` is production.
 fn project() -> TempDir {
     let dir = TempDir::new();
     git(dir.path(), &["init", "-q", "-b", "main"]);
@@ -452,7 +452,7 @@ fn project() -> TempDir {
           "requires": { "fire-cli": "0.1.0" },
           "types": {
             "texture": { "tool": "fire-cli", "extensions": ["png", "tga", "psd"] },
-            "model": { "tool": "3d-review-cli", "extensions": ["fbx"] }
+            "model": { "tool": "review3d-cli", "extensions": ["fbx"] }
           },
           "profiles": [
             { "id": "normal-map", "type": "texture", "label": "Normal map",

@@ -4,7 +4,7 @@
 says, in plain language, what is wrong, why it matters and how to fix it. It reads images with
 fire-decode, Fire's own decoder, so it sees exactly what the viewer sees. It is a console program
 shipped beside the viewer, built for the Asset Check `pre-commit` hook, the Fork command, CI and
-Launcher tools; `3d-review-cli` is its counterpart for models.
+Launcher tools; `review3d-cli` is its counterpart for models.
 
 ```text
 fire-cli check <files>... [--rules <rules.json> | --profile <file>] [--results <file>]
@@ -24,12 +24,17 @@ fire-cli --version | --help
 | Windows | `fire-cli.exe` beside `fire.exe`, in Fire's install folder (`%LOCALAPPDATA%\Programs\Fire` for the default per-user install). |
 | macOS | `Fire.app/Contents/MacOS/fire-cli`, signed with the hardened runtime like the viewer. |
 
-Neither installer puts it on the PATH. Asset Check's setup records where it is
+On Windows, the installer's **Add fire-cli to PATH** task, ticked by default, puts Fire's install
+folder on the user's PATH (so `fire` is on it too), for terminals opened after Setup. Unticking it
+on a reinstall takes the folder off again, and uninstalling always does. The macOS app doesn't put
+it on the PATH.
+
+Asset Check doesn't use the PATH either way: its setup records where fire-cli is
 (`.git/asset-check/tools.env`), so the hook never depends on a PATH it doesn't control.
 
 ## The contract
 
-`3d-review-cli`'s contract, so a tool that drives one drives the other the same way.
+`review3d-cli`'s contract, so a tool that drives one drives the other the same way.
 
 - **Long options only, no prompts, no standard input.** Nothing ever waits for an answer.
 - **Exit status 0**: nothing at warning level or worse was found.
@@ -58,7 +63,7 @@ fire-cli check --files-from changed.txt --rules rules/rules.json
 
 | Option | |
 |---|---|
-| `--rules <rules.json>` | Asset Check's rules. Each image's type, profile and stage come from its name, its folder and the branch, through the `asset-rules` crate, so `3d-review-cli` resolves every file the same way. |
+| `--rules <rules.json>` | Asset Check's rules. Each image's type, profile and stage come from its name, its folder and the branch, through the `asset-rules` crate, so `review3d-cli` resolves every file the same way. |
 | `--profile <file>` | One texture rules file (below) for every image. |
 | `--staged` | The images staged for the next commit in the repository the current folder is in, checked as staged. Takes no files and no `--files-from`. |
 | `--files-from <list>` | A file listing images, one per line. Windows limits a command line to about 32,000 characters, which a big commit can exceed. |
@@ -75,7 +80,7 @@ PNGs and TGAs (146 MB) measured 0.3 s, and 0.13 s from the cache, on a 24-core P
 
 **With `--rules`:**
 
-- A file whose type belongs to another tool (a `.fbx` is `3d-review-cli`'s), or whose extension no
+- A file whose type belongs to another tool (a `.fbx` is `review3d-cli`'s), or whose extension no
   type lists, is left out: not checked and not in the results. So is a file a version-2 `rules.json`
   leaves out with `check` or `skip`. A file named on the command line gets a line saying why; a
   staged one is passed over silently.
@@ -117,7 +122,7 @@ Checking 3 images against rules/rules.json
 ## Texture rules files
 
 The rules file a profile names in `rules.json` (and the file `--profile` takes) uses
-`3d-review-cli`'s profile envelope:
+`review3d-cli`'s profile envelope:
 
 ```json
 {
@@ -210,14 +215,14 @@ Exit status 1 if a file couldn't be read.
 ## rules check, rules explain and rules catalog
 
 For the technical artist who writes `rules.json` and the rules files. `check` and `explain` are the
-`asset-rules` crate's own, so `3d-review-cli rules ...` says the same thing about the same file.
+`asset-rules` crate's own, so `review3d-cli rules ...` says the same thing about the same file.
 
 - **`rules check <rules.json>`** lists the problems in a configuration: an unknown type, stage or
   tool, a stage with no rules file, a rules file that doesn't exist, an invalid pattern, a profile
   that can never match, duplicate ids, and a tool older than `requires` asks for. It also reads each
   texture rules file the configuration names against fire-cli's catalog: a rule fire-cli doesn't
   have, a parameter of the wrong kind or out of range, or a field it doesn't know is an error
-  (`3d-review-cli` checks the model rules files). Exit status 1 on any problem, warnings included,
+  (`review3d-cli` checks the model rules files). Exit status 1 on any problem, warnings included,
   so a CI step that runs it stops on one.
 - **`rules explain <files>... --rules <rules.json>`** says, for each file, which type, profile,
   stage and rules file apply and why: every profile tried and why it did or didn't match, and where

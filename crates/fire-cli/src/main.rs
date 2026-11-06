@@ -2,7 +2,7 @@
 //! viewer. It checks images against a technical artist's rules with fire-decode, Fire's own
 //! decoder, and writes what it found in Asset Check's results format.
 //!
-//! Exit status, as `3d-review-cli`'s (AC10): 0 when nothing at warning level or worse was found,
+//! Exit status, as `review3d-cli`'s (AC10): 0 when nothing at warning level or worse was found,
 //! 1 when something was found or a file couldn't be checked, 2 when the command line couldn't be
 //! followed. A refused command line runs nothing and writes no results; results an earlier run
 //! left at its `--results` path are removed all the same, so after any run the file is this run's

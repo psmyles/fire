@@ -127,7 +127,7 @@ fi
 bin="$repo/target/release/fire"
 [[ -x "$bin" ]] || die "no release binary at $bin — drop --no-build?"
 # fire-cli, Asset Check's image checker: a console program shipped inside the bundle, beside the
-# viewer, as 3d-review-cli is in 3D Review's. Asset Check's setup records where it is; it is not
+# viewer, as review3d-cli is in 3D Review's. Asset Check's setup records where it is; it is not
 # linked onto the PATH.
 cli="$repo/target/release/fire-cli"
 [[ -x "$cli" ]] || die "no release binary at $cli — drop --no-build?"
