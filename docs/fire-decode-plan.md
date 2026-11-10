@@ -1,6 +1,6 @@
 # fire-decode - Shared Decoder Plan
 
-**Status: in progress.** Steps 0-5, 6a and 6b are done on the Mac, each with its Windows half
+**Status: in progress.** Steps 0-5 and 6a-6c are done on the Mac, each with its Windows half
 still to do; `docs/PLAN.md` tracks them. The design was revised in November 2026, after fire, bite
 and 3D Review shipped their late-October releases. That revision made three changes:
 - HEIF / HEIC / AVIF moves into the crate. The October version kept it in fire.
@@ -958,6 +958,34 @@ exposure / tonemap handles the range.
   modes, the lossy `pq_ycbcr.avif` within 2%; `texture()` / `thumbnail()` output bit-identical to
   before on every corpus file but the five PQ / HLG fixtures; SDR HEIC TTFP within noise
   (`docs/baselines.md`).
+
+**As built (step 6c):**
+- **libheif re-checked:** 1.23.7 is still the newest release (26 October), and `master` has no
+  gain-map API either (`tmap` appears only inside its `mini` box parser).
+- **The crate reads the structure in Rust** (`heif_meta`): items, references, properties in
+  `ipma` order and entity groups, shared with `probe()`. libheif decodes the two images by item
+  ID (hidden items and iPhone grid auxiliaries included) and reads the `tmap` / XMP / `Exif`
+  items' data; no new FFI was needed.
+- **A `tmap` primary can't even be opened by libheif**, not only decoded. The crate opens a copy
+  of the file with `pitm` pointed at the base (the `tmap`'s first input, which the `altr` group
+  offers), so `Sdr` shows the base and `Linear` renders it with the map.
+- **Colour:** the base is linearised through the sRGB curve in its own primaries: its nclx, else
+  its ICC profile's colorants adapted from D50 with Bradford (iPhone bases are Display P3 by ICC),
+  else Rec.709. The gain applies there (or in the `tmap`'s nclx primaries when the map says it was
+  made in the alternate's space), and the result goes to Rec.709.
+- **Apple's MakerNote formula** (tags 33 / 48) reproduces the XMP headroom to four figures on the
+  three iPhone photos, so either serves. ISO wins over both.
+- **`source.hdr` is `GainMap` in both modes**, and `probe()` says so before decoding; a `tmap`
+  primary is `GainMap` whatever its own nclx says (it describes the HDR alternate, often as PQ).
+- **A gain map that can't be read falls back to the SDR base** under `Linear`; a cancel or
+  `TooLarge` stands.
+- **fire:** the `toggle-hdr` action (`H`) puts a window in HDR mode: decodes ask for `Linear`, and
+  the shown gain-map photo is re-decoded in place. The status line names PQ, HLG and
+  "gain map: SDR / HDR".
+- **Measured:** every gain-map fixture within 3% of ImageIO's HDR rendering, the portraits turned
+  by the base's `irot` alone, ISO winning; the three iPhone photos within 0.3% of ImageIO's HDR
+  decode on average (16 px blocks, worst 1.4%), 100-220 ms for 12-24 MP; `Sdr` output unchanged
+  on every other file; SDR HEIC TTFP within noise.
 
 ### FD18 - Animated AVIF and HEIF sequences
 
