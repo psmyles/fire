@@ -1,8 +1,8 @@
 # fire-decode - Shared Decoder Plan
 
-**Status: design, revised November 2026.** fire, bite and 3D Review shipped their late-October releases.
-Of this work, only 3D Review's part of step 0 and its static CRT (FD20) are done. This revision makes
-three changes:
+**Status: in progress.** Steps 0-5 are done on the Mac, each with its Windows half still to do;
+`docs/PLAN.md` tracks them. The design was revised in November 2026, after fire, bite and 3D Review
+shipped their late-October releases. That revision made three changes:
 - HEIF / HEIC / AVIF moves into the crate. The October version kept it in fire.
 - fire's viewer gains HDR, gain-map and image-sequence support.
 - All three apps move to the static C runtime on Windows.
@@ -117,6 +117,10 @@ Expected gains, format by format:
   camera's rendering, not what ImageMagick develops. bite's preview would stop matching its output.
 
 How much faster is measured before bite switches (section 6), not assumed.
+
+**Measured in step 5** (macOS): a cold import is 64-96% faster for every routed format, and a warm
+re-import of PSD, EXR, HEIC or AVIF takes about a millisecond instead of up to 0.8 s. JPG is
+unchanged, as expected.
 
 ---
 
@@ -497,6 +501,15 @@ the cores. A model's own textures keep their scoped pool in `render`'s `imported
 same rule, rather than moving onto the app's workers: that loader also serves the preview and both
 shells, which have no app pool.
 
+**Measured in bite (step 5): concurrent callers must cap each decode.** A lease takes the threads
+that are free when the decode starts and keeps them to the end, without waiting. So of three iPhone
+HEICs decoded at once, the first took nearly every core and the other two ran libheif on one thread
+each: 637 ms, against 243 ms one after another. Capping each at a third of the cores
+(`max_threads`) took it to 219 ms, and three AVIFs from 246 to 120 ms. PNG, PSD and EXR didn't
+change. bite caps each concurrent decode at the cores divided by the decodes. A fairer lease in the
+crate (a share of the cores per decode in flight) would make the cap unnecessary; it would change
+fire's timings, so it is not done here.
+
 ### FD9 - Formats: accept what the crate decodes; route before decoding
 
 - **3D Review accepts everything the crate decodes.**
@@ -531,6 +544,12 @@ without magic (TGA) or sharing it (the TIFF-structured raws), and is `Format::Un
 It answers whatever the build decodes, so a PSD is `Format::Psd` in a build without `psd`, and its
 decode is `Unsupported(Format::Psd)`.
 
+**As built in bite (step 5):** `in_process::is_routed` sends PNG, TGA, PSD, EXR, HEIC, HEIF and
+AVIF to the crate by extension. EXR is routed after its comparison: ImageMagick shows EXR clamped
+with no curve, as the crate does, so no sRGB option was added. bite enables `heif` for Windows and
+macOS only, since heif-sys has libraries for no other target: its CLI still builds on Linux, where
+a HEIC fails in the crate and goes to ImageMagick through FD10's retry.
+
 ### FD10 - Errors
 
 - **New variants:**
@@ -554,6 +573,9 @@ decode is `Unsupported(Format::Psd)`.
     30000 px / 1 GiB get thumbnails today. They keep getting them, at today's speed.
 - **3D Review maps errors to its existing message strings** (`app-notifications.ftl`). Diagnostics stay
   in English, per its invariant 12.
+
+**As built in bite (step 5):** any error from the crate sends the file to ImageMagick, alone, after
+the batch. A 30001×2 PNG, which `thumbnail()` refuses, gets its thumbnail that way (a test).
 
 ### FD11 - Mip builder, phase 2
 
@@ -596,6 +618,23 @@ tables, and adopts a file's own chain.
   process.
 - **A HEIC / HEIF chip** (`.heic`, `.heif`) joins the Input node's format chips, **off by default** like
   AVIF. Today a folder import never picks up `.heic` / `.heif`; only the picker and drag-and-drop do.
+
+**As built (step 5):**
+- **A thumbnail is written without alpha when every pixel is opaque**, scanned on the thumbnail
+  itself. ImageMagick's lossy WebP dropped an alpha plane that held nothing too, so the preview
+  chain sees the channels it always saw. (`alpha_opaque` can't decide it: it is false for a source
+  with no alpha channel at all.)
+- **Written to a file of its own and renamed over the name**, so a cancelled import or the preview
+  worker writing the same thumbnail never leaves a half file that reads as valid.
+- **Crate and ImageMagick thumbnails are made at the same time**, the crate's on up to
+  `default_jobs()` threads, each decode capped to its share of the cores (FD8).
+- **Cached reads take `thumbnail()` without its fit and with `Limits::VIEWER`**, so a preview a chain
+  enlarged past 30000 px still shows. A cache file the crate can't read still goes through
+  ImageMagick, as before.
+- **Sizes:** three to seven times the quality-85 files: 63 KiB for a HEIC at the default 256 px,
+  780 KiB at 1024 (`docs/baselines.md`). Lossy was not needed at 256 px. Whether 1024 px folders
+  of photographs need FD12's lossy fallback is open.
+- **The HEIC chip sits beside AVIF**, and the eleventh chip starts a third row.
 
 ### FD13 - Repository setup
 
@@ -950,6 +989,12 @@ decoding pixels, for every format the crate decodes.
 It equals `decode()` with `inspect()` on every format built in its tests, every HEIF fixture,
 and 188 images of fire's, bite's, 3D Review's and CrimeCrew's.
 
+**As built in bite (step 5):** `header.rs` is gone. The cache and `Magick::metadata` both take the
+size from `probe()`, and the format as `identify`'s `%m` spells it (`JPEG`, `HEIC`, `HEIF`, `FF`,
+`PGM`, ...). It agrees with `identify` on all 115 files of the corpus and the fixtures that
+`identify` can read, the portrait HEIC included. On the 14 it can't (malformed files, size
+bombs), `probe()` still reports the header's size, and the decode then fails as it would have.
+
 ### FD20 - Static CRT on Windows
 
 The HEIF stack and psd_sdk are C++. Built against the DLL runtime, they need `MSVCP140.dll`.
@@ -1106,6 +1151,10 @@ Each step lands only when its gate passes.
 
 3D Review goes before bite: it was the original motivation, and its gains do not depend on a benchmark.
 
+**Step 5 as built:** bite's floor is Rust 1.99, not 1.88: the crate's own `rust-version` became
+1.99 in step 1, and bite inherits it in every crate. bite's `heif` is on for Windows and macOS only
+(FD9).
+
 Step 6 is fire-only and can start any time after step 3, in parallel with steps 4-5. Any tag that
 3D Review or bite moves to must keep `texture()` / `thumbnail()` output unchanged.
 
@@ -1138,6 +1187,31 @@ Step 6 is fire-only and can start any time after step 3, in parallel with steps 
     the raw signal); record how, not whether;
   - decode time: dav1d (crate) against libaom (bite's ImageMagick).
 - **Cache size** with lossless WebP, ICC embedded, at 256 and 1024 px on a typical folder.
+
+**Measured in step 5** (macOS; `docs/baselines.md` has the tables):
+- **Cold import:** PNG -72%, TGA -96%, PSD -94%, EXR -89%, HEIC -64%, AVIF -81%; JPG, still on
+  ImageMagick, unchanged. bench/bite-import, baseline and branch built side by side.
+- **Warm re-import:** no `magick` process for any crate format; PSD / EXR / HEIC / AVIF went from
+  127-805 ms to 1 ms.
+- **Over 30000 px:** thumbnailed through the retry (a test).
+- **EXR:** ImageMagick shows it clamped with no curve too, so no sRGB option.
+- **HEIC / AVIF:** ImageMagick applies `irot` / `imir` (identical on every orientation fixture).
+  It shows the gain-map fixtures' SDR base, as the crate does (identical), and PQ / HLG as the raw
+  signal, as the crate does until 6b (0.4% apart, the filters). dav1d decodes a 12 MP AVIF in 78 ms
+  on one thread, where ImageMagick's libaom takes 172 ms with its start-up.
+- **Cache size:** three to seven times the quality-85 files (FD12).
+- **Found:** ImageMagick un-blends a white matte from any PSD whose merged image has a 4th
+  channel, which crushes a flat document's mask texture to black. fire-decode keeps the stored
+  colour; see **PSD** below.
+
+**PSD**
+- **Transparent documents saved by Photoshop:** does their merged image carry a white matte the
+  crate should divide out? Photoshop's merged data for a document with transparency is said to be
+  blended over white, and ImageMagick un-blends it. But it does so for any 4th channel: on a flat
+  document whose 4th channel is a mask (`T_Noise_Burshed_01_M.psd`), and on ImageMagick's own RGBA
+  PSDs, it is wrong, and the crate's stored colour is right. If Photoshop's transparent documents
+  do carry a matte, the crate should remove it only when the layer count is negative (the
+  spec's mark for a merged transparency channel). No such file is on the Mac; it needs Photoshop.
 
 **HEIF**
 - **libheif's own SDR rendering of PQ / HLG** (no output nclx): does it re-encode to sRGB or
