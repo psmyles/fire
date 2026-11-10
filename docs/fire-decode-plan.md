@@ -302,6 +302,11 @@ Narrowing rules:
 - **16 → 8-bit rounds to nearest**, matching ImageMagick. bite's current `STRIP_16` truncates, and
   so does 3D Review's PSD path.
 
+**As built in 3D Review (step 4):** its `DecodedImage` stays RGBA8 and carries a float source's two
+readings, the sRGB-encoded one for colour slots and the clamped one for data. The colour reading is
+byte-identical to what its PSD bridge gave a 32-bit document. **The Tex viewport shows the colour
+reading**, as it showed a 32-bit PSD before: linear light shown as sRGB looks too dark.
+
 ### FD5 - Named setups, no `Default`
 
 `DecodeOptions` loses its `Default` (which is fire's behaviour) in favour of named constructors. Each
@@ -434,6 +439,13 @@ the composite fire shrank the same way.
 keeps its own. The `panic = "abort"` check is a `compile_error!` under
 `cfg(all(panic = "abort", not(feature = "allow-abort")))`.
 
+**As built in 3D Review (step 4):** a panic hook has to tell a decode's panic from any other on
+the panicking thread, and a decode can panic on one of its passes' helper threads, which a flag the
+app set around `decode()` wouldn't cover. So the crate says itself: **`fire_decode::in_decode()`**
+is true inside `decode()`, `probe()` and `PsdLayers::decode_layer`, and on their helper threads.
+3D Review's release viewer installs `review_log::install_aborting(.., in_decode)`; a debug viewer
+keeps unwinding, as it always has.
+
 ### FD8 - A process-wide thread budget
 
 Today threads multiply:
@@ -479,6 +491,11 @@ The decision:
   from a shared queue, so an efficiency core takes fewer of them instead of holding the pass up.
 - The PSD bridge leases for its whole call too; `PsdLayers` leases per stage, up to what
   `LayerCtl::threads` asks.
+
+**As built in 3D Review (step 4):** pool imports and reloads run on a fixed set of workers, half
+the cores. A model's own textures keep their scoped pool in `render`'s `imported.rs`, sized by the
+same rule, rather than moving onto the app's workers: that loader also serves the preview and both
+shells, which have no app pool.
 
 ### FD9 - Formats: accept what the crate decodes; route before decoding
 
