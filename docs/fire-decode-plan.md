@@ -118,8 +118,8 @@ Expected gains, format by format:
 
 How much faster is measured before bite switches (section 6), not assumed.
 
-**Measured in step 5** (macOS): a cold import is 64-96% faster for every routed format, and a warm
-re-import of PSD, EXR, HEIC or AVIF takes about a millisecond instead of up to 0.8 s. JPG is
+**Measured in step 5** (macOS): a cold import is 63-92% faster for every routed format, and a warm
+re-import of PSD, EXR, HEIC or AVIF takes a millisecond or two instead of up to 0.8 s. JPG is
 unchanged, as expected.
 
 ---
@@ -631,9 +631,12 @@ tables, and adopts a file's own chain.
 - **Cached reads take `thumbnail()` without its fit and with `Limits::VIEWER`**, so a preview a chain
   enlarged past 30000 px still shows. A cache file the crate can't read still goes through
   ImageMagick, as before.
-- **Sizes:** three to seven times the quality-85 files: 63 KiB for a HEIC at the default 256 px,
-  780 KiB at 1024 (`docs/baselines.md`). Lossy was not needed at 256 px. Whether 1024 px folders
-  of photographs need FD12's lossy fallback is open.
+- **Lossy after all, at quality 85, through libwebp** (decided 10 November). Lossless files were
+  three to seven times the quality-85 ones: 63 KiB for a HEIC at the default 256 px, 780 KiB at
+  1024 (`docs/baselines.md`). libwebp is already built by the crate (libwebp-sys), and its simple
+  API at 85 writes byte-for-byte what ImageMagick's `-quality 85` writes for the same pixels. It
+  writes no ICC profile, so bite adds the `VP8X` header and `ICCP` chunk itself. The cache is the
+  size it was.
 - **The HEIC chip sits beside AVIF**, and the eleventh chip starts a third row.
 
 ### FD13 - Repository setup
@@ -1189,17 +1192,18 @@ Step 6 is fire-only and can start any time after step 3, in parallel with steps 
 - **Cache size** with lossless WebP, ICC embedded, at 256 and 1024 px on a typical folder.
 
 **Measured in step 5** (macOS; `docs/baselines.md` has the tables):
-- **Cold import:** PNG -72%, TGA -96%, PSD -94%, EXR -89%, HEIC -64%, AVIF -81%; JPG, still on
+- **Cold import:** PNG -70%, TGA -92%, PSD -87%, EXR -89%, HEIC -63%, AVIF -81%; JPG, still on
   ImageMagick, unchanged. bench/bite-import, baseline and branch built side by side.
 - **Warm re-import:** no `magick` process for any crate format; PSD / EXR / HEIC / AVIF went from
-  127-805 ms to 1 ms.
+  121-807 ms to 1-2 ms.
 - **Over 30000 px:** thumbnailed through the retry (a test).
 - **EXR:** ImageMagick shows it clamped with no curve too, so no sRGB option.
 - **HEIC / AVIF:** ImageMagick applies `irot` / `imir` (identical on every orientation fixture).
   It shows the gain-map fixtures' SDR base, as the crate does (identical), and PQ / HLG as the raw
   signal, as the crate does until 6b (0.4% apart, the filters). dav1d decodes a 12 MP AVIF in 78 ms
   on one thread, where ImageMagick's libaom takes 172 ms with its start-up.
-- **Cache size:** three to seven times the quality-85 files (FD12).
+- **Cache size:** lossless files were three to seven times the quality-85 ones, so the thumbnails
+  stay lossy, as ImageMagick wrote them (FD12).
 - **Found:** ImageMagick un-blends a white matte from any PSD whose merged image has a 4th
   channel, which crushes a flat document's mask texture to black. fire-decode keeps the stored
   colour; see **PSD** below.
