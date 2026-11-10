@@ -1,8 +1,8 @@
 # fire-decode - Shared Decoder Plan
 
-**Status: in progress.** Steps 0-5 are done on the Mac, each with its Windows half still to do;
-`docs/PLAN.md` tracks them. The design was revised in November 2026, after fire, bite and 3D Review
-shipped their late-October releases. That revision made three changes:
+**Status: in progress.** Steps 0-5, 6a and 6b are done on the Mac, each with its Windows half
+still to do; `docs/PLAN.md` tracks them. The design was revised in November 2026, after fire, bite
+and 3D Review shipped their late-October releases. That revision made three changes:
 - HEIF / HEIC / AVIF moves into the crate. The October version kept it in fire.
 - fire's viewer gains HDR, gain-map and image-sequence support.
 - All three apps move to the static C runtime on Windows.
@@ -936,6 +936,29 @@ exposure / tonemap handles the range.
   - bite's ImageMagick almost certainly shows the raw signal as libheif does, so bite's previews of
     PQ / HLG files will differ from ImageMagick's (section 6). That is the intent.
 
+**As built (steps 6a and 6b):**
+- **6a: both tone curves clamp negatives**, not only Reinhard: the ACES fit reads a large negative
+  as white (about 1.06 at -10, clamped to 1). The clamp opens `reinhard()` and `aces()` in
+  `shader.glsl` and in fire-thumbs. fire-thumbs' copy is tested on values (-1, below -1,
+  -infinity); a fire test checks the clamp in the source and in both generated backends.
+- **6b: the conversion lives in the crate's `hdr` module**, run by the HEIF backend on a source
+  whose nclx says PQ (16) or HLG (18). PQ is the ST 2084 EOTF; HLG is BT.2100's inverse OETF
+  and its OOTF on the luminance of the source's primaries (1000 cd/m², gamma 1.2). Then ÷ 203 and
+  a matrix to Rec.709 (computed from the primaries' chromaticities, so BT.2020 and Display P3
+  both work). `Linear` keeps `Rgba16Float`; `Sdr` writes `Rgba16Unorm` for `output` to narrow.
+- **Matrices only, no lcms2.** An ICC profile beside a PQ / HLG nclx can't describe the HDR
+  transfer, so the nclx is followed and the profile dropped, in both modes.
+- **`Linear` with `Output::Rgba8` is `DecodeError::Other`.** `source` keeps describing the file
+  (10-bit unorm, PQ / HLG, BT.2020), so the pass that marks float buffers as float sources skips
+  these.
+- **`Probe` gained `hdr: HdrKind`**, read from the primary item's first nclx `colr` box. fire needs
+  to know before decoding, since it opens PQ / HLG as `Linear` and gain-map photos as `Sdr`; its
+  decode pool probes HEIF and AVIF only (`with_hdr_for`). Step 6c adds `GainMap`.
+- **Measured:** every patch of the four lossless fixtures within 0.2% of `expected.json` in both
+  modes, the lossy `pq_ycbcr.avif` within 2%; `texture()` / `thumbnail()` output bit-identical to
+  before on every corpus file but the five PQ / HLG fixtures; SDR HEIC TTFP within noise
+  (`docs/baselines.md`).
+
 ### FD18 - Animated AVIF and HEIF sequences
 
 - **With `frames: All` (viewer), an `avis` or other HEIF image sequence decodes to `Animation` frames,
@@ -1050,7 +1073,8 @@ impl Format {                                                   // name(): "PNG"
     pub fn is_supported(self) -> bool;                          // compiled into this build
     pub fn from_extension(ext: &str) -> Option<Format>;
 }
-pub struct Probe { pub width: u32, pub height: u32, pub format: Format }
+pub struct Probe { pub width: u32, pub height: u32, pub format: Format,
+                   pub hdr: HdrKind }                 // hdr: from 6b, HEIF's nclx (PQ / HLG)
 
 // Decoding
 pub fn decode(bytes: &[u8], ext_hint: Option<&str>, opts: &DecodeOptions)
@@ -1070,7 +1094,7 @@ pub struct DecodeOptions {                     // no Default
     #[cfg(feature = "icc")] pub honor_icc: bool,  // ICC, and wide-gamut nclx with no profile
     pub honor_exif: bool,                      // EXIF (and a raw preview's) orientation only
     pub output: Output,                        // Native | Rgba8 | Rgba8OrFloat
-    pub hdr: Hdr,                              // #[non_exhaustive] Sdr; Linear arrives in 6b
+    pub hdr: Hdr,                              // #[non_exhaustive] Sdr | Linear (6b)
     pub fit: Option<Fit>,                      // Fit { max: u32, filter: Filter::{Nearest, Area} }
     pub frames: Frames,                        // All | First
     pub surfaces: Surfaces,                    // Sheet | First
