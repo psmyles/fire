@@ -1,81 +1,28 @@
-//! The image's mip chain, built on the CPU.
+//! The image's mip chain: what fire keeps of it.
 //!
 //! sokol_gfx has no `GenerateMips` and its rules rule out building the pyramid in place on the
 //! GPU: an image that is rendered into cannot be created with data, and an image cannot be bound
 //! as a texture in the pass that renders into it. So the chain is what sokol's documentation says
 //! it should be — supplied by the application, every level as data, on the immutable image. It is
-//! built here, on the decode worker, right after the decode and before the image is posted, so the
+//! built on the decode worker, right after the decode and before the image is posted, so the
 //! UI thread never pays for it — and while level 0 is being copied to the GPU, where the backend
 //! allows (see [`crate::render::gpu::Uploader`]).
 //!
-//! Each level is a 2×2 box filter of the level above (what a hardware `GenerateMips` does), with
-//! the 8-bit sRGB source averaged in *linear* light — also what the hardware does for an `*_SRGB`
-//! format — through two lookup tables. Odd edges clamp. Rows are split across threads for the
-//! big levels; the small ones are not worth the thread hand-off.
+//! The builder itself is fire-decode's (its `mips` feature, FD11: [`fire_decode::mips`]), which
+//! 3D Review shares: a 2×2 box filter per level, 8-bit sRGB averaged in linear light, a DDS's own
+//! levels adopted, the big levels split across the process-wide thread budget. What stays here is
+//! the upload side: how many levels a texture has, how wide a texel is, and the conversions for a
+//! device that lacks the decoder's format.
 
-use std::sync::OnceLock;
-
+pub use fire_decode::mips::level_count;
 // The halving rule lives with the decode contract that states it (`DecodedImage::source_mips`).
 pub use fire_decode::level_dims;
 use fire_decode::PixelFormat;
 
-/// The number of mip levels in a full chain for a `w`×`h` texture.
-pub fn level_count(w: u32, h: u32) -> u32 {
-    32 - w.max(h).max(1).leading_zeros()
-}
-
-/// Turn a file's own mip chain into the full one the uploader requires.
-///
-/// A decoder may hand over a chain that is short (a `.dds` is free to stop at 4x4), longer than
-/// the dimensions allow, or simply wrong. Each supplied level is kept only while its length
-/// matches what its dimensions demand; the first that does not ends the adopted run, because
-/// past that point the file's own offsets are no longer trustworthy. The tail is then box-filtered
-/// down from the last level kept — not from level 0 — so the authored levels stay upstream of
-/// everything computed.
-///
-/// The alternative, throwing the whole chain away and rebuilding, would be simpler and worse:
-/// authored mips are the reason to look at a texture's mips at all.
-pub fn complete(
-    supplied: Vec<Vec<u8>>,
-    level0: &[u8],
-    w: u32,
-    h: u32,
-    format: PixelFormat,
-) -> Vec<Vec<u8>> {
-    let bpp = bytes_per_texel(format);
-    let levels = level_count(w, h) as usize;
-    let adopted = authored_levels(&supplied, w, h, format);
-    let mut out: Vec<Vec<u8>> = Vec::with_capacity(levels.saturating_sub(1));
-    out.extend(supplied.into_iter().take(adopted));
-    // Whatever the file did not carry, and the whole chain when it carried nothing usable.
-    while out.len() + 1 < levels {
-        let n = out.len() as u32;
-        let (sw, sh) = level_dims(w, h, n);
-        let (dw, dh) = level_dims(w, h, n + 1);
-        let src: &[u8] = out.last().map_or(level0, |v| v.as_slice());
-        if src.len() < sw as usize * sh as usize * bpp {
-            return Vec::new();
-        }
-        out.push(downsample_level(src, sw, sh, dw, dh, format, 0));
-    }
-    out
-}
-
-/// How many of a file's `supplied` levels (`1..`) [`complete`] keeps: the leading run whose
-/// lengths match their dimensions, capped at the chain a `w`×`h` texture can have. These are the
-/// levels the file really authored, as opposed to the tail `complete` computes.
-pub fn authored_levels(supplied: &[Vec<u8>], w: u32, h: u32, format: PixelFormat) -> usize {
-    let bpp = bytes_per_texel(format);
-    let max = (level_count(w, h) as usize).saturating_sub(1);
-    supplied
-        .iter()
-        .take(max)
-        .enumerate()
-        .take_while(|(i, level)| {
-            let (lw, lh) = level_dims(w, h, *i as u32 + 1);
-            level.len() == lw as usize * lh as usize * bpp
-        })
-        .count()
+/// The options fire builds every chain with: 8-bit colour averaged in linear light (fire uploads
+/// it as `*_SRGB`), as many levels as the dimensions allow, threads from the budget.
+pub fn options() -> fire_decode::mips::MipOptions {
+    fire_decode::mips::MipOptions::new(true)
 }
 
 /// Bytes per texel of `format` as the decoder hands it over.
@@ -84,234 +31,6 @@ pub fn bytes_per_texel(format: PixelFormat) -> usize {
         PixelFormat::Rgba8Unorm => 4,
         PixelFormat::Rgba16Unorm | PixelFormat::Rgba16Float => 8,
         PixelFormat::Rgba32Float => 16,
-    }
-}
-
-/// Build levels `1..` of the chain for `pixels` (level 0, `w`×`h`, `format`). Each returned
-/// buffer is one level, in `format`, smallest last; empty for a 1×1 image. A `pixels` shorter
-/// than its dimensions declare yields an empty chain rather than a read past the end.
-pub fn build(pixels: &[u8], w: u32, h: u32, format: PixelFormat) -> Vec<Vec<u8>> {
-    build_with_threads(pixels, w, h, format, 0)
-}
-
-/// [`build`] on at most `max_threads` threads (0 = as many as the big levels want). PSD layers
-/// pre-decoded in the background build theirs on one, so they never compete with the image the
-/// user is waiting for.
-pub fn build_with_threads(
-    pixels: &[u8],
-    w: u32,
-    h: u32,
-    format: PixelFormat,
-    max_threads: usize,
-) -> Vec<Vec<u8>> {
-    let bpp = bytes_per_texel(format);
-    let needed = (w as usize)
-        .checked_mul(h as usize)
-        .and_then(|n| n.checked_mul(bpp));
-    if needed.is_none_or(|n| pixels.len() < n) {
-        return Vec::new();
-    }
-    let levels = level_count(w, h);
-    let mut out: Vec<Vec<u8>> = Vec::with_capacity(levels.saturating_sub(1) as usize);
-    let (mut sw, mut sh) = (w, h);
-    for _ in 1..levels {
-        let (dw, dh) = ((sw / 2).max(1), (sh / 2).max(1));
-        let next = {
-            let src: &[u8] = out.last().map_or(pixels, |v| v.as_slice());
-            downsample_level(src, sw, sh, dw, dh, format, max_threads)
-        };
-        out.push(next);
-        sw = dw;
-        sh = dh;
-    }
-    out
-}
-
-/// One level's reduction, dispatched on the pixel format. Shared by [`build`] and [`complete`].
-fn downsample_level(
-    src: &[u8],
-    sw: u32,
-    sh: u32,
-    dw: u32,
-    dh: u32,
-    format: PixelFormat,
-    max_threads: usize,
-) -> Vec<u8> {
-    let t = max_threads;
-    match format {
-        PixelFormat::Rgba8Unorm => {
-            downsample::<4>(src, (sw, sh, dw, dh), t, load_srgb8, store_srgb8)
-        }
-        PixelFormat::Rgba16Unorm => downsample::<8>(src, (sw, sh, dw, dh), t, load_u16, store_u16),
-        PixelFormat::Rgba16Float => downsample::<8>(src, (sw, sh, dw, dh), t, load_f16, store_f16),
-        PixelFormat::Rgba32Float => downsample::<16>(src, (sw, sh, dw, dh), t, load_f32, store_f32),
-    }
-}
-
-/// Levels with at least this many texels are reduced on several threads.
-const PARALLEL_MIN_TEXELS: usize = 256 * 256;
-
-/// One 2×2 box-filter reduction of a `sw`×`sh` level (`E` bytes per texel) into `dw`×`dh`.
-///
-/// `load` and `store` are taken as generic function items rather than `fn` pointers so that each
-/// format gets its own copy of the loop with its codec inlined: through a pointer every texel paid
-/// five indirect calls, which was most of the cost.
-fn downsample<const E: usize>(
-    src: &[u8],
-    (sw, sh, dw, dh): (u32, u32, u32, u32),
-    max_threads: usize,
-    load: impl Fn(&[u8]) -> [f32; 4] + Sync,
-    store: impl Fn([f32; 4], &mut [u8]) + Sync,
-) -> Vec<u8> {
-    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
-    let src_row = sw * E;
-    let dst_row = dw * E;
-    let mut out = vec![0u8; dst_row * dh];
-
-    let reduce_rows = |first_row: usize, rows: &mut [u8]| {
-        for (i, drow) in rows.chunks_exact_mut(dst_row).enumerate() {
-            let y = first_row + i;
-            let y0 = (2 * y).min(sh - 1);
-            let y1 = (2 * y + 1).min(sh - 1);
-            let r0 = &src[y0 * src_row..y0 * src_row + src_row];
-            let r1 = &src[y1 * src_row..y1 * src_row + src_row];
-            for (x, dst) in drow.as_chunks_mut::<E>().0.iter_mut().enumerate() {
-                let x0 = (2 * x).min(sw - 1) * E;
-                let x1 = (2 * x + 1).min(sw - 1) * E;
-                let a = load(&r0[x0..x0 + E]);
-                let b = load(&r0[x1..x1 + E]);
-                let c = load(&r1[x0..x0 + E]);
-                let d = load(&r1[x1..x1 + E]);
-                let mut s = [0f32; 4];
-                for ch in 0..4 {
-                    s[ch] = (a[ch] + b[ch] + c[ch] + d[ch]) * 0.25;
-                }
-                store(s, dst);
-            }
-        }
-    };
-
-    let threads = if dw * dh >= PARALLEL_MIN_TEXELS {
-        let cap = if max_threads == 0 { 8 } else { max_threads };
-        std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .clamp(1, cap)
-            .min(dh)
-    } else {
-        1
-    };
-    if threads <= 1 {
-        reduce_rows(0, &mut out);
-    } else {
-        let rows_per = dh.div_ceil(threads);
-        std::thread::scope(|scope| {
-            for (i, chunk) in out.chunks_mut(rows_per * dst_row).enumerate() {
-                let reduce_rows = &reduce_rows;
-                scope.spawn(move || reduce_rows(i * rows_per, chunk));
-            }
-        });
-    }
-    out
-}
-
-// --- texel codecs ---------------------------------------------------------------------------
-
-/// sRGB byte → linear, for the 8-bit source's color channels.
-fn srgb_to_linear_table() -> &'static [f32; 256] {
-    static TABLE: OnceLock<[f32; 256]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        std::array::from_fn(|i| {
-            let c = i as f32 / 255.0;
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        })
-    })
-}
-
-/// Linear (quantized to 1/4095) → sRGB byte. 4096 steps resolve the curve's steep dark end to
-/// well under one output code, so the rounding error is that of the 8-bit result itself.
-fn linear_to_srgb_table() -> &'static [u8; 4096] {
-    static TABLE: OnceLock<[u8; 4096]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        std::array::from_fn(|i| {
-            let c = i as f32 / 4095.0;
-            let s = if c <= 0.003_130_8 {
-                c * 12.92
-            } else {
-                1.055 * c.powf(1.0 / 2.4) - 0.055
-            };
-            (s * 255.0 + 0.5) as u8
-        })
-    })
-}
-
-fn load_srgb8(b: &[u8]) -> [f32; 4] {
-    let t = srgb_to_linear_table();
-    [
-        t[b[0] as usize],
-        t[b[1] as usize],
-        t[b[2] as usize],
-        b[3] as f32 / 255.0,
-    ]
-}
-
-fn store_srgb8(v: [f32; 4], out: &mut [u8]) {
-    let t = linear_to_srgb_table();
-    let q = |x: f32| t[(x.clamp(0.0, 1.0) * 4095.0 + 0.5) as usize];
-    out[0] = q(v[0]);
-    out[1] = q(v[1]);
-    out[2] = q(v[2]);
-    out[3] = (v[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-}
-
-fn load_u16(b: &[u8]) -> [f32; 4] {
-    std::array::from_fn(|i| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as f32 / 65535.0)
-}
-
-fn store_u16(v: [f32; 4], out: &mut [u8]) {
-    for (i, x) in v.iter().enumerate() {
-        let q = (x.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
-        out[2 * i..2 * i + 2].copy_from_slice(&q.to_le_bytes());
-    }
-}
-
-fn load_f16(b: &[u8]) -> [f32; 4] {
-    let t = f16_to_f32_table();
-    std::array::from_fn(|i| t[u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as usize])
-}
-
-/// Every half float, widened: [`f16_bits_to_f32`] for all 65536 bit patterns. The mip builder
-/// reads four half texels per output texel, and a table lookup is several times cheaper than
-/// the bit-by-bit conversion (whose subnormal case even loops).
-fn f16_to_f32_table() -> &'static [f32; 65536] {
-    static TABLE: OnceLock<Box<[f32; 65536]>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut t = Box::new([0f32; 65536]);
-        for (h, v) in t.iter_mut().enumerate() {
-            *v = f16_bits_to_f32(h as u16);
-        }
-        t
-    })
-}
-
-fn store_f16(v: [f32; 4], out: &mut [u8]) {
-    for (i, x) in v.iter().enumerate() {
-        out[2 * i..2 * i + 2].copy_from_slice(&f32_to_f16_bits(*x).to_le_bytes());
-    }
-}
-
-fn load_f32(b: &[u8]) -> [f32; 4] {
-    std::array::from_fn(|i| {
-        f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]])
-    })
-}
-
-fn store_f32(v: [f32; 4], out: &mut [u8]) {
-    for (i, x) in v.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&x.to_le_bytes());
     }
 }
 
@@ -356,33 +75,6 @@ pub fn f32_to_f16_bits(x: f32) -> u16 {
     sign | half
 }
 
-/// IEEE binary16 → binary32 (exact).
-pub fn f16_bits_to_f32(h: u16) -> f32 {
-    let sign = ((h >> 15) & 1) as u32;
-    let exp = ((h >> 10) & 0x1f) as i32;
-    let mant = (h & 0x3ff) as u32;
-    let bits = if exp == 0 {
-        if mant == 0 {
-            sign << 31
-        } else {
-            // Subnormal: normalize.
-            let mut e = -1;
-            let mut m = mant;
-            while m & 0x400 == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            let e = (e + 1 + 127 - 15) as u32;
-            (sign << 31) | (e << 23) | ((m & 0x3ff) << 13)
-        }
-    } else if exp == 0x1f {
-        (sign << 31) | (0xff << 23) | (mant << 13)
-    } else {
-        (sign << 31) | (((exp - 15 + 127) as u32) << 23) | (mant << 13)
-    };
-    f32::from_bits(bits)
-}
-
 /// Reinterpret 16-bit unorm samples as float16 of the same 0..1 value.
 pub fn u16_to_f16(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
@@ -412,29 +104,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn f16_conversion_round_trips_representable_values() {
-        for v in [
-            0.0f32,
-            1.0,
-            -1.0,
-            0.5,
-            0.25,
-            2.0,
-            1024.0,
-            65504.0,
-            6.1035156e-5,
-            1.0 / 3.0,
+    fn f16_conversion_matches_the_known_encodings() {
+        for (v, bits) in [
+            (0.0f32, 0x0000u16),
+            (-0.0, 0x8000),
+            (1.0, 0x3c00),
+            (-1.0, 0xbc00),
+            (0.5, 0x3800),
+            (2.0, 0x4000),
+            (1024.0, 0x6400),
+            (65504.0, 0x7bff),
+            (6.103_515_6e-5, 0x0400), // the smallest normal
+            (5.960_464_5e-8, 0x0001), // the smallest subnormal
+            (3.051_757_8e-5, 0x0200), // a subnormal
+            (1.0 / 3.0, 0x3555),
         ] {
-            let h = f32_to_f16_bits(v);
-            let back = f16_bits_to_f32(h);
-            assert!(
-                (back - v).abs() <= v.abs() * 1e-3 + 1e-7,
-                "{v} -> {h:#06x} -> {back}"
-            );
+            assert_eq!(f32_to_f16_bits(v), bits, "{v}");
         }
         assert_eq!(f32_to_f16_bits(1e6), 0x7c00); // overflow → +inf
         assert_eq!(f32_to_f16_bits(-1e6), 0xfc00);
-        assert!(f16_bits_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
+        assert_eq!(f32_to_f16_bits(f32::NAN) & 0x7c00, 0x7c00);
+        assert_ne!(f32_to_f16_bits(f32::NAN) & 0x3ff, 0, "a NaN stays a NaN");
         assert_eq!(f32_to_f16_bits(1e-9), 0); // underflow → 0
     }
 
@@ -444,41 +134,6 @@ mod tests {
         assert_eq!(level_count(2, 1), 2);
         assert_eq!(level_count(256, 128), 9);
         assert_eq!(level_count(1000, 3), 10);
-    }
-
-    #[test]
-    fn chain_has_one_buffer_per_level_with_halved_dims() {
-        let (w, h) = (5u32, 3u32);
-        let px = vec![0u8; (w * h * 4) as usize];
-        let chain = build(&px, w, h, PixelFormat::Rgba8Unorm);
-        assert_eq!(chain.len(), 2); // 5×3 → 2×1 → 1×1
-        assert_eq!(chain[0].len(), 2 * 4); // 2×1 px, 4 bytes each
-        assert_eq!(chain[1].len(), 4);
-        assert!(build(&px[..8], w, h, PixelFormat::Rgba8Unorm).is_empty());
-    }
-
-    #[test]
-    fn box_filter_averages_in_linear_light() {
-        // Black and white average to linear 0.5, which is sRGB 188 — not 128.
-        let px = [
-            0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
-        ];
-        let chain = build(&px, 2, 2, PixelFormat::Rgba8Unorm);
-        assert_eq!(chain.len(), 1);
-        assert_eq!(&chain[0][..3], &[188, 188, 188]);
-        assert_eq!(chain[0][3], 255);
-    }
-
-    #[test]
-    fn float_levels_average_exactly() {
-        let mut px = Vec::new();
-        for v in [1.0f32, 3.0, 5.0, 7.0] {
-            for _ in 0..4 {
-                px.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        let chain = build(&px, 2, 2, PixelFormat::Rgba32Float);
-        assert_eq!(load_f32(&chain[0][..16]), [4.0; 4]);
     }
 
     /// Levels floor-halve and stop at 1, on each axis independently — the rule a DDS stores its
@@ -492,113 +147,5 @@ mod tests {
         assert_eq!(level_dims(8, 4, 99), (1, 1));
         // Non-power-of-two floors rather than rounds.
         assert_eq!(level_dims(5, 3, 1), (2, 1));
-    }
-
-    /// A solid buffer of `v` at `w`x`h`, RGBA8.
-    fn solid(w: u32, h: u32, v: u8) -> Vec<u8> {
-        vec![v; w as usize * h as usize * 4]
-    }
-
-    /// A full chain from the file is taken exactly as given: the point of an authored chain is
-    /// that its levels are *not* what a box filter would have produced.
-    #[test]
-    fn complete_adopts_a_full_chain_untouched() {
-        let level0 = solid(4, 4, 10);
-        let supplied = vec![solid(2, 2, 200), solid(1, 1, 250)];
-        let chain = complete(supplied.clone(), &level0, 4, 4, PixelFormat::Rgba8Unorm);
-        assert_eq!(chain, supplied, "no level was recomputed");
-    }
-
-    /// A file may stop its chain early. What it supplied is kept, and only the tail is computed —
-    /// from the last authored level, not from level 0, so the authored data stays upstream.
-    #[test]
-    fn complete_pads_a_partial_chain_from_the_last_authored_level() {
-        // Level 0 is black, but the file's level 1 is white. A correctly padded level 2 must come
-        // from the white level 1, not from the black level 0.
-        let level0 = solid(4, 4, 0);
-        let chain = complete(
-            vec![solid(2, 2, 255)],
-            &level0,
-            4,
-            4,
-            PixelFormat::Rgba8Unorm,
-        );
-        assert_eq!(chain.len(), 2, "4x4 has three levels in all");
-        assert_eq!(chain[0], solid(2, 2, 255));
-        assert_eq!(
-            chain[1],
-            solid(1, 1, 255),
-            "padded from level 1, not level 0"
-        );
-    }
-
-    /// A level whose length does not match its dimensions ends the adopted run: past a bad
-    /// offset the file's own layout is no longer trustworthy, so the rest is recomputed.
-    #[test]
-    fn complete_stops_adopting_at_a_wrong_sized_level() {
-        let level0 = solid(4, 4, 0);
-        let chain = complete(
-            vec![solid(2, 2, 255), vec![1u8; 3]],
-            &level0,
-            4,
-            4,
-            PixelFormat::Rgba8Unorm,
-        );
-        assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0], solid(2, 2, 255));
-        assert_eq!(chain[1], solid(1, 1, 255), "the short level was recomputed");
-    }
-
-    /// A header can claim more levels than the dimensions allow. The extras are dropped rather
-    /// than uploaded — sokol takes at most 16, and a chain longer than `level_count` would index
-    /// past its mip-level array.
-    #[test]
-    fn complete_drops_levels_past_the_end_of_the_chain() {
-        let level0 = solid(2, 2, 0);
-        let chain = complete(
-            vec![solid(1, 1, 9), solid(1, 1, 9), solid(1, 1, 9)],
-            &level0,
-            2,
-            2,
-            PixelFormat::Rgba8Unorm,
-        );
-        assert_eq!(chain.len(), level_count(2, 2) as usize - 1);
-    }
-
-    /// No usable chain at all falls back to building the whole thing, which is the pre-existing
-    /// behaviour for every format but DDS.
-    #[test]
-    fn complete_with_nothing_supplied_matches_build() {
-        let level0 = solid(4, 4, 40);
-        assert_eq!(
-            complete(Vec::new(), &level0, 4, 4, PixelFormat::Rgba8Unorm),
-            build(&level0, 4, 4, PixelFormat::Rgba8Unorm)
-        );
-    }
-
-    /// A level 0 shorter than its dimensions declare yields no chain rather than a read past the
-    /// end — the same refusal `build` makes.
-    #[test]
-    fn complete_refuses_a_short_level_zero() {
-        assert!(complete(Vec::new(), &[0u8; 3], 4, 4, PixelFormat::Rgba8Unorm).is_empty());
-    }
-
-    /// The authored count is exactly the run `complete` adopts: a full chain, a partial one, one
-    /// cut short by a bad level, and one that overshoots the dimensions.
-    #[test]
-    fn authored_levels_counts_only_what_complete_adopts() {
-        let f = PixelFormat::Rgba8Unorm;
-        assert_eq!(authored_levels(&[], 4, 4, f), 0);
-        assert_eq!(
-            authored_levels(&[solid(2, 2, 0), solid(1, 1, 0)], 4, 4, f),
-            2
-        );
-        assert_eq!(authored_levels(&[solid(2, 2, 0)], 4, 4, f), 1);
-        assert_eq!(authored_levels(&[solid(2, 2, 0), vec![1u8; 3]], 4, 4, f), 1);
-        assert_eq!(authored_levels(&[vec![1u8; 3], solid(1, 1, 0)], 4, 4, f), 0);
-        assert_eq!(
-            authored_levels(&[solid(1, 1, 0), solid(1, 1, 0), solid(1, 1, 0)], 2, 2, f),
-            1
-        );
     }
 }

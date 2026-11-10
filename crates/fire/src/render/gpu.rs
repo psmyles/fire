@@ -27,7 +27,7 @@
 //! method touches it, and its math already lives in [`crate::render::view`].
 //!
 //! The mip chain is the app's to supply (sokol_gfx has no `GenerateMips` and its rules rule out
-//! building one in place); [`crate::render::mips`] builds it on the decode worker. The texture is
+//! building one in place); fire-decode builds it on the decode worker ([`crate::render::mips`]). The texture is
 //! built there too, on the backend's device directly ([`Uploader`]), and handed to sokol_gfx
 //! ready-made, so adopting even a 16k float image moves no pixels on the main thread. Only when
 //! that is unavailable (a decode that finished before the GPU was up) does the adopt upload every
@@ -1996,7 +1996,7 @@ fn adopt_prepared(p: Prepared) -> Result<(sg::Image, u32, i32), String> {
 }
 
 /// Build an immutable image (+ its texture view) from one RGBA frame and its mip chain — `mips`
-/// as [`crate::render::mips::build`] makes it, or `None` to build it here — returning the image,
+/// as [`fire_decode::mips::chain`] makes it, or `None` to build it here — returning the image,
 /// its view, and the `linear_sample` flag for `format` (1 if the sample is already linear — 8-bit
 /// sRGB / float — 0 if the shader must sRGB-decode 16-bit unorm). A free function (not a method)
 /// so the per-frame animation upload can borrow pixels straight out of [`AnimState`] without
@@ -2026,7 +2026,7 @@ fn create_image_texture(
         Some(m) if m.len() + 1 == levels => m,
         // No chain (an animation frame), or one that does not match this image: build it now.
         _ => {
-            built = mips::build(level0, width, height, format);
+            built = fire_decode::mips::chain(level0, width, height, format, &mips::options());
             &built
         }
     };

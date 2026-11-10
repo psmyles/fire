@@ -123,7 +123,7 @@ pub struct DecodeOutcome {
     /// no pixels. `None` when the worker could not build it — the GPU was not up yet (a launch
     /// decode that beat it), or the device refused — and then `mips` is filled instead.
     pub texture: Option<Prepared>,
-    /// Levels `1..` of the image's mip chain (see [`crate::render::mips`]), built here on the
+    /// Levels `1..` of the image's mip chain (see [`fire_decode::mips`]), built here on the
     /// worker, for the UI thread to upload with level 0 when there is no `texture`. Empty
     /// otherwise, and on failure.
     pub mips: Vec<Vec<u8>>,
@@ -390,23 +390,17 @@ fn run_decode(
                 let t = Instant::now();
                 // Counted before `complete` consumes the levels: only the run it adopts is the
                 // file's, everything past it is computed.
+                let opts = crate::render::mips::options();
+                let (w, h, format) = (img.width, img.height, img.format);
                 let authored = source_mips.as_deref().map_or(0, |src| {
-                    crate::render::mips::authored_levels(src, img.width, img.height, img.format)
+                    fire_decode::mips::stored_levels(src, w, h, format, &opts)
                 });
                 let chain = match source_mips {
                     // A DDS brings its own, and those levels were authored — with a filter and a
                     // gamma a box filter does not reproduce. Keep what the file supplied and compute
                     // only the tail it stopped short of.
-                    Some(src) => crate::render::mips::complete(
-                        src,
-                        &img.pixels,
-                        img.width,
-                        img.height,
-                        img.format,
-                    ),
-                    None => {
-                        crate::render::mips::build(&img.pixels, img.width, img.height, img.format)
-                    }
+                    Some(src) => fire_decode::mips::complete(src, &img.pixels, w, h, format, &opts),
+                    None => fire_decode::mips::chain(&img.pixels, w, h, format, &opts),
                 };
                 crate::render::gpu::report_timing(&format!(
                     "mips — {:.2} ms ({} levels, {authored} from the file, {}×{})",
@@ -616,13 +610,9 @@ fn decode_layer(job: &LayerJob) -> Result<LayerData, LayerFail> {
         return Err(LayerFail::Superseded);
     }
     let im = &img.image;
-    let mips = crate::render::mips::build_with_threads(
-        &im.pixels,
-        im.width,
-        im.height,
-        im.format,
-        threads(),
-    );
+    let mut opts = crate::render::mips::options();
+    opts.max_threads = threads();
+    let mips = fire_decode::mips::chain(&im.pixels, im.width, im.height, im.format, &opts);
     if !wanted() {
         return Err(LayerFail::Superseded);
     }

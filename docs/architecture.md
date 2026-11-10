@@ -224,10 +224,11 @@ called from the forward path. macOS needs no equivalent - Launch Services activa
 - **The image is a texture, not a per-frame computation.** On adopt, the decoded pixels are
   uploaded as an immutable image carrying **every mip level in one `sg_make_image`**. sokol_gfx has
   no `GenerateMips` and its rules forbid rendering into an image created with data, so the chain is
-  built on the CPU on the decode worker (`render/mips.rs`, D21) - ~5 ms on an 8.9 MB image, off the
-  UI thread. Each level is a 2×2 box filter of the level above, with 8-bit sRGB sources averaged in
-  *linear* light through two lookup tables (what hardware does for an `*_SRGB` format); rows are
-  split across threads for the big levels. **A decoder that brings its own chain keeps it**: a DDS
+  built on the CPU on the decode worker (D21) by fire-decode's builder (its `mips` feature, FD11,
+  which 3D Review shares; `render/mips.rs` keeps the upload side) - ~5 ms on an 8.9 MB image, off
+  the UI thread. Each level is a 2×2 box filter of the level above, with 8-bit sRGB sources
+  averaged in *linear* light through two lookup tables (what hardware does for an `*_SRGB`
+  format); the big levels are split across threads from fire-decode's budget. **A decoder that brings its own chain keeps it**: a DDS
   stores authored levels, filtered and gamma-corrected by whatever tool built the texture, and a
   box filter does not reproduce them - so `mips::complete` adopts what the file supplied and
   computes only the tail it stopped short of (`DecodedImage::source_mips`, dropped by
@@ -908,7 +909,7 @@ fire/
 ├─ crates/
 │  ├─ fire/           # the viewer: winit shell, sokol_gfx render, decode pool, instance socket
 │  │  ├─ src/app/     #   the ApplicationHandler (Fire) + one Viewer per window + the timer queue
-│  │  ├─ src/render/  #   view math, gpu.rs, d3d11.rs | metal.rs, mips.rs, imgui.rs, the shader
+│  │  ├─ src/render/  #   view math, gpu.rs, d3d11.rs | metal.rs, mips.rs (upload side), imgui.rs, the shader
 │  │  ├─ src/ui/      #   pure immediate-mode UI + the stylesheet (theme.toml)
 │  │  └─ simgui/      #   sokol_imgui.h + cimgui.h, compiled as C by build.rs
 │  ├─ fire-cli/       # fire-cli — Asset Check's image checker, a console program (docs/cli.md)
@@ -1150,7 +1151,7 @@ numbered holes rather than renumbered, so a `D18` in this document means what it
 | D18 | **GPU bring-up on its own thread, started on the first line of `main`; the window is created *before* the join** | Device creation is the longest single item on the launch path and needs no window — but neither does the window need to wait for it | **Shipped**, and it is the one ordering that matters. `Viewer::new` takes the GPU as a closure; get it wrong and the window's 9-31 ms serialize after the device (§1) |
 | D19 | **The shell owns the device and the swapchain; sokol_gfx is handed them** (`sg_environment` / `sg_swapchain`) | sokol_app's window model was a dealbreaker (Appendix B.3); this keeps winit's window *and* sokol's one drawing API | **Shipped on both.** ~250 lines per OS — the only GPU-API-specific code left — with `render/mod.rs` aliasing one as `backend` so `gpu.rs` carries no `cfg` (§5) |
 | D20 | **The swapchain backbuffer is plain UNORM; the fragment shader sRGB-encodes its own output** | Flip-model swapchains disallow `*_SRGB` formats, and ImGui's colors are already sRGB, so one UNORM target is correct for both passes | **Shipped.** The old two-render-target-view trick is gone; the shader owns the encode and must not be "fixed" into a linear write. The *format* is per-OS (§5.1) |
-| D21 | **The mip chain is built on the CPU, on the decode worker** | sokol_gfx has no `GenerateMips`, and its rules forbid rendering into an image created with data | **Shipped.** ~5 ms on an 8.9 MB image, off the UI thread; the upload is one `sg_make_image` carrying every level |
+| D21 | **The mip chain is built on the CPU, on the decode worker** | sokol_gfx has no `GenerateMips`, and its rules forbid rendering into an image created with data | **Shipped.** ~5 ms on an 8.9 MB image, off the UI thread; the upload is one `sg_make_image` carrying every level. The builder is fire-decode's since its step 7 (FD11) |
 | D22 | **`sokol-rust` is vendored; `sokol_imgui.h` is compiled by `fire`'s `build.rs`** | The crates.io `sokol` name belongs to an unrelated 2019 crate, and sokol_imgui must be compiled with the *same* cimgui defines and `SOKOL_*` backend as its neighbours or the struct layouts differ | **Shipped.** A vendored tree to update by hand, and three sets of defines that must stay in lockstep — a mismatch is silent (§15) |
 | D23 | **The whole dev pipeline runs on macOS** — clippy, `cargo test`, the native decoders, the TTFP harness, the release build and packaging | A platform you cannot lint, test or measure on is a platform you cannot maintain; the alternative is mac fixes only Windows CI can verify | **Shipped.** The two sys crates lost their Windows-only short-circuit, the vendor layout went per-target, CI grew a mac leg (§13) and `ttfp.ps1` gained a portable twin |
 | D24 | **Metal shaders are precompiled to a `.metallib` with `xcrun metal`**, so the macOS toolchain floor is full Xcode rather than the Command Line Tools | Keeps D4's "no shader compile on the cold-start path" on *both* OSes; the wgpu branch lost ~32 ms to exactly this | **Shipped.** Every dev machine and the CI runner need Xcode plus an 839 MB `MetalToolchain` component, and its absence is near-silent: asked for bytecode without it, sokol-shdc emits shader *source* and exits 0 (§13) |
