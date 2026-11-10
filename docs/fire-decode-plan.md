@@ -747,9 +747,10 @@ Considered:
 
 **Gain maps**
 
-Most HDR HEIC / AVIF photos (iPhone, recent Android) are an SDR image plus a gain map: either Apple's
-HDR gain-map auxiliary image, or ISO 21496-1 (`tmap`). With `Linear`, the crate applies the gain map at
-the file's full headroom into the same linear output, and fire's exposure / tonemap handles the range.
+Most HDR HEIC / AVIF photos (iPhone, recent Android) are an SDR image plus a gain map: Apple's HDR
+gain-map auxiliary image, ISO 21496-1 (`tmap`), or both. Recent iPhones write both. With `Linear`, the
+crate applies the gain map at the file's full headroom into the same linear output, and fire's
+exposure / tonemap handles the range.
 - **libheif 1.23 has no gain-map API** (no `tmap` or gain-map functions in the vendored headers).
   - The crate reads the pieces through what libheif does have: auxiliary images (Apple's URN), generic
     item data and references, `altr` entity groups, and EXIF / XMP metadata blocks.
@@ -759,14 +760,26 @@ the file's full headroom into the same linear output, and fire's exposure / tone
     step 6c starts.
 - **Transform order:**
   - Base and gain map are decoded with `ignore_transformations`.
-  - The gain map is resampled to the base's coded size and applied.
-  - Then the displayed item's `clap` / `irot` / `imir` are applied.
-  - Why: a portrait iPhone photo carries `irot` on the primary item and usually none on the gain map,
-    so applying each item's own transforms first would transpose one against the other. A portrait
-    fixture is a gate.
-- **An ISO `tmap` item can be the primary item itself.** libheif 1.23 may fail to fetch it as primary,
-  so the crate falls back through the `altr` group to the SDR base.
+  - The gain map is resampled to the base's coded size and applied. Its own transforms are not used.
+  - Then the **base's** `clap` / `irot` / `imir` are applied, then the `tmap` item's own. Apple's
+    files give the `tmap` item none.
+- **Why that order:** Apple's writers store the gain map in the base's coded orientation, whatever
+  its own `irot` says.
+  - A portrait iPhone photo gives the base and the gain map the same `irot` 270. ImageIO's ISO
+    encoder gives the gain map `irot` 0.
+  - Both give the `tmap` item the rotated size and `irot` 0.
+  - So applying only the displayed (`tmap`) item's transforms would leave every Apple portrait
+    unrotated. Applying each input's own transforms before compositing would turn ImageIO's map
+    against its base.
+  - Checked on three iPhone photos and on ImageIO's own HDR decode (`fixtures/heif/README.md`). A
+    portrait fixture is a gate.
+- **An ISO `tmap` item can be the primary item itself.** libheif 1.23.6 can't decode it as primary
+  (checked), so the crate falls back through the `altr` group to the SDR base.
 - **When a file carries both maps, the ISO map wins** (standardised metadata).
+  - This is the usual case: every iPhone photo checked carries both.
+  - The iPhone's `tmap` item takes Apple's gain-map image as its gain-map input, so the two maps
+    share pixels and differ only in their metadata.
+  - ImageIO picks the ISO map too.
 
 **How fire uses it**
 - **PQ / HLG files open as HDR** (`Linear`); there is no SDR image to show instead.
