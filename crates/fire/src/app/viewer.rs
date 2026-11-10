@@ -64,6 +64,17 @@ pub fn decode_options() -> DecodeOptions {
     }
 }
 
+/// The viewer's setup in a window's HDR mode (the `toggle-hdr` key). `Linear` changes only HDR
+/// sources, so with it on a gain-map photo renders as HDR and every other file decodes as before;
+/// PQ / HLG files are HDR either way ([`with_hdr_for`]).
+pub fn options_for(hdr_mode: bool) -> DecodeOptions {
+    let mut opts = decode_options();
+    if hdr_mode {
+        opts.hdr = fire_decode::Hdr::Linear;
+    }
+    opts
+}
+
 /// The [`Hdr`](fire_decode::Hdr) to decode `bytes` with (fire-decode plan, FD17): a PQ or HLG HEIF /
 /// AVIF opens as HDR, linear light through the viewer's exposure and tone curve as an EXR does,
 /// since there is no SDR picture in the file to show instead. Everything else keeps `opts`'s.
@@ -255,6 +266,12 @@ pub struct Viewer {
     /// Full path of the image currently loaded (or loading) — the hot-reload target. `None`
     /// before the first open.
     current_path: Option<PathBuf>,
+    /// Gain-map photos as HDR (the `toggle-hdr` key; fire-decode plan, FD17). Off by default:
+    /// Reinhard maps SDR white to half, so the HDR rendering at 0 stops looks dimmer than the
+    /// photo's own SDR base. Kept while browsing, for this window.
+    hdr_mode: bool,
+    /// The shown image's HDR kind, so the toggle knows whether it has anything to re-decode.
+    shown_hdr: fire_decode::HdrKind,
     /// Full path of the image whose pixels are actually **on the surface**. Trails
     /// [`Self::current_path`], which flips at *request* time: between the two, a decode is in
     /// flight and the previous image is still the one being displayed.
@@ -453,6 +470,8 @@ impl Viewer {
             fade: None,
             folder: None,
             current_path: None,
+            hdr_mode: false,
+            shown_hdr: fire_decode::HdrKind::None,
             shown_path: None,
             watcher,
             cfg,
@@ -575,7 +594,7 @@ impl Viewer {
         if let Some(w) = &self.watcher {
             w.watch(generation, path);
         }
-        let opts = decode_options();
+        let opts = options_for(self.hdr_mode);
         self.load_progress = Arc::default();
         self.pool.submit(DecodeJob {
             window: Some(self.id()),
@@ -588,6 +607,22 @@ impl Viewer {
             progress: Arc::clone(&self.load_progress),
         });
         generation
+    }
+
+    /// Gain-map photos as HDR, or back to their SDR base. The shown image is re-decoded in place,
+    /// keeping the view, when it is one; otherwise the mode waits for the next.
+    fn toggle_hdr(&mut self) {
+        self.hdr_mode = !self.hdr_mode;
+        eprintln!(
+            "fire: gain-map photos as {}",
+            if self.hdr_mode { "HDR" } else { "SDR" }
+        );
+        if self.shown_hdr == fire_decode::HdrKind::GainMap {
+            if let Some(path) = self.current_path.clone() {
+                self.begin_decode(&path, true);
+            }
+        }
+        self.redraw();
     }
 
     /// Hot-reload the current image after its file changed on disk. Re-decodes off-thread *without*
@@ -699,6 +734,7 @@ impl Viewer {
         match outcome.result {
             Ok(img) => {
                 let (w, h, fmt) = (img.width, img.height, img.source.name);
+                self.shown_hdr = img.source.hdr;
                 // Read before the image moves into the surface below.
                 let layout = img.layout;
                 self.file_label.clone_from(&name);
@@ -1332,6 +1368,7 @@ impl Viewer {
             KeyAction::ChannelB => self.surface.toggle_channel(Channel::B),
             KeyAction::ChannelA => self.surface.toggle_channel(Channel::A),
             KeyAction::ToggleTonemap => self.surface.toggle_tonemap(),
+            KeyAction::ToggleHdr => return self.toggle_hdr(),
             KeyAction::MipFiner => self.surface.step_mip(-1),
             KeyAction::MipCoarser => self.surface.step_mip(1),
             KeyAction::ExposureUp => self.surface.adjust_exposure(self.cfg.exposure_step),
@@ -2479,6 +2516,14 @@ fn format_meta(img: &DecodedImage, file_size: Option<u64>) -> String {
     if img.icc.is_some() {
         s.push_str("   ICC");
     }
+    // What makes it HDR, and for a gain-map photo which rendering this is.
+    match img.source.hdr {
+        fire_decode::HdrKind::Pq => s.push_str("   PQ"),
+        fire_decode::HdrKind::Hlg => s.push_str("   HLG"),
+        fire_decode::HdrKind::GainMap if img.format.is_hdr() => s.push_str("   gain map: HDR"),
+        fire_decode::HdrKind::GainMap => s.push_str("   gain map: SDR"),
+        _ => {}
+    }
     if let Some((ow, oh)) = img.downscaled_from {
         let _ = write!(s, "   (from {ow}×{oh})");
     }
@@ -2522,6 +2567,24 @@ mod tests {
             "the viewer's HDR path keys on a float buffer"
         );
         assert_eq!(img.source.hdr, HdrKind::Pq);
+    }
+
+    /// A gain-map photo opens as its SDR base, and as HDR in HDR mode (step 6c). Both report
+    /// the kind, which is what tells the toggle there is something to re-decode.
+    #[cfg(feature = "heif")]
+    #[test]
+    fn a_gain_map_photo_is_sdr_until_hdr_mode() {
+        use fire_decode::{HdrKind, PixelFormat};
+        const GAIN_MAP_HEIC: &[u8] = include_bytes!("../../tests/data/gainmap_iso.heic");
+        for (hdr_mode, format) in [
+            (false, PixelFormat::Rgba8Unorm),
+            (true, PixelFormat::Rgba16Float),
+        ] {
+            let opts = with_hdr_for(options_for(hdr_mode), GAIN_MAP_HEIC, Some("heic"));
+            let img = fire_decode::decode(GAIN_MAP_HEIC, Some("heic"), &opts).unwrap();
+            assert_eq!(img.format, format, "HDR mode {hdr_mode}");
+            assert_eq!(img.source.hdr, HdrKind::GainMap);
+        }
     }
 
     #[test]

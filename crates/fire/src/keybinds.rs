@@ -47,6 +47,8 @@ pub enum KeyAction {
     ChannelA,
     // HDR
     ToggleTonemap,
+    /// Gain-map photos as HDR rather than their SDR base (fire-decode plan, FD17).
+    ToggleHdr,
     ExposureUp,
     ExposureDown,
     ExposureReset,
@@ -93,6 +95,7 @@ pub const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ChannelB,
     KeyAction::ChannelA,
     KeyAction::ToggleTonemap,
+    KeyAction::ToggleHdr,
     KeyAction::ExposureUp,
     KeyAction::ExposureDown,
     KeyAction::ExposureReset,
@@ -129,6 +132,7 @@ impl KeyAction {
             KeyAction::ChannelB => "blue-channel",
             KeyAction::ChannelA => "alpha-channel",
             KeyAction::ToggleTonemap => "toggle-tonemap",
+            KeyAction::ToggleHdr => "toggle-hdr",
             KeyAction::ExposureUp => "exposure-up",
             KeyAction::ExposureDown => "exposure-down",
             KeyAction::ExposureReset => "exposure-reset",
@@ -164,6 +168,7 @@ impl KeyAction {
             KeyAction::ChannelB => "Blue channel",
             KeyAction::ChannelA => "Alpha channel",
             KeyAction::ToggleTonemap => "Tone map: Reinhard \u{2194} ACES",
+            KeyAction::ToggleHdr => "Gain-map photos: SDR \u{2194} HDR",
             KeyAction::ExposureUp => "Increase exposure",
             KeyAction::ExposureDown => "Decrease exposure",
             KeyAction::ExposureReset => "Reset exposure",
@@ -197,6 +202,7 @@ impl KeyAction {
             | KeyAction::ChannelB
             | KeyAction::ChannelA => "Channels",
             KeyAction::ToggleTonemap
+            | KeyAction::ToggleHdr
             | KeyAction::ExposureUp
             | KeyAction::ExposureDown
             | KeyAction::ExposureReset => "HDR",
@@ -588,6 +594,7 @@ impl Keybinds {
                 bind(KeyAction::ChannelB, &["B"]),
                 bind(KeyAction::ChannelA, &["A"]),
                 bind(KeyAction::ToggleTonemap, &["T"]),
+                bind(KeyAction::ToggleHdr, &["H"]),
                 bind(KeyAction::ExposureUp, &["]"]),
                 bind(KeyAction::ExposureDown, &["["]),
                 bind(KeyAction::ExposureReset, &[]),
@@ -864,6 +871,7 @@ mod tests {
             (KeyCode::KeyA, KeyAction::ChannelA),
             (KeyCode::KeyC, KeyAction::ChannelRgb),
             (KeyCode::KeyT, KeyAction::ToggleTonemap),
+            (KeyCode::KeyH, KeyAction::ToggleHdr),
             (KeyCode::KeyK, KeyAction::ToggleFlipbook),
             (KeyCode::BracketRight, KeyAction::ExposureUp),
             (KeyCode::BracketLeft, KeyAction::ExposureDown),
