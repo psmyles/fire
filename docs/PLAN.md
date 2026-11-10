@@ -191,6 +191,11 @@ It depends on asset-rules `v0.2.0`, tagged 5 November 2026; `v0.2.1` since 6 Nov
    committed, so it isn't the place (3D Review's `docs/cli.md`, "Building against unreleased
    asset-rules", shows the pattern). fire's `main` keeps its in-tree crates until migration step 1's gate
    passes on **both** platforms; that needs the Windows HEIF libraries.
+**Behaviour changes fire picks up with fire-decode's tag** (step 2a, 10 November 2026): a PSD with
+a malformed RLE run is refused rather than shown with that plane blacked out, and an RGB / CMYK PSD
+declaring fewer channels than its colour mode needs is refused rather than filled from plane 0.
+Both are malformed files Photoshop doesn't write.
+
 4. **Move each consumer to its setup (step 3).**
    - **The viewer** to `viewer()`.
    - **fire-shellext** to `viewer()` with `frames: First`, `stored_mips: false` and `hdr: Sdr`. It
