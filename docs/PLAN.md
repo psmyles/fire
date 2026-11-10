@@ -2,8 +2,8 @@
 
 **Status, 10 November 2026:** A1 and A2 are done and merged into `main`, and A2's end-to-end check
 against review3d-cli has passed on Windows. A3, the rules catalog, is done and merged. Asset Check
-is done across its repositories, so B is next. B hasn't started. fire-cli depends on asset-rules
-`v0.2.1`.
+is done across its repositories, so B is next. B.3 and B.4 are done on the `fire-decode` branch
+(10 November 2026), against fire-decode's step 3. fire-cli depends on asset-rules `v0.2.1`.
 
 Open items, in order:
 1. **A2 on the Mac:** run `build-mac.sh` and `dev-app.sh`, and `fire-cli` inside the bundle (A2's
@@ -191,12 +191,37 @@ It depends on asset-rules `v0.2.0`, tagged 5 November 2026; `v0.2.1` since 6 Nov
    committed, so it isn't the place (3D Review's `docs/cli.md`, "Building against unreleased
    asset-rules", shows the pattern). fire's `main` keeps its in-tree crates until migration step 1's gate
    passes on **both** platforms; that needs the Windows HEIF libraries.
+   - **Done (10 November 2026): the `fire-decode` branch.** It removes `crates/fire-decode`,
+     `psd-sdk-sys` and `heif-sys`, and depends on
+     `git = "https://github.com/psmyles/fire-decode", branch = "main"`. An untracked
+     `~/Dev/.cargo/config.toml` patches that to the checkout beside this one.
+   - fire, fire-cli and fire-shellext name the crate's `icc` and `raw` features, since the crate
+     has none on by default.
+   - The installer-association test moved into `crates/fire/tests/installer.rs`, against
+     `fire_decode::all_extensions()`.
+   - The workspace dependencies only the in-tree crates used are gone, `bindgen` among them.
+   - **Builds use `cargo +1.99.1`.** The crate needs Rust 1.99, and this Mac's `stable` is 1.98.1.
+   - **CI isn't updated on the branch.** Its jobs still name `-p fire-decode` and the vendored
+     artifacts. They move when the branch merges for the tag (fire-decode's `docs/PLAN.md`, "Needs
+     Windows", item 7).
 **Behaviour changes fire picks up with fire-decode's tag** (step 2a, 10 November 2026): a PSD with
 a malformed RLE run is refused rather than shown with that plane blacked out, and an RGB / CMYK PSD
 declaring fewer channels than its colour mode needs is refused rather than filled from plane 0.
 Both are malformed files Photoshop doesn't write.
 
-4. **Move each consumer to its setup (step 3).**
+4. **Move each consumer to its setup (step 3). Done on the `fire-decode` branch** (10 November
+   2026); the macOS gate passed (fire-decode's `docs/baselines.md`). Details:
+   - **fire-shellext's setup:** it is `fire_thumbs::decode_options()`, so a test on every OS checks
+     that a cubemap's thumbnail draws all six faces. fire-shellext itself builds only on Windows,
+     so its changed call waits for a Windows build.
+   - **The viewer's setup:** one `app::decode_options()`, `viewer()` with the RAM-guard fit at
+     `MAX_CPU_DIM`.
+   - **The loading bar** gets the crate's progress through a `DecodeCtl`, whose cancel never fires
+     until step 6d.
+   - **Without `heif`, `.avif` and `.heic` aren't listed:** the extension lists follow the build's
+     features. That matters only to CI's decoder-free job.
+
+   The plan for each consumer:
    - **The viewer** to `viewer()`.
    - **fire-shellext** to `viewer()` with `frames: First`, `stored_mips: false` and `hdr: Sdr`. It
      keeps `surfaces: Sheet`, so a cubemap's thumbnail still shows every face.
