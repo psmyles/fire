@@ -355,6 +355,9 @@ inheriting fire's:
 - **Wide-gamut colour without an ICC profile follows the ICC switch.** This means an nclx box declaring
   Display P3 or BT.2020, which is common in Android AVIF. It is converted to sRGB in `viewer()` and left
   as stored in `inspect()`, `texture()` and `thumbnail()`.
+  - **The crate does that conversion itself (step 3).** Measured in step 2b, libheif's default
+    output leaves nclx primaries as stored: a Display P3 (200, 120, 60) comes back as (200, 120, 60),
+    not sRGB's (213, 115, 42).
 
 ### FD6 - Resizing: `fit` with a filter
 
@@ -806,6 +809,12 @@ exposure / tonemap handles the range.
 - **`texture()` / `thumbnail()` get libheif's own SDR rendering** of a PQ / HLG file (what libheif does
   with no output nclx).
   - Whether that re-encodes the signal or reinterprets it is measured in step 2b.
+  - **Measured (step 2b): it reinterprets.** libheif applies the YCbCr matrix but neither the PQ /
+    HLG transfer nor the BT.2020 primaries: the RGB it returns is the encoded signal, exactly (a PQ
+    code of 594, 203 cd/m², comes back as 594). Shown as sRGB, a PQ file looks flat and dark. An HLG
+    one is closer, its curve being gamma-like, but dim (reference white lands at 75% grey), and both
+    keep BT.2020's colours unconverted. fire shows it that way today.
+    What `Sdr` should do instead is a step 6b decision.
   - For bite it is also compared with ImageMagick (section 6).
 
 ### FD18 - Animated AVIF and HEIF sequences
@@ -1014,6 +1023,9 @@ Step 6 is fire-only and can start any time after step 3, in parallel with steps 
 - **libheif's own SDR rendering of PQ / HLG** (no output nclx): does it re-encode to sRGB or
   reinterpret the signal? Measured in step 2b. It decides what 3D Review textures and bite thumbnails
   of such files look like.
+  - **Measured: it reinterprets** (FD17), with heif-sys's `nclx_rendering` example on
+    `fixtures/heif/pq_*` and `hlg_*`. bite's ImageMagick uses libheif too, so it very likely does the
+    same; section 6's comparison confirms it.
 
 **3D Review**
 - **Binary size and startup** after the switch to unwind, and per binary with `heif` and `crt-static`.
