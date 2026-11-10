@@ -53,6 +53,10 @@ rest on, so they can be re-checked before work starts.
   slot, sRGB-encoding colour as its PSD path does today.
 - **bite retries `TooLarge` through ImageMagick** (FD10), so images over `thumbnail()`'s limits
   keep getting thumbnails.
+- **`Sdr` converts PQ / HLG to SDR itself** (FD17, step 6b). libheif hands back the encoded HDR
+  signal unconverted (measured in step 2b), which looks flat and dark as sRGB. The crate decodes it
+  to light, puts 203 cd/m² at white and sRGB-encodes it, so textures and thumbnails of these files
+  look like the picture. bite's previews of them will differ from ImageMagick's.
 
 3D Review has already done its step 0 `links` key, its Windows step 0 baselines and the static CRT
 (FD20, recorded as its D25).
@@ -289,8 +293,8 @@ The buffer and the file are described separately:
 Narrowing rules:
 - **Linear float → 8-bit (`Rgba8`): clamp to 0..1 and scale, no transfer curve.** This is bite's
   thumbnail path for EXR and Radiance HDR, and what `image`'s `to_rgba8()` does with float.
-  - Display-referred HDR (PQ / HLG HEIF) never takes this path: with `hdr: Sdr`, libheif renders it to
-    SDR (FD17).
+  - Display-referred HDR (PQ / HLG HEIF) never takes this path: with `hdr: Sdr`, the crate renders it
+    to SDR itself, sRGB-encoded (FD17).
   - An sRGB-encode option is added only if bite's ImageMagick comparison calls for it (section 6).
   - 3D Review doesn't take this path (`Rgba8OrFloat`). It narrows float per slot. Colour slots clamp
     and sRGB-encode, as its PSD path does for 32-bit documents today (`crates/psd/src/wrapper.cpp`).
@@ -738,7 +742,8 @@ Considered:
 ### FD17 - HDR and gain maps (fire's viewer)
 
 `DecodeOptions` gains **`hdr: Sdr | Linear`**.
-- `Sdr` is today's behaviour, and the value in `texture()`, `thumbnail()` and fire-shellext.
+- `Sdr` is today's behaviour for every file but PQ / HLG ones, which it converts to SDR (below), and
+  the value in `texture()`, `thumbnail()` and fire-shellext.
 - `Linear` with `output: Rgba8` is rejected.
 
 **What a `Linear` buffer holds**
@@ -806,16 +811,23 @@ exposure / tonemap handles the range.
   - Reinhard maps 1.0 to 0.5, so a gain-map photo shown as HDR at 0 stops looks dimmer than its SDR
     base. That is why HDR is opt-in, not the default.
 - **fire-shellext stays SDR** (FD5).
-- **`texture()` / `thumbnail()` get libheif's own SDR rendering** of a PQ / HLG file (what libheif does
-  with no output nclx).
-  - Whether that re-encodes the signal or reinterprets it is measured in step 2b.
-  - **Measured (step 2b): it reinterprets.** libheif applies the YCbCr matrix but neither the PQ /
-    HLG transfer nor the BT.2020 primaries: the RGB it returns is the encoded signal, exactly (a PQ
-    code of 594, 203 cd/m², comes back as 594). Shown as sRGB, a PQ file looks flat and dark. An HLG
-    one is closer, its curve being gamma-like, but dim (reference white lands at 75% grey), and both
-    keep BT.2020's colours unconverted. fire shows it that way today.
-    What `Sdr` should do instead is a step 6b decision.
-  - For bite it is also compared with ImageMagick (section 6).
+- **libheif's own SDR rendering of a PQ / HLG file reinterprets the signal** (measured in step 2b).
+  libheif applies the YCbCr matrix but neither the PQ / HLG transfer nor the BT.2020 primaries: the
+  RGB it returns is the encoded signal, exactly (a PQ code of 594, 203 cd/m², comes back as 594).
+  Shown as sRGB, a PQ file looks flat and dark. An HLG one is closer, its curve being gamma-like, but
+  dim (reference white lands at 75% grey), and both keep BT.2020's colours unconverted. fire shows it
+  that way today.
+- **So `Sdr` converts PQ / HLG itself** (settled on 10 November; `texture()`, `thumbnail()`,
+  fire-shellext, and any `Sdr` decode):
+  - the same decode to light as `Linear` (PQ EOTF, or HLG at 1000 cd/m² with gamma 1.2), ÷ 203, and
+    the primaries to Rec.709;
+  - then each channel clamped to 0..1, so 203 cd/m² is white and anything brighter clips, and
+    sRGB-encoded into `Rgba16Unorm` (`Native`) or `Rgba8`. No tonemap curve: highlights above
+    reference white are the part an SDR rendering gives up;
+  - a shoulder above white is added only if the step 6b fixtures or bite's comparison show the clip
+    reads badly on real files.
+  - bite's ImageMagick almost certainly shows the raw signal as libheif does, so bite's previews of
+    PQ / HLG files will differ from ImageMagick's (section 6). That is the intent.
 
 ### FD18 - Animated AVIF and HEIF sequences
 
@@ -981,7 +993,7 @@ Each step lands only when its gate passes.
 | 4 | **3D Review adopts `texture()`** with `heif` in every binary (`crt-static` is already in place). It deletes `crates/psd` and its decode code in the same commit, and narrows float textures per slot (FD4). Release switches to `unwind` with the viewer-only decode hook (FD7). Worker pool. The stats' Format row from `source`. Licences, README, D22, invariant 9, the non-goal, and `review-log`'s comments that a release build aborts on panic | Startup gate. Size and imports per binary against step 0. Before/after pixel comparison over its textures, with differences explained (e.g. 16-bit PSDs now round rather than truncate); 32-bit PSDs in colour slots unchanged. A texture over the GPU limit still uploads from its first mip that fits. HEIC / AVIF textures load in the viewer, the preview pane, and Quick Look via an FBX with an embedded HEIC texture (Quick Look's sandbox reaches only embedded textures). Shell panics still caught. Asset Check reports a review3d-cli panic as the tool failing. `minos` 11.0 |
 | 5 | **bite.** Licences and spec first (FD14). Rust ≥ 1.88, inherited by every crate, and `crt-static`. Cold-import benchmark by format. Route PNG / TGA / PSD / HEIC / HEIF / AVIF through the crate, and EXR after its ImageMagick comparison. Failures, `TooLarge` included, retried through ImageMagick (FD10). `probe()` replaces `header.rs`. HEIC chip. Lossless WebP with ICC. Cached reads through the crate | Cold import faster per routed format. No `magick` process on a warm re-import of crate formats. `probe()` matches `identify`. HEIC orientation matches ImageMagick. Previews visually unchanged, ICC-tagged files included. An image over 30000 px still gets a thumbnail. Cache size acceptable |
 | 6a | **fire: tonemap safe for negative values**, in the shader and in fire-thumbs (FD17) | Unit test with negative and below −1 inputs |
-| 6b | **PQ / HLG → `Linear` half float.** `source` reports the HDR kind; fire opens PQ / HLG as HDR | Synthetic PQ / HLG fixtures numerically correct (known cd/m² → known value). SDR HEIC TTFP unchanged. `texture()` / `thumbnail()` output bit-identical to the previous tag |
+| 6b | **PQ / HLG → `Linear` half float, and to sRGB in `Sdr`.** `source` reports the HDR kind; fire opens PQ / HLG as HDR. `Sdr` converts PQ / HLG to SDR itself (FD17) | Synthetic PQ / HLG fixtures numerically correct in both modes (known cd/m² → known value; 203 cd/m² → white in `Sdr`). SDR HEIC TTFP unchanged. `texture()` / `thumbnail()` output bit-identical to the previous tag for every file but PQ / HLG ones |
 | 6c | **Gain maps** (the newest libheif re-checked first), plus fire's HDR toggle | Portrait fixture aligned. Apple and ISO maps both applied, and ISO wins when both are present. SDR default unchanged |
 | 6d | **Sequences (FD18), plus HEIF progress / cancel** in fire's loading bar | The infinite-loop file terminates. Truncation flagged. Progress only rises. Cancel stops a long sequence |
 | 7 | **Phase 2: `mips` feature (FD11).** fire uses it; 3D Review builds chains on its workers, and settles `rhi/mips.rs`'s place in the UV-checker bake | fire TTFP. 3D Review frame times while textures load. The UV-checker bake still builds |
@@ -1015,7 +1027,9 @@ Step 6 is fire-only and can start any time after step 3, in parallel with steps 
   Add an sRGB-encode option only if they differ visibly.
 - **HEIC / AVIF thumbnails** against `magick <file>[0] -thumbnail ...`:
   - orientation: does ImageMagick apply `irot` / `imir`, as FD5 expects;
-  - how ImageMagick renders PQ / HLG and gain-map files in SDR, against the crate's `Sdr` path;
+  - how ImageMagick renders PQ / HLG and gain-map files in SDR, against the crate's `Sdr` path. PQ /
+    HLG files are expected to differ (FD17: the crate converts them, ImageMagick very likely shows
+    the raw signal); record how, not whether;
   - decode time: dav1d (crate) against libaom (bite's ImageMagick).
 - **Cache size** with lossless WebP, ICC embedded, at 256 and 1024 px on a typical folder.
 
@@ -1026,6 +1040,8 @@ Step 6 is fire-only and can start any time after step 3, in parallel with steps 
   - **Measured: it reinterprets** (FD17), with heif-sys's `nclx_rendering` example on
     `fixtures/heif/pq_*` and `hlg_*`. bite's ImageMagick uses libheif too, so it very likely does the
     same; section 6's comparison confirms it.
+  - **Settled: `Sdr` converts them itself** (FD17), so this no longer decides how textures and
+    thumbnails look.
 
 **3D Review**
 - **Binary size and startup** after the switch to unwind, and per binary with `heif` and `crt-static`.

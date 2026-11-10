@@ -200,6 +200,9 @@ Both are malformed files Photoshop doesn't write.
    - **The viewer** to `viewer()`.
    - **fire-shellext** to `viewer()` with `frames: First`, `stored_mips: false` and `hdr: Sdr`. It
      keeps `surfaces: Sheet`, so a cubemap's thumbnail still shows every face.
+     - From fire-decode's step 6b, `Sdr` converts a PQ / HLG HEIF to SDR (203 cd/m² at white,
+       sRGB-encoded). Today its thumbnail shows the raw HDR signal, flat and dark (FD17, settled
+       10 November 2026). The viewer opens those files as HDR (`Linear`) from the same step.
    - **fire-cli** to `inspect()`: full size, no ICC conversion, EXIF orientation off.
      - A rotated JPEG then reports its stored size, which is what Unity imports. Today it reports
        the upright size. Add a test for it.
