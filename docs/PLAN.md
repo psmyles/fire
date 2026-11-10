@@ -1,15 +1,19 @@
 # fire - Work Plan
 
-**Status, 5 November 2026:** A1 and A2 are done and merged into `main`, and A2's end-to-end check
-against review3d-cli has passed on Windows. A3, the rules catalog, is done and merged. B hasn't
-started. fire-cli depends on asset-rules `v0.2.1`.
+**Status, 10 November 2026:** A1 and A2 are done and merged into `main`, and A2's end-to-end check
+against review3d-cli has passed on Windows. A3, the rules catalog, is done and merged. Asset Check
+is done across its repositories, so B is next. B hasn't started. fire-cli depends on asset-rules
+`v0.2.1`.
 
 Open items, in order:
 1. **A2 on the Mac:** run `build-mac.sh` and `dev-app.sh`, and `fire-cli` inside the bundle (A2's
    last section).
-2. **Next by the order below:** the Launcher's results table is done (5 November). Asset Check's
-   rules repo, SandboxVR/exp-content-rules, comes next, then B. B's step 2, the tonemap fix, can be
-   done at any time.
+2. **B, the migration.** The Launcher's results table and Asset Check's rules repo,
+   SandboxVR/exp-content-rules, are done. B's step 2, the tonemap fix, can be done at any time.
+
+`docs/fire-decode-plan.md` was updated on 10 November 2026 from the canonical copy. It now gives
+fire-cli its own setup (`inspect()`, EXIF orientation off) and keeps fire-shellext's cubemap sheets
+(B.4 below).
 
 The work is ordered for a stretch on a Mac; items that need Windows are collected at the end.
 
@@ -35,7 +39,7 @@ the artist pilot. The migration comes after, starting with what a Mac can do.
 **Order across repositories:**
 1. `asset-rules` - its `docs/PLAN.md`;
 2. this repo's A1-A2 (done), alongside 3D Review's `review3d-cli` changes (done);
-3. the Launcher's results table (done), then Asset Check's rules repo;
+3. the Launcher's results table (done), then Asset Check's rules repo (done);
 4. the migration.
 
 **Do A1 before the fire-decode extraction** (`git filter-repo`), so the additions travel with the
@@ -187,12 +191,22 @@ It depends on asset-rules `v0.2.0`, tagged 5 November 2026; `v0.2.1` since 6 Nov
    committed, so it isn't the place (3D Review's `docs/cli.md`, "Building against unreleased
    asset-rules", shows the pattern). fire's `main` keeps its in-tree crates until migration step 1's gate
    passes on **both** platforms; that needs the Windows HEIF libraries.
+4. **Move each consumer to its setup (step 3).**
+   - **The viewer** to `viewer()`.
+   - **fire-shellext** to `viewer()` with `frames: First`, `stored_mips: false` and `hdr: Sdr`. It
+     keeps `surfaces: Sheet`, so a cubemap's thumbnail still shows every face.
+   - **fire-cli** to `inspect()`: full size, no ICC conversion, EXIF orientation off.
+     - A rotated JPEG then reports its stored size, which is what Unity imports. Today it reports
+       the upright size. Add a test for it.
+     - Drop the per-worker `with_max_threads` share; the crate's budget divides the cores.
+     - The facts it reads (`bit_depth`, `channels`, `palette`, `source_format`) move to
+       `DecodedImage::source`.
 
 ## Needs Windows (later)
 
 - Windows TTFP baselines; fire's switch to the fire-decode tag (step 1).
 - The static CRT for fire, fire-shellext and fire-cli (FD20), checked by an import table with no
-  `MSVCP140` / `VCRUNTIME140*` entries.
+  `MSVCP140` / `VCRUNTIME140*` / `api-ms-win-crt-*` entries.
   - `fire-cli.exe` links psd_sdk and the HEIF stack too, and imports `MSVCP140.dll` today, as
     `fire.exe` does. FD20 and the step-1 gate in `fire-decode-plan.md` now name it.
 - Verifying the installer changes:
