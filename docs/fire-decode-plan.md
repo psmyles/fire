@@ -215,7 +215,13 @@ The merge takes:
   - The two RLE fixes overlap. They are reconciled into one, which lands only when both apps'
     malformed-file suites pass in the crate (fire's `tests/psd.rs`; 3D Review's `tests/synthetic.rs`,
     ~17 cases).
+  - **How they were reconciled (step 2a):** both bound every run against both buffers. A malformed
+    run is now refused (`DecodeFailed`), as 3D Review did and as a truncated file already was.
+    fire's zero-fill of the rest of the plane stays, for psd_sdk callers that ignore the result.
+    fire's test that kept such an image now expects the refusal.
   - P2 and the throwing assert come over as they are.
+  - **Also from 3D Review's checks:** a channel count below the colour mode's planes (RGB under 3,
+    CMYK under 4) is refused. fire used to fill a missing RGB plane from the first one.
 - **From 3D Review: committed bindings** with size / offset asserts. The shared repo never runs bindgen
   or needs libclang.
 - **From fire: the wrapper's speed work.** From 3D Review: its borrowed-bytes read and fallible
@@ -226,6 +232,15 @@ The merge takes:
 - **Limits from Rust.** The wrapper takes them from `DecodeOptions::limits` (FD5) instead of compiling
   in its own constants. The planar-data and channel caps are derived in step 2a; 3D Review's are 2× the
   output limit and 56.
+  - **As built (step 2a):** `fire_psd_decode_merged` takes `{ max_dim, max_output_bytes,
+    max_planar_bytes, max_channels }`. The planar cap is 2× the output's, and channels are capped at
+    56, for every setup. Until step 3 adds `limits`, fire-decode passes today's 131072 px / 4 GiB.
+  - **The C ABI is staged, as 3D Review's was** (ABI version 2): open reads the header only; the
+    decode checks it against the limits before psd_sdk sizes a plane; the read interleaves at the
+    document's depth.
+- **psd_sdk stays at `f514495`.** Upstream's three later commits (to `bfa1173`, August 2026) add PSB
+  and smart objects to the document and layer parsers. They don't touch the two files the merged
+  decode goes through, so they would bring an unused layer parser and no PSB merged image.
 - **psd_sdk's image-resources parser is never called.**
   - 3D Review stopped calling it because its `DISPLAY_INFO` branch writes through NULL for a greyscale
     document with alpha.
