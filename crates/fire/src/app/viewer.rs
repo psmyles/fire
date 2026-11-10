@@ -64,6 +64,23 @@ pub fn decode_options() -> DecodeOptions {
     }
 }
 
+/// The [`Hdr`](fire_decode::Hdr) to decode `bytes` with (fire-decode plan, FD17): a PQ or HLG HEIF /
+/// AVIF opens as HDR, linear light through the viewer's exposure and tone curve as an EXR does,
+/// since there is no SDR picture in the file to show instead. Everything else keeps `opts`'s.
+/// Only HEIF and AVIF are probed, so no other file pays for a second read of its headers.
+pub fn with_hdr_for(mut opts: DecodeOptions, bytes: &[u8], ext: Option<&str>) -> DecodeOptions {
+    use fire_decode::{Format, Hdr, HdrKind};
+    if matches!(
+        fire_decode::sniff(bytes, ext),
+        Format::Heic | Format::Heif | Format::Avif
+    ) && fire_decode::probe(std::io::Cursor::new(bytes), ext)
+        .is_ok_and(|p| matches!(p.hdr, HdrKind::Pq | HdrKind::Hlg))
+    {
+        opts.hdr = Hdr::Linear;
+    }
+    opts
+}
+
 /// The flipbook playback timer's interval: a fixed ~60 Hz, whatever the sheet's frame rate and
 /// whether or not it is crossfading.
 ///
@@ -2478,5 +2495,42 @@ fn human_size(bytes: u64) -> String {
         b if b >= MB => format!("{:.1} MB", b as f64 / MB as f64),
         b if b >= KB => format!("{:.0} KB", b as f64 / KB as f64),
         b => format!("{b} B"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fire_decode::Hdr;
+
+    /// A 288×64 lossless PQ AVIF from fire-decode's `fixtures/heif/` (generated, redistributable).
+    #[cfg(feature = "heif")]
+    const PQ_AVIF: &[u8] = include_bytes!("../../tests/data/pq_lossless.avif");
+
+    /// A PQ file opens as HDR: linear half float, through the viewer's exposure and tone curve
+    /// (fire-decode plan, step 6b). An SDR file keeps the viewer's setup.
+    #[cfg(feature = "heif")]
+    #[test]
+    fn a_pq_file_opens_as_linear_hdr() {
+        use fire_decode::{HdrKind, PixelFormat};
+        let opts = with_hdr_for(decode_options(), PQ_AVIF, Some("avif"));
+        assert_eq!(opts.hdr, Hdr::Linear);
+        let img = fire_decode::decode(PQ_AVIF, Some("avif"), &opts).unwrap();
+        assert_eq!(img.format, PixelFormat::Rgba16Float);
+        assert!(
+            img.format.is_hdr(),
+            "the viewer's HDR path keys on a float buffer"
+        );
+        assert_eq!(img.source.hdr, HdrKind::Pq);
+    }
+
+    #[test]
+    fn an_sdr_file_keeps_the_viewer_setup() {
+        let png = b"\x89PNG\r\n\x1a\n";
+        assert_eq!(
+            with_hdr_for(decode_options(), png, Some("png")),
+            decode_options()
+        );
+        assert_eq!(decode_options().hdr, Hdr::Sdr);
     }
 }

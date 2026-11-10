@@ -655,7 +655,8 @@ fn decode(job: &DecodeJob) -> (Result<DecodedImage, DecodeError>, Option<Vec<u8>
             progress: &progress,
             cancel: &|| false,
         };
-        let result = fire_decode::decode_with_progress(&bytes, ext, &job.opts, &ctl);
+        let opts = crate::app::with_hdr_for(job.opts, &bytes, ext);
+        let result = fire_decode::decode_with_progress(&bytes, ext, &opts, &ctl);
         let keep = result.is_ok() && bytes.starts_with(b"8BPS");
         (result, keep.then_some(bytes))
     }))
