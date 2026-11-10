@@ -29,6 +29,19 @@ pub mod registry;
 
 pub use settings::{Backdrop, ThumbnailsCfg, Tonemap};
 
+/// How a thumbnail's file is decoded: the viewer's setup with an animation's first frame, the
+/// file's own mips skipped and SDR output (fire-decode plan, FD5). It keeps the DDS sheet, so a
+/// cubemap's thumbnail shows every face, as the viewer's sheet does. Here rather than in
+/// `fire-shellext` so it is tested on every OS.
+pub fn decode_options() -> fire_decode::DecodeOptions {
+    fire_decode::DecodeOptions {
+        frames: fire_decode::Frames::First,
+        stored_mips: false,
+        hdr: fire_decode::Hdr::Sdr,
+        ..fire_decode::DecodeOptions::viewer()
+    }
+}
+
 /// The class id of Fire's thumbnail provider: what the per-extension `ShellEx` entries name, what
 /// `HKCU\Software\Classes\CLSID` maps to the DLL, and what the DLL's `DllGetClassObject` answers
 /// to. Never change it once shipped — the registrations already out there name this one.

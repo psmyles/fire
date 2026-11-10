@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use winit::event_loop::EventLoop;
 
-use app::{AppEvent, Fire, Initial, MAX_CPU_DIM};
+use app::{AppEvent, Fire, Initial};
 use config::Config;
 use decode_pool::{fresh_generation, DecodeJob, DecodePool, Progress};
 
@@ -135,10 +135,7 @@ fn main() {
             window: None,
             generation,
             path: path.clone(),
-            opts: fire_decode::DecodeOptions {
-                max_dim: MAX_CPU_DIM,
-                honor_icc: true,
-            },
+            opts: app::decode_options(),
             reload: false,
             detect_flipbook: cfg.flipbook.auto_detect,
             // No window yet, so no live generation to check: the launch decode's layer index is

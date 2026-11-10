@@ -201,12 +201,12 @@ mod tests {
                 assert!(seen.insert(*e), ".{e} is in two groups");
             }
         }
-        let decoder: BTreeSet<&str> = fire_decode::SUPPORTED_EXTENSIONS.iter().copied().collect();
+        let decoder: BTreeSet<&str> = fire_decode::all_extensions().iter().copied().collect();
         let missing: Vec<_> = decoder.difference(&seen).collect();
         let extra: Vec<_> = seen.difference(&decoder).collect();
         assert!(
             missing.is_empty() && extra.is_empty(),
-            "formats table and SUPPORTED_EXTENSIONS disagree.\n  no checkbox: {missing:?}\n  \
+            "formats table and fire_decode::all_extensions() disagree.\n  no checkbox: {missing:?}\n  \
              not decodable: {extra:?}"
         );
     }

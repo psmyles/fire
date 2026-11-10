@@ -16,7 +16,7 @@ psd = ["fire-decode/psd"]
 heif = ["fire-decode/heif"]
 
 [dependencies]
-fire-decode.workspace = true
+fire-decode = { workspace = true, features = ["icc", "raw"] }
 asset-rules.workspace = true
 serde.workspace = true
 serde_json.workspace = true

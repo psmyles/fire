@@ -1,9 +1,10 @@
 //! What one image is, as the rules measure it: gathered once per file, from fire-decode and from
 //! the file's own bytes.
 //!
-//! The image is decoded the way Asset Check needs it (AC12): at full size, never downscaled, and
-//! with no ICC conversion, so the alpha scan sees every pixel as stored and the colour-profile test
-//! sees the profile the file carries.
+//! The image is decoded the way Asset Check needs it (AC12), with fire-decode's `inspect()` setup:
+//! at full size, never downscaled, with no ICC conversion and no EXIF rotation, so the alpha scan
+//! sees every pixel as stored, the colour-profile test sees the profile the file carries, and the
+//! size is the stored one Unity imports.
 //!
 //! Two kinds of Photoshop file can't be decoded, but are still worth checking: a PSB (fire-decode
 //! reads PSD only), and a PSD with no merged image. For those, the size and depth come from the
@@ -123,11 +124,9 @@ pub fn gather(path: &Path) -> Result<Facts, String> {
     }
 
     let ext = path.extension().and_then(|e| e.to_str());
-    let opts = DecodeOptions {
-        max_dim: 0,
-        honor_icc: false,
-    };
-    let image = match fire_decode::decode(&bytes, ext, &opts) {
+    // Full size, no ICC conversion and no EXIF rotation: the file as stored, which is what Unity
+    // imports (fire-decode's `inspect()` setup).
+    let image = match fire_decode::decode(&bytes, ext, &DecodeOptions::inspect()) {
         Ok(image) => image,
         Err(DecodeError::NoMergedImage) => match header {
             Some(header) => return Ok(from_header(&header, file_size, true, generation)),
@@ -150,15 +149,15 @@ pub fn gather(path: &Path) -> Result<Facts, String> {
     });
     Ok(Facts {
         file_size,
-        format: Format::of_decoded(image.source_format),
+        format: Format::of_decoded(image.source.name),
         width,
         height,
         surfaces,
-        bit_depth: image.bit_depth,
+        bit_depth: image.source.bit_depth,
         float: image.format.is_hdr(),
-        palette: image.palette,
+        palette: image.source.palette,
         pixels: Some(Pixels {
-            channels: image.channels,
+            channels: image.source.channels,
             alpha_opaque: image.alpha_opaque,
             icc,
         }),
@@ -255,6 +254,41 @@ mod tests {
         assert_eq!(normalize_format("JPEG"), "jpg");
         assert_eq!(normalize_format("tif"), "tiff");
         assert_eq!(normalize_format("PNG"), "png");
+    }
+
+    /// A JPEG whose EXIF says "rotate 90° clockwise" reports its stored size, which is what Unity
+    /// imports, not the upright size a viewer shows. Before fire-decode's `inspect()` setup it
+    /// reported the upright one.
+    #[test]
+    fn a_rotated_jpeg_reports_its_stored_size() {
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(16, 8))
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        // APP1: "Exif\0\0", a little-endian TIFF header, one IFD entry: Orientation (a SHORT) = 6.
+        let mut app1 = b"Exif\0\0II\x2a\x00\x08\x00\x00\x00\x01\x00".to_vec();
+        app1.extend_from_slice(&0x0112u16.to_le_bytes());
+        app1.extend_from_slice(&3u16.to_le_bytes());
+        app1.extend_from_slice(&1u32.to_le_bytes());
+        app1.extend_from_slice(&6u32.to_le_bytes());
+        app1.extend_from_slice(&0u32.to_le_bytes());
+        let mut bytes = jpeg[..2].to_vec();
+        bytes.extend_from_slice(&[0xFF, 0xE1]);
+        bytes.extend_from_slice(&(app1.len() as u16 + 2).to_be_bytes());
+        bytes.extend_from_slice(&app1);
+        bytes.extend_from_slice(&jpeg[2..]);
+
+        let path =
+            std::env::temp_dir().join(format!("fire-cli-rotated-{}.jpg", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let facts = gather(&path);
+        let _ = std::fs::remove_file(&path);
+        let facts = facts.unwrap();
+        assert_eq!((facts.width, facts.height), (16, 8));
+        assert_eq!(facts.format.id, "jpg");
     }
 
     #[test]

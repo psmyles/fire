@@ -52,6 +52,18 @@ mod psd;
 /// An RGBA8 bitmap at 16384² is ~1 GiB; float HDR is 4×. Larger images are CPU-downscaled.
 pub const MAX_CPU_DIM: u32 = 16384;
 
+/// How the viewer decodes: fire-decode's `viewer()` setup, shrunk past [`MAX_CPU_DIM`] (which is
+/// also `viewer()`'s own fit, but the GPU limit is requested from this constant).
+pub fn decode_options() -> DecodeOptions {
+    DecodeOptions {
+        fit: Some(fire_decode::Fit {
+            max: MAX_CPU_DIM,
+            filter: fire_decode::Filter::Nearest,
+        }),
+        ..DecodeOptions::viewer()
+    }
+}
+
 /// The flipbook playback timer's interval: a fixed ~60 Hz, whatever the sheet's frame rate and
 /// whether or not it is crossfading.
 ///
@@ -158,12 +170,12 @@ pub enum Dialog {
 /// thread boundary here is sound.
 fn pick(dialog: Dialog, window: &Window) -> Option<PathBuf> {
     match dialog {
-        // The extensions come from `fire_decode::SUPPORTED_EXTENSIONS` — the same list folder
+        // The extensions come from `fire_decode::supported_extensions()` — the same list folder
         // navigation uses. (A file the filter misses is still openable via "All files": the
         // decoder routes by magic bytes, not by name.)
         Dialog::OpenImage => rfd::FileDialog::new()
             .set_title("Open image")
-            .add_filter("Image files", fire_decode::SUPPORTED_EXTENSIONS)
+            .add_filter("Image files", fire_decode::supported_extensions())
             .add_filter("All files", &["*"])
             .set_parent(window)
             .pick_file(),
@@ -546,10 +558,7 @@ impl Viewer {
         if let Some(w) = &self.watcher {
             w.watch(generation, path);
         }
-        let opts = DecodeOptions {
-            max_dim: MAX_CPU_DIM,
-            honor_icc: true,
-        };
+        let opts = decode_options();
         self.load_progress = Arc::default();
         self.pool.submit(DecodeJob {
             window: Some(self.id()),
@@ -672,7 +681,7 @@ impl Viewer {
         self.end_loading();
         match outcome.result {
             Ok(img) => {
-                let (w, h, fmt) = (img.width, img.height, img.source_format);
+                let (w, h, fmt) = (img.width, img.height, img.source.name);
                 // Read before the image moves into the surface below.
                 let layout = img.layout;
                 self.file_label.clone_from(&name);
@@ -2422,7 +2431,7 @@ fn file_name(path: &Path) -> String {
 
 /// Status-bar metadata tail: "PNG   2048×1024   8-bit RGBA   1.4 MB   ICC".
 fn format_meta(img: &DecodedImage, file_size: Option<u64>) -> String {
-    let ch = match img.channels {
+    let ch = match img.source.channels {
         1 => "Gray",
         2 => "Gray+A",
         3 => "RGB",
@@ -2444,7 +2453,7 @@ fn format_meta(img: &DecodedImage, file_size: Option<u64>) -> String {
     };
     let mut s = format!(
         "{}   {size}   {}-bit {}",
-        img.source_format, img.bit_depth, ch
+        img.source.name, img.source.bit_depth, ch
     );
     use std::fmt::Write as _;
     if let Some(bytes) = file_size {

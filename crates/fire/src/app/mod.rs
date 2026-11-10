@@ -39,7 +39,7 @@ use crate::render::gpu::Gpu;
 use timers::{TimerQueue, Timers};
 use viewer::{Dialog, Viewer};
 
-pub use viewer::MAX_CPU_DIM;
+pub use viewer::decode_options;
 
 /// A message from another thread (or from the instance socket) for the event loop.
 pub enum AppEvent {

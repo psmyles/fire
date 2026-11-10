@@ -21,6 +21,10 @@ toml.workspace = true
 dirs.workspace = true
 half.workspace = true
 
+[dev-dependencies]
+# A cubemap fixture for the every-face test, written by the parser fire-decode reads DDS with.
+ddsfile = "0.6"
+
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",

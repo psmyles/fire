@@ -3,7 +3,7 @@
 //! An in-process COM server with one class, [`fire_thumbs::CLSID`], implementing
 //! `IInitializeWithStream` + `IThumbnailProvider`. Explorer hands it the file as a stream, asks for
 //! a `cx`-pixel thumbnail, and gets back a 32-bit DIB section. Everything between is the viewer's:
-//! `fire_decode::decode` reads the file exactly as the viewer would (same sniffing, same EXIF
+//! `fire_decode::decode` reads the file as the viewer would (same sniffing, same EXIF
 //! orientation, same ICC transform), and `fire_thumbs::render` draws it the way the viewer's shader
 //! does — see that module for the colour pipeline.
 //!
@@ -131,12 +131,8 @@ impl IThumbnailProvider_Impl for Provider_Impl {
 fn thumbnail(stream: &IStream, cx: u32) -> Result<Thumbnail> {
     let cfg = ThumbnailsCfg::load();
     let (bytes, ext) = read_all(stream, cfg.max_file_bytes())?;
-    let img = fire_decode::decode(
-        &bytes,
-        ext.as_deref(),
-        &fire_decode::DecodeOptions::default(),
-    )
-    .map_err(|_| E_FAIL)?;
+    let img = fire_decode::decode(&bytes, ext.as_deref(), &fire_thumbs::decode_options())
+        .map_err(|_| E_FAIL)?;
     // The file and the decoded image can each be large; only one of them need be alive while the
     // thumbnail is drawn.
     drop(bytes);

@@ -327,18 +327,74 @@ fn fill_band(img: &DecodedImage, tx: &Taps, ty: &Taps, j0: usize, band: &mut [Px
 mod tests {
     use super::*;
 
+    /// fire-decode plan step 3's gate: a cubemap decoded the way `fire-shellext` decodes it is
+    /// still the sheet of all six faces, and its thumbnail draws every one of them.
+    #[test]
+    fn a_cubemap_thumbnail_draws_every_face() {
+        use ddsfile::{AlphaMode, D3D10ResourceDimension, Dds, DxgiFormat, NewDxgiParams};
+        let face = 64u32; // a 192x128 sheet, shrunk to the 96 px thumbnail
+        let mut dds = Dds::new_dxgi(NewDxgiParams {
+            height: face,
+            width: face,
+            depth: None,
+            format: DxgiFormat::R8G8B8A8_UNorm,
+            mipmap_levels: Some(1),
+            array_layers: Some(6),
+            is_cubemap: true,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Straight,
+            caps2: Default::default(),
+        })
+        .unwrap();
+        let colours: [[u8; 3]; 6] = [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 0],
+            [255, 0, 255],
+            [0, 255, 255],
+        ];
+        for (k, chunk) in dds.data.chunks_mut((face * face * 4) as usize).enumerate() {
+            for px in chunk.chunks_mut(4) {
+                px[..3].copy_from_slice(&colours[k]);
+                px[3] = 255;
+            }
+        }
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+
+        let img = fire_decode::decode(&bytes, Some("dds"), &crate::decode_options()).unwrap();
+        let layout = img.layout.expect("still a sheet");
+        assert_eq!((layout.cols, layout.rows, layout.frames), (3, 2, 6));
+
+        let cfg = ThumbnailsCfg {
+            backdrop: crate::Backdrop::Transparent,
+            ..ThumbnailsCfg::default()
+        };
+        let thumb = render(&img, 96, &cfg).unwrap();
+        assert_eq!((thumb.width, thumb.height), (96, 64));
+        for (k, want) in colours.iter().enumerate() {
+            let (cx, cy) = (k as u32 % 3 * 32 + 16, k as u32 / 3 * 32 + 16);
+            let i = ((cy * thumb.width + cx) * 4) as usize;
+            let bgra = &thumb.bgra[i..i + 4];
+            let rgb = [bgra[2], bgra[1], bgra[0]];
+            assert!(
+                rgb.iter().zip(want).all(|(a, b)| a.abs_diff(*b) < 8),
+                "face {k} is {rgb:?}, expected {want:?}"
+            );
+        }
+    }
+
     fn image(w: u32, h: u32, format: PixelFormat, pixels: Vec<u8>) -> DecodedImage {
         DecodedImage {
             pixels,
             width: w,
             height: h,
             format,
-            bit_depth: 8,
-            channels: 4,
-            palette: false,
+            source: fire_decode::SourceInfo::new(fire_decode::Format::Unknown, "test", 4, 8),
             alpha_opaque: false,
             icc: None,
-            source_format: "test",
+
             downscaled_from: None,
             source_mips: None,
             layout: None,

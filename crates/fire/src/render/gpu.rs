@@ -803,7 +803,7 @@ impl GpuSurface {
         self.tex
             .current
             .as_ref()
-            .is_some_and(|i| matches!(i.channels, 2 | 4))
+            .is_some_and(|i| matches!(i.source.channels, 2 | 4))
     }
 
     pub fn background(&self) -> Background {
@@ -1816,7 +1816,7 @@ fn channel_code(ch: Channel) -> i32 {
 /// and an inspectable alpha channel (`alpha_opaque`); the user can still isolate the all-white
 /// alpha.
 fn default_background(img: &DecodedImage) -> Background {
-    let has_transparency = matches!(img.channels, 2 | 4) && !img.alpha_opaque;
+    let has_transparency = matches!(img.source.channels, 2 | 4) && !img.alpha_opaque;
     if has_transparency {
         Background::Checker
     } else {

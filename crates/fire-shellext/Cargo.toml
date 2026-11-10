@@ -18,7 +18,7 @@ psd = ["fire-decode/psd"]
 heif = ["fire-decode/heif"]
 
 [dependencies]
-fire-decode.workspace = true
+fire-decode = { workspace = true, features = ["icc", "raw"] }
 fire-thumbs.workspace = true
 
 [target.'cfg(windows)'.dependencies]

@@ -438,7 +438,8 @@ fn plan(
 fn gather_all(jobs: &[&Subject], repo: Option<&Repo>) -> Vec<Option<Result<Facts, String>>> {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let workers = jobs.len().min(cores).clamp(1, MAX_WORKERS);
-    let threads_each = (cores / workers).max(1);
+    // No per-worker share of the cores: fire-decode's process-wide budget divides them between
+    // the workers' decodes (its FD8).
     let next = AtomicUsize::new(0);
     let mut out: Vec<Option<Result<Facts, String>>> = (0..jobs.len()).map(|_| None).collect();
     std::thread::scope(|scope| {
@@ -451,9 +452,7 @@ fn gather_all(jobs: &[&Subject], repo: Option<&Repo>) -> Vec<Option<Result<Facts
                         let Some(subject) = jobs.get(index) else {
                             break;
                         };
-                        let facts = fire_decode::with_max_threads(threads_each, || {
-                            gather_one(subject, repo)
-                        });
+                        let facts = gather_one(subject, repo);
                         mine.push((index, facts));
                     }
                     mine

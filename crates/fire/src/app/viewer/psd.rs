@@ -303,12 +303,9 @@ impl Viewer {
             width: 1,
             height: 1,
             format,
-            bit_depth: 8,
-            channels: 4,
-            palette: false,
+            source: fire_decode::SourceInfo::new(fire_decode::Format::Psd, "PSD", 4, 8),
             alpha_opaque: false,
             icc: None,
-            source_format: "PSD",
             downscaled_from: None,
             source_mips: None,
             layout: None,
@@ -404,10 +401,7 @@ impl Viewer {
                 ctl,
                 pos: p,
                 doc: Arc::clone(&s.doc),
-                opts: fire_decode::DecodeOptions {
-                    max_dim: super::MAX_CPU_DIM,
-                    honor_icc: true,
-                },
+                opts: super::decode_options(),
             });
         }
     }

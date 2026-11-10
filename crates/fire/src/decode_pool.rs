@@ -649,7 +649,13 @@ fn decode(job: &DecodeJob) -> (Result<DecodedImage, DecodeError>, Option<Vec<u8>
         };
         let ext = job.path.extension().and_then(|e| e.to_str());
         let progress = |f: f32| job.progress.advance(READ_END + f * (DECODE_END - READ_END));
-        let result = fire_decode::decode_with_progress(&bytes, ext, &job.opts, &progress);
+        // Never cancelled yet: a superseded job runs to the end and is stale-dropped (step 6d
+        // wires fire's cancel into libheif's).
+        let ctl = fire_decode::DecodeCtl {
+            progress: &progress,
+            cancel: &|| false,
+        };
+        let result = fire_decode::decode_with_progress(&bytes, ext, &job.opts, &ctl);
         let keep = result.is_ok() && bytes.starts_with(b"8BPS");
         (result, keep.then_some(bytes))
     }))

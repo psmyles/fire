@@ -17,8 +17,8 @@ use std::str::Chars;
 
 /// Whether `path`'s extension is one fire decodes (the folder-navigation membership test).
 ///
-/// The list itself lives in [`fire_decode::SUPPORTED_EXTENSIONS`], next to the routing it
-/// describes. This module used to keep a copy, and it had drifted from the Open dialog's copy in
+/// The list itself is [`fire_decode::supported_extensions`], next to the routing it describes, and
+/// follows the build's features. This module used to keep a copy, and it had drifted from the Open dialog's copy in
 /// `win.rs` — arrow-key navigation stepped through `.qoi`/`.jxl` files the dialog wouldn't show.
 pub fn is_supported_image(path: &Path) -> bool {
     path.extension()
@@ -162,7 +162,11 @@ mod tests {
         assert!(is_supported_image(Path::new("a.png")));
         assert!(is_supported_image(Path::new("a.PNG")));
         assert!(is_supported_image(Path::new(r"C:\x\photo.JpEg")));
-        assert!(is_supported_image(Path::new("a.avif")));
+        // What this build decodes: no AVIF without `heif` (fire-decode's `supported_extensions`).
+        assert_eq!(
+            is_supported_image(Path::new("a.avif")),
+            cfg!(feature = "heif")
+        );
         assert!(!is_supported_image(Path::new("a.txt")));
         assert!(!is_supported_image(Path::new("noext")));
     }

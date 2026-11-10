@@ -4,11 +4,8 @@ members = [
     "crates/fire-ipc",
     "crates/fire",
     "crates/fire-cli",
-    "crates/fire-decode",
     "crates/fire-thumbs",
     "crates/fire-shellext",
-    "crates/psd-sdk-sys",
-    "crates/heif-sys",
 ]
 # `vendor/sokol-rust` is a pinned upstream copy (D22), not our code, but it sits inside the
 # workspace directory and cargo makes any path dependency there a member automatically — which
@@ -64,8 +61,6 @@ winit = "=0.30.13"
 sokol = { path = "vendor/sokol-rust" }
 dear-imgui-rs = { version = "=0.17.0", default-features = false }
 dear-imgui-winit = "=0.17.0"
-# POD casts: the shader's uniform block and 16-bit pixel reinterpretation in the decode path.
-bytemuck = { version = "1", features = ["derive"] }
 # Instance coordination: one named pipe (Windows) / Unix socket (macOS) behind one API. The bind
 # *is* the single-instance lock — no mutex.
 interprocess = "2.4"
@@ -75,39 +70,10 @@ dirs = "6"
 rfd = { version = "0.17", default-features = false }
 
 # --- decode ---
-# zune is the hot-path decoder for the common formats. Its default feature is `all`, which is
-# wider than the routing in `sniff()` can ever reach: PSD goes to psd_sdk before zune sees it,
-# and PNG/HDR are deliberately routed to the `image` crate (measured faster - see `decode_png` /
-# `decode_hdr`), so zune-psd/zune-png/zune-hdr would be decoders nothing can call. `metadata`
-# (kamadak-exif) is likewise unused - the ICC accessor we do read is unconditional, and the only
-# EXIF Fire cares about is the orientation of a raw's embedded preview, which `raw.rs` reads
-# itself. Enable exactly the formats routed here, plus the two speed features.
-zune-image = { version = "0.5", default-features = false, features = [
-    "jpeg",
-    "bmp",
-    "qoi",
-    "ppm",
-    "farbfeld",
-    "webp",
-    "jpeg-xl",
-    "simd",
-    "threads",
-] }
-zune-core = "0.5"
-zune-jpeg = "0.5"
-zune-bmp = "0.5"
-zune-ppm = "0.5"
-zune-farbfeld = "0.5"
-jxl-oxide = "0.12"
-qoi = "0.4"
-libwebp-sys = "0.14"
+# Decoding itself is fire-decode's (below). What fire's own crates still name: fire-cli reads an
+# ICC profile's description with lcms2 and inflates XMP with miniz_oxide, and writes its test
+# fixtures with `image` and `image-webp`; fire-thumbs reads half floats.
 image-webp = "0.2"
-# The `image` crate is the fallback decoder (TIFF/TGA/ICO), the multi-frame GIF path, and —
-# deliberately — the PNG and Radiance HDR paths, whose decoders measured faster than zune's; see
-# `decode_png` / `decode_hdr`. Only the formats we actually route to it are enabled: the default
-# feature set also pulls in `avif`, i.e. `ravif` -> `rav1e`, a complete AV1 *encoder* (one of the
-# heaviest builds in the ecosystem) that fire can never reach — AVIF is sniffed by magic bytes and
-# decoded by libheif/dav1d.
 image = { version = "0.25", default-features = false, features = [
     "png",
     "gif",
@@ -118,25 +84,8 @@ image = { version = "0.25", default-features = false, features = [
     "bmp",
     "jpeg",
 ] }
-# TIFF is decoded directly against this crate rather than through `image`, which collapses
-# everything the `tiff` crate does not hand it as a named colour type: it drops a 4th sample it
-# was not told is alpha, refuses grey+alpha outright, and narrows 16-bit to 8. Same crate
-# `image` uses underneath, so this adds no build weight — see `fire-decode`'s `tiff` module.
-tiff = "0.11"
-exr = "1"
 lcms2 = { version = "6", features = ["static"] }
-# DDS: a container parser plus a block decompressor, both pure Rust and both tiny. `ddsfile`
-# reads the header (legacy D3D9 pixel formats and the DX10 `DxgiFormat` extension, plus the
-# cubemap/array/volume flags); `bcdec_rs` is a safe port of iOrange's `bcdec` and decodes the
-# BC1-BC7 blocks, BC6H included. Deliberately not `image_dds` (it wraps both but hides the
-# format table we want to own) and not `image`'s own `dds` feature (DXT1/3/5 only, no BC6H/BC7).
-ddsfile = "0.6"
-bcdec_rs = "0.2"
-# zlib inflate for ZIP-compressed PSD layer channels (`fire-decode`'s `psd_layers`). Already in
-# the build through `png`/`flate2`, so naming it adds no crate.
 miniz_oxide = "0.8"
-# Half floats, for `fire-thumbs` reading half-float sources (half EXR, BC6H DDS). Already in the
-# build through `exr`, so naming it adds no crate.
 half = "2"
 
 # --- config / fs ---
@@ -187,17 +136,16 @@ objc2-app-kit = "0.2"
 
 # --- internal crates ---
 fire-ipc = { path = "crates/fire-ipc" }
-# `default-features = false` here is load-bearing, not tidiness: without it cargo ignores a
-# member's own `default-features = false` (with only a warning) and the psd/heif gate silently
-# does nothing. `fire` turns both back on through its own default feature.
-fire-decode = { path = "crates/fire-decode", default-features = false }
+# The shared decoder (fire-decode plan, FD1), from its own repository. Until its first tag, the
+# branch; local work on both goes through a `[patch."https://github.com/psmyles/fire-decode"]` in
+# an untracked `.cargo/config.toml` in the folder that holds both checkouts (FD13). It has no
+# default features: each member names the ones it uses, and `fire` turns PSD and HEIF on through
+# its own default feature.
+fire-decode = { git = "https://github.com/psmyles/fire-decode", branch = "main" }
 fire-thumbs = { path = "crates/fire-thumbs" }
-psd-sdk-sys = { path = "crates/psd-sdk-sys" }
-heif-sys = { path = "crates/heif-sys" }
 
 # --- build deps ---
 cc = "1"
-bindgen = "0.71"
 # Embeds the Fire .ico + version/product metadata into fire.exe (Explorer file
 # icon, taskbar fallback, file-properties "Product name").
 winresource = "0.1"
