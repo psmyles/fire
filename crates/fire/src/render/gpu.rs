@@ -2070,6 +2070,47 @@ fn make_level_view(image: sg::Image, level: u32) -> Result<sg::View, String> {
 mod tests {
     use super::Placement;
 
+    /// Both tone curves clamp negatives before anything else (fire-decode plan, step 6a; FD17), in
+    /// the one shader source and in both backends `scripts/gen-shaders.sh` generated from it, so a
+    /// source edited without regenerating fails here too. fire-thumbs' CPU copy of the curves is
+    /// the one tested on values, down past Reinhard's pole at -1
+    /// (`negative_values_tonemap_to_black`); the shader has to read the same.
+    #[test]
+    fn the_tone_curves_clamp_negatives_first() {
+        let glsl = include_str!("shader.glsl");
+        let metal = include_str!("generated/shader_viewport_metal_macos_fragment.metal");
+        let hlsl = include_str!("generated/shader_viewport_hlsl5_fragment.hlsl");
+        for (curve, x) in [("reinhard", "c"), ("aces", "x")] {
+            for (source, signature, clamp) in [
+                (
+                    glsl,
+                    format!("vec3 {curve}(vec3 {x})"),
+                    format!("{x} = max({x}, 0.0);"),
+                ),
+                (
+                    metal,
+                    format!("float3 {curve}(thread float3& {x})"),
+                    format!("{x} = fast::max({x}, float3(0.0));"),
+                ),
+                (
+                    hlsl,
+                    format!("float3 {curve}(inout float3 {x})"),
+                    format!("{x} = max({x}, 0.0f.xxx);"),
+                ),
+            ] {
+                let start = source
+                    .find(&signature)
+                    .unwrap_or_else(|| panic!("no `{signature}`"));
+                let body = &source[start..];
+                let first = body[body.find('{').unwrap() + 1..].trim_start();
+                assert!(
+                    first.starts_with(&clamp),
+                    "`{signature}` must start with `{clamp}`"
+                );
+            }
+        }
+    }
+
     /// A canvas pixel maps into a placed layer's texture only where the texture reaches.
     #[test]
     fn placement_texel_maps_canvas_pixels_into_the_layer() {

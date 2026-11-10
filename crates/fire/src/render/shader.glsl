@@ -72,7 +72,14 @@ vec3 linear_to_srgb(vec3 c) {
     vec3 hi = 1.055 * pow(max(c, 0.0), vec3(1.0 / 2.4)) - 0.055;
     return mix(hi, lo, step(c, vec3(0.0031308)));
 }
-vec3 reinhard(vec3 c) { return c / (1.0 + c); }
+// Both tone curves clamp negatives to 0 first. A float image can hold negative values - a colour
+// outside Rec.709 after a wide-gamut conversion (fire-decode plan, FD17) - and both curves misread
+// them: Reinhard's c / (1 + c) is infinite at -1 and large and positive below it, and the ACES fit
+// reads a large negative as white. fire-thumbs' CPU copy does the same, and is the one unit-tested.
+vec3 reinhard(vec3 c) {
+    c = max(c, 0.0);
+    return c / (1.0 + c);
+}
 
 // The viewport backdrop in linear light: solid black/white/40%-grey, or a Photoshop-style
 // checkerboard keyed to the surface pixel. Used both for the letterbox around the image and as
@@ -88,6 +95,7 @@ vec3 backdrop(vec2 sp) {
     return vec3(v);
 }
 vec3 aces(vec3 x) {
+    x = max(x, 0.0);
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }

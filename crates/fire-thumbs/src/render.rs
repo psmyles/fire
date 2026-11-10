@@ -119,7 +119,12 @@ fn backdrop(b: Backdrop, x: usize, y: usize, cell: usize) -> Option<[f32; 3]> {
     Some([v; 3])
 }
 
+/// The HDR tone curves, the viewer shader's in CPU form. Negatives are clamped to 0 first: a float
+/// image can hold them (a colour outside Rec.709 after a wide-gamut conversion, fire-decode plan
+/// FD17), and both curves misread them. Reinhard's `c / (1 + c)` is infinite at -1 and large and
+/// positive below it, and the ACES fit reads a large negative as white.
 fn tonemap(t: Tonemap, c: [f32; 3]) -> [f32; 3] {
+    let c = c.map(|x| x.max(0.0));
     match t {
         Tonemap::Reinhard => c.map(|x| x / (1.0 + x)),
         Tonemap::Aces => c.map(|x| {
@@ -532,6 +537,27 @@ mod tests {
         };
         let t = render(&img, 1, &aces).unwrap();
         assert_eq!(at(&t, 0, 0)[0], encode(tonemap(Tonemap::Aces, [1.0; 3])[0]));
+    }
+
+    /// Negative values are black under both curves, at -1 (Reinhard's pole), below it, and at
+    /// -infinity: never infinite, never white (step 6a). The other channels are untouched.
+    #[test]
+    fn negative_values_tonemap_to_black() {
+        for t in [Tonemap::Reinhard, Tonemap::Aces] {
+            let half = tonemap(t, [0.5; 3])[0];
+            assert!(half > 0.0 && half < 1.0);
+            for x in [-1e-6f32, -0.25, -1.0, -1.5, -10.0, -1e6, f32::NEG_INFINITY] {
+                assert_eq!(tonemap(t, [x, 0.5, x]), [0.0, half, 0.0], "{t:?} at {x}");
+            }
+        }
+        // And a whole render: an out-of-gamut HDR texel keeps its in-gamut channel only.
+        let px: Vec<u8> = [-1.0f32, -2.0, 1.0, 1.0]
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+        let img = image(1, 1, PixelFormat::Rgba32Float, px);
+        let t = render(&img, 1, &ThumbnailsCfg::default()).unwrap();
+        assert_eq!(at(&t, 0, 0), [188, 0, 0, 255]); // BGRA: 1.0 under Reinhard is sRGB 188
     }
 
     /// One NaN or infinite texel in a float image costs its own pixel, not the average around it.

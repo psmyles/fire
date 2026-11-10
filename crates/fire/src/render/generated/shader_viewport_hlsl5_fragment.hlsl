@@ -1,28 +1,28 @@
 cbuffer params : register(b0)
 {
-    float2 _112_img_size : packoffset(c0);
-    float2 _112_surf_size : packoffset(c0.z);
-    float2 _112_pan : packoffset(c1);
-    float _112_inv_zoom : packoffset(c1.z);
-    float _112_exposure : packoffset(c1.w);
-    int _112_channel : packoffset(c2);
-    int _112_tonemap : packoffset(c2.y);
-    int _112_is_hdr : packoffset(c2.z);
-    int _112_has_image : packoffset(c2.w);
-    int _112_linear_sample : packoffset(c3);
-    int _112_background : packoffset(c3.y);
-    int _112_outline : packoffset(c3.z);
-    int _112_fb_on : packoffset(c3.w);
-    float4 _112_clear_lin : packoffset(c4);
-    float2 _112_sheet_size : packoffset(c5);
-    float2 _112_cell_a : packoffset(c5.z);
-    float2 _112_cell_b : packoffset(c6);
-    float _112_fb_blend : packoffset(c6.z);
-    float _112_fb_max_lod : packoffset(c6.w);
-    float2 _112_surf_origin : packoffset(c7);
-    float _112_oct_crop : packoffset(c7.z);
-    float _112_oct_hide : packoffset(c7.w);
-    float4 _112_layer_rect : packoffset(c8);
+    float2 _115_img_size : packoffset(c0);
+    float2 _115_surf_size : packoffset(c0.z);
+    float2 _115_pan : packoffset(c1);
+    float _115_inv_zoom : packoffset(c1.z);
+    float _115_exposure : packoffset(c1.w);
+    int _115_channel : packoffset(c2);
+    int _115_tonemap : packoffset(c2.y);
+    int _115_is_hdr : packoffset(c2.z);
+    int _115_has_image : packoffset(c2.w);
+    int _115_linear_sample : packoffset(c3);
+    int _115_background : packoffset(c3.y);
+    int _115_outline : packoffset(c3.z);
+    int _115_fb_on : packoffset(c3.w);
+    float4 _115_clear_lin : packoffset(c4);
+    float2 _115_sheet_size : packoffset(c5);
+    float2 _115_cell_a : packoffset(c5.z);
+    float2 _115_cell_b : packoffset(c6);
+    float _115_fb_blend : packoffset(c6.z);
+    float _115_fb_max_lod : packoffset(c6.w);
+    float2 _115_surf_origin : packoffset(c7);
+    float _115_oct_crop : packoffset(c7.z);
+    float _115_oct_hide : packoffset(c7.w);
+    float4 _115_layer_rect : packoffset(c8);
 };
 
 Texture2D<float4> tex : register(t0);
@@ -69,21 +69,21 @@ float3 srgb_to_linear(float3 c)
 
 float3 backdrop(float2 sp)
 {
-    if (_112_background == 0)
+    if (_115_background == 0)
     {
         return 0.0f.xxx;
     }
-    if (_112_background == 1)
+    if (_115_background == 1)
     {
         return 1.0f.xxx;
     }
-    if (_112_background == 2)
+    if (_115_background == 2)
     {
         float3 param = 0.4000000059604644775390625f.xxx;
         return srgb_to_linear(param);
     }
-    float2 _148 = floor(sp * 0.083333335816860198974609375f.xx);
-    return ((mod(_148.x + _148.y, 2.0f) < 0.5f) ? 0.449999988079071044921875f : 0.20999999344348907470703125f).xxx;
+    float2 _151 = floor(sp * 0.083333335816860198974609375f.xx);
+    return ((mod(_151.x + _151.y, 2.0f) < 0.5f) ? 0.449999988079071044921875f : 0.20999999344348907470703125f).xxx;
 }
 
 float2 texel_center(float2 t, float2 size)
@@ -93,220 +93,224 @@ float2 texel_center(float2 t, float2 size)
 
 float4 sample_cell(float2 f, float2 cell)
 {
-    float2 _231 = cell + clamp(f, 0.5f.xx, _112_img_size - 0.5f.xx);
+    float2 _237 = cell + clamp(f, 0.5f.xx, _115_img_size - 0.5f.xx);
     float4 s;
-    if (_112_inv_zoom <= 1.0f)
+    if (_115_inv_zoom <= 1.0f)
     {
-        float2 param = _231;
-        float2 param_1 = _112_sheet_size;
+        float2 param = _237;
+        float2 param_1 = _115_sheet_size;
         s = tex.SampleLevel(samp_point, texel_center(param, param_1), 0.0f);
     }
     else
     {
-        s = tex.SampleLevel(samp_aniso, _231 / _112_sheet_size, min(log2(_112_inv_zoom), _112_fb_max_lod));
+        s = tex.SampleLevel(samp_aniso, _237 / _115_sheet_size, min(log2(_115_inv_zoom), _115_fb_max_lod));
     }
-    if (_112_linear_sample == 0)
+    if (_115_linear_sample == 0)
     {
         float3 param_2 = s.xyz;
-        float3 _286 = srgb_to_linear(param_2);
-        float4 _709 = s;
-        _709.x = _286.x;
-        _709.y = _286.y;
-        _709.z = _286.z;
-        s = _709;
+        float3 _292 = srgb_to_linear(param_2);
+        float4 _715 = s;
+        _715.x = _292.x;
+        _715.y = _292.y;
+        _715.z = _292.z;
+        s = _715;
     }
     return s;
 }
 
 float2 grad_x(float2 size)
 {
-    return float2(_112_inv_zoom / size.x, 0.0f);
+    return float2(_115_inv_zoom / size.x, 0.0f);
 }
 
 float2 grad_y(float2 size)
 {
-    return float2(0.0f, _112_inv_zoom / size.y);
+    return float2(0.0f, _115_inv_zoom / size.y);
 }
 
-float3 aces(float3 x)
+float3 aces(inout float3 x)
 {
+    x = max(x, 0.0f.xxx);
     return clamp((x * ((x * 2.5099999904632568359375f) + 0.02999999932944774627685546875f.xxx)) / ((x * ((x * 2.4300000667572021484375f) + 0.589999973773956298828125f.xxx)) + 0.14000000059604644775390625f.xxx), 0.0f.xxx, 1.0f.xxx);
 }
 
-float3 reinhard(float3 c)
+float3 reinhard(inout float3 c)
 {
+    c = max(c, 0.0f.xxx);
     return c / (1.0f.xxx + c);
 }
 
 float4 shade(float4 pos)
 {
-    if (_112_has_image == 0)
+    if (_115_has_image == 0)
     {
-        return _112_clear_lin;
+        return _115_clear_lin;
     }
-    float2 _314 = pos.xy - _112_surf_origin;
-    float2 _332 = (_112_img_size * 0.5f) + ((_314 - ((_112_surf_size * 0.5f) + _112_pan)) * _112_inv_zoom);
-    float _335 = _332.x;
-    float _344 = _332.y;
-    float _357 = max(max(-_335, _335 - _112_img_size.x), max(-_344, _344 - _112_img_size.y)) / _112_inv_zoom;
-    if (((_112_outline != 0) && (_357 > (-0.00390625f))) && (_357 < 0.99609375f))
+    float2 _320 = pos.xy - _115_surf_origin;
+    float2 _338 = (_115_img_size * 0.5f) + ((_320 - ((_115_surf_size * 0.5f) + _115_pan)) * _115_inv_zoom);
+    float _341 = _338.x;
+    float _350 = _338.y;
+    float _363 = max(max(-_341, _341 - _115_img_size.x), max(-_350, _350 - _115_img_size.y)) / _115_inv_zoom;
+    if (((_115_outline != 0) && (_363 > (-0.00390625f))) && (_363 < 0.99609375f))
     {
-        float _376 = float(_112_background == 0);
-        return float4(_376, _376, _376, 1.0f);
+        float _382 = float(_115_background == 0);
+        return float4(_382, _382, _382, 1.0f);
     }
-    bool _382 = _335 < 0.0f;
-    bool _389;
-    if (!_382)
+    bool _388 = _341 < 0.0f;
+    bool _395;
+    if (!_388)
     {
-        _389 = _344 < 0.0f;
-    }
-    else
-    {
-        _389 = _382;
-    }
-    bool _398;
-    if (!_389)
-    {
-        _398 = _335 >= _112_img_size.x;
+        _395 = _350 < 0.0f;
     }
     else
     {
-        _398 = _389;
+        _395 = _388;
     }
-    bool _407;
-    if (!_398)
+    bool _404;
+    if (!_395)
     {
-        _407 = _344 >= _112_img_size.y;
+        _404 = _341 >= _115_img_size.x;
     }
     else
     {
-        _407 = _398;
+        _404 = _395;
     }
-    if (_407)
+    bool _413;
+    if (!_404)
     {
-        float2 param = _314;
+        _413 = _350 >= _115_img_size.y;
+    }
+    else
+    {
+        _413 = _404;
+    }
+    if (_413)
+    {
+        float2 param = _320;
         return float4(backdrop(param), 1.0f);
     }
     float3 rgb;
     float a;
-    if (_112_fb_on != 0)
+    if (_115_fb_on != 0)
     {
-        float2 param_1 = _332;
-        float2 param_2 = _112_cell_a;
+        float2 param_1 = _338;
+        float2 param_2 = _115_cell_a;
         float4 s = sample_cell(param_1, param_2);
-        if (_112_fb_blend > 0.0f)
+        if (_115_fb_blend > 0.0f)
         {
-            float2 param_3 = _332;
-            float2 param_4 = _112_cell_b;
-            s = lerp(s, sample_cell(param_3, param_4), _112_fb_blend.xxxx);
+            float2 param_3 = _338;
+            float2 param_4 = _115_cell_b;
+            s = lerp(s, sample_cell(param_3, param_4), _115_fb_blend.xxxx);
         }
         rgb = s.xyz;
         a = s.w;
     }
     else
     {
-        float2 _464 = _332 - _112_layer_rect.xy;
-        float _470 = _464.x;
-        bool _471 = _470 < 0.0f;
-        bool _478;
-        if (!_471)
+        float2 _470 = _338 - _115_layer_rect.xy;
+        float _476 = _470.x;
+        bool _477 = _476 < 0.0f;
+        bool _484;
+        if (!_477)
         {
-            _478 = _464.y < 0.0f;
+            _484 = _470.y < 0.0f;
         }
         else
         {
-            _478 = _471;
+            _484 = _477;
         }
-        bool _487;
-        if (!_478)
+        bool _493;
+        if (!_484)
         {
-            _487 = _470 >= _112_layer_rect.z;
+            _493 = _476 >= _115_layer_rect.z;
         }
         else
         {
-            _487 = _478;
+            _493 = _484;
         }
-        bool _496;
-        if (!_487)
+        bool _502;
+        if (!_493)
         {
-            _496 = _464.y >= _112_layer_rect.w;
+            _502 = _470.y >= _115_layer_rect.w;
         }
         else
         {
-            _496 = _487;
+            _502 = _493;
         }
-        if (_496)
+        if (_502)
         {
             rgb = 0.0f.xxx;
             a = 0.0f;
         }
         else
         {
-            float4 _504;
-            if (_112_inv_zoom <= 1.0f)
+            float4 _510;
+            if (_115_inv_zoom <= 1.0f)
             {
-                float2 param_5 = _464;
-                float2 param_6 = _112_layer_rect.zw;
-                _504 = tex.SampleLevel(samp_point, texel_center(param_5, param_6), 0.0f);
+                float2 param_5 = _470;
+                float2 param_6 = _115_layer_rect.zw;
+                _510 = tex.SampleLevel(samp_point, texel_center(param_5, param_6), 0.0f);
             }
             else
             {
-                float2 param_7 = _112_layer_rect.zw;
-                float2 param_8 = _112_layer_rect.zw;
-                _504 = tex.SampleGrad(samp_aniso, _464 / _112_layer_rect.zw, grad_x(param_7), grad_y(param_8));
+                float2 param_7 = _115_layer_rect.zw;
+                float2 param_8 = _115_layer_rect.zw;
+                _510 = tex.SampleGrad(samp_aniso, _470 / _115_layer_rect.zw, grad_x(param_7), grad_y(param_8));
             }
-            rgb = _504.xyz;
-            a = _504.w;
-            if (_112_linear_sample == 0)
+            rgb = _510.xyz;
+            a = _510.w;
+            if (_115_linear_sample == 0)
             {
                 float3 param_9 = rgb;
                 rgb = srgb_to_linear(param_9);
             }
         }
     }
-    if (_112_is_hdr != 0)
+    if (_115_is_hdr != 0)
     {
-        rgb *= _112_exposure;
-        float3 _558;
-        if (_112_tonemap == 1)
+        rgb *= _115_exposure;
+        float3 _564;
+        if (_115_tonemap == 1)
         {
             float3 param_10 = rgb;
-            _558 = aces(param_10);
+            float3 _569 = aces(param_10);
+            _564 = _569;
         }
         else
         {
             float3 param_11 = rgb;
-            _558 = reinhard(param_11);
+            float3 _573 = reinhard(param_11);
+            _564 = _573;
         }
-        rgb = _558;
+        rgb = _564;
     }
     float3 outc;
-    if (_112_channel == 1)
+    if (_115_channel == 1)
     {
         outc = rgb.xxx;
     }
     else
     {
-        if (_112_channel == 2)
+        if (_115_channel == 2)
         {
             outc = rgb.yyy;
         }
         else
         {
-            if (_112_channel == 3)
+            if (_115_channel == 3)
             {
                 outc = rgb.zzz;
             }
             else
             {
-                if (_112_channel == 4)
+                if (_115_channel == 4)
                 {
                     float3 param_12 = a.xxx;
                     outc = srgb_to_linear(param_12).xxx;
                 }
                 else
                 {
-                    if (_112_channel == 5)
+                    if (_115_channel == 5)
                     {
                         outc = rgb;
                     }
@@ -315,7 +319,7 @@ float4 shade(float4 pos)
                         outc = rgb;
                         if (a < 0.999000012874603271484375f)
                         {
-                            float2 param_13 = _314;
+                            float2 param_13 = _320;
                             outc = (backdrop(param_13) * (1.0f - a)) + (rgb * a);
                         }
                     }
@@ -323,16 +327,16 @@ float4 shade(float4 pos)
             }
         }
     }
-    if (_112_oct_hide > 0.0f)
+    if (_115_oct_hide > 0.0f)
     {
-        float2 _642 = abs((_332 / _112_img_size) - 0.5f.xx);
-        float _651 = _112_oct_crop / max(1.0f - _112_oct_crop, 0.5f);
-        float _653 = _642.x;
-        float _656 = _642.y;
-        if (max(_653 + (_651 * _656), _656 + (_651 * _653)) > 0.5f)
+        float2 _648 = abs((_338 / _115_img_size) - 0.5f.xx);
+        float _657 = _115_oct_crop / max(1.0f - _115_oct_crop, 0.5f);
+        float _659 = _648.x;
+        float _662 = _648.y;
+        if (max(_659 + (_657 * _662), _662 + (_657 * _659)) > 0.5f)
         {
-            float2 param_14 = _314;
-            outc = lerp(outc, backdrop(param_14), _112_oct_hide.xxx);
+            float2 param_14 = _320;
+            outc = lerp(outc, backdrop(param_14), _115_oct_hide.xxx);
         }
     }
     return float4(outc, 1.0f);
@@ -346,9 +350,9 @@ float3 linear_to_srgb(float3 c)
 void frag_main()
 {
     float4 param = gl_FragCoord;
-    float4 _690 = shade(param);
-    float3 param_1 = clamp(_690.xyz, 0.0f.xxx, 1.0f.xxx);
-    frag_color = float4(linear_to_srgb(param_1), _690.w);
+    float4 _696 = shade(param);
+    float3 param_1 = clamp(_696.xyz, 0.0f.xxx, 1.0f.xxx);
+    frag_color = float4(linear_to_srgb(param_1), _696.w);
 }
 
 SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)
