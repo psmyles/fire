@@ -2,18 +2,20 @@
 
 **Status, 10 November 2026:** A1 and A2 are done and merged into `main`, and A2's end-to-end check
 against review3d-cli has passed on Windows. A3, the rules catalog, is done and merged. Asset Check
-is done across its repositories, so B is next. B.3 and B.4 are done on the `fire-decode` branch
-(10 November 2026), against fire-decode's step 3. fire-cli depends on asset-rules `v0.2.1`.
+is done across its repositories, so B is next. B.1's macOS baselines are recorded (fire-decode's
+`docs/baselines.md`), and B.2 to B.6 are done on the `fire-decode` branch (10 November 2026),
+against fire-decode's steps 3, 6 and 7. fire-cli depends on asset-rules
+`v0.2.1`.
 
 Open items, in order:
 1. **A2 on the Mac:** run `build-mac.sh` and `dev-app.sh`, and `fire-cli` inside the bundle (A2's
    last section).
 2. **B, the migration.** The Launcher's results table and Asset Check's rules repo,
-   SandboxVR/exp-content-rules, are done. B's step 2, the tonemap fix, can be done at any time.
+   SandboxVR/exp-content-rules, are done. What fire's side still needs is Windows: the merge onto
+   fire-decode's first tag, and the checks in "Needs Windows".
 
-`docs/fire-decode-plan.md` was updated on 10 November 2026 from the canonical copy. It now gives
-fire-cli its own setup (`inspect()`, EXIF orientation off) and keeps fire-shellext's cubemap sheets
-(B.4 below).
+`docs/fire-decode-plan.md` is kept in step with the canonical copy; on 10 November 2026 it gained
+steps 3-7 as built.
 
 The work is ordered for a stretch on a Mac; items that need Windows are collected at the end.
 
@@ -181,11 +183,14 @@ It depends on asset-rules `v0.2.0`, tagged 5 November 2026; `v0.2.1` since 6 Nov
 
 1. **macOS baselines (step 0):** record TTFP per format, HEIC and AVIF included, with
    `scripts/ttfp.sh`. Windows baselines come later.
-2. **Make the tonemap safe for negative values (step 6a).**
+2. **Make the tonemap safe for negative values (step 6a). Done on the `fire-decode` branch**
+   (`1a88bbb`, 10 November 2026).
    - `reinhard(c) = c / (1 + c)` (`crates/fire/src/render/shader.glsl:75`, and the copy in
-     `crates/fire-thumbs/src/render.rs`) returns infinity at −1 and a large positive value below it.
-   - Clamp negatives before tonemapping, and add a test with negative inputs and inputs below −1.
-   - This is independent of everything else, so it can be done any time.
+     `crates/fire-thumbs/src/render.rs`) returned infinity at −1 and a large positive value below
+     it.
+   - Both tone curves, Reinhard and ACES, now clamp negatives first, in the shader and in
+     fire-thumbs, with a test of negative inputs and inputs below −1. ACES needed it too: a large
+     negative came out white.
 3. **Develop fire against the new fire-decode repo** on a branch, through a `[patch]` in a
    `.cargo/config.toml` in the folder that holds both checkouts. fire's own `.cargo/config.toml` is
    committed, so it isn't the place (3D Review's `docs/cli.md`, "Building against unreleased
@@ -200,7 +205,7 @@ It depends on asset-rules `v0.2.0`, tagged 5 November 2026; `v0.2.1` since 6 Nov
    - The installer-association test moved into `crates/fire/tests/installer.rs`, against
      `fire_decode::all_extensions()`.
    - The workspace dependencies only the in-tree crates used are gone, `bindgen` among them.
-   - **Builds use `cargo +1.99.1`.** The crate needs Rust 1.99, and this Mac's `stable` is 1.98.1.
+   - **Builds need Rust 1.99**, the crate's floor; this Mac's `stable` is 1.99.1.
    - **CI isn't updated on the branch.** Its jobs still name `-p fire-decode` and the vendored
      artifacts. They move when the branch merges for the tag (fire-decode's `docs/PLAN.md`, "Needs
      Windows", item 7).
@@ -235,6 +240,24 @@ Both are malformed files Photoshop doesn't write.
      - The facts it reads (`bit_depth`, `channels`, `palette`, `source_format`) move to
        `DecodedImage::source`.
 
+5. **HDR, gain maps and sequences (steps 6b-6d). Done on the `fire-decode` branch** (10 November
+   2026); fire-decode's `docs/baselines.md` has the gates.
+   - **6b** (`28a892d`): a PQ / HLG HEIC or AVIF opens as HDR. fire asks for `Hdr::Linear` from
+     what `probe()` reports, before the decode.
+   - **6c** (`1ccce64`): a gain-map photo opens as its SDR base. `H` (`toggle-hdr`) switches the
+     window to HDR mode and decodes it again with its gain map applied, keeping the view.
+   - **6d** (`94bc48e`): animated AVIF / HEIF play as GIFs do, each for its stated loop count. A
+     decode the window has moved on from is cancelled.
+
+6. **The mip builder moves to fire-decode (step 7). Done on the `fire-decode` branch**
+   (`c66ac58`, 10 November 2026).
+   - `render/mips.rs`'s builder is fire-decode's `mips` feature (FD11), which 3D Review now
+     shares. `render/mips.rs` keeps the upload side: the level count, the texel width and the
+     half-float conversions.
+   - 8-bit chains are byte-identical to before. 16-bit chains round exactly now, up to 2 in
+     65535 apart. Half-float chains are now right at subnormals, which the old table halved.
+   - The builder is faster on every format: 8-bit by 20%, half float 4×. TTFP is within noise.
+
 ## Needs Windows (later)
 
 - Windows TTFP baselines; fire's switch to the fire-decode tag (step 1).
@@ -247,6 +270,8 @@ Both are malformed files Photoshop doesn't write.
     compiled the installer with ISCC.
   - FD20's: no runtime DLL needed on a clean machine.
 - Moving the installer-association test out of fire-decode into a fire crate (FD2, FD9).
+- Steps 6 and 7 on Direct3D 11: fire-decode's `docs/PLAN.md`, "Needs Windows", items 13 and 14
+  (the regenerated HLSL, HDR mode, sequences, TTFP with the new mip builder).
 
 ## References
 

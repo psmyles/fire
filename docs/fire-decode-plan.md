@@ -1,6 +1,6 @@
 # fire-decode - Shared Decoder Plan
 
-**Status: in progress.** Steps 0-6 are done on the Mac, each with its Windows half still to
+**Status: in progress.** Steps 0-7 are done on the Mac, each with its Windows half still to
 do; `docs/PLAN.md` tracks them. The design was revised in November 2026, after fire, bite
 and 3D Review shipped their late-October releases. That revision made three changes:
 - HEIF / HEIC / AVIF moves into the crate. The October version kept it in fire.
@@ -596,6 +596,34 @@ tables, and adopts a file's own chain.
     the crate's builder or keeps the file for the bake alone.
 - bite leaves the feature off.
 
+**As built (step 7):**
+- **It is a module, `fire_decode::mips`, over a level-0 slice** rather than one function over a
+  `DecodedImage`: 3D Review builds chains of its own buffers (a float source has two readings).
+  - `chain` builds levels `1..`. `complete` keeps a DDS's stored levels and computes the tail.
+    `stored_levels` counts the levels `complete` keeps. `fit` returns the first level within a
+    size, for 3D Review's `fitted_within`. `level_count` gives the number of levels.
+  - `MipOptions` carries `srgb`, `max_levels` and `max_threads`.
+- **8-bit chains are byte-identical** to fire's builder and to 3D Review's `rhi/mips.rs`, in both
+  of 3D Review's modes, over every 8-bit file in the corpus.
+  - Integer samples now round exactly, ties up, so 16-bit chains move by up to 2 in 65535.
+  - fire's old half-float table halved every subnormal; the crate's is exact. Half-float chains
+    differ only at those values, all below 6.1×10⁻⁵.
+- **Threads:** a level of 256×256 texels or more is split across up to 8 threads leased from the
+  budget, fire's cap.
+  - The crate's builder is faster than fire's on every format: 20% on 8-bit, 4× on half float.
+  - On one thread it is 20% faster than 3D Review's.
+- **3D Review keeps each chain with its decoded image** (`DecodedImage::mips`), one per kind of
+  upload: colour, data, or shown as stored in the Tex viewport. Since images are cached by path,
+  this is FD11's "cached by `(path, srgb)`".
+  - A model's textures build the chains their slots need on the decode workers.
+  - A reload builds the chains its last decode had.
+  - Any other chain is built at first use.
+  - The chains stay in memory with the image: +83 MB (+3.7%) on a 15-texture test model.
+- **`rhi/mips.rs` stays for the UV-checker bake alone**, moved to `build/mips.rs`.
+  - Compiling the crate into the build script would build it a second time for the host,
+    libwebp's C code included.
+  - A test holds the file to the crate's builder byte for byte, and the bake's output is unchanged.
+
 ### FD12 - bite's thumbnail cache
 
 - **Thumbnails the crate makes are written as lossless WebP through `image-webp`.** It is already a
@@ -676,6 +704,8 @@ tables, and adopts a file's own chain.
 step 7. CI runs core, psd, psd + heif (thumbnail and texture until `mips`) and psd + heif + icc +
 raw (viewer). The local performance gate is `bench/decode-formats`, built against this checkout
 or, with `--features old-api`, an older one.
+
+**As built (step 7):** `mips` exists, and CI runs the four sets as the table lists them.
 
 ### FD14 - Licences and consumer docs
 
@@ -1186,8 +1216,22 @@ pub enum DecodeError { Malformed(String), TooLarge(String), NoMergedImage, Unsup
 
 pub use psd_layers::{PsdLayers, LayerInfo, LayerCtl, LayerImage, LayerError, BlendMode, Rect};
 
-#[cfg(feature = "mips")]                       // step 7
-pub fn mip_chain(img: &DecodedImage, srgb: bool, max_levels: u32) -> Vec<Vec<u8>>;
+#[cfg(feature = "mips")]                       // step 7 (FD11)
+pub mod mips {
+    #[non_exhaustive] pub struct MipOptions { pub srgb: bool,          // 8-bit in linear light
+                                              pub max_levels: u32,     // 0 = no cap
+                                              pub max_threads: usize } // 0 = the budget's
+    impl MipOptions { pub fn new(srgb: bool) -> MipOptions; }
+    pub fn level_count(width: u32, height: u32) -> u32;
+    pub fn chain(level0: &[u8], width: u32, height: u32, format: PixelFormat,
+                 opts: &MipOptions) -> Vec<Vec<u8>>;                  // levels 1..
+    pub fn complete(stored: Vec<Vec<u8>>, level0: &[u8], width: u32, height: u32,
+                    format: PixelFormat, opts: &MipOptions) -> Vec<Vec<u8>>;
+    pub fn stored_levels(stored: &[Vec<u8>], width: u32, height: u32, format: PixelFormat,
+                         opts: &MipOptions) -> usize;
+    pub fn fit(level0: &[u8], width: u32, height: u32, format: PixelFormat, max_side: u32,
+               opts: &MipOptions) -> Option<(Vec<u8>, u32, u32)>;
+}
 ```
 
 **Changed from the October sketch while building it:**
@@ -1202,6 +1246,7 @@ pub fn mip_chain(img: &DecodedImage, srgb: bool, max_levels: u32) -> Vec<Vec<u8>
   count in the `image` crate's decoder, and fire loops every animation today.
 - **`.psb` stays in both lists**, as `Format::Psd`. The crate reads PSD only, so a PSB fails to
   decode, but fire-cli checks one from its header and fire's installer registers it.
+- **`mips` is a module over slices** (step 7), not `mip_chain(&DecodedImage, ..)`: see FD11.
 
 ---
 
