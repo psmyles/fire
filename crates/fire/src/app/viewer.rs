@@ -2516,6 +2516,14 @@ fn format_meta(img: &DecodedImage, file_size: Option<u64>) -> String {
     if img.icc.is_some() {
         s.push_str("   ICC");
     }
+    // An animation's length, and whether a cap cut it short (fire-decode plan, FD18): 1 GiB of
+    // frames or 10,000 of them. The frames kept still play.
+    if let Some(a) = &img.animation {
+        let _ = write!(s, "   {} frames", a.frames.len());
+        if a.truncated {
+            s.push_str(" (cut short: too long to hold)");
+        }
+    }
     // What makes it HDR, and for a gain-map photo which rendering this is.
     match img.source.hdr {
         fire_decode::HdrKind::Pq => s.push_str("   PQ"),

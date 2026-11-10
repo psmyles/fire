@@ -152,6 +152,23 @@ pub struct FlipbookParams {
 struct AnimState {
     img: Option<Arc<DecodedImage>>,
     index: usize,
+    /// Whole passes through the frames so far, for an animation that plays a set number of
+    /// times (a HEIF sequence's `loop_count`, FD18).
+    plays: u32,
+}
+
+/// The frame after `index` of `n`, and the plays completed, or `None` when the animation has
+/// played its `loop_count` times and stops on its last frame. `None` loops forever, as every
+/// animation did before (GIF has no loop count from its decoder).
+fn next_frame(index: usize, n: usize, plays: u32, loop_count: Option<u32>) -> Option<(usize, u32)> {
+    if index + 1 < n {
+        return Some((index + 1, plays));
+    }
+    let plays = plays.saturating_add(1);
+    match loop_count {
+        Some(count) if plays >= count => None,
+        _ => Some((0, plays)),
+    }
 }
 
 impl AnimState {
@@ -159,11 +176,20 @@ impl AnimState {
     fn adopt(&mut self, img: &Arc<DecodedImage>) {
         self.img = img.animation.is_some().then(|| Arc::clone(img));
         self.index = 0;
+        self.plays = 0;
     }
 
     fn clear(&mut self) {
         self.img = None;
         self.index = 0;
+        self.plays = 0;
+    }
+
+    fn loop_count(&self) -> Option<u32> {
+        self.img
+            .as_ref()
+            .and_then(|i| i.animation.as_ref())
+            .and_then(|a| a.loop_count)
     }
 
     fn frames(&self) -> &[AnimationFrame] {
@@ -1221,7 +1247,8 @@ impl GpuSurface {
 
     /// Advance to the next animation frame (wrapping) and upload it as the texture, returning the
     /// now-current frame's delay (ms) so the caller can reschedule the timer (GIF frame delays
-    /// vary). Returns `None` and does nothing for a still image. On a GPU upload error the visible
+    /// vary). Returns `None` and does nothing for a still image, or for an animation that has
+    /// played its loop count, which stays on its last frame. On a GPU upload error the visible
     /// frame is left unchanged and the current frame's delay is returned, so a transient failure
     /// paces the retry rather than wedging playback. The frame's mip chain is built here, on the
     /// UI thread: GIF frames are small.
@@ -1234,7 +1261,9 @@ impl GpuSurface {
         // mip level being viewed, and a frame is uploaded whole.
         let img = self.tex.current.as_ref()?;
         let (w, h, format) = (img.width, img.height, img.format);
-        let next = (self.anim.index + 1) % n;
+        let (next, plays) =
+            next_frame(self.anim.index, n, self.anim.plays, self.anim.loop_count())?;
+        self.anim.plays = plays;
         match create_image_texture(
             &self.gpu,
             &self.anim.frames()[next].pixels,
@@ -2069,6 +2098,24 @@ fn make_level_view(image: sg::Image, level: u32) -> Result<sg::View, String> {
 #[cfg(test)]
 mod tests {
     use super::Placement;
+
+    /// An animation loops forever without a count, and with one plays that many times and stops
+    /// on its last frame (a HEIF sequence's repetitions, FD18).
+    #[test]
+    fn animations_play_their_loop_count() {
+        use super::next_frame;
+        // Three frames, played twice: 0 1 2 0 1 2, then stop on 2.
+        let (mut index, mut plays, mut shown) = (0, 0, vec![0]);
+        while let Some((i, p)) = next_frame(index, 3, plays, Some(2)) {
+            (index, plays) = (i, p);
+            shown.push(i);
+        }
+        assert_eq!(shown, [0, 1, 2, 0, 1, 2]);
+        // No count: it wraps for as long as it is asked.
+        assert_eq!(next_frame(2, 3, 41, None), Some((0, 42)));
+        // Once, as `seq_over_cap.avif` says: 0 1 2 and done.
+        assert_eq!(next_frame(2, 3, 0, Some(1)), None);
+    }
 
     /// Both tone curves clamp negatives before anything else (fire-decode plan, step 6a; FD17), in
     /// the one shader source and in both backends `scripts/gen-shaders.sh` generated from it, so a

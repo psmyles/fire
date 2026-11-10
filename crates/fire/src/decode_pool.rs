@@ -649,11 +649,18 @@ fn decode(job: &DecodeJob) -> (Result<DecodedImage, DecodeError>, Option<Vec<u8>
         };
         let ext = job.path.extension().and_then(|e| e.to_str());
         let progress = |f: f32| job.progress.advance(READ_END + f * (DECODE_END - READ_END));
-        // Never cancelled yet: a superseded job runs to the end and is stale-dropped (step 6d
-        // wires fire's cancel into libheif's).
+        // A job its window has moved on from (another image, or this one re-decoded) is
+        // cancelled: fire-decode polls this between stages, between a sequence's frames and
+        // inside libheif (fire-decode plan, FD16 / FD18). It would be stale-dropped anyway; this
+        // stops a long HEIF or sequence decode from holding the pool meanwhile.
+        let cancel = || {
+            job.gen_cell
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed) != job.generation)
+        };
         let ctl = fire_decode::DecodeCtl {
             progress: &progress,
-            cancel: &|| false,
+            cancel: &cancel,
         };
         let opts = crate::app::with_hdr_for(job.opts, &bytes, ext);
         let result = fire_decode::decode_with_progress(&bytes, ext, &opts, &ctl);
