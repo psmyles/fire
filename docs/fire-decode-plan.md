@@ -1,7 +1,7 @@
 # fire-decode - Shared Decoder Plan
 
-**Status: in progress.** Steps 0-5 and 6a-6c are done on the Mac, each with its Windows half
-still to do; `docs/PLAN.md` tracks them. The design was revised in November 2026, after fire, bite
+**Status: in progress.** Steps 0-6 are done on the Mac, each with its Windows half still to
+do; `docs/PLAN.md` tracks them. The design was revised in November 2026, after fire, bite
 and 3D Review shipped their late-October releases. That revision made three changes:
 - HEIF / HEIC / AVIF moves into the crate. The October version kept it in fire.
 - fire's viewer gains HDR, gain-map and image-sequence support.
@@ -1009,6 +1009,26 @@ exposure / tonemap handles the range.
 
 **Done early (step 3):** `Animation::truncated`, set for GIF when a cap cuts the walk short.
 
+**As built (step 6d):**
+- **`Animation::loop_count: Option<u32>`**: the track's repetitions, `None` for an infinite loop and
+  for GIF (whose count the `image` crate doesn't read), so fire keeps looping those as it did.
+  fire plays a counted animation that many times and stops on its last frame.
+- **The sequence is the first visual track**, decoded only with `frames: All` and only when the
+  file has a `moov` box; one that fails leaves the still when there is one. Delays are rounded
+  to milliseconds, and 0 is shown as 100 ms, as GIF's are.
+- **Truncation is judged against the track's sample count** (`stsz` / `stz2`, read in Rust),
+  rather than by decoding a frame past the cap: at 4096² that frame alone would be 64 MiB. A frame
+  of another size or depth ends the sequence, flagged too.
+- **Progress** is frames done over that count, from a `moov` the crate reads itself; **cancel** is
+  polled between frames and by libheif. fire's pool now cancels a decode its window has moved on
+  from, so a long one stops instead of running to a stale drop.
+- **A PQ / HLG track converts frame by frame**, from its sample entry's nclx: `hdr::convert` runs
+  over every buffer.
+- **Measured:** the three fixture sequences' frames, colours, delays and loop counts; the infinite
+  loop ends; `seq_over_cap.avif` keeps 16 frames at the real cap (606 ms) and 4 under a 256 MiB
+  budget, flagged; progress rises to 1; a cancel after the first frame stops it. `texture()` /
+  `thumbnail()` output is unchanged (they take `First`).
+
 ### FD19 - `probe()`
 
 `probe(reader, ext_hint) -> Result<Probe, DecodeError>` returns width, height and `Format` without
@@ -1147,8 +1167,8 @@ pub struct DecodedImage {
     pub downscaled_from: Option<(u32, u32)>,
     pub source_mips: Option<Vec<Vec<u8>>>,
     pub layout: Option<SheetLayout>,
-    pub animation: Option<Animation>,          // Animation { frames, truncated: bool };
-}                                              // loop_count arrives with sequences in 6d
+    pub animation: Option<Animation>,          // Animation { frames, truncated: bool,
+}                                              //   loop_count: Option<u32> } (6d; None = forever)
 
 pub struct SourceInfo {                        // SourceInfo::new(format, name, channels, depth)
     pub format: Format,
