@@ -37,8 +37,8 @@ see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 - **[dav1d](https://code.videolan.org/videolan/dav1d)** - VideoLAN and the dav1d authors. AV1
   decoding for AVIF.
 - **[psd_sdk](https://github.com/MolecularMatters/psd_sdk)** - Stefan Reinalter / Molecular
-  Matters. The composite image of Photoshop `.psd` and `.psb` files. Fire's patches are listed in
-  `crates/psd-sdk-sys/vendor/VENDOR.txt`.
+  Matters. The composite image of Photoshop `.psd` files, inside fire-decode, whose hardening
+  patches are listed in its `crates/psd-sdk-sys/vendor/VENDOR.txt`.
 - **[miniz_oxide](https://github.com/Frommi/miniz_oxide)** - Frommi and oyvindln, from miniz by
   Rich Geldreich. Inflates ZIP-compressed PSD layer channels.
 
@@ -129,15 +129,14 @@ see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
   **[parking_lot](https://github.com/Amanieu/parking_lot)**,
   **[smallvec](https://github.com/servo/rust-smallvec)**,
   **[hashbrown](https://github.com/rust-lang/hashbrown)** and others - see
-  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the complete list of 184 crates.
+  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the complete list of 187 crates.
 
 ## Build tooling
 
 Used to build Fire; not linked into the binary.
 
-- **[bindgen](https://github.com/rust-lang/rust-bindgen)** and
-  **[cc](https://github.com/rust-lang/cc-rs)** - the Rust project. FFI bindings and C/C++
-  compilation for psd_sdk, libheif, sokol and sokol_imgui.
+- **[cc](https://github.com/rust-lang/cc-rs)** - the Rust project. C/C++ compilation for
+  psd_sdk and the HEIF wrapper (inside fire-decode), sokol and sokol_imgui.
 - **`sokol-shdc`** - Andre Weissflog. Shader cross-compilation to Direct3D and Metal, with
   reflection.
 - **`fxc` (Windows SDK) and `xcrun metal` (Xcode)** - Microsoft and Apple. Offline shader

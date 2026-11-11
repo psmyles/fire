@@ -11,62 +11,68 @@ Fire's own code is MIT licensed; see [`../LICENSE`](../LICENSE).
 * **Section 1** covers the native C/C++ libraries. Read this one — it is short, and it contains
   the only obligation in the whole distribution that goes beyond attribution (the LGPL relink
   right, below).
-* **Section 2** covers the Rust crates (184 of them). One of them, `option-ext`, is MPL-2.0; the
+* **Section 2** covers the Rust crates (187 of them). One of them, `option-ext`, is MPL-2.0; the
   note under the table says what that does and does not require.
 * **Section 3** notes what is *not* here, and why.
 
 Generated against Fire 0.6.0 (`Cargo.lock`, runtime dependencies only, for the union of the two
 shipped targets `x86_64-pc-windows-msvc` and `aarch64-apple-darwin` — a crate that appears on only
 one of them is still listed, since both binaries are built from this tree). Build-time-only
-tooling — `bindgen`, `cc`, `resvg`, `winresource`, `sokol-shdc`, `fxc`, `xcrun metal` — is
-excluded: it produces the binary but no part of it is linked into the binary.
+tooling — `cc`, `resvg`, `winresource`, `sokol-shdc`, `fxc`, `xcrun metal` — is excluded: it
+produces the binary but no part of it is linked into the binary.
 
 ---
 
 ## 1. Native libraries
 
-These are C/C++ libraries, statically linked: vendored under `crates/*/vendor/`, or inside the
-`-sys` crate that compiles them.
+These are C/C++ libraries, statically linked. Most come through
+[fire-decode](https://github.com/psmyles/fire-decode), Fire's image decoder, a git dependency at
+the release tag `Cargo.toml` names: its `heif-sys` links the HEIF stack, prebuilt and committed in
+its tree, and its `psd-sdk-sys` compiles psd_sdk. The rest are inside the `-sys` crate that
+compiles them.
 
-### libheif — LGPL-3.0-only
+### libheif — LGPL-3.0-or-later
 
-*HEIF/AVIF container parsing and API. Version 1.23.0 (Windows) / 1.23.2 (macOS). Linked via `crates/heif-sys`.*
+*HEIF/AVIF container parsing and API. Version 1.23.7, a prebuilt static library in fire-decode's
+`crates/heif-sys/vendor/<target>/lib/`.*
 Copyright © Dirk Farin and contributors — <https://github.com/strukturag/libheif>
 
-### libde265 — LGPL-3.0-only
+### libde265 — LGPL-3.0-or-later
 
-*HEVC decoder, used for `.heic` / `.heif`. Version 1.1.1. Linked via `crates/heif-sys`.*
+*HEVC decoder, used for `.heic` / `.heif`. Version 1.1.3, prebuilt as libheif is.*
 Copyright © struktur AG and contributors — <https://github.com/strukturag/libde265>
 
 > ### Your rights under the LGPL
 >
-> libheif and libde265 are licensed under the **GNU Lesser General Public License, version 3**
-> ([`licenses/LGPL-3.0.txt`](../licenses/LGPL-3.0.txt), which incorporates
-> [`licenses/GPL-3.0.txt`](../licenses/GPL-3.0.txt)). Fire links them statically, so LGPL-3.0 §4
+> libheif and libde265 are licensed under the **GNU Lesser General Public License, version 3 or
+> any later version** ([`licenses/LGPL-3.0.txt`](../licenses/LGPL-3.0.txt), which incorporates
+> [`licenses/GPL-3.0.txt`](../licenses/GPL-3.0.txt)). `fire.exe`, `fire-cli.exe`,
+> `fire_shellext.dll` and the binaries in `Fire.app` link them statically, so LGPL-3.0 §4
 > entitles you to modify those libraries and relink Fire against your modified versions.
 >
 > Fire does not restrict that in any way:
 >
 > * **Fire's complete source is public and MIT licensed**, including every build script that
->   produces `fire.exe`.
-> * **The exact static libraries linked into this build are in the source tree**, at
->   `crates/heif-sys/vendor/<target>/lib/` — `x64-windows/` (`heif.lib`, `libde265.lib`) and
->   `arm64-macos/` (`libheif.a`, `libde265.a`) — each beside the public headers it was built
->   against, in the same target directory.
-> * **`crates/heif-sys/vendor/VENDOR.txt` documents precisely how those `.lib` files were built**
->   — the upstream versions, the vcpkg triplet (`x64-windows-static-md`), the port patches, and
->   the post-build strip step — so you can reproduce or replace them.
+>   produces its binaries, and so is fire-decode's.
+> * **The exact static libraries are in fire-decode's tree at the tag Fire uses**, in
+>   `crates/heif-sys/vendor/<target>/lib/` (`x64-windows/`, `arm64-macos/`), beside the public
+>   headers they were built against. Its `crates/heif-sys/vendor/VENDOR.txt` is the recipe they
+>   were built by: the vcpkg baseline, the triplets and the checks.
+> * **Each fire-decode tag's GitHub release carries the upstream source tarballs** of the exact
+>   versions, so the corresponding source stays available from there, not only from upstream.
 >
-> To relink: build your own libheif / libde265 static libraries from modified sources, drop them
-> into `crates/heif-sys/vendor/<target>/lib/` under the names already there, and run
-> `cargo build -p fire --release`. The resulting binary uses your libraries.
+> **To relink:** build your own libheif / libde265 static libraries from modified sources; put
+> them in a local checkout of that fire-decode tag, in `crates/heif-sys/vendor/<target>/lib/`,
+> under the names already there; point Fire at that checkout with a
+> `[patch."https://github.com/psmyles/fire-decode"]` entry in an untracked `.cargo/config.toml`;
+> and run `cargo build -p fire -p fire-cli -p fire-shellext --release`. On macOS, re-sign the
+> relinked app. The resulting binaries use your libraries.
 >
-> Neither library was modified for Fire. Corresponding sources for the versions above are
-> available from the upstream projects linked next to each entry.
+> Neither library is modified.
 
 ### dav1d — BSD-2-Clause
 
-*AV1 decoder, used for `.avif`. Linked via `crates/heif-sys`.*
+*AV1 decoder, used for `.avif`. Version 1.5.4, prebuilt as libheif is.*
 Copyright © 2018-2024 VideoLAN and dav1d authors. All rights reserved.
 <https://code.videolan.org/videolan/dav1d>
 License text: [`licenses/BSD-2-Clause.txt`](../licenses/BSD-2-Clause.txt)
@@ -82,8 +88,9 @@ grants a patent license for WebP; its terms are in the `PATENTS` file of the lib
 
 ### psd_sdk — BSD-2-Clause
 
-*Photoshop `.psd` / `.psb` reader. Linked via `crates/psd-sdk-sys`; vendored at commit
-`f514495`.*
+*Photoshop `.psd` reader. Compiled from source by fire-decode's `psd-sdk-sys`, from upstream
+commit `f514495` with fire-decode's hardening patches (marked in the source; see its
+`crates/psd-sdk-sys/vendor/VENDOR.txt`).*
 Copyright © 2011-2020 Molecular Matters GmbH — <https://github.com/MolecularMatters/psd_sdk>
 License text: [`licenses/BSD-2-Clause.txt`](../licenses/BSD-2-Clause.txt)
 
@@ -120,14 +127,14 @@ License text: [`licenses/Zlib.txt`](../licenses/Zlib.txt)
 
 ## 2. Rust crates
 
-184 crates are linked into the Fire binaries (the union of both shipped targets). Where a crate
+187 crates are linked into the Fire binaries (the union of both shipped targets). Where a crate
 offers a choice of licenses, the column below records **the license Fire elects**, not the full
 SPDX expression — Fire elects MIT wherever MIT is offered, then the most permissive of what is
 left. Full texts:
 
 | License | Text |
 |---|---|
-| MIT (172 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
+| MIT (175 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
 | BSD-3-Clause (6) | [`licenses/BSD-3-Clause.txt`](../licenses/BSD-3-Clause.txt) |
 | 0BSD (3) | [`licenses/0BSD.txt`](../licenses/0BSD.txt) |
 | Apache-2.0 (1, plus 1 in addition to MIT) | [`licenses/Apache-2.0.txt`](../licenses/Apache-2.0.txt) |
@@ -190,6 +197,7 @@ rows name the authors the crate itself declares.
 | `exr` | 1.74.0 | BSD-3-Clause | Copyright (c) Contributors to the OpenEXR Project. All rights reserved. |
 | `fax` | 0.2.7 | MIT | Copyright © 2021 The pdf-rs contributers. |
 | `fdeflate` | 0.3.7 | MIT | (no notice in crate; authors: The image-rs Developers) |
+| `fire-decode` | 0.1.0 | MIT | Copyright (c) 2026 Chandan Singh |
 | `flate2` | 1.1.9 | MIT | Copyright (c) 2014-2026 Alex Crichton |
 | `foreign-types` | 0.5.0 | MIT | Copyright (c) 2017 The foreign-types Developers |
 | `foreign-types-macros` | 0.2.3 | MIT | Copyright (c) 2017 The foreign-types Developers |
@@ -199,6 +207,7 @@ rows name the authors the crate itself declares.
 | `globset` | 0.4.21 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant |
 | `half` | 2.7.1 | MIT | (no notice in crate; authors: Kathryn Long <squeeself@gmail.com>) |
 | `hashbrown` | 0.17.1 | MIT | Copyright (c) 2016 Amanieu d'Antras |
+| `heif-sys` | 0.1.0 | MIT | Copyright (c) 2026 Chandan Singh |
 | `hybrid-array` | 0.4.15 | MIT | Copyright (c) 2022-2026 The RustCrypto Project Developers |
 | `image` | 0.25.10 | MIT | (no notice in crate; authors: The image-rs Developers) |
 | `image-webp` | 0.2.4 | MIT | (no copyright notice supplied by the crate) |
@@ -253,6 +262,7 @@ rows name the authors the crate itself declares.
 | `pin-project-lite` | 0.2.17 | MIT | (no copyright notice supplied by the crate) |
 | `png` | 0.18.1 | MIT | Copyright (c) 2015 nwin |
 | `proc-macro2` | 1.0.106 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>, Alex Crichton <alex@alexcrichton.com>) |
+| `psd-sdk-sys` | 0.1.0 | MIT | Copyright (c) 2026 Chandan Singh |
 | `pxfm` | 0.1.29 | BSD-3-Clause | Copyright (c) Radzivon Bartoshyk. All rights reserved. |
 | `qoi` | 0.4.1 | MIT | Copyright (c) 2022 Ivan Smirnov |
 | `quick-error` | 2.0.1 | MIT | Copyright (c) 2015 The quick-error Developers |
@@ -365,7 +375,7 @@ affected. Full text: [`licenses/MPL-2.0.txt`](../licenses/MPL-2.0.txt).
   `advapi32`, `shell32`, `ole32` and friends from the Windows SDK. On macOS it links the `Cocoa`,
   `QuartzCore`, `Metal` and `Foundation` frameworks. These are operating-system components
   licensed to the user by Microsoft and by Apple as part of the OS, not redistributed by Fire.
-* **Build-time tooling.** `bindgen`, `cc`, `resvg`, `winresource`, `sokol-shdc`, `fxc.exe` and
+* **Build-time tooling.** `cc`, `resvg`, `winresource`, `sokol-shdc`, `fxc.exe` and
   `xcrun metal` run during the build and contribute no code to the binary. Inno
   Setup builds the Windows installer; its license permits distributing the installers it produces
   without attribution. The macOS `.dmg` is built with Apple's own `codesign` / `notarytool` /

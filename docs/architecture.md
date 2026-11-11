@@ -995,8 +995,10 @@ accelerator leaves AppKit to pick. The red button still closes the window.
   only system DLLs (D3D11/DXGI and friends - no redistributable, no bundled runtime, and with the shader
   precompiled, not even `d3dcompiler`); on macOS it links the system frameworks the vendored sokol
   tree names for itself (`Cocoa` / `QuartzCore` / `Metal`). The C++ `psd_sdk` and the
-  `libheif`/`libde265`/`dav1d` decoder stack are built/linked via the `cc`/`bindgen` build scripts
-  in `psd-sdk-sys` and `heif-sys`; `fire`'s own `build.rs` compiles the shader bytecode (§5.3),
+  `libheif`/`libde265`/`dav1d` decoder stack come with fire-decode, a git dependency at a release
+  tag: its `psd-sdk-sys` compiles psd_sdk with `cc`, and its `heif-sys` links the HEIF stack,
+  prebuilt for both targets and built `/MT`, so Windows builds use the static C runtime
+  (`.cargo/config.toml`, FD20). `fire`'s own `build.rs` compiles the shader bytecode (§5.3),
   compiles `simgui.c`, rasterizes the toolbar SVGs, and on Windows embeds the `.ico` + version
   resource via `winresource`.
 - **`product.json` (repo root) is the single source of product metadata** - name, version,
@@ -1023,11 +1025,11 @@ accelerator leaves AppKit to pick. The red button still closes the window.
   are mandatory (D23): clippy on Windows never sees `render/metal.rs`, `openfiles.rs` or
   `menubar.rs`, and clippy on macOS never sees `render/d3d11.rs` or the `windows-sys` leaves, so a
   single-host CI cannot keep the workspace lint-clean. Each host runs two jobs: `check` with
-  `--no-default-features` (no vendored native trees, so no bindgen and no LLVM needed - it covers
-  `fire-ipc`, the pure-Rust decode core and the whole shell), and `full`, gated on a restored
-  vendor cache, which adds the PSD/HEIF FFI tests and the release build. The vendor cache key
-  carries the runner OS and arch, or the arm64 `.a`s and the x64 `.lib`s would collide. Per D11 CI
-  stops at build-and-test on macOS: it never signs, notarizes or packages.
+  `--no-default-features` (fire-decode without its native decoders: `fire-ipc` and the whole
+  shell), and `full`, the workspace with its defaults, which adds the PSD/HEIF tests and the
+  release build. fire-decode's own tests run in its own CI. Every cargo command is `--locked`, so
+  a lockfile left pointing at a local fire-decode checkout fails. Per D11 CI stops at
+  build-and-test on macOS: it never signs, notarizes or packages.
 
   The mac leg needs one thing the Windows leg does not: the **Metal toolchain**, which since
   Xcode 26 is an optional ~700 MB component present on some runner images and not others, and which

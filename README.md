@@ -49,17 +49,21 @@ crates/
                  instance socket (the whole app; the file manager launches it directly)
   fire-cli/      fire-cli, Asset Check's image checker: a console program that checks images
                  against a technical artist's rules (docs/cli.md)
-  fire-decode/   uniform decode core: bytes → (pixels, format, bit depth, ICC)
   fire-ipc/      wire format for forwarding an open to the running instance, dependency-light
   fire-thumbs/   Explorer thumbnails minus the COM: settings, format table, CPU render, and (Windows)
                  the HKCU registration and the thumbnail-cache purge
   fire-shellext/ fire_shellext.dll, the IThumbnailProvider Explorer loads (Windows)
-  psd-sdk-sys/   FFI to vendored psd_sdk C++ (cc + bindgen)
-  heif-sys/      FFI to vendored libheif + libde265 + dav1d for AVIF / HEIF / HEIC (cc + bindgen)
 vendor/
   sokol-rust/    pinned upstream copy of floooh/sokol-rust (the crates.io `sokol` name is taken
                  by an unrelated crate); excluded from the workspace, built as a path dependency
 ```
+
+Every image is decoded by [fire-decode](https://github.com/psmyles/fire-decode), the decoder Fire
+shares with 3D Review and bite. It is a git dependency at a release tag (`Cargo.toml`;
+`Cargo.lock` records it), and it brings its own native code: psd_sdk, compiled from source, and
+the HEIF / HEIC / AVIF stack, prebuilt for both targets. To try a change to it in Fire, point
+Fire at a checkout of it with a `[patch."https://github.com/psmyles/fire-decode"]` in an untracked
+`.cargo/config.toml` above both, and take that out again before updating `Cargo.lock`.
 
 ## Build & dev
 
@@ -68,13 +72,14 @@ cargo build --workspace
 cargo run -p fire -- path/to/img.png   # open an image
 cargo run -p fire                      # open with no image (drag/drop or forward later)
 cargo test -p fire                     # view/config/keybinds/flipbook/folder/theme unit tests
-cargo test -p fire-decode              # decode core tests (incl. tests/heif.rs end-to-end)
 cargo build -p fire --release          # release build (the single fire binary)
 cargo clippy --workspace --all-targets -- -D warnings   # what CI runs
 ```
 
-`--no-default-features` builds the viewer without the two vendored native decoders (PSD and
-HEIF/AVIF), which is how CI checks the whole shell on a runner that has no vendor tree.
+`--no-default-features` builds the viewer without fire-decode's two native decoders (PSD and
+HEIF/AVIF), which CI checks too. On Windows, `.cargo/config.toml` builds with the static C
+runtime: fire-decode's HEIF libraries need it, and the binaries then need no Visual C++
+redistributable.
 
 **Packaging.**
 
@@ -117,13 +122,13 @@ menu).
 
 ## Toolchain prerequisites
 
-Common to both: **Rust stable** via rustup (targets pinned in `rust-toolchain.toml`).
+Common to both: **Rust stable**, 1.99 or later (fire-decode's floor), via rustup (targets
+pinned in `rust-toolchain.toml`). `rustup update stable` if yours is older.
 
 **Windows (`x86_64-pc-windows-msvc`)**
 
 - MSVC C/C++ build tools (VS 2022) + Windows SDK - for `cc` builds and `fxc.exe` (offline
   HLSL → DXBC compile in `build.rs`)
-- LLVM / libclang on `PATH` (or `LIBCLANG_PATH` set) - for `psd-sdk-sys` / `heif-sys` bindgen
 - Inno Setup 6 and ImageMagick, for `scripts/build-installer.ps1` only
 
 **macOS (`aarch64-apple-darwin`)**
@@ -133,14 +138,10 @@ Common to both: **Rust stable** via rustup (targets pinned in `rust-toolchain.to
   shader offline, so this is needed for _every_ build. Verify by **running**
   `xcrun -sdk macosx metal --version` - `xcrun --find metal` succeeds even when the toolchain is
   absent, because what it finds is a stub that only fails when used.
-- Nothing else: libclang for bindgen ships inside Xcode and `clang-sys` finds it unaided.
-- Homebrew `cmake ninja meson nasm pkg-config` plus a bootstrapped vcpkg are needed **only** to
-  re-vendor the HEIF stack (`crates/heif-sys/vendor/VENDOR.txt`), never for a normal build.
+- Nothing else.
 
-The Rust crates are fetched automatically by `cargo`. The external artifacts to vendor are the
-`psd_sdk` C++ source (into `crates/psd-sdk-sys/vendor/`, for the PSD decoder) and the prebuilt
-static `libheif` + `libde265` + `dav1d` libs (into `crates/heif-sys/vendor/<target>/`, one
-directory per target, for AVIF/HEIF/HEIC). See each crate's `vendor/VENDOR.txt` for the recipe.
+Everything else is fetched by `cargo`, fire-decode and its native libraries included: there is
+nothing to vendor by hand.
 
 ## License
 
@@ -151,8 +152,9 @@ The Fire binary is statically linked, so it contains code from ~160 other projec
 carries the formal per-package copyright notices, with full license texts in [licenses/](licenses/).
 The installer and the `.dmg` ship all of it alongside the binary.
 
-One dependency is copyleft: **libheif** and **libde265** are LGPL-3.0-only. Fire links them
+One dependency is copyleft: **libheif** and **libde265** are LGPL-3.0-or-later. Fire links them
 statically, so you are entitled to relink Fire against your own modified builds of those
-libraries - the exact static libraries are in `crates/heif-sys/vendor/<target>/lib/` and the recipe
-that produced them is in `crates/heif-sys/vendor/VENDOR.txt`. See the LGPL section of
+libraries. The exact static libraries are in fire-decode's tree at the tag Fire uses, in
+`crates/heif-sys/vendor/<target>/lib/`, with the recipe beside them, and each fire-decode release
+carries their source. See the LGPL section of
 [docs/THIRD-PARTY-NOTICES.md](docs/THIRD-PARTY-NOTICES.md) for details.
