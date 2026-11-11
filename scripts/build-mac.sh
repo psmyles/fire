@@ -225,15 +225,26 @@ cp "$icns" "$app/Contents/Resources/$name.icns"
 # The four-byte type/creator file. Vestigial, but its absence still confuses some tools.
 printf 'APPL????' > "$app/Contents/PkgInfo"
 
-# The file types Finder will offer Fire for. Read straight out of `SUPPORTED_EXTENSIONS` in
-# fire-decode — *the* extension table — so this cannot drift from what the app can actually open.
+# The file types Finder will offer Fire for. Read straight out of `ALL_EXTENSIONS` in fire-decode's
+# `src/format.rs` — *the* extension table, behind `all_extensions()` — so this cannot drift from
+# what the app can actually open. The whole table rather than `supported_extensions()`, which
+# filters it by decoder feature: the build above turns every decoder on, so the two are one list.
 # `installer/fire.iss` is the one consumer that has to keep its own copy (it is an Inno Setup
 # script and can import nothing), which is why a test asserts it matches; parsing the table here
 # means this file needs no such test.
+#
+# fire-decode is a git dependency, so its source is wherever cargo put it: the checkout of the tag
+# Cargo.lock records, or a local checkout while a `[patch]` points there. `cargo metadata` says
+# which — the same source the binary was built from. jq ships with macOS 15 and later.
+decode_manifest="$(cargo metadata --format-version 1 --manifest-path "$repo/Cargo.toml" \
+    | jq -r '.packages[] | select(.name == "fire-decode") | .manifest_path')"
+[[ -n "$decode_manifest" ]] || die "cargo metadata found no fire-decode package"
+decode_table="$(dirname "$decode_manifest")/src/format.rs"
+[[ -f "$decode_table" ]] || die "no $decode_table — fire-decode's extension table has moved"
 extensions=()
 while IFS= read -r ext; do extensions+=("$ext"); done < <(
-    awk '/^pub const SUPPORTED_EXTENSIONS/{f=1;next} f&&/^\];/{exit} f' \
-        "$repo/crates/fire-decode/src/lib.rs" | sed 's|//.*||' | grep -o '"[a-z0-9]*"' | tr -d '"'
+    awk '/^(pub )?const ALL_EXTENSIONS/{f=1;next} f&&/^\];/{exit} f' "$decode_table" \
+        | sed 's|//.*||' | grep -o '"[a-z0-9]*"' | tr -d '"'
 )
 # A silent parse failure would produce a bundle Finder never offers, which is exactly the kind of
 # thing nobody notices until a colleague reports it. Fail loudly instead.

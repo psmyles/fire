@@ -419,8 +419,8 @@ also detected by magic so a no-extension open still routes correctly.
 | Camera raw (CR2/CR3, NEF, ARW, RAF, ORF, RW2, DNG, …) | **`raw`** (pure Rust) → extract the embedded JPEG **preview**, decode via zune |
 | ICC transforms | **Little CMS** (`lcms2`) over FFI |
 
-`SUPPORTED_EXTENSIONS` in `fire-decode` is *the* table of what Fire opens - 61 extensions. The
-Windows installer keeps a second copy because an Inno Setup script can import nothing, and a test
+`all_extensions()` in `fire-decode` (its `ALL_EXTENSIONS`) is *the* table of what Fire opens - 61
+extensions. The Windows installer keeps a second copy because an Inno Setup script can import nothing, and a test
 (`installer_associations_match_the_extension_table`) polices the two against each other; the macOS `Info.plist`
 needs no such test because `scripts/build-mac.sh` parses the const itself.
 
@@ -889,7 +889,7 @@ not assumed: Windows' own photo thumbnailer returns a 50%-transparent red PNG th
 shows up in "Open With" and can be made the default, without taking `.png` away from Preview on
 install. One entry rather than one per format, because with `Alternate` we do not own the UTI and
 the per-type name never surfaces. The extension list is **parsed out of `fire-decode`'s
-`SUPPORTED_EXTENSIONS`** by `scripts/build-mac.sh`, so unlike the installer's copy it cannot drift;
+`ALL_EXTENSIONS`** by `scripts/build-mac.sh`, so unlike the installer's copy it cannot drift;
 61 extensions in, and LaunchServices resolves them to 48 claimed UTIs (the real ones -
 `public.png`, `com.ilm.openexr-image`, `com.adobe.photoshop-image`, every camera-raw UTI - plus
 dynamic ones for formats macOS has no UTI for, like `.qoi`, `.ff`, `.x3f`). `NSSupportsSuddenTermination`

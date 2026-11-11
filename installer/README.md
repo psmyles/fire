@@ -4,7 +4,7 @@ Unsigned [Inno Setup](https://jrsoftware.org/isinfo.php) installer for `fire.exe
 
 This is the **Windows** package. The macOS twin is `scripts/build-mac.sh`, which produces a signed
 and notarized `dist/Fire-<version>.dmg`; it reads the same `product.json` and, unlike the list
-below, takes its file associations straight out of `fire-decode`'s `SUPPORTED_EXTENSIONS`.
+below, takes its file associations straight out of `fire-decode`'s `ALL_EXTENSIONS`.
 
 ## Build
 
