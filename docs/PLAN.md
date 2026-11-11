@@ -267,9 +267,11 @@ Both are malformed files Photoshop doesn't write.
     three imports `MSVCP140`, `VCRUNTIME140*` or `api-ms-win-crt-*`;
   - fire-shellext's decode path, driven directly: HEIC and AVIF thumbnails upright,
     `pq_lossless.avif` as SDR.
-- fire's switch to the fire-decode tag (step 1): done on this branch, 11 November, onto
-  `v0.1.0`; it lands on `main` with the branch's merge. The installer script runs plain `cargo`,
-  so the machine building it needs a `stable` of at least 1.99 (`rustup update stable`).
+- fire's switch to the fire-decode tag (step 1): done on this branch, 11 November, onto `v0.1.1`,
+  the release that sets every decoder's version (fire-decode pins each exactly: here `exr` 1.74.3,
+  and `lcms2` 6.2.0 with Little-CMS 2.19); it lands on `main` with the branch's merge. The
+  installer script runs plain `cargo`, so the machine building it needs a `stable` of at least
+  1.99 (`rustup update stable`).
 - Hands-on: Explorer thumbnails through the new `fire_shellext.dll` (HEIC, AVIF, PQ as SDR, a
   cubemap DDS's every face); the tone curves on an EXR and a PQ file; `H` on an iPhone HEIC;
   sequences' loop counts and cancel.

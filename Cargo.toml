@@ -137,12 +137,14 @@ objc2-app-kit = "0.2"
 # --- internal crates ---
 fire-ipc = { path = "crates/fire-ipc" }
 # The shared decoder (fire-decode plan, FD1), from its own repository at a release tag, which
-# Cargo.lock records; moving to a new release is this tag and `cargo update -p fire-decode`. Local
-# work on both goes through a `[patch."https://github.com/psmyles/fire-decode"]` in an untracked
-# `.cargo/config.toml` in the folder that holds both checkouts (FD13); take it out before updating
-# Cargo.lock, or the lock records the path. It has no default features: each member names the
-# ones it uses, and `fire` turns PSD and HEIF on through its own default feature.
-fire-decode = { git = "https://github.com/psmyles/fire-decode", tag = "v0.1.0" }
+# Cargo.lock records; moving to a new release is this tag and `cargo update -p fire-decode`. The
+# release sets the decoders' versions too: fire-decode pins each one exactly, so Cargo.lock takes
+# them from the tag, and the decoder crates named here (lcms2, miniz_oxide, image, ...) follow.
+# Local work on both goes through a `[patch."https://github.com/psmyles/fire-decode"]` in an
+# untracked `.cargo/config.toml` in the folder that holds both checkouts (FD13); take it out
+# before updating Cargo.lock, or the lock records the path. It has no default features: each
+# member names the ones it uses, and `fire` turns PSD and HEIF on through its own default feature.
+fire-decode = { git = "https://github.com/psmyles/fire-decode", tag = "v0.1.1" }
 fire-thumbs = { path = "crates/fire-thumbs" }
 
 # --- build deps ---

@@ -136,9 +136,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bcdec_rs"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09c37bc0e9f0924b7dae9988265ef3c76c88538f41a3b06caf4bed07cee5226"
+checksum = "8d521509f38a9ab0fce76656a0416161ee5d42c1eab6672b958391e2ac7a0e31"
 
 [[package]]
 name = "bit_field"
@@ -640,14 +640,15 @@ dependencies = [
 
 [[package]]
 name = "exr"
-version = "1.74.0"
+version = "1.74.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4300e043a56aa2cb633c01af81ca8f699a321879a7854d3896a0ba89056363be"
+checksum = "cb29d0be702adf92c645d9b2f93472906ba83d400e59f98adb3770ce5c18c2f6"
 dependencies = [
  "bit_field",
  "half",
  "lebe",
  "miniz_oxide",
+ "multiversion",
  "rayon-core",
  "smallvec",
  "zune-inflate",
@@ -726,29 +727,51 @@ dependencies = [
 [[package]]
 name = "fire-decode"
 version = "0.0.0"
-source = "git+https://github.com/psmyles/fire-decode?tag=v0.1.0#c68d0eba70c5ec8990698f81ebf35942915e74f7"
+source = "git+https://github.com/psmyles/fire-decode?tag=v0.1.1#be6de7e7844e605c65e4862891add748fe78d61b"
 dependencies = [
  "bcdec_rs",
  "bytemuck",
  "ddsfile",
  "exr",
+ "fax",
+ "fdeflate",
+ "gif 0.14.2",
  "heif-sys",
  "image",
  "image-webp",
+ "jxl-bitstream",
+ "jxl-coding",
+ "jxl-color",
+ "jxl-frame",
+ "jxl-grid",
+ "jxl-image",
+ "jxl-jbr",
+ "jxl-modular",
  "jxl-oxide",
+ "jxl-oxide-common",
+ "jxl-render",
+ "jxl-threadpool",
+ "jxl-vardct",
  "lcms2",
+ "lcms2-sys",
  "libwebp-sys",
  "miniz_oxide",
+ "moxcms",
+ "png 0.18.1",
  "psd-sdk-sys",
+ "pxfm",
  "qoi",
  "serde_json",
  "tiff",
+ "weezl",
  "zune-bmp",
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
  "zune-farbfeld",
  "zune-image",
+ "zune-inflate",
  "zune-jpeg 0.5.15",
  "zune-ppm",
+ "zune-qoi",
 ]
 
 [[package]]
@@ -968,7 +991,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 [[package]]
 name = "heif-sys"
 version = "0.0.0"
-source = "git+https://github.com/psmyles/fire-decode?tag=v0.1.0#c68d0eba70c5ec8990698f81ebf35942915e74f7"
+source = "git+https://github.com/psmyles/fire-decode?tag=v0.1.1#be6de7e7844e605c65e4862891add748fe78d61b"
 dependencies = [
  "cc",
 ]
@@ -1002,7 +1025,7 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
  "zune-jpeg 0.5.15",
 ]
 
@@ -1378,9 +1401,9 @@ dependencies = [
 
 [[package]]
 name = "lcms2"
-version = "6.1.1"
+version = "6.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b75877b724685dd49310bdbadbf973fc69b1d01992a6d4a861b928fc3943f87b"
+checksum = "80205450f4d8b4de92f18111de879f3df4a6b728915e89b73c38f7a59a81ad90"
 dependencies = [
  "bytemuck",
  "foreign-types",
@@ -1389,9 +1412,9 @@ dependencies = [
 
 [[package]]
 name = "lcms2-sys"
-version = "4.0.6"
+version = "4.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c2604b23848ca80b2add60f0fb2270fd980e622c25029b6597fa01cfd5f8d5f"
+checksum = "264db0b78119c5a37d78bb41fb355daab29b3b29430b53cd92e3da51f0ab06cc"
 dependencies = [
  "cc",
  "dunce",
@@ -1547,6 +1570,28 @@ dependencies = [
  "png 0.18.1",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "multiversion"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb8a68be21d0755f83bfe47e79b896cc732687cf1903f0e50585e8d6ecc53076"
+dependencies = [
+ "multiversion-macros",
+ "target-features",
+]
+
+[[package]]
+name = "multiversion-macros"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a05e0c3c3e4edaa21d87c645852ed0b0c3663752bcc6ec43353bd6189dce35e1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "target-features",
 ]
 
 [[package]]
@@ -2049,16 +2094,16 @@ dependencies = [
 [[package]]
 name = "psd-sdk-sys"
 version = "0.0.0"
-source = "git+https://github.com/psmyles/fire-decode?tag=v0.1.0#c68d0eba70c5ec8990698f81ebf35942915e74f7"
+source = "git+https://github.com/psmyles/fire-decode?tag=v0.1.1#be6de7e7844e605c65e4862891add748fe78d61b"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "pxfm"
-version = "0.1.29"
+version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
+checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qoi"
@@ -2546,6 +2591,12 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "target-features"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1bbb9f3c5c463a01705937a24fdabc5047929ac764b2d5b9cf681c1f5041ed5"
 
 [[package]]
 name = "thiserror"
@@ -3543,7 +3594,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b77b890dbf6b1a32fc57d9f1f30e22175694c454581de7c6e466f2853cf9fe3"
 dependencies = [
  "log",
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
@@ -3554,9 +3605,9 @@ checksum = "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
 
 [[package]]
 name = "zune-core"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9"
+checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
 dependencies = [
  "log",
 ]
@@ -3567,7 +3618,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46689bf6c90702cba18ef876cc0d29affa8cda58e82a1246fced3a820e0e4c3d"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
@@ -3581,7 +3632,7 @@ dependencies = [
  "jpeg-encoder",
  "jxl-oxide",
  "zune-bmp",
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
  "zune-farbfeld",
  "zune-jpeg 0.5.15",
  "zune-jpegxl",
@@ -3614,7 +3665,7 @@ version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
@@ -3623,7 +3674,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cba11ecd07cc23351500e840ae03841b7e4997923ec8e4832ee3ae199ea0b6b4"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
@@ -3632,7 +3683,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a321146329f7617ba0a5b26982cba45b7ce78163135aba78be25850aefcea80"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
  "zune-inflate",
 ]
 
@@ -3642,7 +3693,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6fa3b8ca5bfe13b58735c3c8e56442390946e8e0e0ff50e12b9215afd278d422"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]
 
 [[package]]
@@ -3651,5 +3702,5 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdfb703f475bc1190ebece625c1ddf162214933188a3572af8e8f697ad043d5a"
 dependencies = [
- "zune-core 0.5.1",
+ "zune-core 0.5.3",
 ]

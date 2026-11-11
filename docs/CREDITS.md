@@ -129,7 +129,7 @@ see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
   **[parking_lot](https://github.com/Amanieu/parking_lot)**,
   **[smallvec](https://github.com/servo/rust-smallvec)**,
   **[hashbrown](https://github.com/rust-lang/hashbrown)** and others - see
-  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the complete list of 192 crates.
+  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the complete list of 195 crates.
 
 ## Build tooling
 
