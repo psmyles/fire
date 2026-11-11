@@ -1,8 +1,8 @@
 # fire-decode - Shared Decoder Plan
 
-**Status: design, revised November 2026.** fire, bite and 3D Review shipped their late-October releases.
-Of this work, only 3D Review's part of step 0 and its static CRT (FD20) are done. This revision makes
-three changes:
+**Status: in progress.** Steps 0-7 are done on the Mac, each with its Windows half still to
+do; `docs/PLAN.md` tracks them. The design was revised in November 2026, after fire, bite
+and 3D Review shipped their late-October releases. That revision made three changes:
 - HEIF / HEIC / AVIF moves into the crate. The October version kept it in fire.
 - fire's viewer gains HDR, gain-map and image-sequence support.
 - All three apps move to the static C runtime on Windows.
@@ -117,6 +117,10 @@ Expected gains, format by format:
   camera's rendering, not what ImageMagick develops. bite's preview would stop matching its output.
 
 How much faster is measured before bite switches (section 6), not assumed.
+
+**Measured in step 5** (macOS): a cold import is 63-92% faster for every routed format, and a warm
+re-import of PSD, EXR, HEIC or AVIF takes a millisecond or two instead of up to 0.8 s. JPG is
+unchanged, as expected.
 
 ---
 
@@ -302,6 +306,11 @@ Narrowing rules:
 - **16 → 8-bit rounds to nearest**, matching ImageMagick. bite's current `STRIP_16` truncates, and
   so does 3D Review's PSD path.
 
+**As built in 3D Review (step 4):** its `DecodedImage` stays RGBA8 and carries a float source's two
+readings, the sRGB-encoded one for colour slots and the clamped one for data. The colour reading is
+byte-identical to what its PSD bridge gave a 32-bit document. **The Tex viewport shows the colour
+reading**, as it showed a 32-bit PSD before: linear light shown as sRGB looks too dark.
+
 ### FD5 - Named setups, no `Default`
 
 `DecodeOptions` loses its `Default` (which is fire's behaviour) in favour of named constructors. Each
@@ -363,6 +372,17 @@ inheriting fire's:
     output leaves nclx primaries as stored: a Display P3 (200, 120, 60) comes back as (200, 120, 60),
     not sRGB's (213, 115, 42).
 
+**As built (step 3):**
+- The four setups are as the table says, with `Limits::VIEWER` (131072 px, 4 GiB) and
+  `Limits::TEXTURE` (30000 px, 1 GiB). `inspect()` keeps the DDS sheet and drops stored mips.
+- **fire-shellext's setup lives in fire-thumbs** (`fire_thumbs::decode_options()`), so the
+  every-face cubemap check runs on every OS, not only in the Windows-only DLL.
+- The limits reach every backend's header guard, zune's per-axis caps, the PSD bridge and
+  libheif's security limits. A GIF's frames are capped by the lower of 1 GiB and `max_bytes`.
+- The nclx conversion is lcms2's, from a profile built of the declared primaries (Display P3 and
+  BT.2020) with sRGB's curve on both sides, so only the gamut moves. A file with an ICC profile
+  takes the profile's.
+
 ### FD6 - Resizing: `fit` with a filter
 
 `max_dim` becomes **`fit: Option<Fit { max, filter: Nearest | Area }>`** (values per setup in FD5).
@@ -377,6 +397,11 @@ inheriting fire's:
   - It deliberately differs from the mip builders (FD11) and 3D Review's `fitted_within`, which average
     colour in linear light. The crate documents why.
 - `downscaled_from` is reported as today; fire's viewer shows it.
+
+**As built (step 3):** `Area` is separable over fractional spans, on the budget's threads.
+Colour is weighted by alpha, so a transparent pixel lends the average no colour (ImageMagick's
+resize does the same). PSD layers always shrink nearest-neighbour, so they land on the pixels of
+the composite fire shrank the same way.
 
 ### FD7 - Panics are caught by the crate, and unwinding is required
 
@@ -413,6 +438,18 @@ inheriting fire's:
     aborting. Step 4 checks that Asset Check still reports that as the tool failing.
   - Binary size and startup are measured with its startup gate after the switch.
 
+**As built (step 3):** `decode()`, `decode_with_progress()` and `probe()` run inside one
+`catch_unwind`; the per-bridge ones it replaces mapped a panic to `Ffi`. `PsdLayers::decode_layer`
+keeps its own. The `panic = "abort"` check is a `compile_error!` under
+`cfg(all(panic = "abort", not(feature = "allow-abort")))`.
+
+**As built in 3D Review (step 4):** a panic hook has to tell a decode's panic from any other on
+the panicking thread, and a decode can panic on one of its passes' helper threads, which a flag the
+app set around `decode()` wouldn't cover. So the crate says itself: **`fire_decode::in_decode()`**
+is true inside `decode()`, `probe()` and `PsdLayers::decode_layer`, and on their helper threads.
+3D Review's release viewer installs `review_log::install_aborting(.., in_decode)`; a debug viewer
+keeps unwinding, as it always has.
+
 ### FD8 - A process-wide thread budget
 
 Today threads multiply:
@@ -445,6 +482,34 @@ The decision:
     same workers.
   - The budget bounds CPU, not memory: twenty concurrent 4K decodes hold ~1.3 GB of RGBA8 at once.
 
+**As built (step 3), with what measuring on the 14-core M3 Max changed:**
+- **The budget is the core count less two, never below the old `min(cores, 8)`**, not the whole
+  core count. Leasing all 14 made fire open a 12 MP HEIC 2% slower than step 2b's 8: the decode
+  was faster, but fire's startup on its main thread was slower. Twelve opened it as fast as 8 did,
+  and a 48 MP HEIC 7% faster.
+- **A pass over memory takes at most 8 threads**: widening, interleaving, narrowing, the alpha
+  scan. Fourteen gained nothing on 64-256 MiB buffers and cost 0.05 ms on 8 MiB ones, 3% of a
+  2 ms TGA. What is bound by computation takes every core the budget has free: the colour
+  transform (lcms2, ~9 ns a pixel), the area filter, and libheif and its codecs for the whole call.
+- Below 1 MiB a pass stays on the calling thread. A pass is cut into four parts per thread, taken
+  from a shared queue, so an efficiency core takes fewer of them instead of holding the pass up.
+- The PSD bridge leases for its whole call too; `PsdLayers` leases per stage, up to what
+  `LayerCtl::threads` asks.
+
+**As built in 3D Review (step 4):** pool imports and reloads run on a fixed set of workers, half
+the cores. A model's own textures keep their scoped pool in `render`'s `imported.rs`, sized by the
+same rule, rather than moving onto the app's workers: that loader also serves the preview and both
+shells, which have no app pool.
+
+**Measured in bite (step 5): concurrent callers must cap each decode.** A lease takes the threads
+that are free when the decode starts and keeps them to the end, without waiting. So of three iPhone
+HEICs decoded at once, the first took nearly every core and the other two ran libheif on one thread
+each: 637 ms, against 243 ms one after another. Capping each at a third of the cores
+(`max_threads`) took it to 219 ms, and three AVIFs from 246 to 120 ms. PNG, PSD and EXR didn't
+change. bite caps each concurrent decode at the cores divided by the decodes. A fairer lease in the
+crate (a share of the cores per decode in flight) would make the cap unnecessary; it would change
+fire's timings, so it is not done here.
+
 ### FD9 - Formats: accept what the crate decodes; route before decoding
 
 - **3D Review accepts everything the crate decodes.**
@@ -474,6 +539,17 @@ The decision:
 - **HEIF is recognised by the `ftyp` major brand**, as today (`avif` / `avis` → AVIF; `heic`, `heix`,
   ... → HEIC; `mif1` / `msf1` / `mif2` → HEIF).
 
+**As built (step 3):** `sniff` names the format by magic, then by extension for the formats
+without magic (TGA) or sharing it (the TIFF-structured raws), and is `Format::Unknown` otherwise.
+It answers whatever the build decodes, so a PSD is `Format::Psd` in a build without `psd`, and its
+decode is `Unsupported(Format::Psd)`.
+
+**As built in bite (step 5):** `in_process::is_routed` sends PNG, TGA, PSD, EXR, HEIC, HEIF and
+AVIF to the crate by extension. EXR is routed after its comparison: ImageMagick shows EXR clamped
+with no curve, as the crate does, so no sRGB option was added. bite enables `heif` for Windows and
+macOS only, since heif-sys has libraries for no other target: its CLI still builds on Linux, where
+a HEIC fails in the crate and goes to ImageMagick through FD10's retry.
+
 ### FD10 - Errors
 
 - **New variants:**
@@ -498,6 +574,9 @@ The decision:
 - **3D Review maps errors to its existing message strings** (`app-notifications.ftl`). Diagnostics stay
   in English, per its invariant 12.
 
+**As built in bite (step 5):** any error from the crate sends the file to ImageMagick, alone, after
+the batch. A 30001×2 PNG, which `thumbnail()` refuses, gets its thumbnail that way (a test).
+
 ### FD11 - Mip builder, phase 2
 
 fire's `crates/fire/src/render/mips.rs` moves into the crate as a **`mips` feature**, after the decode
@@ -516,6 +595,34 @@ tables, and adopts a file's own chain.
     UV-checker bake, which also hashes it (`build/uv_checker.rs`). Step 7 either moves the bake onto
     the crate's builder or keeps the file for the bake alone.
 - bite leaves the feature off.
+
+**As built (step 7):**
+- **It is a module, `fire_decode::mips`, over a level-0 slice** rather than one function over a
+  `DecodedImage`: 3D Review builds chains of its own buffers (a float source has two readings).
+  - `chain` builds levels `1..`. `complete` keeps a DDS's stored levels and computes the tail.
+    `stored_levels` counts the levels `complete` keeps. `fit` returns the first level within a
+    size, for 3D Review's `fitted_within`. `level_count` gives the number of levels.
+  - `MipOptions` carries `srgb`, `max_levels` and `max_threads`.
+- **8-bit chains are byte-identical** to fire's builder and to 3D Review's `rhi/mips.rs`, in both
+  of 3D Review's modes, over every 8-bit file in the corpus.
+  - Integer samples now round exactly, ties up, so 16-bit chains move by up to 2 in 65535.
+  - fire's old half-float table halved every subnormal; the crate's is exact. Half-float chains
+    differ only at those values, all below 6.1×10⁻⁵.
+- **Threads:** a level of 256×256 texels or more is split across up to 8 threads leased from the
+  budget, fire's cap.
+  - The crate's builder is faster than fire's on every format: 20% on 8-bit, 4× on half float.
+  - On one thread it is 20% faster than 3D Review's.
+- **3D Review keeps each chain with its decoded image** (`DecodedImage::mips`), one per kind of
+  upload: colour, data, or shown as stored in the Tex viewport. Since images are cached by path,
+  this is FD11's "cached by `(path, srgb)`".
+  - A model's textures build the chains their slots need on the decode workers.
+  - A reload builds the chains its last decode had.
+  - Any other chain is built at first use.
+  - The chains stay in memory with the image: +83 MB (+3.7%) on a 15-texture test model.
+- **`rhi/mips.rs` stays for the UV-checker bake alone**, moved to `build/mips.rs`.
+  - Compiling the crate into the build script would build it a second time for the host,
+    libwebp's C code included.
+  - A test holds the file to the crate's builder byte for byte, and the bake's output is unchanged.
 
 ### FD12 - bite's thumbnail cache
 
@@ -539,6 +646,26 @@ tables, and adopts a file's own chain.
   process.
 - **A HEIC / HEIF chip** (`.heic`, `.heif`) joins the Input node's format chips, **off by default** like
   AVIF. Today a folder import never picks up `.heic` / `.heif`; only the picker and drag-and-drop do.
+
+**As built (step 5):**
+- **A thumbnail is written without alpha when every pixel is opaque**, scanned on the thumbnail
+  itself. ImageMagick's lossy WebP dropped an alpha plane that held nothing too, so the preview
+  chain sees the channels it always saw. (`alpha_opaque` can't decide it: it is false for a source
+  with no alpha channel at all.)
+- **Written to a file of its own and renamed over the name**, so a cancelled import or the preview
+  worker writing the same thumbnail never leaves a half file that reads as valid.
+- **Crate and ImageMagick thumbnails are made at the same time**, the crate's on up to
+  `default_jobs()` threads, each decode capped to its share of the cores (FD8).
+- **Cached reads take `thumbnail()` without its fit and with `Limits::VIEWER`**, so a preview a chain
+  enlarged past 30000 px still shows. A cache file the crate can't read still goes through
+  ImageMagick, as before.
+- **Lossy after all, at quality 85, through libwebp** (decided 10 November). Lossless files were
+  three to seven times the quality-85 ones: 63 KiB for a HEIC at the default 256 px, 780 KiB at
+  1024 (`docs/baselines.md`). libwebp is already built by the crate (libwebp-sys), and its simple
+  API at 85 writes byte-for-byte what ImageMagick's `-quality 85` writes for the same pixels. It
+  writes no ICC profile, so bite adds the `VP8X` header and `ICCP` chunk itself. The cache is the
+  size it was.
+- **The HEIC chip sits beside AVIF**, and the eleventh chip starts a third row.
 
 ### FD13 - Repository setup
 
@@ -572,6 +699,13 @@ tables, and adopts a file's own chain.
   - It runs before each tag. **No tag if any format is more than 2% slower than the previous tag.**
   - fire's TTFP benchmark remains the app-level gate when fire moves to a new tag.
 - **Releases:** each tag's GitHub release carries the LGPL source tarballs (FD14).
+
+**As built (step 3):** features `psd`, `heif`, `icc`, `raw` and `allow-abort`; `mips` arrives in
+step 7. CI runs core, psd, psd + heif (thumbnail and texture until `mips`) and psd + heif + icc +
+raw (viewer). The local performance gate is `bench/decode-formats`, built against this checkout
+or, with `--features old-api`, an older one.
+
+**As built (step 7):** `mips` exists, and CI runs the four sets as the table lists them.
 
 ### FD14 - Licences and consumer docs
 
@@ -717,6 +851,9 @@ it moves and gains two more consumers.
   Sequences report per frame (FD18).
 - **Cancel** maps to libheif's `cancel_decoding` and returns `DecodeError::Cancelled`, so fire can
   abandon decodes it no longer needs.
+- **Wired in step 3:** `DecodeCtl` reaches libheif, and cancel is also polled between the decode's
+  stages for every format. fire passes its loading bar's progress and, until 6d, a cancel that
+  never fires.
 
 **What libheif 1.23 offers for this** (checked in the vendored headers):
 - security limits;
@@ -829,6 +966,57 @@ exposure / tonemap handles the range.
   - bite's ImageMagick almost certainly shows the raw signal as libheif does, so bite's previews of
     PQ / HLG files will differ from ImageMagick's (section 6). That is the intent.
 
+**As built (steps 6a and 6b):**
+- **6a: both tone curves clamp negatives**, not only Reinhard: the ACES fit reads a large negative
+  as white (about 1.06 at -10, clamped to 1). The clamp opens `reinhard()` and `aces()` in
+  `shader.glsl` and in fire-thumbs. fire-thumbs' copy is tested on values (-1, below -1,
+  -infinity); a fire test checks the clamp in the source and in both generated backends.
+- **6b: the conversion lives in the crate's `hdr` module**, run by the HEIF backend on a source
+  whose nclx says PQ (16) or HLG (18). PQ is the ST 2084 EOTF; HLG is BT.2100's inverse OETF
+  and its OOTF on the luminance of the source's primaries (1000 cd/m², gamma 1.2). Then ÷ 203 and
+  a matrix to Rec.709 (computed from the primaries' chromaticities, so BT.2020 and Display P3
+  both work). `Linear` keeps `Rgba16Float`; `Sdr` writes `Rgba16Unorm` for `output` to narrow.
+- **Matrices only, no lcms2.** An ICC profile beside a PQ / HLG nclx can't describe the HDR
+  transfer, so the nclx is followed and the profile dropped, in both modes.
+- **`Linear` with `Output::Rgba8` is `DecodeError::Other`.** `source` keeps describing the file
+  (10-bit unorm, PQ / HLG, BT.2020), so the pass that marks float buffers as float sources skips
+  these.
+- **`Probe` gained `hdr: HdrKind`**, read from the primary item's first nclx `colr` box. fire needs
+  to know before decoding, since it opens PQ / HLG as `Linear` and gain-map photos as `Sdr`; its
+  decode pool probes HEIF and AVIF only (`with_hdr_for`). Step 6c adds `GainMap`.
+- **Measured:** every patch of the four lossless fixtures within 0.2% of `expected.json` in both
+  modes, the lossy `pq_ycbcr.avif` within 2%; `texture()` / `thumbnail()` output bit-identical to
+  before on every corpus file but the five PQ / HLG fixtures; SDR HEIC TTFP within noise
+  (`docs/baselines.md`).
+
+**As built (step 6c):**
+- **libheif re-checked:** 1.23.7 is still the newest release (26 October), and `master` has no
+  gain-map API either (`tmap` appears only inside its `mini` box parser).
+- **The crate reads the structure in Rust** (`heif_meta`): items, references, properties in
+  `ipma` order and entity groups, shared with `probe()`. libheif decodes the two images by item
+  ID (hidden items and iPhone grid auxiliaries included) and reads the `tmap` / XMP / `Exif`
+  items' data; no new FFI was needed.
+- **A `tmap` primary can't even be opened by libheif**, not only decoded. The crate opens a copy
+  of the file with `pitm` pointed at the base (the `tmap`'s first input, which the `altr` group
+  offers), so `Sdr` shows the base and `Linear` renders it with the map.
+- **Colour:** the base is linearised through the sRGB curve in its own primaries: its nclx, else
+  its ICC profile's colorants adapted from D50 with Bradford (iPhone bases are Display P3 by ICC),
+  else Rec.709. The gain applies there (or in the `tmap`'s nclx primaries when the map says it was
+  made in the alternate's space), and the result goes to Rec.709.
+- **Apple's MakerNote formula** (tags 33 / 48) reproduces the XMP headroom to four figures on the
+  three iPhone photos, so either serves. ISO wins over both.
+- **`source.hdr` is `GainMap` in both modes**, and `probe()` says so before decoding; a `tmap`
+  primary is `GainMap` whatever its own nclx says (it describes the HDR alternate, often as PQ).
+- **A gain map that can't be read falls back to the SDR base** under `Linear`; a cancel or
+  `TooLarge` stands.
+- **fire:** the `toggle-hdr` action (`H`) puts a window in HDR mode: decodes ask for `Linear`, and
+  the shown gain-map photo is re-decoded in place. The status line names PQ, HLG and
+  "gain map: SDR / HDR".
+- **Measured:** every gain-map fixture within 3% of ImageIO's HDR rendering, the portraits turned
+  by the base's `irot` alone, ISO winning; the three iPhone photos within 0.3% of ImageIO's HDR
+  decode on average (16 px blocks, worst 1.4%), 100-220 ms for 12-24 MP; `Sdr` output unchanged
+  on every other file; SDR HEIC TTFP within noise.
+
 ### FD18 - Animated AVIF and HEIF sequences
 
 - **With `frames: All` (viewer), an `avis` or other HEIF image sequence decodes to `Animation` frames,
@@ -849,6 +1037,28 @@ exposure / tonemap handles the range.
   - fire can then tell the user.
 - **Progress** is reported per frame (FD16).
 
+**Done early (step 3):** `Animation::truncated`, set for GIF when a cap cuts the walk short.
+
+**As built (step 6d):**
+- **`Animation::loop_count: Option<u32>`**: the track's repetitions, `None` for an infinite loop and
+  for GIF (whose count the `image` crate doesn't read), so fire keeps looping those as it did.
+  fire plays a counted animation that many times and stops on its last frame.
+- **The sequence is the first visual track**, decoded only with `frames: All` and only when the
+  file has a `moov` box; one that fails leaves the still when there is one. Delays are rounded
+  to milliseconds, and 0 is shown as 100 ms, as GIF's are.
+- **Truncation is judged against the track's sample count** (`stsz` / `stz2`, read in Rust),
+  rather than by decoding a frame past the cap: at 4096² that frame alone would be 64 MiB. A frame
+  of another size or depth ends the sequence, flagged too.
+- **Progress** is frames done over that count, from a `moov` the crate reads itself; **cancel** is
+  polled between frames and by libheif. fire's pool now cancels a decode its window has moved on
+  from, so a long one stops instead of running to a stale drop.
+- **A PQ / HLG track converts frame by frame**, from its sample entry's nclx: `hdr::convert` runs
+  over every buffer.
+- **Measured:** the three fixture sequences' frames, colours, delays and loop counts; the infinite
+  loop ends; `seq_over_cap.avif` keeps 16 frames at the real cap (606 ms) and 4 under a 256 MiB
+  budget, flagged; progress rises to 1; a cancel after the first frame stops it. `texture()` /
+  `thumbnail()` output is unchanged (they take `First`).
+
 ### FD19 - `probe()`
 
 `probe(reader, ext_hint) -> Result<Probe, DecodeError>` returns width, height and `Format` without
@@ -867,6 +1077,27 @@ decoding pixels, for every format the crate decodes.
   - `header.rs` has a second caller, `Magick::metadata`, used by every workflow run and a file's
     first preview. It takes the size from `probe()` too. Its `identify` reads of depth, resolution
     and EXIF stay.
+
+**As built (step 3):** each format is read the cheapest exact way:
+- **a few bytes of header:** PSD, QOI, farbfeld, PNM (zune's header reader), WebP (libwebp's),
+  DDS (its header and the file length, for the layers the data backs);
+- **walking with seeks:** JPEG's markers to the Start-Of-Frame, past EXIF thumbnails and ICC
+  chunks. HEIF's top-level boxes, to read `meta` wherever it is: the primary item's `ispe`, then
+  its `clap` and `irot` in `ipma` order, as libheif computes it (no libheif call). A sequence-only
+  file takes its first visual track's sample size;
+- **lazy header readers:** TIFF (the `tiff` crate), OpenEXR (the first layer with R, G and B), and
+  the `image` crate's for PNG, GIF, BMP, TGA, ICO / CUR and Radiance HDR;
+- **the whole file:** JPEG XL (jxl-oxide parses before it can say), and camera raw (the embedded
+  preview's size).
+
+It equals `decode()` with `inspect()` on every format built in its tests, every HEIF fixture,
+and 188 images of fire's, bite's, 3D Review's and CrimeCrew's.
+
+**As built in bite (step 5):** `header.rs` is gone. The cache and `Magick::metadata` both take the
+size from `probe()`, and the format as `identify`'s `%m` spells it (`JPEG`, `HEIC`, `HEIF`, `FF`,
+`PGM`, ...). It agrees with `identify` on all 115 files of the corpus and the fixtures that
+`identify` can read, the portrait HEIC included. On the 14 it can't (malformed files, size
+bombs), `probe()` still reports the header's size, and the decode then fails as it would have.
 
 ### FD20 - Static CRT on Windows
 
@@ -901,81 +1132,121 @@ Considered:
 
 ---
 
-## 4. API sketch
+## 4. API, as built in step 3
 
-Illustrative only - names settle during step 3 of the migration.
+The names settled in step 3 (10 November 2026). What is still to come is marked with its step.
 
 ```rust
-pub fn sniff(bytes: &[u8], ext_hint: Option<&str>) -> Format;
+// Formats (FD9, FD19)
+pub fn sniff(bytes: &[u8], ext_hint: Option<&str>) -> Format;   // a few KiB of the start suffice
 pub fn probe(reader: impl Read + Seek, ext_hint: Option<&str>)
-    -> Result<Probe, DecodeError>;                               // FD19, catch_unwind inside
-pub fn supported_extensions() -> &'static [&'static str];        // feature-aware
-pub fn all_extensions() -> &'static [&'static str];              // feature-independent, for tests
+    -> Result<Probe, DecodeError>;                              // catch_unwind inside
+pub fn supported_extensions() -> &'static [&'static str];       // follows the features
+pub fn all_extensions() -> &'static [&'static str];             // whatever the features, for tests
+pub fn is_supported_extension(ext: &str) -> bool;               // supported_extensions(), any case
+#[non_exhaustive] pub enum Format { Png, Jpeg, Gif, Bmp, Tiff, Tga, Ico, Cur, WebP, Qoi, Pnm,
+    Farbfeld, JpegXl, RadianceHdr, Exr, Dds, Psd, Heic, Heif, Avif, CameraRaw, Unknown }
+impl Format {                                                   // name(): "PNG", "OpenEXR", ...
+    pub fn name(self) -> &'static str;
+    pub fn is_supported(self) -> bool;                          // compiled into this build
+    pub fn from_extension(ext: &str) -> Option<Format>;
+}
+pub struct Probe { pub width: u32, pub height: u32, pub format: Format,
+                   pub hdr: HdrKind }                 // hdr: from 6b, HEIF's nclx (PQ / HLG)
 
+// Decoding
 pub fn decode(bytes: &[u8], ext_hint: Option<&str>, opts: &DecodeOptions)
-    -> Result<DecodedImage, DecodeError>;                        // catch_unwind inside
+    -> Result<DecodedImage, DecodeError>;                       // catch_unwind inside
 pub fn decode_with_progress(bytes: &[u8], ext_hint: Option<&str>, opts: &DecodeOptions,
                             ctl: &DecodeCtl) -> Result<DecodedImage, DecodeError>;
 pub fn decode_path(path: &Path, opts: &DecodeOptions) -> Result<DecodedImage, DecodeError>;
 pub fn level_dims(w: u32, h: u32, level: u32) -> (u32, u32);
-#[cfg(feature = "icc")] pub fn icc_is_srgb(profile: &[u8]) -> bool;  // already in fire's tree
+#[cfg(feature = "icc")] pub fn icc_is_srgb(profile: &[u8]) -> bool;
 
-pub struct DecodeCtl<'a> {
-    pub progress: &'a (dyn Fn(f32) + Sync),  // monotonic; may be called from libheif's threads
-    pub cancel: &'a (dyn Fn() -> bool + Sync),
+pub struct DecodeCtl<'a> {                     // DecodeCtl::NONE: no reports, never cancelled
+    pub progress: &'a (dyn Fn(f32) + Sync),    // only rises; may be called from libheif's threads
+    pub cancel: &'a (dyn Fn() -> bool + Sync), // polled between stages and by libheif
 }
 
-pub struct DecodeOptions {
-    #[cfg(feature = "icc")] pub honor_icc: bool,
-    pub honor_exif: bool,              // EXIF only; HEIF irot / imir / clap always applied
-    pub output: Output,                // Native | Rgba8 | Rgba8OrFloat
-    pub hdr: Hdr,                      // Sdr | Linear (FD17)
-    pub fit: Option<Fit>,              // Fit { max: u32, filter: Filter /* Nearest | Area */ }
-    pub frames: Frames,                // All | First: GIF frames, HEIF sequences
-    pub surfaces: Surfaces,            // Sheet | First: DDS array layers, cube faces, volume slices
-    pub stored_mips: bool,             // keep a DDS file's own mip chain (viewer() only)
-    pub limits: Limits,                // Limits { max_dim: u32, max_bytes: u64 }
-    pub max_threads: Option<usize>,
+pub struct DecodeOptions {                     // no Default
+    #[cfg(feature = "icc")] pub honor_icc: bool,  // ICC, and wide-gamut nclx with no profile
+    pub honor_exif: bool,                      // EXIF (and a raw preview's) orientation only
+    pub output: Output,                        // Native | Rgba8 | Rgba8OrFloat
+    pub hdr: Hdr,                              // #[non_exhaustive] Sdr | Linear (6b)
+    pub fit: Option<Fit>,                      // Fit { max: u32, filter: Filter::{Nearest, Area} }
+    pub frames: Frames,                        // All | First
+    pub surfaces: Surfaces,                    // Sheet | First
+    pub stored_mips: bool,
+    pub limits: Limits,                        // Limits { max_dim: u32, max_bytes: u64 }
+    pub max_threads: Option<usize>,            // caps this decode, the calling thread included
 }
 impl DecodeOptions {
-    pub fn viewer() -> Self;
+    pub fn viewer() -> Self;                   // FD5's table, below
     pub fn inspect() -> Self;
     pub fn texture() -> Self;
     pub fn thumbnail(size: u32) -> Self;
 }
+impl Limits { pub const VIEWER: Limits; /* 131072 px, 4 GiB */ pub const TEXTURE: Limits; /* 30000 px, 1 GiB */ }
 
 pub struct DecodedImage {
     pub pixels: Vec<u8>, pub width: u32, pub height: u32,
-    pub format: PixelFormat,           // the buffer
-    pub source: SourceInfo,            // the file
+    pub format: PixelFormat,                   // the buffer
+    pub source: SourceInfo,                    // the file
     pub alpha_opaque: bool,
-    pub icc: Option<Vec<u8>>,          // returned whether or not it was applied
+    pub icc: Option<Vec<u8>>,                  // returned whether or not it was applied
     pub downscaled_from: Option<(u32, u32)>,
     pub source_mips: Option<Vec<Vec<u8>>>,
     pub layout: Option<SheetLayout>,
-    pub animation: Option<Animation>,  // Animation { frames, loop_count: Option<u32>, truncated: bool }
-}
+    pub animation: Option<Animation>,          // Animation { frames, truncated: bool,
+}                                              //   loop_count: Option<u32> } (6d; None = forever)
 
-pub struct SourceInfo {
-    pub format: Format, pub channels: u8, pub bit_depth: u8,
-    pub palette: bool,                 // today DecodedImage::palette; PNG only so far
-    pub sample: Sample,                // Unorm | Float
-    pub transfer: Transfer,            // Srgb | Linear | Pq | Hlg | Unknown
-    pub primaries: Primaries,          // Bt709 | DisplayP3 | Bt2020 | Other
-    pub hdr: HdrKind,                  // None | Pq | Hlg | GainMap
-}
+pub struct SourceInfo {                        // SourceInfo::new(format, name, channels, depth)
+    pub format: Format,
+    pub name: &'static str,                    // "Nikon NEF", "DDS BC7 sRGB": the status bar's
+    pub channels: u8, pub bit_depth: u8, pub palette: bool,
+    pub sample: Sample,                        // Unorm | Float
+    pub transfer: Transfer,                    // Srgb | Linear | Pq | Hlg | Other
+    pub primaries: Primaries,                  // Bt709 | DisplayP3 | Bt2020 | Other
+    pub hdr: HdrKind,                          // None | Pq | Hlg | GainMap (GainMap from 6c)
+}                                              // the four enums are #[non_exhaustive]
 
-pub struct Probe { pub width: u32, pub height: u32, pub format: Format }
+#[non_exhaustive]
+pub enum DecodeError { Malformed(String), TooLarge(String), NoMergedImage, Unsupported(Format),
+                       Cancelled, Panicked, Ffi(String), Other(String) }
 
-pub enum DecodeError { Malformed(String), TooLarge(String), Ffi(String),
-                       Unsupported(Format), Cancelled, Panicked, NoMergedImage, Other(String) }
-
-#[cfg(feature = "psd")]
 pub use psd_layers::{PsdLayers, LayerInfo, LayerCtl, LayerImage, LayerError, BlendMode, Rect};
 
-#[cfg(feature = "mips")]
-pub fn mip_chain(img: &DecodedImage, srgb: bool, max_levels: u32) -> Vec<Vec<u8>>;
+#[cfg(feature = "mips")]                       // step 7 (FD11)
+pub mod mips {
+    #[non_exhaustive] pub struct MipOptions { pub srgb: bool,          // 8-bit in linear light
+                                              pub max_levels: u32,     // 0 = no cap
+                                              pub max_threads: usize } // 0 = the budget's
+    impl MipOptions { pub fn new(srgb: bool) -> MipOptions; }
+    pub fn level_count(width: u32, height: u32) -> u32;
+    pub fn chain(level0: &[u8], width: u32, height: u32, format: PixelFormat,
+                 opts: &MipOptions) -> Vec<Vec<u8>>;                  // levels 1..
+    pub fn complete(stored: Vec<Vec<u8>>, level0: &[u8], width: u32, height: u32,
+                    format: PixelFormat, opts: &MipOptions) -> Vec<Vec<u8>>;
+    pub fn stored_levels(stored: &[Vec<u8>], width: u32, height: u32, format: PixelFormat,
+                         opts: &MipOptions) -> usize;
+    pub fn fit(level0: &[u8], width: u32, height: u32, format: PixelFormat, max_side: u32,
+               opts: &MipOptions) -> Option<(Vec<u8>, u32, u32)>;
+}
 ```
+
+**Changed from the October sketch while building it:**
+- **`with_max_threads` and `SUPPORTED_EXTENSIONS` are gone**, for `max_threads` and the two
+  extension functions. `is_supported_extension` stays: fire's folder navigation and fire-cli's
+  folder walk use it.
+- **`SourceInfo` has a `name`**, the label fire's status bar shows, more specific than
+  `Format::name` (a DDS file's pixel format, a raw's camera family).
+- **`Hdr` has only `Sdr` until 6b.** A `Linear` that decoded as `Sdr` would be a promise the type
+  doesn't keep; the enum is `#[non_exhaustive]` so 6b's variant isn't a breaking change.
+- **`Animation::loop_count` waits for 6d**, with the sequences it is read from. GIF has no loop
+  count in the `image` crate's decoder, and fire loops every animation today.
+- **`.psb` stays in both lists**, as `Format::Psd`. The crate reads PSD only, so a PSB fails to
+  decode, but fire-cli checks one from its header and fire's installer registers it.
+- **`mips` is a module over slices** (step 7), not `mip_chain(&DecodedImage, ..)`: see FD11.
 
 ---
 
@@ -999,6 +1270,10 @@ Each step lands only when its gate passes.
 | 7 | **Phase 2: `mips` feature (FD11).** fire uses it; 3D Review builds chains on its workers, and settles `rhi/mips.rs`'s place in the UV-checker bake | fire TTFP. 3D Review frame times while textures load. The UV-checker bake still builds |
 
 3D Review goes before bite: it was the original motivation, and its gains do not depend on a benchmark.
+
+**Step 5 as built:** bite's floor is Rust 1.99, not 1.88: the crate's own `rust-version` became
+1.99 in step 1, and bite inherits it in every crate. bite's `heif` is on for Windows and macOS only
+(FD9).
 
 Step 6 is fire-only and can start any time after step 3, in parallel with steps 4-5. Any tag that
 3D Review or bite moves to must keep `texture()` / `thumbnail()` output unchanged.
@@ -1032,6 +1307,32 @@ Step 6 is fire-only and can start any time after step 3, in parallel with steps 
     the raw signal); record how, not whether;
   - decode time: dav1d (crate) against libaom (bite's ImageMagick).
 - **Cache size** with lossless WebP, ICC embedded, at 256 and 1024 px on a typical folder.
+
+**Measured in step 5** (macOS; `docs/baselines.md` has the tables):
+- **Cold import:** PNG -70%, TGA -92%, PSD -87%, EXR -89%, HEIC -63%, AVIF -81%; JPG, still on
+  ImageMagick, unchanged. bench/bite-import, baseline and branch built side by side.
+- **Warm re-import:** no `magick` process for any crate format; PSD / EXR / HEIC / AVIF went from
+  121-807 ms to 1-2 ms.
+- **Over 30000 px:** thumbnailed through the retry (a test).
+- **EXR:** ImageMagick shows it clamped with no curve too, so no sRGB option.
+- **HEIC / AVIF:** ImageMagick applies `irot` / `imir` (identical on every orientation fixture).
+  It shows the gain-map fixtures' SDR base, as the crate does (identical), and PQ / HLG as the raw
+  signal, as the crate does until 6b (0.4% apart, the filters). dav1d decodes a 12 MP AVIF in 78 ms
+  on one thread, where ImageMagick's libaom takes 172 ms with its start-up.
+- **Cache size:** lossless files were three to seven times the quality-85 ones, so the thumbnails
+  stay lossy, as ImageMagick wrote them (FD12).
+- **Found:** ImageMagick un-blends a white matte from any PSD whose merged image has a 4th
+  channel, which crushes a flat document's mask texture to black. fire-decode keeps the stored
+  colour; see **PSD** below.
+
+**PSD**
+- **Transparent documents saved by Photoshop:** does their merged image carry a white matte the
+  crate should divide out? Photoshop's merged data for a document with transparency is said to be
+  blended over white, and ImageMagick un-blends it. But it does so for any 4th channel: on a flat
+  document whose 4th channel is a mask (`T_Noise_Burshed_01_M.psd`), and on ImageMagick's own RGBA
+  PSDs, it is wrong, and the crate's stored colour is right. If Photoshop's transparent documents
+  do carry a matte, the crate should remove it only when the layer count is negative (the
+  spec's mark for a merged transparency channel). No such file is on the Mac; it needs Photoshop.
 
 **HEIF**
 - **libheif's own SDR rendering of PQ / HLG** (no output nclx): does it re-encode to sRGB or
