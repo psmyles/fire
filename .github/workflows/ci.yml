@@ -4,23 +4,20 @@
 # `render/d3d11.rs` or the `windows-sys` leaves, so a single-host CI cannot keep the workspace
 # lint-clean now that both leaves exist (D23).
 #
-# The one thing that makes this workflow non-obvious is the *vendored native artifacts*. `heif-sys`
-# links prebuilt static libs (heif/libde265/dav1d) and `psd-sdk-sys` compiles the psd_sdk C++ source,
-# and neither is in the Rust crate graph — they are fetched per `vendor/VENDOR.txt`. They are also
-# not in the repository. Those two crates are reached only through `fire-decode`'s `psd` / `heif`
-# features (default-on, so the shipped exe is unaffected), which is what lets the job split be:
+# The decoder is fire-decode, a git dependency at a release tag (Cargo.lock records it). It brings
+# its native code with it: psd_sdk's C++ source, compiled by `cc`, and the HEIF stack's prebuilt
+# static libraries for both targets, with committed bindings (no bindgen, so no LLVM). Its own
+# tests run in its own CI; this workflow tests fire. Two jobs:
 #
-#   * `check` always runs, with `--no-default-features`: no psd_sdk, no libheif, and so no bindgen
-#     or LLVM either. That covers everything else — `fire-ipc`, the pure-Rust decode core, and the
-#     whole shell including `fire`'s pure-logic modules (view/config/keybinds/flipbook/ui).
-#   * `full` runs only when the vendor tree is present (a cached restore, or a self-hosted runner
-#     with it checked out). It adds the native decoders: the real binary and the PSD/HEIF
-#     end-to-end tests.
+#   * `check`, with `--no-default-features`: no psd_sdk and no libheif. It lints and tests the
+#     build that leaves the native decoders out, which no other job compiles: `fire-ipc` and the
+#     whole shell, including `fire`'s pure-logic modules (view/config/keybinds/flipbook/ui).
+#   * `full`: the workspace with its default features, the native decoders included. The real
+#     binaries and the PSD / HEIF end-to-end tests.
 #
-# Without that split, a fork's first push would fail on a missing `heif.lib` and teach everyone to
-# ignore the badge. Without the features, `check` could only ever have covered `fire-ipc` — every
-# other crate pulls the vendored trees in transitively, so a cache miss meant a green badge over
-# code nothing had linted.
+# Every cargo command is `--locked`. A Cargo.lock written while a local `[patch]` pointed
+# fire-decode at a checkout names a path, not the tag, and fails here rather than quietly building
+# against whatever the tag resolves to today.
 #
 # Per D11 this workflow stops at build-and-test on macOS: it never signs, notarizes or packages a
 # `.dmg`. That runs only on the dev Mac via `scripts/build-mac.sh`, so the Developer ID certificate
@@ -74,36 +71,32 @@ jobs:
             xcrun -sdk macosx metal --version
           fi
 
-      # Everything except the two FFI decoders, so this needs no vendored input and no LLVM.
+      # Everything without the two FFI decoders.
       - name: Clippy (no native decoders)
-        run: cargo clippy -p fire-ipc -p fire-decode -p fire-thumbs -p fire-shellext -p fire -p fire-cli --no-default-features --all-targets -- -D warnings
+        run: cargo clippy --locked -p fire-ipc -p fire-thumbs -p fire-shellext -p fire -p fire-cli --no-default-features --all-targets -- -D warnings
 
       # `fire-ipc` is dependency-free and holds the instance-socket wire format — the one place
       # that parses bytes from outside the process. It must always be tested.
       - name: Test (fire-ipc)
-        run: cargo test -p fire-ipc
-
-      # The pure-Rust decoders (PNG/JPEG/GIF/TIFF/EXR/HDR/raw), the decode-bomb guards, and the
-      # extension-table drift test that keeps installer/fire.iss honest.
-      - name: Test (fire-decode, no native decoders)
-        run: cargo test -p fire-decode --no-default-features
+        run: cargo test --locked -p fire-ipc
 
       # Explorer thumbnails: the CPU render, the settings table, and the two drift tests that hold
       # installer/fire.iss's thumbnails page and class id to the crate. On Windows also the HKCU
       # registration round trips, on throwaway extensions they clean up after.
       - name: Test (fire-thumbs)
-        run: cargo test -p fire-thumbs
+        run: cargo test --locked -p fire-thumbs
 
       # The shell's pure-logic modules: view math, config round-trip, keybinds, flipbook
-      # detection, folder navigation, theme parsing, icon ordering.
+      # detection, folder navigation, theme parsing, icon ordering; and the drift test that keeps
+      # installer/fire.iss's extension table to fire-decode's (tests/installer.rs).
       - name: Test (fire, no native decoders)
-        run: cargo test -p fire --no-default-features
+        run: cargo test --locked -p fire --no-default-features
 
       # Asset Check's image checker: its rules, the results it writes, and `--staged` in a scratch
       # git repository (git is on every runner). The PSD fixture needs the native decoder and runs
       # in `full`.
       - name: Test (fire-cli, no native decoders)
-        run: cargo test -p fire-cli --no-default-features
+        run: cargo test --locked -p fire-cli --no-default-features
 
   full:
     name: clippy + tests (full workspace, ${{ matrix.os }})
@@ -111,13 +104,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            # The vendored heif tree is per-target (D25); this is the subdirectory and the one
-            # library file whose presence stands for "the tree was restored".
-            heif_lib: crates/heif-sys/vendor/x64-windows/lib/heif.lib
-          - os: macos-latest
-            heif_lib: crates/heif-sys/vendor/arm64-macos/lib/libheif.a
+        os: [windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -139,54 +126,19 @@ jobs:
             xcrun -sdk macosx metal --version
           fi
 
-      # bindgen needs libclang. Windows has none by default; macOS ships one inside Xcode and
-      # `clang-sys` finds it unaided, so there is nothing to install there.
-      - name: Install LLVM (libclang, for bindgen in psd-sdk-sys / heif-sys)
-        if: runner.os == 'Windows'
-        run: choco install llvm --no-progress -y
-
-      # The vendored artifacts are large and licence-encumbered, so they are not committed. Restore
-      # them from cache if a previous run populated it; otherwise this job reports that it skipped,
-      # rather than failing with a link error nobody can act on.
-      #
-      # The key carries the runner OS: the arm64 `.a`s and the x64 `.lib`s are different artifacts
-      # built from the same recipe, so one key for both would have each host restoring the other's
-      # and failing to link.
-      - name: Restore vendored native artifacts
-        id: vendor
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            crates/heif-sys/vendor
-            crates/psd-sdk-sys/vendor
-          key: vendor-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/*/vendor/VENDOR.txt') }}
-
-      - name: Check the vendor tree is present
-        id: have_vendor
-        shell: bash
-        run: |
-          if [ -f "${{ matrix.heif_lib }}" ] && [ -d crates/psd-sdk-sys/vendor/Psd ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Vendored native artifacts absent — skipping the full build."
-            echo "::notice::Populate them per crates/*/vendor/VENDOR.txt to enable this job."
-          fi
-
-      # `--workspace` covers the seven crates in `[workspace] members`. `vendor/sokol-rust` is a
+      # `--workspace` covers the five crates in `[workspace] members`. `vendor/sokol-rust` is a
       # path dependency inside the workspace directory and so was a member by default; it is
       # excluded in the root manifest, because linting a pinned upstream tree to our standard
       # fails on upstream's style and there is nothing to fix on our side.
+      # On Windows the static CRT (FD20) comes from .cargo/config.toml; fire-decode's HEIF
+      # libraries need it, and stop the build with a named error without it.
       - name: Clippy (workspace)
-        if: steps.have_vendor.outputs.present == 'true'
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      # Adds what `check` cannot reach: the PSD C++ FFI fixtures and the HEIF/AVIF containers.
+      # Adds what `check` cannot reach: PSD and HEIF / AVIF through the native decoders.
       - name: Test (workspace)
-        if: steps.have_vendor.outputs.present == 'true'
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       # Build only. Signing, notarization and the .dmg are the dev Mac's, not CI's (D11).
       - name: Build release binary
-        if: steps.have_vendor.outputs.present == 'true'
-        run: cargo build -p fire -p fire-cli -p fire-shellext --release
+        run: cargo build --locked -p fire -p fire-cli -p fire-shellext --release
