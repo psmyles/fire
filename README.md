@@ -61,9 +61,16 @@ vendor/
 Every image is decoded by [fire-decode](https://github.com/psmyles/fire-decode), the decoder Fire
 shares with 3D Review and bite. It is a git dependency at a release tag (`Cargo.toml`;
 `Cargo.lock` records it), and it brings its own native code: psd_sdk, compiled from source, and
-the HEIF / HEIC / AVIF stack, prebuilt for both targets. To try a change to it in Fire, point
-Fire at a checkout of it with a `[patch."https://github.com/psmyles/fire-decode"]` in an untracked
-`.cargo/config.toml` above both, and take that out again before updating `Cargo.lock`.
+the HEIF / HEIC / AVIF stack, prebuilt for both targets. Nothing outside this repository decides
+where it comes from. To try a change to it in Fire, patch it for that one command, from a
+checkout beside this one:
+
+```sh
+cargo build --config 'patch."https://github.com/psmyles/fire-decode".fire-decode.path="../fire-decode/crates/fire-decode"'
+```
+
+That build writes the path into `Cargo.lock`, so `git checkout Cargo.lock` afterwards; CI's
+`--locked` builds refuse a lock that names a path.
 
 ## Build & dev
 

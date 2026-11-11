@@ -99,8 +99,8 @@ serde_json = "1"
 # --- Asset Check (fire-cli) ---
 # Which rules apply to a file, the results format, the git helpers and the cache, shared with
 # 3D Review's `review3d-cli` so both checkers answer the same way (Asset Check AC9). Used by tag;
-# to build against an unreleased checkout, give this repository an untracked `.cargo/config.toml`
-# with `[patch."https://github.com/psmyles/asset-rules"] asset-rules = { path = "../asset-rules" }`.
+# to build against an unreleased checkout, patch it for one command, as fire-decode is below:
+# `--config 'patch."https://github.com/psmyles/asset-rules".asset-rules.path="../asset-rules"'`.
 asset-rules = { git = "https://github.com/psmyles/asset-rules", tag = "v0.2.1" }
 # Byte-string search for generation metadata in XMP. Already in the build through `globset`.
 memchr = "2"
@@ -140,10 +140,13 @@ fire-ipc = { path = "crates/fire-ipc" }
 # Cargo.lock records; moving to a new release is this tag and `cargo update -p fire-decode`. The
 # release sets the decoders' versions too: fire-decode pins each one exactly, so Cargo.lock takes
 # them from the tag, and the decoder crates named here (lcms2, miniz_oxide, image, ...) follow.
-# Local work on both goes through a `[patch."https://github.com/psmyles/fire-decode"]` in an
-# untracked `.cargo/config.toml` in the folder that holds both checkouts (FD13); take it out
-# before updating Cargo.lock, or the lock records the path. It has no default features: each
-# member names the ones it uses, and `fire` turns PSD and HEIF on through its own default feature.
+# Nothing outside this repository decides where it comes from: no `.cargo/config.toml` above it
+# patches it. To try an unreleased fire-decode, patch it for one command only, from a checkout
+# beside this one:
+#   cargo build --config 'patch."https://github.com/psmyles/fire-decode".fire-decode.path="../fire-decode/crates/fire-decode"'
+# That writes the path into Cargo.lock: `git checkout Cargo.lock` afterwards, and never commit a
+# lock it wrote (CI's `--locked` refuses one). It has no default features: each member names the
+# ones it uses, and `fire` turns PSD and HEIF on through its own default feature.
 fire-decode = { git = "https://github.com/psmyles/fire-decode", tag = "v0.1.1" }
 fire-thumbs = { path = "crates/fire-thumbs" }
 
