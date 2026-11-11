@@ -11,15 +11,15 @@ Fire's own code is MIT licensed; see [`../LICENSE`](../LICENSE).
 * **Section 1** covers the native C/C++ libraries. Read this one — it is short, and it contains
   the only obligation in the whole distribution that goes beyond attribution (the LGPL relink
   right, below).
-* **Section 2** covers the Rust crates (187 of them). One of them, `option-ext`, is MPL-2.0; the
+* **Section 2** covers the Rust crates (192 of them). One of them, `option-ext`, is MPL-2.0; the
   note under the table says what that does and does not require.
 * **Section 3** notes what is *not* here, and why.
 
-Generated against Fire 0.6.0 (`Cargo.lock`, runtime dependencies only, for the union of the two
-shipped targets `x86_64-pc-windows-msvc` and `aarch64-apple-darwin` — a crate that appears on only
-one of them is still listed, since both binaries are built from this tree). Build-time-only
-tooling — `cc`, `resvg`, `winresource`, `sokol-shdc`, `fxc`, `xcrun metal` — is excluded: it
-produces the binary but no part of it is linked into the binary.
+Generated from `Cargo.lock` (runtime dependencies only, proc-macros included, for the union of
+the two shipped targets `x86_64-pc-windows-msvc` and `aarch64-apple-darwin` — a crate that
+appears on only one of them is still listed, since both binaries are built from this tree).
+Build-time-only tooling — `cc`, `resvg`, `winresource`, `sokol-shdc`, `fxc`, `xcrun metal` — is
+excluded: it produces the binary but no part of it is linked into the binary.
 
 ---
 
@@ -127,14 +127,14 @@ License text: [`licenses/Zlib.txt`](../licenses/Zlib.txt)
 
 ## 2. Rust crates
 
-187 crates are linked into the Fire binaries (the union of both shipped targets). Where a crate
+192 crates are linked into the Fire binaries (the union of both shipped targets). Where a crate
 offers a choice of licenses, the column below records **the license Fire elects**, not the full
 SPDX expression — Fire elects MIT wherever MIT is offered, then the most permissive of what is
 left. Full texts:
 
 | License | Text |
 |---|---|
-| MIT (175 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
+| MIT (180 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
 | BSD-3-Clause (6) | [`licenses/BSD-3-Clause.txt`](../licenses/BSD-3-Clause.txt) |
 | 0BSD (3) | [`licenses/0BSD.txt`](../licenses/0BSD.txt) |
 | Apache-2.0 (1, plus 1 in addition to MIT) | [`licenses/Apache-2.0.txt`](../licenses/Apache-2.0.txt) |
@@ -152,7 +152,7 @@ rows name the authors the crate itself declares.
 | `aho-corasick` | 1.1.4 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant |
 | `alloc-no-stdlib` | 2.0.4 | BSD-3-Clause | Copyright (c) 2016 Dropbox, Inc. |
 | `alloc-stdlib` | 0.2.4 | BSD-3-Clause | (no notice in crate; authors: Daniel Reiter Horn <danielrh@dropbox.com>) |
-| `asset-rules` | 0.1.0 | MIT | Copyright (c) 2026 Chandan Singh |
+| `asset-rules` | 0.2.1 | MIT | Copyright (c) 2026 Chandan Singh |
 | `bit_field` | 0.10.3 | MIT | Copyright (c) 2016 Philipp Oppermann |
 | `bitflags` | 1.3.2 | MIT | Copyright (c) 2014 The Rust Project Developers |
 | `bitflags` | 2.13.0 | MIT | Copyright (c) 2014 The Rust Project Developers |
@@ -281,6 +281,7 @@ rows name the authors the crate itself declares.
 | `serde_derive` | 1.0.228 | MIT | (no notice in crate; authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com>) |
 | `serde_json` | 1.0.150 | MIT | (no notice in crate; authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com>) |
 | `serde_spanned` | 0.6.9 | MIT | Copyright (c) Individual contributors |
+| `serde_spanned` | 1.1.1 | MIT | Copyright (c) Individual contributors |
 | `sha2` | 0.11.1 | MIT | Copyright (c) 2016-2026 The RustCrypto Project Developers; Copyright (c) 2016 Artyom Pavlov; Copyright (c) 2009-2013 Mozilla Foundation; Copyright (c) 2006-2009 Graydon Hoare |
 | `simd-adler32` | 0.3.9 | MIT | Copyright (c) [2021] [Marvin Countryman] |
 | `smallvec` | 1.15.2 | MIT | Copyright (c) 2018 The Servo Project Developers |
@@ -290,8 +291,11 @@ rows name the authors the crate itself declares.
 | `thiserror-impl` | 2.0.18 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>) |
 | `tiff` | 0.11.3 | MIT | Copyright (c) 2018 PistonDevelopers |
 | `toml` | 0.8.23 | MIT | Copyright (c) Individual contributors |
+| `toml` | 1.1.2+spec-1.1.0 | MIT | Copyright (c) Individual contributors |
 | `toml_datetime` | 0.6.11 | MIT | Copyright (c) Individual contributors |
+| `toml_datetime` | 1.1.1+spec-1.1.0 | MIT | Copyright (c) Individual contributors |
 | `toml_edit` | 0.22.27 | MIT | Copyright (c) Individual contributors |
+| `toml_parser` | 1.1.2+spec-1.1.0 | MIT | Copyright (c) Individual contributors |
 | `toml_write` | 0.1.2 | MIT | Copyright (c) Individual contributors |
 | `tracing` | 0.1.44 | MIT | Copyright (c) 2019 Tokio Contributors |
 | `tracing-core` | 0.1.36 | MIT | Copyright (c) 2019 Tokio Contributors |
@@ -323,6 +327,7 @@ rows name the authors the crate itself declares.
 | `windows_x86_64_msvc` | 0.53.1 | MIT | Copyright (c) Microsoft Corporation. |
 | `winit` | 0.30.13 | Apache-2.0 | (no notice in crate; authors: The winit contributors, Pierre Krieger <pierre.krieger1708@gmail.com>) |
 | `winnow` | 0.7.15 | MIT | (no copyright notice supplied by the crate) |
+| `winnow` | 1.0.3 | MIT | (no copyright notice supplied by the crate) |
 | `zerocopy` | 0.8.52 | MIT | Copyright 2023 The Fuchsia Authors |
 | `zerocopy-derive` | 0.8.52 | MIT | Copyright 2023 The Fuchsia Authors |
 | `zmij` | 1.0.21 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>) |
