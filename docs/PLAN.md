@@ -212,16 +212,24 @@ Both are malformed files Photoshop doesn't write.
 
 ## Needs Windows (later)
 
-- Windows TTFP baselines; fire's switch to the fire-decode tag (step 1).
-- The static CRT for fire, fire-shellext and fire-cli (FD20), checked by an import table with no
-  `MSVCP140` / `VCRUNTIME140*` / `api-ms-win-crt-*` entries.
-  - `fire-cli.exe` links psd_sdk and the HEIF stack too, and imports `MSVCP140.dll` today, as
-    `fire.exe` does. FD20 and the step-1 gate in `fire-decode-plan.md` now name it.
+- **Done 11 November 2026** (fire-decode's `docs/baselines.md`, "Windows"):
+  - the Windows TTFP baselines, and every fire-decode step's TTFP gate on this branch: every
+    format within 2% of `710b3f6` or faster;
+  - the static CRT for fire, fire-shellext and fire-cli (FD20, `.cargo/config.toml`): none of the
+    three imports `MSVCP140`, `VCRUNTIME140*` or `api-ms-win-crt-*`;
+  - fire-shellext's decode path, driven directly: HEIC and AVIF thumbnails upright,
+    `pq_lossless.avif` as SDR.
+- fire's switch to the fire-decode tag (step 1): waits for `v0.1.0`. The installer script runs
+  plain `cargo`, so it needs a toolchain of at least 1.99 (`stable` here is 1.98.1).
+- Hands-on: Explorer thumbnails through the new `fire_shellext.dll` (HEIC, AVIF, PQ as SDR, a
+  cubemap DDS's every face); the tone curves on an EXR and a PQ file; `H` on an iPhone HEIC;
+  sequences' loop counts and cancel.
 - Verifying the installer changes:
   - run the installer and check that `fire-cli.exe` lands beside `fire.exe` and runs. A2 only
     compiled the installer with ISCC.
   - FD20's: no runtime DLL needed on a clean machine.
-- Moving the installer-association test out of fire-decode into a fire crate (FD2, FD9).
+- Moving the installer-association test out of fire-decode into a fire crate (FD2, FD9): done on
+  this branch in step 3.
 
 ## References
 
