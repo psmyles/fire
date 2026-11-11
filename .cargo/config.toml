@@ -1,9 +1,20 @@
-# No LIBCLANG_PATH pin here on purpose.
+# The static CRT on Windows (FD20 in fire-decode's plan, `docs/fire-decode-plan.md`).
 #
-# bindgen (psd-sdk-sys, heif-sys) loads libclang at build time through clang-sys, which
-# already finds it on both platforms: on Windows it globs `C:\Program Files*\LLVM\lib` and
-# the sibling `bin` (so an off-PATH LLVM still resolves), on macOS it looks inside
-# `xcode-select -p`'s XcodeDefault toolchain. An absolute path pinned here would be a
-# *global* override — `[env]` cannot be made host-conditional — so a Windows path set here
-# breaks every Mac build by short-circuiting that search. Set LIBCLANG_PATH in your own
-# environment if you need to point at a specific libclang.
+# Every Windows binary - `fire.exe`, `fire-cli.exe`, the Explorer shell extension
+# `fire_shellext.dll` - links the C and C++ runtimes into itself rather than importing them.
+# Built against the DLL runtime, fire-decode's C++ (psd_sdk and the HEIF stack) makes each of them
+# import `MSVCP140.dll` and `VCRUNTIME140*.dll`, and the installer doesn't ship the Visual C++
+# redistributable: a clean machine without it could not start fire. The shell extension has a
+# second reason - it loads into Explorer's shared surrogate, where another vendor's handler may
+# already have loaded an older `msvcp140.dll`.
+#
+# What `cc` compiles (psd_sdk, the HEIF wrapper, sokol, lcms2, libwebp) follows this flag on its
+# own, building `/MT`, and fire-decode's prebuilt HEIF libraries are built `/MT` for it; its
+# heif-sys refuses a Windows build without the flag. Nothing prebuilt and `/MD` is linked, which
+# is what makes the switch safe: a mixed-CRT link fails or misbehaves. The gate is the import
+# tables: no `MSVCP140` / `VCRUNTIME140*` / `api-ms-win-crt-*` entries.
+#
+# A `RUSTFLAGS` environment variable replaces this list rather than adding to it, so a build with
+# one set must carry `-C target-feature=+crt-static` itself.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
