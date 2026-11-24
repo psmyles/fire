@@ -49,8 +49,8 @@ pub fn fit(w: u32, h: u32, cx: u32) -> (u32, u32) {
 /// Draw `img` as a thumbnail at most `cx` pixels on its long side. `None` when the image has no
 /// pixels or its buffer is shorter than its dimensions say — a decoder bug, not a picture.
 ///
-/// Draws the canvas: an animated GIF's first frame, a DDS cubemap's whole sheet of faces — what the
-/// viewer opens on.
+/// Draws the canvas: an animated GIF's first frame, a DDS or KTX cubemap's whole sheet of faces —
+/// what the viewer opens on.
 pub fn render(img: &DecodedImage, cx: u32, cfg: &ThumbnailsCfg) -> Option<Thumbnail> {
     let (sw, sh) = (img.width as usize, img.height as usize);
     let needed = sw

@@ -498,9 +498,9 @@ struct ImageContent {
     /// minified display samples it — but most of it is usually computed here, not read from the
     /// file; see `authored_mips`.
     mip_count: u32,
-    /// How many of the texture's levels past 0 the *file* supplied (a DDS's own chain). 0 for
-    /// every format that carries none. Only these levels are offered for viewing: stepping into
-    /// a box-filtered level the viewer made up would say nothing about the file.
+    /// How many of the texture's levels past 0 the *file* supplied (a DDS's or KTX's own chain).
+    /// 0 for every format that carries none. Only these levels are offered for viewing: stepping
+    /// into a box-filtered level the viewer made up would say nothing about the file.
     authored_mips: u32,
     /// The displayed image — retained for the pixel inspector (#16) and for re-fit on resize.
     /// For an animated source this holds frame 0 (dimensions/format/metadata are frame-invariant);

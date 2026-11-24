@@ -32,6 +32,16 @@ see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 - **[bcdec_rs](https://github.com/ScanMountGoat/bcdec_rs)** - ScanMountGoat, a port of
   **[bcdec](https://github.com/iOrange/bcdec)** by Sergii "iOrange" Kudlai. BC1-BC7 block
   decoding, BC6H included.
+- **[ktx2](https://github.com/BVE-Reborn/ktx2)** - the BVE-Reborn developers. The KTX2
+  container: its header, levels and data format descriptor.
+- **[texture2ddecoder](https://github.com/UniversalGameExtraction/texture2ddecoder)** - Rudolf
+  Kolbe, from decoders by Perfare (AssetStudio) and Ishotihadus (mikunyan). ETC1 / ETC2 / EAC,
+  ASTC and PVRTC block decoding for KTX and KTX2.
+- **[basisu](https://github.com/marcogomez/basisu)** - Marco Gomez, a port of Binomial's
+  **[Basis Universal](https://github.com/BinomialLLC/basis_universal)** transcoder. ETC1S, UASTC
+  and UASTC HDR in KTX2 files.
+- **[ruzstd](https://github.com/KillingSpark/zstd-rs)** - Moritz Borcherding. Zstandard
+  supercompression in KTX2 files.
 - **[libheif](https://github.com/strukturag/libheif)** and
   **[libde265](https://github.com/strukturag/libde265)** - Dirk Farin and struktur AG. HEIF/HEIC.
 - **[dav1d](https://code.videolan.org/videolan/dav1d)** - VideoLAN and the dav1d authors. AV1
@@ -129,7 +139,7 @@ see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
   **[parking_lot](https://github.com/Amanieu/parking_lot)**,
   **[smallvec](https://github.com/servo/rust-smallvec)**,
   **[hashbrown](https://github.com/rust-lang/hashbrown)** and others - see
-  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the complete list of 195 crates.
+  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the complete list of 200 crates.
 
 ## Build tooling
 

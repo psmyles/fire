@@ -128,8 +128,8 @@ pub struct DecodeOutcome {
     /// otherwise, and on failure.
     pub mips: Vec<Vec<u8>>,
     /// How many of `mips` (from level 1) came from the file itself rather than being computed
-    /// here. Only a DDS carries its own chain, so this is 0 for every other format — and the
-    /// mip-level control is offered only when it is above 0.
+    /// here. Only the texture containers (DDS, KTX, KTX2) carry their own chain, so this is 0
+    /// for every other format — and the mip-level control is offered only when it is above 0.
     pub authored_mips: u32,
     /// Echoed from the job; see [`DecodeJob::reload`].
     pub reload: bool,
@@ -396,9 +396,9 @@ fn run_decode(
                     fire_decode::mips::stored_levels(src, w, h, format, &opts)
                 });
                 let chain = match source_mips {
-                    // A DDS brings its own, and those levels were authored — with a filter and a
-                    // gamma a box filter does not reproduce. Keep what the file supplied and compute
-                    // only the tail it stopped short of.
+                    // A DDS or KTX brings its own, and those levels were authored — with a filter
+                    // and a gamma a box filter does not reproduce. Keep what the file supplied and
+                    // compute only the tail it stopped short of.
                     Some(src) => fire_decode::mips::complete(src, &img.pixels, w, h, format, &opts),
                     None => fire_decode::mips::chain(&img.pixels, w, h, format, &opts),
                 };
@@ -451,7 +451,7 @@ fn run_decode(
     };
     // Keep a clone to run flipbook detection *after* the image is posted, so a large sheet
     // reaches the screen without waiting on the per-pixel scan. Skipped for animated sources (a
-    // GIF is not a sprite sheet), for a source whose grid the *file* stated (a DDS
+    // GIF is not a sprite sheet), for a source whose grid the *file* stated (a DDS or KTX
     // cubemap/array/volume — authored structure is never guessed at), and when the user turned
     // detection off.
     let detect_input = result

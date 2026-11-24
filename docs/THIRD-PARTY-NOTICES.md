@@ -11,7 +11,7 @@ Fire's own code is MIT licensed; see [`../LICENSE`](../LICENSE).
 * **Section 1** covers the native C/C++ libraries. Read this one — it is short, and it contains
   the only obligation in the whole distribution that goes beyond attribution (the LGPL relink
   right, below).
-* **Section 2** covers the Rust crates (195 of them). One of them, `option-ext`, is MPL-2.0; the
+* **Section 2** covers the Rust crates (200 of them). One of them, `option-ext`, is MPL-2.0; the
   note under the table says what that does and does not require.
 * **Section 3** notes what is *not* here, and why.
 
@@ -127,17 +127,17 @@ License text: [`licenses/Zlib.txt`](../licenses/Zlib.txt)
 
 ## 2. Rust crates
 
-195 crates are linked into the Fire binaries (the union of both shipped targets). Where a crate
+200 crates are linked into the Fire binaries (the union of both shipped targets). Where a crate
 offers a choice of licenses, the column below records **the license Fire elects**, not the full
 SPDX expression — Fire elects MIT wherever MIT is offered, then the most permissive of what is
 left. Full texts:
 
 | License | Text |
 |---|---|
-| MIT (183 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
+| MIT (186 crates) | [`licenses/MIT.txt`](../licenses/MIT.txt) |
 | BSD-3-Clause (6) | [`licenses/BSD-3-Clause.txt`](../licenses/BSD-3-Clause.txt) |
 | 0BSD (3) | [`licenses/0BSD.txt`](../licenses/0BSD.txt) |
-| Apache-2.0 (1, plus 1 in addition to MIT) | [`licenses/Apache-2.0.txt`](../licenses/Apache-2.0.txt) |
+| Apache-2.0 (3, plus 1 in addition to MIT) | [`licenses/Apache-2.0.txt`](../licenses/Apache-2.0.txt) |
 | MPL-2.0 (1) | [`licenses/MPL-2.0.txt`](../licenses/MPL-2.0.txt) — see the note below |
 | CC0-1.0 (1) | [`licenses/CC0-1.0.txt`](../licenses/CC0-1.0.txt) |
 | Unicode-3.0 (1, in addition to MIT) | [`licenses/Unicode-3.0.txt`](../licenses/Unicode-3.0.txt) |
@@ -153,6 +153,7 @@ rows name the authors the crate itself declares.
 | `alloc-no-stdlib` | 2.0.4 | BSD-3-Clause | Copyright (c) 2016 Dropbox, Inc. |
 | `alloc-stdlib` | 0.2.4 | BSD-3-Clause | (no notice in crate; authors: Daniel Reiter Horn <danielrh@dropbox.com>) |
 | `asset-rules` | 0.2.1 | MIT | Copyright (c) 2026 Chandan Singh |
+| `basisu` | 0.1.0 | Apache-2.0 | Copyright 2019-2026 Binomial LLC (original C++ transcoder); Copyright 2026 Marco Gomez (pure-Rust port) |
 | `bit_field` | 0.10.3 | MIT | Copyright (c) 2016 Philipp Oppermann |
 | `bitflags` | 1.3.2 | MIT | Copyright (c) 2014 The Rust Project Developers |
 | `bitflags` | 2.13.0 | MIT | Copyright (c) 2014 The Rust Project Developers |
@@ -197,7 +198,7 @@ rows name the authors the crate itself declares.
 | `exr` | 1.74.3 | BSD-3-Clause | Copyright (c) Contributors to the OpenEXR Project. All rights reserved. |
 | `fax` | 0.2.7 | MIT | Copyright © 2021 The pdf-rs contributers. |
 | `fdeflate` | 0.3.7 | MIT | (no notice in crate; authors: The image-rs Developers) |
-| `fire-decode` | 0.1.1 | MIT | Copyright (c) 2026 Chandan Singh |
+| `fire-decode` | 0.2.0 | MIT | Copyright (c) 2026 Chandan Singh |
 | `flate2` | 1.1.9 | MIT | Copyright (c) 2014-2026 Alex Crichton |
 | `foreign-types` | 0.5.0 | MIT | Copyright (c) 2017 The foreign-types Developers |
 | `foreign-types-macros` | 0.2.3 | MIT | Copyright (c) 2017 The foreign-types Developers |
@@ -207,7 +208,7 @@ rows name the authors the crate itself declares.
 | `globset` | 0.4.21 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant |
 | `half` | 2.7.1 | MIT | (no notice in crate; authors: Kathryn Long <squeeself@gmail.com>) |
 | `hashbrown` | 0.17.1 | MIT | Copyright (c) 2016 Amanieu d'Antras |
-| `heif-sys` | 0.1.1 | MIT | Copyright (c) 2026 Chandan Singh |
+| `heif-sys` | 0.2.0 | MIT | Copyright (c) 2026 Chandan Singh |
 | `hybrid-array` | 0.4.15 | MIT | Copyright (c) 2022-2026 The RustCrypto Project Developers |
 | `image` | 0.25.10 | MIT | (no notice in crate; authors: The image-rs Developers) |
 | `image-webp` | 0.2.4 | MIT | (no copyright notice supplied by the crate) |
@@ -229,8 +230,9 @@ rows name the authors the crate itself declares.
 | `jxl-threadpool` | 1.0.0 | MIT | (no notice in crate; authors: Wonwoo Choi <chwo9843@gmail.com>) |
 | `jxl-vardct` | 0.11.1 | MIT | (no notice in crate; authors: Wonwoo Choi <chwo9843@gmail.com>) |
 | `keyboard-types` | 0.7.0 | MIT | Copyright (c) 2017 Pyfisch |
-| `lcms2` | 6.2.0 | MIT | Copyright (c) Kornel Lesiński |
-| `lcms2-sys` | 4.0.7 | MIT | (no notice in crate; authors: Kornel Lesiński <kornel@geekhood.net>) |
+| `ktx2` | 0.5.0 | Apache-2.0 | Copyright 2021 The BVE-Reborn Developers |
+| `lcms2` | 6.3.0 | MIT | Copyright (c) Kornel Lesiński |
+| `lcms2-sys` | 4.2.0 | MIT | (no notice in crate; authors: Kornel Lesiński <kornel@geekhood.net>) |
 | `lebe` | 0.5.3 | BSD-3-Clause | Copyright (c) 2022 Contributors to the lebe Project. All rights reserved. |
 | `libc` | 0.2.186 | MIT | Copyright (c) The Rust Project Developers |
 | `libwebp-sys` | 0.14.4 | MIT | (no notice in crate; authors: XianYou <xianyou.cyq@alibaba-inc.com>, Kornel Lesiński <kornel@geekhood.net>) |
@@ -261,10 +263,11 @@ rows name the authors the crate itself declares.
 | `option-ext` | 0.2.0 | MPL-2.0 | (no notice in crate; authors: Simon Ochsenreither <simon@ochsenreither.de>) |
 | `parking_lot` | 0.12.5 | MIT | Copyright (c) 2016 The Rust Project Developers |
 | `parking_lot_core` | 0.9.12 | MIT | Copyright (c) 2016 The Rust Project Developers |
+| `paste` | 1.0.15 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>) |
 | `pin-project-lite` | 0.2.17 | MIT | (no copyright notice supplied by the crate) |
 | `png` | 0.18.1 | MIT | Copyright (c) 2015 nwin |
 | `proc-macro2` | 1.0.106 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>, Alex Crichton <alex@alexcrichton.com>) |
-| `psd-sdk-sys` | 0.1.1 | MIT | Copyright (c) 2026 Chandan Singh |
+| `psd-sdk-sys` | 0.2.0 | MIT | Copyright (c) 2026 Chandan Singh |
 | `pxfm` | 0.1.30 | BSD-3-Clause | Copyright (c) Radzivon Bartoshyk. All rights reserved. |
 | `qoi` | 0.4.1 | MIT | Copyright (c) 2022 Ivan Smirnov |
 | `quick-error` | 2.0.1 | MIT | Copyright (c) 2015 The quick-error Developers |
@@ -276,6 +279,7 @@ rows name the authors the crate itself declares.
 | `regex-automata` | 0.4.18 | MIT | Copyright (c) 2014 The Rust Project Developers |
 | `regex-syntax` | 0.8.11 | MIT | Copyright (c) 2014 The Rust Project Developers |
 | `rfd` | 0.17.2 | MIT | Copyright (c) 2022 Bartłomiej Maryńczak |
+| `ruzstd` | 0.7.3 | MIT | Copyright (c) 2019 Moritz Borcherding |
 | `same-file` | 1.0.6 | MIT | Copyright (c) 2017 Andrew Gallant |
 | `scopeguard` | 1.2.0 | MIT | Copyright (c) 2016-2019 Ulrik Sverdrup "bluss" and scopeguard developers |
 | `serde` | 1.0.228 | MIT | (no notice in crate; authors: Erick Tryzelaar <erick.tryzelaar@gmail.com>, David Tolnay <dtolnay@gmail.com>) |
@@ -290,6 +294,7 @@ rows name the authors the crate itself declares.
 | `smol_str` | 0.2.2 | MIT | (no notice in crate; authors: Aleksey Kladov <aleksey.kladov@gmail.com>) |
 | `syn` | 2.0.118 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>) |
 | `target-features` | 0.1.6 | MIT | Copyright 2022 Caleb Zulawski |
+| `texture2ddecoder` | 0.1.2 | MIT | (no notice in crate; authors: Rudolf Kolbe <rkolbe96@gmail.com>) — see the note below |
 | `thiserror` | 2.0.18 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>) |
 | `thiserror-impl` | 2.0.18 | MIT | (no notice in crate; authors: David Tolnay <dtolnay@gmail.com>) |
 | `tiff` | 0.11.3 | MIT | Copyright (c) 2018 PistonDevelopers |
@@ -352,6 +357,16 @@ terms are those of the IJG distribution, which permit use, modification and redi
 provided the origin is not misrepresented and any changes are marked. The crate is pulled in by
 `image`'s `jpeg` feature. Fire decodes JPEG with `zune-jpeg` and never encodes, so this code is
 reachable only through `image`'s fallback path.
+
+### Note on `texture2ddecoder`
+
+`texture2ddecoder` is MIT OR Apache-2.0 itself, and ports block decoders that are MIT licensed
+at their sources: ATC and BCn from Perfare's AssetStudio
+(<https://github.com/Perfare/AssetStudio>), ASTC, ETC and PVRTC from Ishotihadus' mikunyan
+(<https://github.com/Ishotihadus/mikunyan>), and its half-float conversion from Marat Dukhan's
+FP16 (<https://github.com/Maratyszcza/FP16>), whose `src/f16.rs` keeps the notices
+Copyright (c) 2017 Facebook Inc., Copyright (c) 2017 Georgia Institute of Technology and
+Copyright 2019 Google LLC. Each is covered by [`licenses/MIT.txt`](../licenses/MIT.txt).
 
 ### Note on `notify` (CC0-1.0)
 

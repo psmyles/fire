@@ -86,7 +86,8 @@ impl FlipbookState {
         s
     }
 
-    /// A fresh state for a sheet the *file* laid out — a DDS cubemap, texture array or volume.
+    /// A fresh state for a sheet the *file* laid out — a DDS or KTX cubemap, texture array or
+    /// volume.
     ///
     /// Two things differ from [`Self::new`]. The frame count is what the file holds rather than
     /// the whole grid, so the empty trailing cells of a five-layer array tiled 3x2 are not

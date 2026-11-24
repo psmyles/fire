@@ -73,6 +73,9 @@ ChangesAssociations=yes
 ; And to reload the environment once [Code] has changed the user's Path (the "addtopath" task), so
 ; a terminal opened after Setup finds fire-cli without signing out. The uninstaller does the same.
 ChangesEnvironment=yes
+; Every install starts from the defaults in [Tasks] — every association ticked, fire-cli on the
+; Path — not from what the last install picked.
+UsePreviousTasks=no
 WizardStyle=modern
 
 ; Fire's own MIT license, shown on the wizard's license page. Paths here are relative to this
@@ -121,8 +124,9 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: deskto
 ; --- file associations: the headline option, one entry per format plus an "All" master ---
 ; The parent "assoc" is the "All supported image formats" toggle: checking it checks every
 ; child (Inno propagates a parent check to children), and individual formats can be toggled.
-; Unchecked by default so an install never silently steals associations the user didn't pick.
-Name: "assoc";          Description: "All supported image formats"; GroupDescription: "Set {#MyAppName} as the default image viewer for:"; Flags: unchecked
+; All ticked by default, on every install: UsePreviousTasks=no, so an upgrade offers every
+; format again rather than what was picked last time.
+Name: "assoc";          Description: "All supported image formats"; GroupDescription: "Set {#MyAppName} as the default image viewer for:"
 Name: "assoc\png";      Description: "PNG image (.png)"
 Name: "assoc\jpeg";     Description: "JPEG image (.jpg, .jpeg, .jpe, .jfif)"
 Name: "assoc\gif";      Description: "GIF image (.gif)"
@@ -138,6 +142,7 @@ Name: "assoc\jxl";      Description: "JPEG XL (.jxl)"
 Name: "assoc\hdr";      Description: "Radiance HDR (.hdr, .pic, .rgbe, .xyze)"
 Name: "assoc\exr";      Description: "OpenEXR (.exr)"
 Name: "assoc\dds";      Description: "DirectDraw Surface (.dds)"
+Name: "assoc\ktx";      Description: "Khronos texture (.ktx, .ktx2)"
 Name: "assoc\psd";      Description: "Photoshop document (.psd, .psb)"
 Name: "assoc\heif";     Description: "HEIF / HEIC image (.heic, .heif)"
 Name: "assoc\avif";     Description: "AVIF image (.avif)"
@@ -353,6 +358,18 @@ Root: HKCU; Subkey: "Software\Classes\.dds\OpenWithProgids"; ValueType: none; Va
 Root: HKCU; Subkey: "Software\Classes\.dds"; ValueType: string; ValueName: ""; ValueData: "Fire.dds"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\dds
 Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".dds"; ValueData: "Fire.dds"; Flags: uninsdeletevalue; Tasks: assoc\dds
 
+; Khronos texture — Fire.ktx
+Root: HKCU; Subkey: "Software\Classes\Fire.ktx"; ValueType: string; ValueName: ""; ValueData: "Khronos texture"; Flags: uninsdeletekey; Tasks: assoc\ktx
+Root: HKCU; Subkey: "Software\Classes\Fire.ktx\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\ktx
+Root: HKCU; Subkey: "Software\Classes\Fire.ktx\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#MyAppName}"; Tasks: assoc\ktx
+Root: HKCU; Subkey: "Software\Classes\Fire.ktx\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExe}"" ""%1"""; Tasks: assoc\ktx
+Root: HKCU; Subkey: "Software\Classes\.ktx\OpenWithProgids"; ValueType: none; ValueName: "Fire.ktx"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\ktx
+Root: HKCU; Subkey: "Software\Classes\.ktx"; ValueType: string; ValueName: ""; ValueData: "Fire.ktx"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\ktx
+Root: HKCU; Subkey: "Software\Classes\.ktx2\OpenWithProgids"; ValueType: none; ValueName: "Fire.ktx"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\ktx
+Root: HKCU; Subkey: "Software\Classes\.ktx2"; ValueType: string; ValueName: ""; ValueData: "Fire.ktx"; Flags: uninsdeletevalue uninsdeletekeyifempty; Tasks: assoc\ktx
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ktx"; ValueData: "Fire.ktx"; Flags: uninsdeletevalue; Tasks: assoc\ktx
+Root: HKCU; Subkey: "Software\{#MyAppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".ktx2"; ValueData: "Fire.ktx"; Flags: uninsdeletevalue; Tasks: assoc\ktx
+
 ; Photoshop image — Fire.psd
 Root: HKCU; Subkey: "Software\Classes\Fire.psd"; ValueType: string; ValueName: ""; ValueData: "Photoshop image"; Flags: uninsdeletekey; Tasks: assoc\psd
 Root: HKCU; Subkey: "Software\Classes\Fire.psd\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExe},0"; Tasks: assoc\psd
@@ -486,19 +503,12 @@ Filename: "{app}\{#MyAppExe}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; F
 Filename: "{app}\{#MyAppExe}"; Parameters: "--remove-thumbnails"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveThumbnails"
 
 [Code]
-const
-  // Fire's thumbnail provider class: fire_thumbs::CLSID (a test there keeps the two equal).
-  FireThumbClsid = '{DA926B60-8532-4616-A98E-889545ADA4AB}';
-  // The ShellEx slot Explorer looks a thumbnail provider up under (IThumbnailProvider's IID).
-  ThumbSlot = '{e357fccd-a995-4576-b01f-234630154e96}';
-
 type
   // One checkbox on the Explorer Thumbnails page.
   TThumbFormat = record
     Id: String;              // fire_thumbs' group id, the token --set-thumbnails takes
-    Ext: String;             // the extension probed to tell whether Fire has the format now
     Caption: String;
-    WindowsHasNone: Boolean; // Windows draws no thumbnail of its own: left column, on by default
+    WindowsHasNone: Boolean; // Windows draws no thumbnail of its own: the left column
     List: TNewCheckListBox;  // the column it is in...
     Row: Integer;            // ...and its row there
   end;
@@ -506,7 +516,7 @@ type
 var
   ThumbFormats: array of TThumbFormat;
 
-procedure AddThumbFormat(WindowsHasNone: Boolean; Id, Ext, Caption: String);
+procedure AddThumbFormat(WindowsHasNone: Boolean; Id, Caption: String);
 var
   N: Integer;
 begin
@@ -514,43 +524,34 @@ begin
   SetArrayLength(ThumbFormats, N + 1);
   ThumbFormats[N].WindowsHasNone := WindowsHasNone;
   ThumbFormats[N].Id := Id;
-  ThumbFormats[N].Ext := Ext;
   ThumbFormats[N].Caption := Caption;
 end;
 
-// Every thumbnail format: whether Windows draws none of its own, the id, the extension probed for
-// its state, and the checkbox. fire_thumbs::formats::GROUPS, in its order — a test there holds the
-// two to each other, captions included (each starts with that table's label).
+// Every thumbnail format: whether Windows draws none of its own, the id, and the checkbox.
+// fire_thumbs::formats::GROUPS, in its order — a test there holds the two to each other, captions
+// included (each starts with that table's label).
 procedure ListThumbFormats;
 begin
-  AddThumbFormat(True,  'tga',      'tga',  'Truevision TGA (.tga)');
-  AddThumbFormat(True,  'dds',      'dds',  'DirectDraw Surface (.dds)');
-  AddThumbFormat(True,  'psd',      'psd',  'Photoshop (.psd, .psb)');
-  AddThumbFormat(True,  'exr',      'exr',  'OpenEXR (.exr)');
-  AddThumbFormat(True,  'hdr',      'hdr',  'Radiance HDR (.hdr, .pic, …)');
-  AddThumbFormat(True,  'qoi',      'qoi',  'QOI (.qoi)');
-  AddThumbFormat(True,  'netpbm',   'ppm',  'Netpbm (.ppm, .pgm, …)');
-  AddThumbFormat(True,  'farbfeld', 'ff',   'Farbfeld (.ff)');
-  AddThumbFormat(False, 'png',      'png',  'PNG (.png)');
-  AddThumbFormat(False, 'jpeg',     'jpg',  'JPEG (.jpg, .jpeg, …)');
-  AddThumbFormat(False, 'gif',      'gif',  'GIF (.gif)');
-  AddThumbFormat(False, 'bmp',      'bmp',  'Bitmap (.bmp, .dib)');
-  AddThumbFormat(False, 'tiff',     'tif',  'TIFF (.tif, .tiff, .tx)');
-  AddThumbFormat(False, 'webp',     'webp', 'WebP (.webp)');
-  AddThumbFormat(False, 'ico',      'ico',  'Icon and cursor (.ico, .cur)');
-  AddThumbFormat(False, 'jxl',      'jxl',  'JPEG XL (.jxl)');
-  AddThumbFormat(False, 'heif',     'heic', 'HEIF / HEIC (.heic, .heif)');
-  AddThumbFormat(False, 'avif',     'avif', 'AVIF (.avif)');
-  AddThumbFormat(False, 'raw',      'cr2',  'Camera raw (.cr2, .nef, …)');
-end;
-
-// Whether Fire is Explorer's thumbnail provider for this extension now.
-function FireHasThumbnails(Ext: String): Boolean;
-var
-  Value: String;
-begin
-  Result := RegQueryStringValue(HKCU, 'Software\Classes\.' + Ext + '\ShellEx\' + ThumbSlot, '', Value)
-    and (CompareText(Value, FireThumbClsid) = 0);
+  AddThumbFormat(True,  'tga',      'Truevision TGA (.tga)');
+  AddThumbFormat(True,  'dds',      'DirectDraw Surface (.dds)');
+  AddThumbFormat(True,  'ktx',      'Khronos texture (.ktx, .ktx2)');
+  AddThumbFormat(True,  'psd',      'Photoshop (.psd, .psb)');
+  AddThumbFormat(True,  'exr',      'OpenEXR (.exr)');
+  AddThumbFormat(True,  'hdr',      'Radiance HDR (.hdr, .pic, …)');
+  AddThumbFormat(True,  'qoi',      'QOI (.qoi)');
+  AddThumbFormat(True,  'netpbm',   'Netpbm (.ppm, .pgm, …)');
+  AddThumbFormat(True,  'farbfeld', 'Farbfeld (.ff)');
+  AddThumbFormat(False, 'png',      'PNG (.png)');
+  AddThumbFormat(False, 'jpeg',     'JPEG (.jpg, .jpeg, …)');
+  AddThumbFormat(False, 'gif',      'GIF (.gif)');
+  AddThumbFormat(False, 'bmp',      'Bitmap (.bmp, .dib)');
+  AddThumbFormat(False, 'tiff',     'TIFF (.tif, .tiff, .tx)');
+  AddThumbFormat(False, 'webp',     'WebP (.webp)');
+  AddThumbFormat(False, 'ico',      'Icon and cursor (.ico, .cur)');
+  AddThumbFormat(False, 'jxl',      'JPEG XL (.jxl)');
+  AddThumbFormat(False, 'heif',     'HEIF / HEIC (.heic, .heif)');
+  AddThumbFormat(False, 'avif',     'AVIF (.avif)');
+  AddThumbFormat(False, 'raw',      'Camera raw (.cr2, .nef, …)');
 end;
 
 // One column of the page, laid out like the tasks list: a checkbox for the whole group, with one
@@ -570,16 +571,14 @@ begin
 end;
 
 // The Explorer Thumbnails page, right after the tasks: two columns, as in Settings ▸ Thumbnails.
-// A fresh install, or an upgrade from a Fire without thumbnails, ticks the formats Windows has no
-// thumbnails for. Otherwise the page shows what is on now, which the user may have changed in
-// Settings since the last install.
+// Every format starts ticked, on a fresh install and an upgrade alike: the page offers the
+// defaults, not what is on now.
 procedure InitializeWizard;
 var
   Page: TWizardPage;
   Intro: TNewStaticText;
   NewColumn, WinColumn: TNewCheckListBox;
   Top, Gap, Half, I: Integer;
-  ShowCurrent: Boolean;
 begin
   Page := CreateCustomPage(wpSelectTasks, 'Explorer Thumbnails',
     'Which image formats should {#MyAppName} draw thumbnails for in File Explorer?');
@@ -605,7 +604,6 @@ begin
   WinColumn.Anchors := [akLeft, akTop, akRight, akBottom];
 
   ListThumbFormats;
-  ShowCurrent := GetPreviousData('ThumbnailsChosen', '') <> '';
   for I := 0 to GetArrayLength(ThumbFormats) - 1 do
   begin
     if ThumbFormats[I].WindowsHasNone then
@@ -614,22 +612,10 @@ begin
       ThumbFormats[I].List := WinColumn;
     ThumbFormats[I].Row := ThumbFormats[I].List.AddCheckBox(ThumbFormats[I].Caption, '', 1,
       False, True, False, True, nil);
-    // An install from before the choice was recorded, which already registered Fire.
-    ShowCurrent := ShowCurrent or FireHasThumbnails(ThumbFormats[I].Ext);
   end;
   // Ticked once every row exists, so each column's own checkbox follows its formats.
   for I := 0 to GetArrayLength(ThumbFormats) - 1 do
-    if ShowCurrent then
-      ThumbFormats[I].List.Checked[ThumbFormats[I].Row] := FireHasThumbnails(ThumbFormats[I].Ext)
-    else
-      ThumbFormats[I].List.Checked[ThumbFormats[I].Row] := ThumbFormats[I].WindowsHasNone;
-end;
-
-// Records that the choice has been made, so the next upgrade shows it, even with nothing ticked,
-// instead of the defaults.
-procedure RegisterPreviousData(PreviousDataKey: Integer);
-begin
-  SetPreviousData(PreviousDataKey, 'ThumbnailsChosen', 'yes');
+    ThumbFormats[I].List.Checked[ThumbFormats[I].Row] := True;
 end;
 
 // The ticked formats, as fire.exe --set-thumbnails takes them: 'tga,dds,psd'.

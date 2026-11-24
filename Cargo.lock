@@ -135,6 +135,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "basisu"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36056503b9996959defdfcf058811637fdf68a2e35a48ee8e39c89a787fe9cdc"
+dependencies = [
+ "portable-atomic",
+ "ruzstd",
+]
+
+[[package]]
 name = "bcdec_rs"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -727,8 +737,9 @@ dependencies = [
 [[package]]
 name = "fire-decode"
 version = "0.0.0"
-source = "git+https://github.com/psmyles/fire-decode?tag=v0.1.1#be6de7e7844e605c65e4862891add748fe78d61b"
+source = "git+https://github.com/psmyles/fire-decode?tag=v0.2.0#30c414a77fe618144607fd4d13963bb462e97c0d"
 dependencies = [
+ "basisu",
  "bcdec_rs",
  "bytemuck",
  "ddsfile",
@@ -752,6 +763,7 @@ dependencies = [
  "jxl-render",
  "jxl-threadpool",
  "jxl-vardct",
+ "ktx2",
  "lcms2",
  "lcms2-sys",
  "libwebp-sys",
@@ -761,7 +773,9 @@ dependencies = [
  "psd-sdk-sys",
  "pxfm",
  "qoi",
+ "ruzstd",
  "serde_json",
+ "texture2ddecoder",
  "tiff",
  "weezl",
  "zune-bmp",
@@ -991,7 +1005,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 [[package]]
 name = "heif-sys"
 version = "0.0.0"
-source = "git+https://github.com/psmyles/fire-decode?tag=v0.1.1#be6de7e7844e605c65e4862891add748fe78d61b"
+source = "git+https://github.com/psmyles/fire-decode?tag=v0.2.0#30c414a77fe618144607fd4d13963bb462e97c0d"
 dependencies = [
  "cc",
 ]
@@ -1389,6 +1403,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ktx2"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d50be8a24c37debdf3170be6ca396d5b5b165f37f94837891adac735ca416b8"
+dependencies = [
+ "bitflags 2.13.0",
+]
+
+[[package]]
 name = "kurbo"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1401,9 +1424,9 @@ dependencies = [
 
 [[package]]
 name = "lcms2"
-version = "6.2.0"
+version = "6.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80205450f4d8b4de92f18111de879f3df4a6b728915e89b73c38f7a59a81ad90"
+checksum = "678106a51fa289d2c059f8594a7b980b4f3ac396c22d60094587dad7ab952f41"
 dependencies = [
  "bytemuck",
  "foreign-types",
@@ -1412,9 +1435,9 @@ dependencies = [
 
 [[package]]
 name = "lcms2-sys"
-version = "4.0.7"
+version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "264db0b78119c5a37d78bb41fb355daab29b3b29430b53cd92e3da51f0ab06cc"
+checksum = "9a0fc4c537f27eb6fd5497862c47072f731c96fc914eba9f63f385240d5978b3"
 dependencies = [
  "cc",
  "dunce",
@@ -1984,6 +2007,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2074,6 +2103,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2094,7 +2129,7 @@ dependencies = [
 [[package]]
 name = "psd-sdk-sys"
 version = "0.0.0"
-source = "git+https://github.com/psmyles/fire-decode?tag=v0.1.1#be6de7e7844e605c65e4862891add748fe78d61b"
+source = "git+https://github.com/psmyles/fire-decode?tag=v0.2.0#30c414a77fe618144607fd4d13963bb462e97c0d"
 dependencies = [
  "cc",
 ]
@@ -2344,6 +2379,12 @@ dependencies = [
  "unicode-properties",
  "unicode-script",
 ]
+
+[[package]]
+name = "ruzstd"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
 
 [[package]]
 name = "same-file"
@@ -2597,6 +2638,15 @@ name = "target-features"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1bbb9f3c5c463a01705937a24fdabc5047929ac764b2d5b9cf681c1f5041ed5"
+
+[[package]]
+name = "texture2ddecoder"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "427ae8ec7f2f0fdd3146b77cfa44bea880caf066f7e55398a8467afe2645c832"
+dependencies = [
+ "paste",
+]
 
 [[package]]
 name = "thiserror"

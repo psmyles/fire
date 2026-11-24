@@ -38,7 +38,7 @@ pub enum Action {
     /// a value rather than a command — see [`crate::ui::Frame::exposure`].
     ExpReset,
     /// Step to a finer (`MipDown`, toward level 0) or coarser (`MipUp`) mip level. Only offered
-    /// when the image has a chain worth stepping through — today, a DDS that brought one.
+    /// when the image has a chain worth stepping through — today, a DDS or KTX that brought one.
     MipDown,
     MipUp,
     /// Toggle the 1px image-boundary outline (right-side group).

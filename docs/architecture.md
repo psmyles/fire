@@ -229,7 +229,7 @@ called from the forward path. macOS needs no equivalent - Launch Services activa
   the UI thread. Each level is a 2×2 box filter of the level above, with 8-bit sRGB sources
   averaged in *linear* light through two lookup tables (what hardware does for an `*_SRGB`
   format); the big levels are split across threads from fire-decode's budget. **A decoder that brings its own chain keeps it**: a DDS
-  stores authored levels, filtered and gamma-corrected by whatever tool built the texture, and a
+  or KTX stores authored levels, filtered and gamma-corrected by whatever tool built the texture, and a
   box filter does not reproduce them - so `mips::complete` adopts what the file supplied and
   computes only the tail it stopped short of (`DecodedImage::source_mips`, dropped by
   `transform_buffers` the moment any pass rewrites the canvas).
@@ -413,13 +413,14 @@ also detected by magic so a no-extension open still routes correctly.
 | TIFF | **`tiff` crate directly** → RGBA at the source depth (8/16/32f, +ICC). Going through `image` lost samples: it can only represent what `tiff`'s conservative `colortype()` names, so an unlabelled 4th sample (Photoshop's `ExtraSamples = 0`) was dropped, grey+alpha was refused outright, and 16-bit was narrowed to 8. Associated (premultiplied) alpha is straightened here. Strips decode in parallel, one decoder per thread (LZW/Deflate files ~5× faster). Palette images, which neither crate reads, are relabelled greyscale in a copy so `tiff` reads the indices, then mapped through `ColorMap` here. CMYK/YCbCr/Lab still fall back to `image` |
 | TGA, ICO, CUR | `image` crate (formats zune doesn't decode). A `.cur` is an ICO with `2` in its type word and two directory fields reused for the hotspot, neither of which the ICO decoder reads - so it decodes unchanged, and is only sniffed and labelled separately |
 | DDS | **`ddsfile`** (header, incl. the DX10 extension) + **`bcdec_rs`** (blocks), both pure Rust → BC1-BC7 to RGBA8, **BC6H to RGBA16F** (the HDR path), and every uncompressed layout via the header's channel bit masks. Decompressed on the CPU rather than uploaded as blocks: `DecodedImage` is an uncompressed canvas by contract, and the mip builder, downscale guard, alpha scan and flipbook detector all read it as one |
+| KTX, KTX2 | fire-decode's `ktx` module, all pure Rust: **`ktx2`** reads the KTX2 container (KTX v1 is parsed directly, in either byte order), **`texture2ddecoder`** decodes ETC1 / ETC2 / EAC, ASTC and PVRTC blocks, **`basisu`** transcodes Basis Universal (ETC1S, UASTC, UASTC HDR), and **`ruzstd`** undoes Zstandard supercompression. BCn and the plain layouts go through the same codecs as DDS. `KTXorientation` is applied. Decompressed on the CPU for the same reason as DDS |
 | AVIF, HEIF, HEIC | **libheif** (+ libde265 / dav1d) over FFI → 8/16-bit RGBA (+ICC) |
 | EXR | `exr` crate (pure Rust), channels read as stored and interleaved in parallel → **half-float RGBA** when every channel is half (lossless, and half the memory, mips and upload of `f32`), 32-bit float RGBA otherwise |
 | PSD | **`psd_sdk`** (Molecular Matters, C++) over FFI → merged composite, at the document's own depth (8/16/32f). `wrapper.cpp` owns the colour-mode conversion: RGB/Grey/Duotone direct, Indexed through the palette, CMYK composited **through K** (PSD stores CMYK inverted), Lab via D50 XYZ; 8/16-bit RGB and greyscale are interleaved directly, in parallel. 16-bit samples are **full-range 0…65535** - Photoshop works in 15-bit+1 (0…32768) internally but scales on save, as a Photoshop 27 file confirms (white = 65535); 1-bit Bitmap mode is refused, since psd_sdk sizes its planes `bits/8` = 0. A document saved without Maximize Compatibility is `DecodeError::NoMergedImage`, not a picture: Photoshop still writes a merged image, but a white one, and says so only by clearing `hasRealMergedData` in the Version Info resource, which is read before psd_sdk runs. The vendored psd_sdk carries three local patches (`vendor/VENDOR.txt`), the important one being that `PSD_ASSERT` throws instead of `abort()`ing. **Layers** are not psd_sdk's: `fire-decode`'s `PsdLayers` parses the layer section and decodes one layer at a time in bounds-checked Rust (RAW/RLE/ZIP/ZIP+prediction, 8/16/32-bit, masks into alpha, the same colour conversion as `wrapper.cpp`), so a malformed layer is an error, never a crash (§10) |
 | Camera raw (CR2/CR3, NEF, ARW, RAF, ORF, RW2, DNG, …) | **`raw`** (pure Rust) → extract the embedded JPEG **preview**, decode via zune |
 | ICC transforms | **Little CMS** (`lcms2`) over FFI |
 
-`all_extensions()` in `fire-decode` (its `ALL_EXTENSIONS`) is *the* table of what Fire opens - 61
+`all_extensions()` in `fire-decode` (its `ALL_EXTENSIONS`) is *the* table of what Fire opens - 63
 extensions. The Windows installer keeps a second copy because an Inno Setup script can import nothing, and a test
 (`installer_associations_match_the_extension_table`) polices the two against each other; the macOS `Info.plist`
 needs no such test because `scripts/build-mac.sh` parses the const itself.
@@ -436,8 +437,8 @@ Notes:
   (This is also why `panic = "abort"` is *not* set in the release profile - `catch_unwind` only
   works with unwinding panics.)
 - **The mip chain is built or completed here too** (§5): on the decode worker, right after the
-  decode and before the image is posted, so the UI thread never pays for it. A DDS supplies its
-  own authored levels, which are adopted rather than recomputed.
+  decode and before the image is posted, so the UI thread never pays for it. A DDS or KTX
+  supplies its own authored levels, which are adopted rather than recomputed.
 - **Camera raw = embedded preview, not develop.** A raw file is a per-vendor container
   around the sensor mosaic plus a full-size, camera-rendered **JPEG preview**. Developing
   the mosaic (demosaic + white balance + color matrices) is slow and at odds with the
@@ -459,16 +460,18 @@ Notes:
   (§10). Animated WebP is *not* animated: it shows its first frame, decoded by zune.
 - **DDS is a container, so a `.dds` can be several images.** A cubemap's six faces, a texture
   array's layers and a volume's depth slices are all "N images of the same size" - which is
-  exactly what the flipbook already displays - so `dds.rs` composites them into one near-square
-  sheet (six faces tile 3x2; a 64-slice volume 8x8) and hands over a `SheetLayout` saying how to
-  read it back. A single strip would be simpler and nearly a decode-guard rejection: six 4096
-  faces side by side is 24576 px wide. Because the grid is *authored* rather than guessed, the
+  exactly what the flipbook already displays - so fire-decode's `texture.rs` composites them into
+  one near-square sheet (six faces tile 3x2; a 64-slice volume 8x8) and hands over a
+  `SheetLayout` saying how to read it back. A single strip would be simpler and nearly a
+  decode-guard rejection: six 4096 faces side by side is 24576 px wide. Because the grid is *authored* rather than guessed, the
   viewer skips `flipbook::detect` for these files entirely and turns the mode on instead of
   offering a hint chip, with playback parked - the transport is there to step faces, not run
   them. `frames` is what the file holds rather than the whole grid, so the empty sixth cell of a
   five-layer array is not steppable. A cubemap's own mip chain is adopted too, since a
   power-of-two face tiles every level exactly; a volume's is not, because its depth halves with
-  each level and half as many slices cannot tile the same grid.
+  each level and half as many slices cannot tile the same grid. KTX and KTX2 hold the same
+  shapes (a cube array's faces come layer by layer, six at a time) and share the code, so
+  everything here applies to them too.
 - **DDS fixups.** Signed block formats are re-centred for display (`bcdec` returns the raw
   -127..127 range as bytes, which would show a signed normal map as noise), and `DXT2`/`DXT4` -
   and any DX10 header that says so - have their premultiplied alpha straightened, the same fixup
@@ -530,7 +533,7 @@ returns a `ui::Frame` of what the user asked for, which the viewer applies.
 
 - **Toolbar:** channel isolation (R/G/B/A/RGB), fit/1:1, zoom, flipbook, HDR tonemap + exposure
   (float sources only), the mip-level pair (only when the file itself supplied a chain to walk -
-  today a DDS that brought its own; the chain Fire builds for display does not count), and a right-docked group (outline, octagon, backdrop, full-screen,
+  today a DDS or KTX that brought its own; the chain Fire builds for display does not count), and a right-docked group (outline, octagon, backdrop, full-screen,
   menu).
   Buttons dispatch the same `Action`s the keybinds drive - one state path. When the window is too
   narrow the left group sheds its lowest-priority slots into a "»" popup. There is **no gear**:
@@ -861,10 +864,10 @@ not assumed: Windows' own photo thumbnailer returns a 50%-transparent red PNG th
   isolation on: a file that crashes a decoder takes down a throwaway surrogate, never Explorer. What a
   stream costs is the file name, which camera raws are partly routed by; `IStream::Stat` returns it.
 - **Independent of the default app.** Formats are switched one by one, in the installer and in
-  Settings ▸ Thumbnails, whichever app opens them. On out of the box: the formats Windows draws no
-  thumbnail for (TGA, PSD, EXR, Radiance HDR, QOI, Netpbm, Farbfeld) and DDS, whose Windows codec
-  stops at BC3. Off: everything Windows' photo thumbnailer already covers — replacing those is the
-  user's call.
+  Settings ▸ Thumbnails, whichever app opens them. The installer ticks every format, each install
+  and upgrade alike; both lists put first the formats Windows draws no thumbnail for (TGA,
+  KTX / KTX2, PSD, EXR, Radiance HDR, QOI, Netpbm, Farbfeld) and DDS, whose Windows codec stops
+  at BC3, then those Windows' photo thumbnailer already covers.
 - **Where it registers.** The shell asks the file's ProgID first, then the extension key, then
   `SystemFileAssociations` (where Windows' thumbnailer sits) — *measured*: with a provider on both a
   ProgID and its extension, the ProgID's runs. So Fire writes `.ext\ShellEx\{IThumbnailProvider}`
@@ -1048,7 +1051,7 @@ path (§4.1)**; GPU render through sokol_gfx with channel/alpha/gamma/exposure/t
 decode; zune + image + tiff + exr + psd_sdk + libheif decoders; camera-raw embedded-preview decode;
 animated GIF playback; ICC honoring via lcms2; tonemap-to-SDR HDR with exposure; downscale-to-fit
 RAM guard; content-detected **flipbook (sprite-sheet) playback** with a transport band, which
-also carries a DDS cubemap's faces / an array's layers / a volume's slices; a **mip-level
+also carries a DDS or KTX cubemap's faces / an array's layers / a volume's slices; a **mip-level
 viewer** for textures that ship a chain; **PSD layer stepping** with background pre-decoding; the
 **octagon overlay**; folder ←/→ navigation; hot-reload of the displayed image; **DPI-aware,
 dark-mode-aware ImGui toolbar + status bar + settings window**; portable physical-key keybinds;

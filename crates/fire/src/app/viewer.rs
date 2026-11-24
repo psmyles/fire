@@ -801,8 +801,8 @@ impl Viewer {
         }
     }
 
-    /// Turn the flipbook on for a source whose surfaces the *file* laid out — a DDS cubemap,
-    /// texture array or volume, composited into one sheet by the decoder.
+    /// Turn the flipbook on for a source whose surfaces the *file* laid out — a DDS or KTX
+    /// cubemap, texture array or volume, composited into one sheet by the decoder.
     ///
     /// Unlike `flipbook::detect`'s guess this is not a suggestion, so it enters the mode instead
     /// of popping the hint chip. Any state the user already established for this path wins: a

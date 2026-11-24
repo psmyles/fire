@@ -15,132 +15,131 @@ pub struct FormatGroup {
     pub label: &'static str,
     /// Every extension, lower-case, no dot.
     pub exts: &'static [&'static str],
-    /// Whether Fire provides this format's thumbnails out of the box. On exactly where Windows
-    /// draws none of its own — or, for DDS, one that only reads the oldest block formats (BC1-3),
-    /// which is not what a game pipeline writes. Everything Windows' photo thumbnailer already
-    /// covers starts off: taking it over is the user's call, not the installer's.
-    pub default_on: bool,
+    /// Whether Windows draws no thumbnail of its own — or, for DDS, one that only reads the
+    /// oldest block formats (BC1-3), which is not what a game pipeline writes. Only which column
+    /// the format is listed in, in Settings ▸ Thumbnails and on the installer's page: the
+    /// installer ticks every format either way.
+    pub windows_has_none: bool,
 }
 
-impl FormatGroup {
-    /// The extension the installer probes to show whether the group is on.
-    pub fn primary_ext(&self) -> &'static str {
-        self.exts[0]
-    }
-}
-
-/// Every group, the ones Fire takes by default first — the order both the Settings tab and the
-/// installer list them in.
+/// Every group, the ones Windows draws no thumbnail for first — the order both the Settings tab
+/// and the installer list them in.
 pub const GROUPS: &[FormatGroup] = &[
     // --- formats Windows draws no thumbnail for -------------------------------------------------
     FormatGroup {
         id: "tga",
         label: "Truevision TGA",
         exts: &["tga"],
-        default_on: true,
+        windows_has_none: true,
     },
     FormatGroup {
         id: "dds",
         label: "DirectDraw Surface",
         exts: &["dds"],
-        default_on: true,
+        windows_has_none: true,
+    },
+    FormatGroup {
+        id: "ktx",
+        label: "Khronos texture",
+        exts: &["ktx", "ktx2"],
+        windows_has_none: true,
     },
     FormatGroup {
         id: "psd",
         label: "Photoshop",
         exts: &["psd", "psb"],
-        default_on: true,
+        windows_has_none: true,
     },
     FormatGroup {
         id: "exr",
         label: "OpenEXR",
         exts: &["exr"],
-        default_on: true,
+        windows_has_none: true,
     },
     FormatGroup {
         id: "hdr",
         label: "Radiance HDR",
         exts: &["hdr", "pic", "rgbe", "xyze"],
-        default_on: true,
+        windows_has_none: true,
     },
     FormatGroup {
         id: "qoi",
         label: "QOI",
         exts: &["qoi"],
-        default_on: true,
+        windows_has_none: true,
     },
     FormatGroup {
         id: "netpbm",
         label: "Netpbm",
         exts: &["ppm", "pgm", "pbm", "pnm", "pam"],
-        default_on: true,
+        windows_has_none: true,
     },
     FormatGroup {
         id: "farbfeld",
         label: "Farbfeld",
         exts: &["ff"],
-        default_on: true,
+        windows_has_none: true,
     },
     // --- formats Windows already thumbnails -----------------------------------------------------
     FormatGroup {
         id: "png",
         label: "PNG",
         exts: &["png"],
-        default_on: false,
+        windows_has_none: false,
     },
     FormatGroup {
         id: "jpeg",
         label: "JPEG",
         exts: &["jpg", "jpeg", "jpe", "jfif"],
-        default_on: false,
+        windows_has_none: false,
     },
     FormatGroup {
         id: "gif",
         label: "GIF",
         exts: &["gif"],
-        default_on: false,
+        windows_has_none: false,
     },
     FormatGroup {
         id: "bmp",
         label: "Bitmap",
         exts: &["bmp", "dib"],
-        default_on: false,
+        windows_has_none: false,
     },
     FormatGroup {
         id: "tiff",
         label: "TIFF",
         exts: &["tif", "tiff", "tx"],
-        default_on: false,
+        windows_has_none: false,
     },
     FormatGroup {
         id: "webp",
         label: "WebP",
         exts: &["webp"],
-        default_on: false,
+        windows_has_none: false,
     },
     FormatGroup {
         id: "ico",
         label: "Icon and cursor",
         exts: &["ico", "cur"],
-        default_on: false,
+        windows_has_none: false,
     },
     FormatGroup {
         id: "jxl",
         label: "JPEG XL",
         exts: &["jxl"],
-        default_on: false,
+        windows_has_none: false,
     },
     FormatGroup {
         id: "heif",
         label: "HEIF / HEIC",
         exts: &["heic", "heif"],
-        default_on: false,
+        windows_has_none: false,
     },
     FormatGroup {
         id: "avif",
         label: "AVIF",
         exts: &["avif"],
-        default_on: false,
+        windows_has_none: false,
     },
     FormatGroup {
         id: "raw",
@@ -150,22 +149,13 @@ pub const GROUPS: &[FormatGroup] = &[
             "srw", "dng", "x3f", "3fr", "fff", "iiq", "erf", "mrw", "dcr", "kdc", "mef", "mos",
             "rwl", "gpr", "raw",
         ],
-        default_on: false,
+        windows_has_none: false,
     },
 ];
 
 /// The group with this id.
 pub fn group(id: &str) -> Option<&'static FormatGroup> {
     GROUPS.iter().find(|g| g.id == id)
-}
-
-/// The groups on out of the box, by id.
-pub fn default_ids() -> Vec<&'static str> {
-    GROUPS
-        .iter()
-        .filter(|g| g.default_on)
-        .map(|g| g.id)
-        .collect()
 }
 
 /// Read a `--set-thumbnails` list (`"tga,psd,exr"`; commas and/or spaces). Unknown ids are
@@ -220,12 +210,12 @@ mod tests {
         }
     }
 
-    /// The default-on groups come first, so both lists can split into "Windows has none" and
-    /// "Windows has its own" under one heading each.
+    /// The groups Windows has no thumbnail for come first, so both lists can split into "Windows
+    /// has none" and "Windows has its own" under one heading each.
     #[test]
-    fn default_on_groups_lead() {
-        let first_off = GROUPS.iter().position(|g| !g.default_on).unwrap();
-        assert!(GROUPS[first_off..].iter().all(|g| !g.default_on));
+    fn windows_has_none_groups_lead() {
+        let first_own = GROUPS.iter().position(|g| !g.windows_has_none).unwrap();
+        assert!(GROUPS[first_own..].iter().all(|g| !g.windows_has_none));
     }
 
     #[test]
@@ -237,41 +227,36 @@ mod tests {
     }
 
     /// The installer's thumbnails page lists every group, in this order and in the column
-    /// `default_on` puts it in, probing its primary extension to show its state, under a caption
-    /// that starts with its label. Read the `[Code]` list back and compare outright, the way
-    /// `fire-decode` polices its association rows — an Inno script cannot `use` this table. Lines
-    /// of the form `AddThumbFormat(True, 'tga', 'tga', 'Truevision TGA (.tga)');`.
+    /// `windows_has_none` puts it in, under a caption that starts with its label. Read the
+    /// `[Code]` list back and compare outright, the way `fire-decode` polices its association
+    /// rows — an Inno script cannot `use` this table. Lines of the form
+    /// `AddThumbFormat(True, 'tga', 'Truevision TGA (.tga)');`.
     #[test]
     fn installer_thumbnail_page_matches_the_table() {
         const ISS: &str = include_str!("../../../installer/fire.iss");
-        let listed: Vec<(bool, String, String, String)> = ISS
+        let listed: Vec<(bool, String, String)> = ISS
             .lines()
             .filter_map(|l| l.trim().strip_prefix("AddThumbFormat("))
             .map(|args| {
-                // The Boolean, then three quoted strings: split on the quotes.
+                // The Boolean, then two quoted strings: split on the quotes.
                 let parts: Vec<&str> = args.split('\'').collect();
-                assert_eq!(parts.len(), 7, "unexpected AddThumbFormat line: {args}");
+                assert_eq!(parts.len(), 5, "unexpected AddThumbFormat line: {args}");
                 let windows_has_none = parts[0].trim().trim_end_matches(',').trim() == "True";
-                (
-                    windows_has_none,
-                    parts[1].to_string(),
-                    parts[3].to_string(),
-                    parts[5].to_string(),
-                )
+                (windows_has_none, parts[1].to_string(), parts[3].to_string())
             })
             .collect();
-        let script: Vec<(bool, &str, &str)> = listed
+        let script: Vec<(bool, &str)> = listed
             .iter()
-            .map(|(on, id, ext, _)| (*on, id.as_str(), ext.as_str()))
+            .map(|(none, id, _)| (*none, id.as_str()))
             .collect();
-        let table: Vec<(bool, &str, &str)> = GROUPS
+        let table: Vec<(bool, &str)> = GROUPS
             .iter()
-            .map(|g| (g.default_on, g.id, g.primary_ext()))
+            .map(|g| (g.windows_has_none, g.id))
             .collect();
         assert_eq!(
             script, table,
-            "installer/fire.iss's ListThumbFormats differs from formats::GROUPS (column, id, \
-             order, or the extension probed)"
+            "installer/fire.iss's ListThumbFormats differs from formats::GROUPS (column, id \
+             or order)"
         );
         for (g, (.., caption)) in GROUPS.iter().zip(&listed) {
             assert!(

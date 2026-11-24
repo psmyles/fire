@@ -80,9 +80,9 @@ jobs:
       - name: Test (fire-ipc)
         run: cargo test --locked -p fire-ipc
 
-      # Explorer thumbnails: the CPU render, the settings table, and the two drift tests that hold
-      # installer/fire.iss's thumbnails page and class id to the crate. On Windows also the HKCU
-      # registration round trips, on throwaway extensions they clean up after.
+      # Explorer thumbnails: the CPU render, the settings table, and the drift test that holds
+      # installer/fire.iss's thumbnails page to the crate. On Windows also the HKCU registration
+      # round trips, on throwaway extensions they clean up after.
       - name: Test (fire-thumbs)
         run: cargo test --locked -p fire-thumbs
 

@@ -203,7 +203,7 @@
 #
 #   backdrop          What shows through transparent pixels: "transparent" (default — Explorer's
 #                     own background), "checker", "black", "white" or "grey".
-#   tonemap           HDR images (EXR / HDR / float DDS): "reinhard" (default) or "aces".
+#   tonemap           HDR images (EXR / HDR / float DDS or KTX): "reinhard" (default) or "aces".
 #   exposure          HDR exposure, in stops, before the tonemap. Range -8 – 8. Default 0.
 #   max-file-size-mb  Files larger than this get no thumbnail from Fire, just their icon — the
 #                     whole file and the whole decoded image have to fit in memory. 0 = no limit.

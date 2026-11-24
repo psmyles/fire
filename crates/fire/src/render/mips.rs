@@ -9,10 +9,10 @@
 //! allows (see [`crate::render::gpu::Uploader`]).
 //!
 //! The builder itself is fire-decode's (its `mips` feature, FD11: [`fire_decode::mips`]), which
-//! 3D Review shares: a 2×2 box filter per level, 8-bit sRGB averaged in linear light, a DDS's own
-//! levels adopted, the big levels split across the process-wide thread budget. What stays here is
-//! the upload side: how many levels a texture has, how wide a texel is, and the conversions for a
-//! device that lacks the decoder's format.
+//! 3D Review shares: a 2×2 box filter per level, 8-bit sRGB averaged in linear light, a DDS's or
+//! KTX's own levels adopted, the big levels split across the process-wide thread budget. What
+//! stays here is the upload side: how many levels a texture has, how wide a texel is, and the
+//! conversions for a device that lacks the decoder's format.
 
 pub use fire_decode::mips::level_count;
 // The halving rule lives with the decode contract that states it (`DecodedImage::source_mips`).
@@ -136,8 +136,8 @@ mod tests {
         assert_eq!(level_count(1000, 3), 10);
     }
 
-    /// Levels floor-halve and stop at 1, on each axis independently — the rule a DDS stores its
-    /// own chain by, which is what lets one be adopted without rescaling.
+    /// Levels floor-halve and stop at 1, on each axis independently — the rule a DDS or KTX
+    /// stores its own chain by, which is what lets one be adopted without rescaling.
     #[test]
     fn level_dims_floor_halve_and_never_reach_zero() {
         assert_eq!(level_dims(8, 4, 0), (8, 4));

@@ -30,7 +30,8 @@ pub mod registry;
 pub use settings::{Backdrop, ThumbnailsCfg, Tonemap};
 
 /// How a thumbnail's file is decoded: the viewer's setup with an animation's first frame, the
-/// file's own mips skipped and SDR output (fire-decode plan, FD5). It keeps the DDS sheet, so a
+/// file's own mips skipped and SDR output (fire-decode plan, FD5). It keeps a texture's sheet
+/// (DDS, KTX), so a
 /// cubemap's thumbnail shows every face, as the viewer's sheet does. Here rather than in
 /// `fire-shellext` so it is tested on every OS.
 pub fn decode_options() -> fire_decode::DecodeOptions {
@@ -45,9 +46,6 @@ pub fn decode_options() -> fire_decode::DecodeOptions {
 /// The class id of Fire's thumbnail provider: what the per-extension `ShellEx` entries name, what
 /// `HKCU\Software\Classes\CLSID` maps to the DLL, and what the DLL's `DllGetClassObject` answers
 /// to. Never change it once shipped — the registrations already out there name this one.
-///
-/// `installer/fire.iss` spells it out too (it reads the registry to show the current state on an
-/// upgrade); a test keeps the two equal.
 pub const CLSID: u128 = 0xDA926B60_8532_4616_A98E_889545ADA4AB;
 
 /// [`CLSID`] in the braced registry form, `{DA926B60-8532-4616-A98E-889545ADA4AB}`.
@@ -70,20 +68,5 @@ mod tests {
     #[test]
     fn clsid_formats_as_the_registry_spells_it() {
         assert_eq!(clsid_braced(), "{DA926B60-8532-4616-A98E-889545ADA4AB}");
-    }
-
-    /// The installer reads the registry for this class id to tick the formats already on, so its
-    /// copy has to be this one. Lines of the form `FireThumbClsid = '{…}';`.
-    #[test]
-    fn installer_names_the_same_clsid() {
-        const ISS: &str = include_str!("../../../installer/fire.iss");
-        let line = ISS
-            .lines()
-            .find(|l| l.trim_start().starts_with("FireThumbClsid"))
-            .expect("fire.iss declares FireThumbClsid");
-        assert!(
-            line.contains(&clsid_braced()),
-            "fire.iss names a different class id: {line}"
-        );
     }
 }

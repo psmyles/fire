@@ -956,7 +956,7 @@ fn thumbnails(ui: &Ui, st: &mut State, out: &mut Frame) {
         let _dis = (!st.thumbs.dll).then(|| ui.begin_disabled());
         let split = GROUPS
             .iter()
-            .position(|g| !g.default_on)
+            .position(|g| !g.windows_has_none)
             .unwrap_or(GROUPS.len());
         for (heading, range) in [
             ("No thumbnails from Windows", 0..split),
@@ -1012,7 +1012,7 @@ fn thumbnails(ui: &Ui, st: &mut State, out: &mut Frame) {
     row_note(
         ui,
         lw,
-        "In stops, before the tone map. Both apply to EXR, Radiance HDR and float DDS files.",
+        "In stops, before the tone map. Both apply to EXR, Radiance HDR and float DDS / KTX files.",
     );
 
     ui.spacing();

@@ -78,26 +78,21 @@ impl Format {
 
     /// The format of a decoded image, from the name fire-decode gives it.
     fn of_decoded(source_format: &str) -> Format {
+        // A texture container names its pixel format after its own (`DDS BC7`, `KTX2 ETC1S`):
+        // the format is the container, the first word.
+        let container = source_format.split(' ').next().unwrap_or(source_format);
+        if matches!(container, "DDS" | "KTX" | "KTX2") {
+            return Format::new(&container.to_lowercase(), container);
+        }
         let id = match source_format {
-            name if name.starts_with("DDS") => "dds",
             "JPEG" => "jpg",
             "JPEG XL" => "jxl",
             "OpenEXR" => "exr",
             "Radiance HDR" => "hdr",
             "Farbfeld" => "ff",
-            other => {
-                return Format {
-                    id: other.to_lowercase(),
-                    name: other.to_owned(),
-                };
-            }
+            other => other,
         };
-        let name = if source_format.starts_with("DDS") {
-            "DDS"
-        } else {
-            source_format
-        };
-        Format::new(id, name)
+        Format::new(&id.to_lowercase(), source_format)
     }
 }
 
@@ -243,6 +238,12 @@ mod tests {
         assert_eq!(id("TIFF"), "tiff");
         assert_eq!(id("DDS BC7"), "dds");
         assert_eq!(Format::of_decoded("DDS BC7").name, "DDS");
+        assert_eq!(id("KTX"), "ktx");
+        assert_eq!(id("KTX ETC2 RGBA"), "ktx");
+        assert_eq!(Format::of_decoded("KTX BC7").name, "KTX");
+        assert_eq!(id("KTX2"), "ktx2");
+        assert_eq!(id("KTX2 ETC1S"), "ktx2");
+        assert_eq!(Format::of_decoded("KTX2 UASTC HDR").name, "KTX2");
         assert_eq!(id("OpenEXR"), "exr");
         assert_eq!(id("Radiance HDR"), "hdr");
         assert_eq!(id("WebP"), "webp");

@@ -182,7 +182,7 @@ rules from it, so a rule added there fails the build until its check exists in
 | `texture.psd_composite` | A PSD saved without Maximize Compatibility, so it has no merged image for Unity to import | - | on, error |
 | `texture.psb` | A PSB (Large Document Format) file | - | off, error |
 
-- **Sizes** are a surface's: for a DDS cubemap, array or volume, one face's.
+- **Sizes** are a surface's: for a DDS or KTX cubemap, array or volume, one face's.
 - **Bit depth** is the file's own: a 4-bit palette PNG is 4, a half-float EXR 16 (float). `allowed`
   lists bits per channel.
 - **A colour profile** is sRGB when converting from it to sRGB moves no colour by more than one 8-bit

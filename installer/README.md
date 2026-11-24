@@ -38,9 +38,12 @@ Flags: `-SkipBuild` (reuse the existing `target/release/fire.exe` and `fire_shel
   install folder to the user's `Path` (`HKCU\Environment`, kept `REG_EXPAND_SZ`), and Setup
   broadcasts the change (`ChangesEnvironment`) so new terminals see it. Unticked on a reinstall, the
   folder comes off again; uninstall always takes it off. Nothing else in the value is touched.
+- **Every install starts from the defaults**, a fresh one and an upgrade alike: every association
+  and every thumbnail format ticked, fire-cli on the Path, no desktop shortcut. What the last
+  install picked, or what was changed in Settings since, is not carried over
+  (`UsePreviousTasks=no`); untick what you don't want each time.
 - A wizard page to set Fire as the default viewer, with a checkbox **per format** plus an **"All
-  supported image formats"** master toggle. All off by default — an install never silently steals
-  associations the user didn't pick.
+  supported image formats"** master toggle. All ticked by default.
 - For each selected format it writes (under `HKCU`): a per-format `Fire.<format>` ProgID (e.g.
   `Fire.png`, `Fire.tga`) whose friendly type name is what Explorer shows in the **Type** column
   ("PNG image", "Truevision TGA image", …), an `OpenWithProgids` entry (adds Fire to "Open with"),
@@ -56,14 +59,12 @@ Flags: `-SkipBuild` (reuse the existing `target/release/fire.exe` and `fire_shel
 - An **Explorer Thumbnails** page of its own, right after the tasks: a checkbox per format,
   independent of the associations — Fire's `fire_shellext.dll` draws those formats' thumbnails
   whichever app opens them. Two columns, as in Settings ▸ Thumbnails: the formats Windows shows no
-  thumbnail for (TGA, DDS, PSD, EXR, Radiance HDR, QOI, Netpbm, Farbfeld), pre-ticked, and the ones
-  Windows already thumbnails, offered unticked. The installer does none of the registry work
+  thumbnail for (TGA, DDS, KTX / KTX2, PSD, EXR, Radiance HDR, QOI, Netpbm, Farbfeld) and the ones
+  Windows already thumbnails, every one pre-ticked. The installer does none of the registry work
   itself — it runs `fire.exe --set-thumbnails "<ids>"` after copying the files, and
   `fire.exe --remove-thumbnails` on uninstall, the same code Fire's Settings ▸ Thumbnails tab uses.
-  Whatever provider a format had before is saved and put back. On an upgrade the page ticks what
-  is on *now*, which the user may have changed in Settings since; Setup records that the choice was
-  made (`Inno Setup CodeFile: ThumbnailsChosen` in its uninstall key), so a choice of nothing stays
-  nothing. A silent install takes the same ticks without showing the page.
+  Whatever provider a format had before is saved and put back. An upgrade ticks every format
+  again, whatever is on now, and a silent install takes the same ticks without showing the page.
 - The DLL is installed whatever is ticked, so formats can be switched on later from Settings.
   Explorer's thumbnail surrogate (`dllhost.exe`) can hold it open for a few minutes after use; an
   upgrade meets that through Setup's Restart Manager page, which offers to close it.

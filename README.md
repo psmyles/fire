@@ -32,9 +32,9 @@ OS plus a handful of small leaves.
 - A customizable context menu that covers basic operations and allows for user defined behavior
 - One process, as many windows as you like: a second launch hands its path to the running Fire
   (`open-in = "new-window"` gives it its own window, `"reuse-window"` swaps it into the focused one)
-- Windows: Explorer thumbnails for the formats Windows can't show (TGA, DDS — BC1 through BC7, PSD,
-  EXR, Radiance HDR, QOI, Netpbm, Farbfeld), drawn by the same decoders as the viewer, and optionally
-  for the formats it can. Chosen per format in the installer or Settings \ Thumbnails, along with
+- Windows: Explorer thumbnails for the formats Windows can't show (TGA, DDS — BC1 through BC7,
+  KTX / KTX2, PSD, EXR, Radiance HDR, QOI, Netpbm, Farbfeld), drawn by the same decoders as the
+  viewer, and optionally for the formats it can. Chosen per format in the installer or Settings \ Thumbnails, along with
   the transparency backdrop, the HDR tonemap and exposure, and a file-size limit
 
 See [docs/architecture.md](docs/architecture.md) for the full design; its appendices carry the

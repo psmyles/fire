@@ -34,7 +34,7 @@ pub enum Backdrop {
     Grey,
 }
 
-/// The operator HDR thumbnails (OpenEXR, Radiance HDR, float DDS) are tonemapped with — the
+/// The operator HDR thumbnails (OpenEXR, Radiance HDR, float DDS / KTX) are tonemapped with — the
 /// viewer's two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
