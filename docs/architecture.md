@@ -649,6 +649,15 @@ returns a `ui::Frame` of what the user asked for, which the viewer applies.
   not treated as a request: `ShellExecuteEx` stamps `STARTF_USESHOWWINDOW` + `SW_SHOWNORMAL` on
   every shell launch, so honouring it made a double-click in Explorer un-maximize a window the
   user had left maximized. Off Windows that leaf answers `None` and the remembered state stands.
+  On Windows the window is always created *normal*, and its reveal applies the first state in
+  one step (`platform::reveal`): `ShowWindow(SW_SHOWMAXIMIZED)`, or for a minimized launch a
+  `SetWindowPlacement` with `SW_SHOWMINNOACTIVE` (plus `WPF_RESTORETOMAXIMIZED` when it should
+  come back maximized). winit performs a creation-time maximize or minimize with `ShowWindow`,
+  which shows the still-hidden window, so it flashed up, vanished while the GPU came up, and
+  appeared again. The restored rect is seeded from the new window, so a session that never
+  leaves maximized saves the rect it started with rather than the maximized one. It is tracked
+  against `IsZoomed`, not winit's maximized flag, because a maximize reports its move before
+  winit updates that flag. A minimize leaves the remembered maximized state alone.
 - **Settings:** stored as **TOML** in the per-user config directory - `%APPDATA%\fire` on Windows,
   `~/Library/Application Support/fire` on macOS, `$XDG_CONFIG_HOME/fire` elsewhere (one definition,
   `util::fire_dir`, so the files cannot drift apart). Fire writes a fully commented

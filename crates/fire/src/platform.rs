@@ -5,12 +5,16 @@
 //! shell above reads as one program:
 //!
 //! * the launcher's Run = Minimized/Maximized (a Windows `STARTUPINFO` field);
+//! * a window's first show, straight into the maximized or minimized state (one `ShowWindow` or
+//!   `SetWindowPlacement` on Windows), and whether it is maximized right now (`IsZoomed`);
 //! * the one-shot foreground grant on the forward path (`AllowSetForegroundWindow`);
 //! * the clipboard, for the actions menu's Copy File / Copy Path / Copy File Name;
 //! * "Show in Explorer" / "Reveal in Finder";
 //! * where the UI font lives.
 
 use std::path::Path;
+
+use winit::window::Window;
 
 /// How the launcher asked the window to be shown — only the two states that are a genuine
 /// *request*. There is deliberately no `Normal`: see [`launcher_show`].
@@ -73,6 +77,63 @@ pub fn launcher_show() -> Option<LaunchShow> {
     {
         None
     }
+}
+
+/// How a new window first appears: the state `window.toml` remembers, or the one the launcher
+/// asked for (see [`launcher_show`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstShow {
+    /// Maximized. Together with `minimized`, the state restoring it from the taskbar gives back.
+    pub maximized: bool,
+    /// On the taskbar without ever appearing on screen (a launcher's Run = Minimized).
+    pub minimized: bool,
+}
+
+impl FirstShow {
+    /// Whether to create the window maximized (winit's `with_maximized`), rather than leave the
+    /// whole first state to [`reveal`].
+    ///
+    /// Never on Windows. There winit carries out a creation-time maximize, and a minimize after
+    /// it, as `ShowWindow` calls, and both *show* the window although it was created hidden.
+    /// winit hides it again straight away, but by then the empty frame has reached the screen:
+    /// a maximized launch appeared, vanished for the ~200 ms the GPU and ImGui take to come up,
+    /// and appeared again, and a minimized one flashed a maximized window before it went to the
+    /// taskbar. A hidden window cannot change state without being shown, so on Windows it is
+    /// created normal and the reveal *is* the state change. Elsewhere it is created maximized,
+    /// as winit expects.
+    pub fn create_maximized(self) -> bool {
+        self.maximized && !cfg!(windows)
+    }
+}
+
+/// Show the window, created hidden, in its first state. On Windows that takes one step, so the
+/// window never appears in any other state first (see [`FirstShow::create_maximized`]).
+pub fn reveal(window: &Window, first: FirstShow) {
+    #[cfg(windows)]
+    win_window::reveal(window, first);
+    #[cfg(not(windows))]
+    {
+        if first.minimized {
+            window.set_minimized(true);
+        }
+        window.set_visible(true);
+    }
+}
+
+/// Whether `window` is maximized, as the OS has it *now*.
+///
+/// On Windows winit's own answer is a flag it updates on `WM_SIZE`, and a maximize sends that
+/// only after the move. The `Moved` that comes first still read "not maximized", so the
+/// maximized position was remembered as the one to restore to. `IsZoomed` is already right when
+/// that move arrives.
+pub fn is_maximized(window: &Window) -> bool {
+    #[cfg(windows)]
+    {
+        if let Some(zoomed) = win_window::is_zoomed(window) {
+            return zoomed;
+        }
+    }
+    window.is_maximized()
 }
 
 /// Grant the running instance the right to take the foreground when it opens our path.
@@ -263,6 +324,72 @@ mod mac_clipboard {
             pasteboard.clearContents();
             pasteboard.writeObjects(&NSArray::from_vec(vec![writer]))
         }
+    }
+}
+
+#[cfg(windows)]
+mod win_window {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowPlacement, IsZoomed, SetWindowPlacement, ShowWindow, SW_SHOWMAXIMIZED,
+        SW_SHOWMINNOACTIVE, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED,
+    };
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::window::Window;
+
+    use super::FirstShow;
+
+    /// `None` never happens in practice: a winit window on Windows always has a Win32 handle.
+    fn hwnd(window: &Window) -> Option<HWND> {
+        match window.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Win32(h)) => Some(h.hwnd.get() as HWND),
+            _ => None,
+        }
+    }
+
+    pub fn is_zoomed(window: &Window) -> Option<bool> {
+        // SAFETY: a query on the live window's own handle.
+        hwnd(window).map(|hwnd| unsafe { IsZoomed(hwnd) } != 0)
+    }
+
+    pub fn reveal(window: &Window, first: FirstShow) {
+        let Some(hwnd) = hwnd(window) else {
+            window.set_visible(true);
+            return;
+        };
+        // SAFETY (each call below): the live window's own handle, on the event-loop thread that
+        // created it; `wp` is a whole `WINDOWPLACEMENT` with its `length` set.
+        if first.minimized {
+            // To the taskbar without activating, as a Run = Minimized launch asks
+            // (`SW_SHOWMINNOACTIVE`), and restoring to maximized when that is the state to come
+            // back to: `WPF_RESTORETOMAXIMIZED`, which only a placement can carry.
+            let mut wp: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+            wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+            if unsafe { GetWindowPlacement(hwnd, &mut wp) } != 0 {
+                wp.showCmd = SW_SHOWMINNOACTIVE as u32;
+                wp.flags = if first.maximized {
+                    WPF_RESTORETOMAXIMIZED
+                } else {
+                    0
+                };
+                unsafe { SetWindowPlacement(hwnd, &wp) };
+            }
+            // Before winit hears of the show below. It reads `IsIconic` and has nothing left to
+            // do, but now knows the window is minimized: otherwise the style refresh that comes
+            // with the show strips `WS_MINIMIZE`, leaving a window that cannot be restored.
+            window.set_minimized(true);
+        } else if first.maximized {
+            // The process's first show can have its command swapped for the launcher's
+            // `STARTUPINFO.wShowWindow` (the `SW_SHOWNORMAL` every shell launch carries); a plain
+            // `SW_SHOW` is, but an explicit `SW_SHOWMAXIMIZED` is left alone. It sends `WM_SIZE`
+            // with `SIZE_MAXIMIZED` before returning, which is where winit learns the window is
+            // maximized.
+            unsafe { ShowWindow(hwnd, SW_SHOWMAXIMIZED) };
+        }
+        // winit keeps its own record of visibility, and without this would hide the window again
+        // on its next style change. For a window that is already up, the `SW_SHOW` (and
+        // `SW_MAXIMIZE`) it sends change nothing.
+        window.set_visible(true);
     }
 }
 

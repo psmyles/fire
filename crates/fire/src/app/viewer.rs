@@ -334,12 +334,15 @@ pub struct Viewer {
     /// The previous left press, for double-click synthesis.
     last_click: Option<(Instant, (f32, f32))>,
     /// The window's placement while it was last neither maximized, minimized nor full-screen —
-    /// what `window.toml` remembers. winit has no "restored rect" query, so it is tracked here
-    /// from the move/resize events instead.
+    /// what `window.toml` remembers. winit has no "restored rect" query, so it is seeded when the
+    /// window is created and tracked from the move/resize events after that.
     normal_pos: Option<PhysicalPosition<i32>>,
     normal_size: Option<PhysicalSize<u32>>,
     /// Whether the last size event found the window maximized; a change persists the placement.
+    /// A minimized window keeps the state it will restore to.
     maximized: bool,
+    /// The state the first [`Viewer::show`] reveals the window in; spent by that show.
+    first_show: Option<platform::FirstShow>,
     requests: Requests,
     dialog: Option<Dialog>,
     /// A picker is up. One at a time: see `run_dialog`.
@@ -369,32 +372,46 @@ impl Viewer {
         // `window.toml` in charge.
         let saved = WindowState::load();
         let launcher = platform::launcher_show();
-        let maximized = match launcher {
-            Some(LaunchShow::Maximized) => true,
-            // `Minimized` says how to *show* the window, not what it should be once it comes
-            // back: restoring from the taskbar has to give back the remembered placement.
-            Some(LaunchShow::Minimized) | None => saved.is_some_and(|s| s.maximized),
+        let first = platform::FirstShow {
+            maximized: match launcher {
+                Some(LaunchShow::Maximized) => true,
+                // `Minimized` says how to *show* the window, not what it should be once it comes
+                // back: restoring from the taskbar has to give back the remembered placement.
+                Some(LaunchShow::Minimized) | None => saved.is_some_and(|s| s.maximized),
+            },
+            minimized: launcher == Some(LaunchShow::Minimized),
         };
+        // The remembered restored rect: the frame's top-left and the client size.
+        let saved_rect = saved.map(|s| {
+            (
+                PhysicalPosition::new(s.x, s.y),
+                PhysicalSize::new(s.width.max(200) as u32, s.height.max(150) as u32),
+            )
+        });
+        // Maximized here only where that keeps the window hidden; otherwise `show` applies the
+        // whole first state (see `platform::FirstShow::create_maximized`).
         let mut attrs = Window::default_attributes()
             .with_title(crate::product::NAME)
             .with_visible(false)
-            .with_maximized(maximized)
+            .with_maximized(first.create_maximized())
             .with_window_icon(window_icon());
-        match &saved {
-            Some(s) => {
-                attrs = attrs
-                    .with_inner_size(PhysicalSize::new(
-                        s.width.max(200) as u32,
-                        s.height.max(150) as u32,
-                    ))
-                    .with_position(PhysicalPosition::new(s.x, s.y));
-            }
+        match saved_rect {
+            Some((pos, size)) => attrs = attrs.with_inner_size(size).with_position(pos),
             None => attrs = attrs.with_inner_size(PhysicalSize::new(1280u32, 800u32)),
         }
         let window = Arc::new(
             el.create_window(attrs)
                 .map_err(|e| format!("could not create the window: {e}"))?,
         );
+        // The restored rect `window.toml` gets if the window never reports one of its own: opened
+        // maximized and closed without ever being restored. A window created normal is asked
+        // (that is the rect it restores to, after any clamping to the screen); one created
+        // maximized has only the remembered rect to go on.
+        let (normal_pos, normal_size) = if first.create_maximized() {
+            (saved_rect.map(|r| r.0), saved_rect.map(|r| r.1))
+        } else {
+            (window.outer_position().ok(), Some(window.inner_size()))
+        };
         let dpi = ((window.scale_factor() * 96.0).round() as u32).max(96);
         let dark = window
             .theme()
@@ -488,26 +505,29 @@ impl Viewer {
             mods: ModifiersState::empty(),
             cursor: (0.0, 0.0),
             last_click: None,
-            normal_pos: None,
-            normal_size: None,
-            maximized,
+            normal_pos,
+            normal_size,
+            maximized: first.maximized,
+            first_show: Some(first),
             requests: Requests::default(),
             dialog: None,
             dialog_running: false,
             layers: None,
         };
         me.apply_min_size();
-        if launcher == Some(LaunchShow::Minimized) {
-            me.window.set_minimized(true);
-        }
         Ok(me)
     }
 
-    /// Reveal the window. Its first appearance is already in the remembered state, and it takes
-    /// the foreground on its own — we are the process the launcher just started. (A *forwarded*
-    /// open raises explicitly; see [`Viewer::open`].)
+    /// Reveal the window. Its first appearance is already in its first state — the remembered
+    /// one, or minimized for a Run = Minimized launch — with nothing else on screen before it
+    /// (see `platform::reveal`). It takes the foreground on its own, unless it opens minimized: we
+    /// are the process the launcher just started. (A *forwarded* open raises explicitly; see
+    /// [`Viewer::open`].)
     pub fn show(&mut self) {
-        self.window.set_visible(true);
+        match self.first_show.take() {
+            Some(first) => platform::reveal(&self.window, first),
+            None => self.window.set_visible(true),
+        }
         self.redraw();
     }
 
@@ -1874,11 +1894,15 @@ impl Viewer {
         .save();
     }
 
-    /// Whether the current placement is a *normal* one worth remembering.
+    /// Whether the current placement is a *normal* one worth remembering. Asked of the OS, not
+    /// winit's record: a maximize reports its move before winit has heard it is a maximize (see
+    /// `platform::is_maximized`).
     fn placement_is_normal(&self) -> bool {
-        !self.fullscreen()
-            && !self.window.is_maximized()
-            && self.window.is_minimized() != Some(true)
+        !self.fullscreen() && !platform::is_maximized(&self.window) && !self.minimized()
+    }
+
+    fn minimized(&self) -> bool {
+        self.window.is_minimized() == Some(true)
     }
 
     // --- events ---------------------------------------------------------------------------------
@@ -1895,11 +1919,13 @@ impl Viewer {
             WindowEvent::Resized(size) => {
                 self.surface.resize(size.width, size.height);
                 self.redraw();
-                let maximized = self.window.is_maximized();
+                let maximized = platform::is_maximized(&self.window);
                 if self.placement_is_normal() {
                     self.normal_size = Some(*size);
                 }
-                if maximized != self.maximized && !self.fullscreen() {
+                // Minimizing does not un-maximize: restoring gives the state back, so a window
+                // closed from the taskbar still has to remember it.
+                if maximized != self.maximized && !self.fullscreen() && !self.minimized() {
                     // The maximize/restore button: persist as it changes, not just on close.
                     self.maximized = maximized;
                     self.save_window_state();

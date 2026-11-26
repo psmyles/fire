@@ -46,7 +46,8 @@ dirs.workspace = true
 rfd.workspace = true
 
 # The remaining Win32 leaves (see `platform.rs`): the one-shot foreground grant on the forward
-# path, the clipboard (Copy File / Path / Name), and the launcher's Run = Maximized/Minimized.
+# path, the clipboard (Copy File / Path / Name), the launcher's Run = Maximized/Minimized, and the
+# window's first show and maximized state.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
@@ -54,7 +55,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Memory",              # GlobalAlloc/Lock for the clipboard payloads
     "Win32_System_Threading",           # GetStartupInfoW (the launcher's Run setting)
     "Win32_UI_Shell",                   # DROPFILES for the CF_HDROP clipboard payload
-    "Win32_UI_WindowsAndMessaging",     # AllowSetForegroundWindow, SW_* show commands
+    "Win32_UI_WindowsAndMessaging",     # AllowSetForegroundWindow, ShowWindow / placement, IsZoomed
 ] }
 # The D3D11 device and DXGI flip-model swapchain sokol_gfx draws through (render::d3d11). The
 # typed crate (vs raw windows-sys) makes the COM calls tractable; nothing else names it.
